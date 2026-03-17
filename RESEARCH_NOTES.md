@@ -285,10 +285,32 @@ These are mostly:
 | 9:30 PM | 88 | + V5 numpy decoder (no new unique) |
 | 9:45 PM | **107** | **+ expanded MASTER.SCP database** |
 
+## N6TV WPX CW 2008 — 125kHz Wideband Validation (2026-03-17)
+
+### Recording
+- N6TV Perseus recording, 125kHz sample rate, 24-bit stereo
+- 20m band, WPX CW 2008, 11.2 minutes
+- ±62.5 kHz bandwidth
+
+### Results
+- 12 validated callsigns: NL7V, K5EK, W8MJ, KA2UQW, K4GHS, VA3CD, N7KA, W8UI, KD4O, KU8E, K4RDU, EE1E
+- Clean CQ decode: `CQ CQ CQ DE NL7VX NL7V`
+- Working bandwidths at 125kHz: BW=125 (119 lines), BW=200 (351), BW=250 (297), BW=400 (203), BW=500 (151)
+- No CW Skimmer baseline available for this file
+
+### Generalization Confirmed
+Pipeline works across:
+- Sample rates: 48kHz, 125kHz, 192kHz
+- Bandwidths: 24kHz, 62.5kHz, 96kHz
+- Bit depths: 16-bit, 24-bit
+- Contests: Region 1 CW 2009, WPX CW 2008
+- Recording sources: DK3QN (EU), N6TV (NA), VU2PTT (AS)
+
 ### Next Steps
 1. **Merge MASTER.SCP with MASTER.DTA** for production — the database gap was the biggest bottleneck
 2. Build automated multi-pass runner with all decoder versions
-3. Test on additional WAV files to validate generalization
+3. Record own 192kHz contest IQ from pitaya during next CW contest
 4. Build real-time version with parallel threads
 5. Package as Docker container with complete database
 6. Contribute master.scp additions back to supercheckpartial.com
+7. Test with ML decoder (V5) on contest recordings
