@@ -13,7 +13,7 @@
 #define USE_AVG_RATIO  0 // 1: Divide each bucket by average value
 #define USE_THRESHOLD  1 // 1: Convert each bucket to 0.0/1.0 values
 
-#define BANDWIDTH    (100)
+#define BANDWIDTH    (50)
 #define NUM_SCALES   (16)
 #define AVG_SECONDS  (3)
 #define NEIGH_WEIGHT (0.5)
