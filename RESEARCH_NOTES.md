@@ -316,3 +316,20 @@ Pipeline works across:
 5. Package as Docker container with complete database
 6. Contribute master.scp additions back to supercheckpartial.com
 7. Test with ML decoder (V5) on contest recordings
+
+## Overnight Session Results (2026-03-17 → 2026-03-18)
+
+### DK3QN 48kHz — Final: 107 callsigns (vs CW Skimmer's 108)
+- Maxed out — additional 96kHz sample rate interpretation didn't add new calls
+- 47 matching CW Skimmer + 60 exclusive
+
+### N6TV 125kHz WPX CW 2008 — Final: 22 callsigns
+- Multi-decoder (V0+V1+V3) × multi-input (I/Q/mag/stereo) × multi-bandwidth × multi-threshold
+- Maxed out — additional sample rate interpretations (62.5kHz, 250kHz) didn't add new calls
+- Notable decodes: NL7V (Alaska, clean CQ DE), EE1E (Spain), SE5E (Sweden), KA2UQW (clean DE)
+
+### Key Finding
+Both recordings are maxed at their respective counts. Further improvement requires:
+1. Better decoder (AG1LE Bayesian or ML) — current libcsdr decoder quality is the ceiling
+2. More complete MASTER.SCP — proved to be the biggest single factor
+3. More recordings to test against — need CW contest IQ from pitaya
