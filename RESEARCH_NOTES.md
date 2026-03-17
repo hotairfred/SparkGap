@@ -297,6 +297,8 @@ These are mostly:
 - Clean CQ decode: `CQ CQ CQ DE NL7VX NL7V`
 - Working bandwidths at 125kHz: BW=125 (119 lines), BW=200 (351), BW=250 (297), BW=400 (203), BW=500 (151)
 - No CW Skimmer baseline available for this file
+- After multi-decoder merge (V0+V1+V3): **22 validated callsigns**
+- New calls from multi-decoder: KN0S, N7UA, SE5E (Sweden), AB8M (Ohio), KD0EE, N0VT, N0UY, NN5NN, W8MO, K5EC
 
 ### Generalization Confirmed
 Pipeline works across:
