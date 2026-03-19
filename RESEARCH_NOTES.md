@@ -608,12 +608,29 @@ search should help.
 
 ### SDC-Inspired Filter Improvements (spot_filter2.py)
 Applied SDC Connectors research findings:
-1. **Noise letter removal** — strip isolated E/I before callsign extraction
-2. **Tiered verification:**
-   - Tier 1: In SCP + context pattern (CQ/TEST/CWT/TU/UP/DE/GE/UR/FB) → 1 decode
+1. **Noise letter removal** — strip isolated E/I/T/M/A before callsign extraction
+2. **Anti-click processing** — strip punctuation and special char artifacts (_?<>()[]{}|&)
+3. **Tiered verification:**
+   - Tier 1: In SCP + context pattern (CQ/TEST/CWT/SST/FD/TU/UP/DE/GE/UR/FB) → 1 decode
    - Tier 2: In SCP + no context + 2+ sightings → spot (trust database)
    - Tier 3: NOT in SCP + 10+ sightings at consistent frequency → spot (trust decoder)
-3. **Contest name patterns** — CWT, CQCQ, CQTEST, CQCWT as triggers
-4. **DXpedition patterns** — TU, UP, DE, K, BK, GE, GM, GA, UR, FB, NR
-5. **Supplementary database** — add_calls.txt for new DXpeditions (CY0S, TT8A)
-6. **Blacklist support** — blacklist.txt for known false positives
+4. **1x1 special event calls** — regex for 3-char calls (N4B, K3I, W1A)
+5. **Contest name patterns** — CWT, SST, FD, CQCQ, CQTEST, CQCWT as triggers
+6. **DXpedition patterns** — TU, UP, DE, K, BK, GE, GM, GA, UR, FB, NR, AGN
+7. **Supplementary database** — add_calls.txt for new DXpeditions (CY0S, TT8A)
+8. **Blacklist support** — blacklist.txt for known false positives
+9. **Expanded false positive list** — QSL, QTH, BT, AR, SK, etc.
+
+### CWT 15-min Final Results (108 passes, Phase 1 filter)
+
+| Metric | Value |
+|--------|-------|
+| Total passes | 108 (6 variants × 3 BWs × 6 thresholds) |
+| Raw decode lines | 322,377 |
+| Real callsigns found | 898 |
+| Match SkimSrv | **74/118 (63%)** |
+| Our exclusive | 824 |
+| SkimSrv exclusive | 44 |
+
+Of the 44 SkimSrv exclusives: 41 never decoded in any pass (decoder quality ceiling),
+3 decoded 1-2 times (threshold edge). All 44 are in SCP — database is not the issue for these.
