@@ -23,20 +23,38 @@ CALL_RE = re.compile(
     r'(?![A-Z0-9])'    # negative lookahead
 )
 
-MIN_CALL_LEN = 4        # Minimum callsign length to reduce false positives
+# 1x1 special event calls: W1A, K3I, N4B etc. (letter + digit + letter)
+CALL_1X1_RE = re.compile(
+    r'(?<![A-Z0-9])'
+    r'([AKNW]\d[A-Z])'
+    r'(?![A-Z0-9])'
+)
+
+MIN_CALL_LEN = 4        # Minimum callsign length for standard calls
 SNR_STRONG = 15          # dB threshold for strong signal (1 decode enough)
 
-CQ_PATTERNS = re.compile(r'(CQ|TEST|QRZ|CWT|CQCQ|CQTEST|CQCWT)', re.IGNORECASE)
-# DXpedition/contest patterns: "TU [CALL]", "[CALL] UP", "DE [CALL]"
-DX_PATTERNS = re.compile(r'\b(TU|UP|DE|K|BK|GE|GM|GA|UR|FB|NR)\b', re.IGNORECASE)
+CQ_PATTERNS = re.compile(r'(CQ|TEST|QRZ|CWT|SST|FD|SS|CQCQ|CQTEST|CQCWT)', re.IGNORECASE)
+# DXpedition/contest patterns
+DX_PATTERNS = re.compile(r'\b(TU|UP|DE|K|BK|GE|GM|GA|UR|FB|NR|AGN)\b', re.IGNORECASE)
+
+# Common false positives that match callsign regex but aren't real calls
+FALSE_POSITIVES = {
+    'CQ', 'TEST', 'QRZ', 'DE', 'TU', '5NN', '599', 'RST',
+    'QSL', 'QTH', 'QRL', 'CFM', 'PSE', 'TNX', 'TKS', 'HW',
+    'BT', 'AR', 'SK', 'KN', 'AS',
+    # Common garbled patterns that look like calls
+    'EE5E', 'TT5T', 'NN5N', 'SS5S', 'AA5A',
+}
 
 
 def remove_noise_letters(text):
-    """Remove isolated E and I characters (SDC 'Remove Noise Letters' feature).
-    E (dit) and I (di-dit) are the most common false decodes from noise,
-    birdies, and digital mode signals."""
-    # Replace isolated E and I (surrounded by spaces or at start/end)
-    text = re.sub(r'(?<![A-Z0-9])([EI])(?![A-Z0-9])', ' ', text)
+    """Remove isolated noise characters from decoded text.
+    E (dit) and I (di-dit) are the most common false decodes from noise.
+    Also removes T (dah), M (dah-dah), and A (di-dah) when isolated."""
+    # Replace isolated single noise chars (E, I, T, M, A)
+    text = re.sub(r'(?<![A-Z0-9])([EITMA])(?![A-Z0-9])', ' ', text)
+    # Remove click artifacts: isolated punctuation and special chars
+    text = re.sub(r'[_?<>()\[\]{}|&]', ' ', text)
     # Collapse multiple spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -80,15 +98,20 @@ def load_master_scp(filename='MASTER.SCP', supplement='add_calls.txt'):
 
 def extract_callsigns(text):
     found = set()
-    for match in CALL_RE.finditer(text.upper()):
+    text = text.upper()
+    # Standard callsigns (4+ chars)
+    for match in CALL_RE.finditer(text):
         call = match.group(1)
-        # Skip common false positives
-        if call in ('CQ', 'TEST', 'QRZ', 'DE', 'TU', '5NN', '599', 'RST'):
+        if call in FALSE_POSITIVES:
             continue
-        # Minimum length filter
         if len(call) < MIN_CALL_LEN:
             continue
         found.add(call)
+    # 1x1 special event calls (3 chars: letter + digit + letter)
+    for match in CALL_1X1_RE.finditer(text):
+        call = match.group(1)
+        if call not in FALSE_POSITIVES:
+            found.add(call)
     return found
 
 def main():
