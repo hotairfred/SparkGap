@@ -39,22 +39,56 @@ MORSE = {
 REVERSE_MORSE = {v: k for k, v in MORSE.items()}
 
 
-def generate_cw_audio(text, wpm=25, freq=600, sample_rate=4000, noise_level=0.1):
-    """Generate CW audio for a text string."""
+def generate_cw_audio(text, wpm=25, freq=600, sample_rate=4000, noise_level=0.1,
+                      fist_jitter=0.0, qsb_depth=0.0, qsb_rate=0.2,
+                      rise_time_ms=5.0):
+    """Generate CW audio for a text string with realistic imperfections.
+
+    Args:
+        fist_jitter: 0.0-0.4 — random variation in element timing (sloppy fist)
+        qsb_depth: 0.0-0.8 — depth of slow amplitude fading
+        qsb_rate: Hz rate of QSB fading
+        rise_time_ms: keying rise/fall time in milliseconds
+    """
     dit_duration = 1.2 / wpm  # seconds
     samples_per_dit = int(sample_rate * dit_duration)
+    rise_samples = int(sample_rate * rise_time_ms / 1000.0)
 
-    audio = []
+    # Phase-continuous tone generation
+    phase = 0.0
+    phase_inc = 2 * math.pi * freq / sample_rate
 
-    def tone(n):
-        return [math.sin(2 * math.pi * freq * i / sample_rate) for i in range(n)]
+    def jittered(n):
+        """Apply timing jitter to element length."""
+        if fist_jitter > 0:
+            return max(int(n * (1.0 + np.random.uniform(-fist_jitter, fist_jitter))), 1)
+        return n
+
+    def shaped_tone(n):
+        """Generate tone with raised-cosine rise/fall shaping."""
+        nonlocal phase
+        rise = min(rise_samples, n // 3)
+        samples = np.zeros(n)
+        for i in range(n):
+            # Envelope shaping
+            if i < rise:
+                env = 0.5 * (1.0 - math.cos(math.pi * i / rise))
+            elif i >= n - rise:
+                env = 0.5 * (1.0 - math.cos(math.pi * (n - i) / rise))
+            else:
+                env = 1.0
+            samples[i] = env * math.sin(phase)
+            phase += phase_inc
+        return samples
 
     def silence(n):
-        return [0.0] * n
+        return np.zeros(n)
+
+    segments = []
 
     for i, char in enumerate(text.upper()):
         if char == ' ':
-            audio.extend(silence(samples_per_dit * 4))  # word space (7 - 3 already added)
+            segments.append(silence(jittered(samples_per_dit * 4)))
             continue
         if char not in MORSE:
             continue
@@ -62,18 +96,24 @@ def generate_cw_audio(text, wpm=25, freq=600, sample_rate=4000, noise_level=0.1)
         code = MORSE[char]
         for j, element in enumerate(code):
             if element == '.':
-                audio.extend(tone(samples_per_dit))
+                segments.append(shaped_tone(jittered(samples_per_dit)))
             else:
-                audio.extend(tone(samples_per_dit * 3))
-            # Inter-element space
+                segments.append(shaped_tone(jittered(samples_per_dit * 3)))
             if j < len(code) - 1:
-                audio.extend(silence(samples_per_dit))
+                segments.append(silence(jittered(samples_per_dit)))
 
-        # Inter-character space
-        audio.extend(silence(samples_per_dit * 3))
+        segments.append(silence(jittered(samples_per_dit * 3)))
+
+    audio = np.concatenate(segments) if segments else np.zeros(100)
+
+    # QSB fading
+    if qsb_depth > 0:
+        t = np.arange(len(audio), dtype=np.float64) / sample_rate
+        qsb_phase = np.random.uniform(0, 2 * math.pi)
+        fading = 1.0 - qsb_depth * 0.5 * (1.0 + np.sin(2 * math.pi * qsb_rate * t + qsb_phase))
+        audio = audio * fading
 
     # Add noise
-    audio = np.array(audio)
     noise = np.random.normal(0, noise_level, len(audio))
     audio = audio + noise
 
@@ -81,42 +121,164 @@ def generate_cw_audio(text, wpm=25, freq=600, sample_rate=4000, noise_level=0.1)
 
 
 def generate_training_data(output_dir='training_data', num_samples=1000):
-    """Generate synthetic CW training data with labels."""
+    """Generate synthetic CW training data with realistic variety.
+
+    Improvements over v1:
+    - 15 exchange patterns (CQ, TEST, DE, QRZ, RST, serial numbers, bare calls)
+    - Slash calls (10% of samples)
+    - Short calls (3-4 chars naturally included)
+    - Sloppy fist timing jitter (0-30%)
+    - QSB fading on 30% of samples
+    - Wider WPM range (10-45)
+    - Wider noise range (0.01-1.0)
+    - Wider frequency range (300-1200 Hz)
+    - Rise/fall keying shape (2-10ms)
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     # Load master.scp for realistic callsigns
     callsigns = []
+    short_calls = []  # 3-4 char calls
+    long_calls = []   # 6+ char calls
+    slash_calls = []  # portable/reciprocal calls
+
     if os.path.exists('MASTER.SCP'):
         with open('MASTER.SCP') as f:
             for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and len(line) >= 4:
+                line = line.strip().upper()
+                if line and not line.startswith('#') and len(line) >= 3:
                     callsigns.append(line)
+                    if len(line) <= 4:
+                        short_calls.append(line)
+                    elif len(line) >= 6:
+                        long_calls.append(line)
 
     if not callsigns:
         callsigns = ['W1ABC', 'DL3XYZ', 'JA1ABC', 'VK2ABC', 'G4XYZ']
 
+    # Generate some slash calls from existing callsigns
+    suffixes = ['/P', '/M', '/QRP', '/1', '/2', '/3', '/4', '/5', '/6', '/7', '/8', '/9', '/0']
+    prefixes_for_slash = ['F', 'DL', 'G', 'I', 'EA', 'OH', 'SM', 'OZ', 'ON', 'PA', 'HB9']
+    for call in callsigns[:500]:
+        if '/' not in call and len(call) >= 4:
+            if np.random.random() < 0.1:
+                slash_calls.append(call + suffixes[np.random.randint(0, len(suffixes))])
+            if np.random.random() < 0.05:
+                pfx = prefixes_for_slash[np.random.randint(0, len(prefixes_for_slash))]
+                slash_calls.append(f"{pfx}/{call}")
+
+    def estimate_cw_duration(text, wpm):
+        """Estimate CW audio duration in seconds for given text and WPM."""
+        dit = 1.2 / wpm
+        total_elements = 0
+        for i, char in enumerate(text.upper()):
+            if char == ' ':
+                total_elements += 4  # word space (7 - 3 already counted)
+            elif char in MORSE:
+                code = MORSE[char]
+                for j, el in enumerate(code):
+                    total_elements += 3 if el == '-' else 1
+                    if j < len(code) - 1:
+                        total_elements += 1  # inter-element
+                total_elements += 3  # inter-character
+        return total_elements * dit
+
+    # Maximum audio duration that fits in 768 spec frames at 4kHz/hop=32
+    MAX_DURATION = 768 * 32 / 4000.0  # ~6.1 seconds
+
+    # Contest serial numbers
+    def random_serial():
+        """Generate a contest serial number."""
+        return str(np.random.randint(1, 2000)).zfill(np.random.choice([0, 2, 3, 4]))
+
+    def random_rst():
+        """Generate a realistic RST."""
+        return np.random.choice(['599', '5NN', '579', '589', '559', '549',
+                                  '339', '449', '569', '5NN'])
+
+    def random_zone():
+        """CQ zone number."""
+        return str(np.random.randint(1, 41)).zfill(2)
+
     labels = []
 
     for i in range(num_samples):
-        # Random parameters
-        wpm = np.random.randint(15, 40)
-        noise_level = np.random.uniform(0.05, 0.5)
-        freq = np.random.randint(400, 800)
+        # Random parameters — wider ranges
+        wpm = np.random.randint(10, 46)
+        noise_level = np.random.uniform(0.01, 1.0)
+        freq = np.random.randint(300, 1201)
 
-        # Generate CQ/TEST message with random callsign
-        call = callsigns[np.random.randint(0, len(callsigns))]
-        patterns = [
+        # Fist quality: 70% clean, 20% slightly sloppy, 10% very sloppy
+        r = np.random.random()
+        if r < 0.70:
+            fist_jitter = np.random.uniform(0.0, 0.05)
+        elif r < 0.90:
+            fist_jitter = np.random.uniform(0.05, 0.15)
+        else:
+            fist_jitter = np.random.uniform(0.15, 0.30)
+
+        # QSB fading on 30% of samples
+        if np.random.random() < 0.30:
+            qsb_depth = np.random.uniform(0.1, 0.6)
+            qsb_rate = np.random.uniform(0.1, 0.5)
+        else:
+            qsb_depth = 0.0
+            qsb_rate = 0.2
+
+        # Rise time: 2-10ms
+        rise_time = np.random.uniform(2.0, 10.0)
+
+        # Pick callsign — 10% slash, 15% short, rest normal
+        r = np.random.random()
+        if r < 0.10 and slash_calls:
+            call = slash_calls[np.random.randint(0, len(slash_calls))]
+        elif r < 0.25 and short_calls:
+            call = short_calls[np.random.randint(0, len(short_calls))]
+        else:
+            call = callsigns[np.random.randint(0, len(callsigns))]
+
+        # Pick a second callsign for QSO-style exchanges
+        other_call = callsigns[np.random.randint(0, len(callsigns))]
+
+        # Patterns grouped by length — pick from longest that fits
+        long_patterns = [
             f"CQ TEST {call} {call}",
-            f"CQ {call} {call}",
-            f"TEST {call} TEST",
-            f"{call} 5NN 28",
-            f"CQ CQ {call}",
+            f"CQ CQ CQ DE {call} {call}",
+            f"CQ CQ CQ DE {call} {call} K",
+            f"{other_call} DE {call} {random_rst()} {random_zone()}",
+            f"{other_call} {call} {random_rst()} {random_serial()}",
         ]
-        text = patterns[np.random.randint(0, len(patterns))]
+        medium_patterns = [
+            f"CQ {call} {call}",
+            f"CQ CQ {call}",
+            f"TEST {call} TEST",
+            f"QRZ DE {call} {call}",
+            f"DE {call} {call} K",
+            f"{call} {random_rst()} {random_zone()}",
+            f"{call} {random_rst()} {random_serial()}",
+            f"R {random_rst()} {random_zone()} {call}",
+        ]
+        short_patterns = [
+            f"{call} {call}",
+            f"TU {call}",
+            f"CQ {call}",
+            f"{call} {random_rst()}",
+        ]
+        minimal_patterns = [
+            f"{call}",
+        ]
 
-        # Generate audio
-        audio = generate_cw_audio(text, wpm=wpm, freq=freq, noise_level=noise_level)
+        # Collect all patterns that fit in the window, pick randomly
+        all_patterns = long_patterns + medium_patterns + short_patterns + minimal_patterns
+        fitting = [p for p in all_patterns if estimate_cw_duration(p, wpm) <= MAX_DURATION * 0.95]
+        if not fitting:
+            fitting = minimal_patterns
+        text = fitting[np.random.randint(0, len(fitting))]
+
+        # Generate audio with all the bells and whistles
+        audio = generate_cw_audio(text, wpm=wpm, freq=freq, noise_level=noise_level,
+                                  fist_jitter=fist_jitter, qsb_depth=qsb_depth,
+                                  qsb_rate=qsb_rate, rise_time_ms=rise_time)
 
         # Save as WAV
         wav_path = os.path.join(output_dir, f'sample_{i:05d}.wav')
@@ -130,13 +292,15 @@ def generate_training_data(output_dir='training_data', num_samples=1000):
         labels.append({
             'file': f'sample_{i:05d}.wav',
             'text': text,
-            'call': call,
-            'wpm': wpm,
+            'callsign': call,
+            'wpm': int(wpm),
             'noise': float(noise_level),
-            'freq': freq,
+            'freq': int(freq),
+            'jitter': float(fist_jitter),
+            'qsb': float(qsb_depth),
         })
 
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 1000 == 0:
             print(f"  Generated {i+1}/{num_samples} samples", file=sys.stderr)
 
     # Save labels
@@ -144,6 +308,9 @@ def generate_training_data(output_dir='training_data', num_samples=1000):
         json.dump(labels, f, indent=2)
 
     print(f"Generated {num_samples} training samples in {output_dir}/", file=sys.stderr)
+    print(f"  Slash calls in pool: {len(slash_calls)}", file=sys.stderr)
+    print(f"  Short calls (3-4): {len(short_calls)}", file=sys.stderr)
+    print(f"  Total call pool: {len(callsigns)}", file=sys.stderr)
 
 
 def audio_to_spectrogram(audio, sample_rate=4000, fft_size=128, hop=32):

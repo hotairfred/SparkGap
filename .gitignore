@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+csdr-cwskimmer
+csdr-cwskimmer-40
+csdr-cwskimmer-tmp
+csdr-cwskimmer-multi
+csdr-rttyskimmer
+threshold-cwskimmer
+bayes-cwskimmer
+bayes-cwskimmer2
+bayes-cwskimmer3
+__pycache__/
+
+# Audio recordings (large)
+*.wav
+
+# Model checkpoints (large)
+*.pth
+
+# Training data (large)
+training_data/
+training.log
+
+# ML eval results
+ml_bw*.txt
+ml_merged.txt
+
+# Binary databases
+MASTER.DTA
