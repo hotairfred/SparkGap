@@ -581,8 +581,39 @@ search should help.
 
 ### Key Lessons
 1. **Brute force scales** — 324 passes → 4,320 passes → 107 → 224 validated. No ceiling proven.
-2. **Database matters enormously** — 2009 SCP vs 2026 SCP: 224 vs 161 validated.
+2. **Database matters enormously** — 2009 SCP vs 2026 SCP: 224 vs 161 validated. CWT: 21% of answer key not in SCP.
 3. **50K training data obliterated the ML plateau** — 70% → 97.6% char accuracy.
 4. **ML still can't match C++ brute force on real recordings** — domain mismatch is the gap.
 5. **CW Skimmer has false positives too** — WF8Z, 0000Z, 0001Z in its output.
 6. **Parameterized decoder is the right architecture** — one binary, runtime config, infinite pass diversity.
+7. **Filter tuning is as important as decoder tuning** — SDC-inspired tiered verification, noise letter removal, DXpedition patterns, and supplementary database all contributed significant gains.
+8. **1x1 special event calls** (N4B, K3I, etc.) need special regex handling — shorter than standard MIN_CALL_LEN=4.
+
+## CY0S + CWT Real-World Validation (2026-03-19)
+
+### CY0S Sable Island DXpedition — 40m Recording
+- File: B1_20260319_004419_7091kHz.wav (192kHz, 24-bit, 15 min)
+- SkimSrv answer key: 108 unique callsigns
+- Arc brute force (648 passes): 118 validated, 9 matching SkimSrv
+- **CY0S decoded perfectly** at 67000 Hz: "TU CY0S UP", "5NN TU CY0S"
+- CY0S was NOT in MASTER.SCP — required add_calls.txt supplementary database
+- Filter needed DXpedition pattern support ("TU [CALL] UP") — CY0S rarely sends CQ
+
+### CWT Mini-Contest — 40m Recording (15-min segment)
+- File: B1_20260319_030000_7090kHz.wav (192kHz, 24-bit, 1 hour, extracted 15 min)
+- SkimSrv answer key (15-min window): 118 unique callsigns
+- Arc brute force (108 passes, ongoing): **72/118 matching SkimSrv (61%)**
+- 716 total real callsigns found, 644 exclusive
+- 25 of 118 answer key calls (21%) NOT in MASTER.SCP — database gap
+
+### SDC-Inspired Filter Improvements (spot_filter2.py)
+Applied SDC Connectors research findings:
+1. **Noise letter removal** — strip isolated E/I before callsign extraction
+2. **Tiered verification:**
+   - Tier 1: In SCP + context pattern (CQ/TEST/CWT/TU/UP/DE/GE/UR/FB) → 1 decode
+   - Tier 2: In SCP + no context + 2+ sightings → spot (trust database)
+   - Tier 3: NOT in SCP + 10+ sightings at consistent frequency → spot (trust decoder)
+3. **Contest name patterns** — CWT, CQCQ, CQTEST, CQCWT as triggers
+4. **DXpedition patterns** — TU, UP, DE, K, BK, GE, GM, GA, UR, FB, NR
+5. **Supplementary database** — add_calls.txt for new DXpeditions (CY0S, TT8A)
+6. **Blacklist support** — blacklist.txt for known false positives

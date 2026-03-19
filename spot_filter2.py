@@ -26,9 +26,9 @@ CALL_RE = re.compile(
 MIN_CALL_LEN = 4        # Minimum callsign length to reduce false positives
 SNR_STRONG = 15          # dB threshold for strong signal (1 decode enough)
 
-CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ)\b', re.IGNORECASE)
-# DXpedition patterns: "TU [CALL]", "[CALL] UP", "DE [CALL]"
-DX_PATTERNS = re.compile(r'\b(TU|UP|DE|K|BK)\b', re.IGNORECASE)
+CQ_PATTERNS = re.compile(r'(CQ|TEST|QRZ|CWT|CQCQ|CQTEST|CQCWT)', re.IGNORECASE)
+# DXpedition/contest patterns: "TU [CALL]", "[CALL] UP", "DE [CALL]"
+DX_PATTERNS = re.compile(r'\b(TU|UP|DE|K|BK|GE|GM|GA|UR|FB|NR)\b', re.IGNORECASE)
 
 
 def remove_noise_letters(text):
@@ -117,22 +117,43 @@ def main():
         text = remove_noise_letters(parts[2].upper())
         all_lines.append((freq, wpm, text, line))
 
-    # Extract all callsign sightings
-    call_sightings = defaultdict(list)  # call -> [(freq, wpm, snr_db, text, line), ...]
+    # Extract all callsign sightings — track both SCP and non-SCP calls
+    call_sightings = defaultdict(list)      # SCP-validated calls
+    noscp_sightings = defaultdict(list)     # calls NOT in SCP (for tier 3)
+    FREQ_TOLERANCE = 1000                   # Hz tolerance for frequency clustering (wide for multi-BW)
+    SCP_CONSISTENT_FREQ = 2                 # sightings for SCP call with no context
+    NOSCP_CONSISTENT_FREQ = 10             # sightings at same freq for non-SCP call
 
     for freq, wpm, text, line in all_lines:
         candidates = extract_callsigns(text)
-        # Parse SNR from WPM field (our decoder outputs log10(snr)*20)
-        snr_db = wpm  # wpm field actually contains SNR in our format
         for call in candidates:
-            if call in master and call not in blacklist:
+            if call in blacklist:
+                continue
+            if call in master:
                 call_sightings[call].append((freq, wpm, text, line))
+            else:
+                noscp_sightings[call].append((freq, wpm, text, line))
+
+    def max_freq_cluster(sightings, tolerance=FREQ_TOLERANCE):
+        """Find the largest cluster of sightings at a consistent frequency."""
+        if not sightings:
+            return 0, 0
+        freqs = sorted(s[0] for s in sightings)
+        best_count = 0
+        best_freq = freqs[0]
+        for f in freqs:
+            count = sum(1 for f2 in freqs if abs(f2 - f) <= tolerance)
+            if count > best_count:
+                best_count = count
+                best_freq = f
+        return best_count, best_freq
 
     # Contest exchange patterns that suggest a real station
     EXCHANGE_RE = re.compile(r'\b(5NN|599|5N|RST|HQ|NR|NE)\b', re.IGNORECASE)
 
     # Apply filtering
     valid_spots = []
+    tier_counts = defaultdict(int)
 
     if strict:
         # Strict: need CQ/TEST in the line
@@ -140,32 +161,55 @@ def main():
             for freq, wpm, text, line in sightings:
                 if CQ_PATTERNS.search(text):
                     valid_spots.append((call, freq, wpm, text))
-                    break  # one per call
+                    break
     else:
-        # Relaxed with tiered verification (SDC-inspired)
         for call, sightings in call_sightings.items():
             has_cq = any(CQ_PATTERNS.search(text) for _, _, text, _ in sightings)
             has_dx = any(DX_PATTERNS.search(text) for _, _, text, _ in sightings)
             has_exchange = any(EXCHANGE_RE.search(text) for _, _, text, _ in sightings)
             n_sightings = len(sightings)
+            freq_count, best_freq = max_freq_cluster(sightings)
 
-            # Confidence tiers (SDC-inspired tiered verification):
-            # Tier 1: CQ/TEST in context — high confidence, accept any length
-            # Tier 2: DXpedition pattern (TU/UP/DE) + 2+ sightings — DXpedition mode
-            # Tier 3: 3+ sightings across different lines — medium confidence
-            # Tier 4: Contest exchange + 5+ char call — medium confidence
-            # Tier 5: 2 sightings + 5+ char call — lower but acceptable
-            tier1 = has_cq
-            tier2 = has_dx and n_sightings >= 2
-            tier3 = n_sightings >= 3
-            tier4 = has_exchange and len(call) >= 5
-            tier5 = n_sightings >= 2 and len(call) >= 5
-
-            if tier1 or tier2 or tier3 or tier4 or tier5:
-                # Pick best sighting (longest text with the call)
+            # Tier 1: CQ/TEST/CWT context — high confidence
+            if has_cq:
                 best = max(sightings, key=lambda s: len(s[2]))
-                freq, wpm, text, line = best
-                valid_spots.append((call, freq, wpm, text))
+                valid_spots.append((call, best[0], best[1], best[2]))
+                tier_counts['T1_context'] += 1
+            # Tier 1b: DXpedition pattern + 2+ sightings
+            elif has_dx and n_sightings >= 2:
+                best = max(sightings, key=lambda s: len(s[2]))
+                valid_spots.append((call, best[0], best[1], best[2]))
+                tier_counts['T1b_dxped'] += 1
+            # Tier 1c: Contest exchange + 5+ char call
+            elif has_exchange and len(call) >= 5:
+                best = max(sightings, key=lambda s: len(s[2]))
+                valid_spots.append((call, best[0], best[1], best[2]))
+                tier_counts['T1c_exchange'] += 1
+            # Tier 2: In SCP, no context, 3+ sightings (trust database)
+            elif n_sightings >= SCP_CONSISTENT_FREQ:
+                best = max(sightings, key=lambda s: len(s[2]))
+                valid_spots.append((call, best[0], best[1], best[2]))
+                tier_counts['T2_scp_multi'] += 1
+            # Tier 2b: In SCP, 2 sightings + 5+ char call
+            elif n_sightings >= 2 and len(call) >= 5:
+                best = max(sightings, key=lambda s: len(s[2]))
+                valid_spots.append((call, best[0], best[1], best[2]))
+                tier_counts['T2b_scp_long'] += 1
+
+        # Tier 3: NOT in SCP, consistent frequency with N+ sightings
+        for call, sightings in noscp_sightings.items():
+            if len(call) < 4:
+                continue
+            freq_count, best_freq = max_freq_cluster(sightings)
+            if freq_count >= NOSCP_CONSISTENT_FREQ:
+                near = [s for s in sightings if abs(s[0] - best_freq) <= FREQ_TOLERANCE]
+                best = max(near, key=lambda s: len(s[2]))
+                valid_spots.append((call, best[0], best[1], best[2]))
+                tier_counts['T3_noscp_freq'] += 1
+
+    if tier_counts:
+        for tier, count in sorted(tier_counts.items()):
+            print(f"  {tier}: {count} calls", file=sys.stderr)
 
     # Sort by frequency
     valid_spots.sort(key=lambda x: x[1])
