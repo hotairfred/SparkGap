@@ -24,16 +24,58 @@ CALL_RE = re.compile(
 )
 
 MIN_CALL_LEN = 4        # Minimum callsign length to reduce false positives
+SNR_STRONG = 15          # dB threshold for strong signal (1 decode enough)
 
 CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ)\b', re.IGNORECASE)
+# DXpedition patterns: "TU [CALL]", "[CALL] UP", "DE [CALL]"
+DX_PATTERNS = re.compile(r'\b(TU|UP|DE|K|BK)\b', re.IGNORECASE)
 
-def load_master_scp(filename='MASTER.SCP'):
+
+def remove_noise_letters(text):
+    """Remove isolated E and I characters (SDC 'Remove Noise Letters' feature).
+    E (dit) and I (di-dit) are the most common false decodes from noise,
+    birdies, and digital mode signals."""
+    # Replace isolated E and I (surrounded by spaces or at start/end)
+    text = re.sub(r'(?<![A-Z0-9])([EI])(?![A-Z0-9])', ' ', text)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def load_blacklist(filename='blacklist.txt'):
+    """Load blacklisted callsigns to never spot."""
+    calls = set()
+    try:
+        with open(filename) as f:
+            for line in f:
+                line = line.strip().upper()
+                if line and not line.startswith('#'):
+                    calls.add(line)
+    except FileNotFoundError:
+        pass
+    return calls
+
+def load_master_scp(filename='MASTER.SCP', supplement='add_calls.txt'):
+    """Load master.scp + optional supplementary callsign file."""
     calls = set()
     with open(filename) as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
                 calls.add(line.upper())
+    # Load supplementary calls (new DXpeditions, etc.)
+    try:
+        with open(supplement) as f:
+            added = 0
+            for line in f:
+                line = line.strip().upper()
+                if line and not line.startswith('#') and line not in calls:
+                    calls.add(line)
+                    added += 1
+            if added:
+                print(f"  + {added} supplementary calls from {supplement}", file=sys.stderr)
+    except FileNotFoundError:
+        pass
     return calls
 
 def extract_callsigns(text):
@@ -52,10 +94,13 @@ def extract_callsigns(text):
 def main():
     strict = '--strict' in sys.argv
     master = load_master_scp()
+    blacklist = load_blacklist()
     print(f"Loaded {len(master)} callsigns from MASTER.SCP", file=sys.stderr)
+    if blacklist:
+        print(f"Loaded {len(blacklist)} blacklisted callsigns", file=sys.stderr)
     print(f"Mode: {'strict (CQ/TEST required)' if strict else 'relaxed (2+ occurrences)'}", file=sys.stderr)
 
-    # Collect all decode lines
+    # Collect all decode lines with noise letter removal
     all_lines = []
     for line in sys.stdin:
         line = line.strip()
@@ -69,16 +114,18 @@ def main():
             wpm = int(parts[1])
         except ValueError:
             continue
-        text = parts[2].upper()
+        text = remove_noise_letters(parts[2].upper())
         all_lines.append((freq, wpm, text, line))
 
     # Extract all callsign sightings
-    call_sightings = defaultdict(list)  # call -> [(freq, wpm, text, line), ...]
+    call_sightings = defaultdict(list)  # call -> [(freq, wpm, snr_db, text, line), ...]
 
     for freq, wpm, text, line in all_lines:
         candidates = extract_callsigns(text)
+        # Parse SNR from WPM field (our decoder outputs log10(snr)*20)
+        snr_db = wpm  # wpm field actually contains SNR in our format
         for call in candidates:
-            if call in master:
+            if call in master and call not in blacklist:
                 call_sightings[call].append((freq, wpm, text, line))
 
     # Contest exchange patterns that suggest a real station
@@ -95,20 +142,26 @@ def main():
                     valid_spots.append((call, freq, wpm, text))
                     break  # one per call
     else:
-        # Relaxed: need 2+ sightings OR CQ/TEST context OR contest exchange
+        # Relaxed with tiered verification (SDC-inspired)
         for call, sightings in call_sightings.items():
             has_cq = any(CQ_PATTERNS.search(text) for _, _, text, _ in sightings)
+            has_dx = any(DX_PATTERNS.search(text) for _, _, text, _ in sightings)
             has_exchange = any(EXCHANGE_RE.search(text) for _, _, text, _ in sightings)
-            # Confidence tiers:
+            n_sightings = len(sightings)
+
+            # Confidence tiers (SDC-inspired tiered verification):
             # Tier 1: CQ/TEST in context — high confidence, accept any length
-            # Tier 2: 3+ sightings across different lines — medium confidence
-            # Tier 3: Contest exchange + 5+ char call — medium confidence
-            # Tier 4: 2 sightings + 5+ char call — lower but acceptable
+            # Tier 2: DXpedition pattern (TU/UP/DE) + 2+ sightings — DXpedition mode
+            # Tier 3: 3+ sightings across different lines — medium confidence
+            # Tier 4: Contest exchange + 5+ char call — medium confidence
+            # Tier 5: 2 sightings + 5+ char call — lower but acceptable
             tier1 = has_cq
-            tier2 = len(sightings) >= 3
-            tier3 = has_exchange and len(call) >= 5
-            tier4 = len(sightings) >= 2 and len(call) >= 5
-            if tier1 or tier2 or tier3 or tier4:
+            tier2 = has_dx and n_sightings >= 2
+            tier3 = n_sightings >= 3
+            tier4 = has_exchange and len(call) >= 5
+            tier5 = n_sightings >= 2 and len(call) >= 5
+
+            if tier1 or tier2 or tier3 or tier4 or tier5:
                 # Pick best sighting (longest text with the call)
                 best = max(sightings, key=lambda s: len(s[2]))
                 freq, wpm, text, line = best
