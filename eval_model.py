@@ -87,25 +87,27 @@ def find_active_channels(samples, sample_rate, bandwidth):
     return channels
 
 
-def channelize(samples, sample_rate, center_freq, target_rate=4000):
-    """Extract a single channel: mix to baseband, FIR filter, decimate."""
+def channelize(samples, sample_rate, center_freq, target_rate=4000, cw_pitch=600.0):
+    """Extract a single channel: mix to baseband, re-modulate to CW pitch, FIR filter, decimate.
+
+    Output is real audio at target_rate with CW tone at cw_pitch Hz.
+    Works correctly for both real (mono) and complex (IQ) inputs at any sample rate.
+    """
     n = len(samples)
     t = np.arange(n, dtype=np.float64) / sample_rate
 
-    # Mix to baseband
+    # Step 1: Mix signal at center_freq down to baseband (DC)
+    # Step 2: Re-modulate to cw_pitch Hz so output has audible CW tone
+    # Combined: multiply by cos(2π × (center_freq - cw_pitch) × t) moves
+    # the signal from center_freq to cw_pitch in one step
+    mix_freq = center_freq - cw_pitch
+
     if np.iscomplexobj(samples):
-        lo = np.exp(-2j * np.pi * center_freq * t)
-        baseband = samples * lo
-        # Take magnitude (we want the amplitude envelope as real audio)
-        # Actually, take the real part after mixing - this gives us the
-        # demodulated CW tone as a real signal near DC
-        # For CW, we want to shift the tone to ~600Hz (standard CW pitch)
-        cw_pitch = 600.0
-        lo2 = np.cos(2 * np.pi * cw_pitch * t)
-        baseband_real = np.real(baseband) * lo2 * 2.0  # re-modulate to 600Hz
+        lo = np.exp(-2j * np.pi * mix_freq * t)
+        mixed = np.real(samples * lo) * 2.0
     else:
-        lo = np.cos(2 * np.pi * center_freq * t)
-        baseband_real = samples * lo * 2.0
+        lo = np.cos(2 * np.pi * mix_freq * t)
+        mixed = samples * lo * 2.0
 
     # Design FIR lowpass at target_rate/2
     decim_factor = sample_rate // target_rate
@@ -117,7 +119,7 @@ def channelize(samples, sample_rate, center_freq, target_rate=4000):
     fir = firwin(numtaps, cutoff / nyq)
 
     # Filter
-    filtered = lfilter(fir, 1.0, baseband_real)
+    filtered = lfilter(fir, 1.0, mixed)
 
     # Decimate
     decimated = filtered[::decim_factor].astype(np.float32)
