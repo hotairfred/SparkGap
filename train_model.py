@@ -476,9 +476,11 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--data-dir', default='training_data', help='Training data directory')
     args = parser.parse_args()
 
     if args.precompute:
-        precompute_spectrograms()
+        precompute_spectrograms(data_dir=args.data_dir, output_dir=args.data_dir)
     else:
-        train(epochs=args.epochs, batch_size=args.batch_size, resume=args.resume, lr=args.lr)
+        train(data_dir=args.data_dir, epochs=args.epochs, batch_size=args.batch_size,
+              resume=args.resume, lr=args.lr)

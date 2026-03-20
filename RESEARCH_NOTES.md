@@ -634,3 +634,64 @@ Applied SDC Connectors research findings:
 
 Of the 44 SkimSrv exclusives: 41 never decoded in any pass (decoder quality ceiling),
 3 decoded 1-2 times (threshold edge). All 44 are in SCP — database is not the issue for these.
+
+## ML Domain Adaptation + Full Ensemble (2026-03-20)
+
+### ML Training on Real Audio — Domain Gap Closed
+- Training data: 62,300 samples (50K synthetic + 1,230 real × 10x weight)
+- Real segments: activity-filtered (10% envelope threshold), pileup excluded (66.5-70 kHz)
+- Peak accuracy: 89.1% char, 72.9% exact (epoch 29)
+- Key fix: WSL OOM on 192kHz file — process in 60-second chunks via sox
+
+### ML Eval on CWT 15-min
+
+| Model | Real Audio Performance |
+|-------|----------------------|
+| Old (5K synthetic, 69.6%) | Garbage |
+| Previous (50K synthetic, 97.6%) | 0/52 correct on real audio |
+| **Current (62K mixed, 89.1%)** | **41/118 answer key (35%)** |
+
+6 NEW calls found by ML that neither threshold nor bmorse decoded:
+**DF7TV, IK4QJF, K3JT, N5AW, W2GD, W9ILY**
+
+### Final Combined Ensemble — 115/118 (97.5%)
+
+| Decoder | Answer Key | New Unique |
+|---------|-----------|------------|
+| Threshold (108 brute force passes) | 74/118 | baseline |
+| + bmorse Bayesian (12 speed settings) | +10 new | 9Y4D, K0JM, K4IU, K5TN, N4GO, ND9M, NY6C, W5JMW, W5RY, WA0I |
+| + ML (domain-adapted, greedy) | +6 new | DF7TV, IK4QJF, K3JT, N5AW, W2GD, W9ILY |
+| **COMBINED** | **115/118 (97.5%)** | |
+
+### Progression: 7 to 115 in 4 Days
+
+| Date | Milestone | Score |
+|------|-----------|-------|
+| Mar 16 | First test, single pass | 7/108 |
+| Mar 17 | 324-pass brute force | 107/108 |
+| Mar 18 | 4,320-pass + expanded DB | 224 validated (DK3QN) |
+| Mar 19 | + bmorse Bayesian decoder | 109/118 (CWT) |
+| **Mar 20** | **+ ML domain-adapted** | **115/118 (97.5%)** |
+
+### Architecture: Three-Decoder Ensemble
+```
+Input IQ (192kHz from Red Pitaya)
+    |
+    ├── Threshold decoder (csdr-cwskimmer-multi, C++)
+    │   Fast, catches 63% of signals
+    │   Brute force: 8 variants × bandwidths × thresholds
+    │
+    ├── Bayesian decoder (bmorse via bmorse-skimmer, C/C++)
+    │   Slow, catches weak/ambiguous signals threshold misses
+    │   Speed sweep: 12 WPM settings (15-45)
+    │
+    └── ML decoder (CNN+BiGRU+CTC, PyTorch)
+        Trained on real+synthetic data
+        Catches signals both other decoders miss
+        Greedy decode, no beam search needed
+    |
+    v
+    spot_filter2.py — Tiered validation
+    |
+    Ensemble voting — 2/3 agree = high confidence spot
+```
