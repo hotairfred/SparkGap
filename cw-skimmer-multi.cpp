@@ -46,6 +46,7 @@ double ditFilter      = 0.5;
 double dahMax         = 3.0;
 double charBreak      = 2.5;
 double wordBreak      = 5.0;
+unsigned int launchDelay = 200;  // ms before emitting chars (AGC settle)
 
 // Preset decoder variants
 void setVariant(int v) {
@@ -220,7 +221,7 @@ int main(int argc, char *argv[])
     cwDecoder[j] = new Csdr::BufferedModule<float, unsigned char>(
         new Csdr::CwDecoder<float>(sampleRate, showCw,
             hysteresisHigh, hysteresisLow, adaptRate, nbTimeMs,
-            ditFilter, dahMax, charBreak, wordBreak),
+            ditFilter, dahMax, charBreak, wordBreak, launchDelay),
         printChars*4);
     cwDecoder[j]->setWriter(out[j]);
     outState[j] = ' ';
