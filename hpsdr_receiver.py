@@ -233,9 +233,14 @@ class HPSDRReceiver:
         self.frequencies = [7000000] * n_receivers  # Default 40m
 
     def set_frequency(self, rx_index, freq_hz):
-        """Set frequency for a receiver (in Hz)."""
+        """Set frequency for a receiver (in Hz).
+
+        Applies -3.9 ppm frequency calibration for the Red Pitaya STEMlab 125-14.
+        SkimSrv uses FreqCalibration=0.9999961 for the same correction.
+        """
         if 0 <= rx_index < self.n_receivers:
-            self.frequencies[rx_index] = int(freq_hz)
+            cal = getattr(self, 'freq_cal', 0.9999961)  # -3.9 ppm
+            self.frequencies[rx_index] = int(freq_hz * cal)
 
     def _send_packet(self, frame1_c0c4, frame2_c0c4):
         """Send a UDP packet with two EP2 frames."""
@@ -257,6 +262,14 @@ class HPSDRReceiver:
         # C0=0x00: general config — speed, #receivers, duplex
         n_rx_bits = (self.n_receivers - 1) & 0x07
         config_c0c4 = bytes([0x00, 0x00, 0x00, 0x00, (1 << 2) | n_rx_bits])  # duplex + n_rx
+
+        # Set LNA gain — C0 address 0x0A (sent as 0x14 = 0x0A << 1)
+        # Bits 6:0 = gain in dB (0-60), bit 7 = 0
+        lna_gain = getattr(self, 'lna_gain', 20)
+        gain_c0c4 = bytes([0x14, 0x00, 0x00, 0x00, lna_gain & 0x7F])
+        self._send_packet(config_c0c4, gain_c0c4)
+        time.sleep(0.01)
+        print(f"  LNA gain: {lna_gain} dB", file=sys.stderr)
 
         # Send frequency for each receiver
         for i in range(self.n_receivers):

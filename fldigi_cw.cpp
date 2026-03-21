@@ -22,10 +22,11 @@
 #include <string>
 #include <complex>
 
-#define SAMPLE_RATE     8000
+static int SAMPLE_RATE = 8000;      // Configurable via -r flag
 #define DEC_RATIO       16          // Decimation ratio
-#define DEC_RATE        (SAMPLE_RATE / DEC_RATIO)  // 500 Hz decimated rate
-#define KWPM            (12 * DEC_RATE / 10)       // 600 at decimated rate
+// These are computed at runtime since SAMPLE_RATE is configurable
+static int DEC_RATE() { return SAMPLE_RATE / DEC_RATIO; }
+static int KWPM() { return 12 * DEC_RATE() / 10; }
 #define MAX_MORSE       6
 #define TWOPI           (2.0 * M_PI)
 #define INITIAL_SPEED   20
@@ -81,7 +82,10 @@ class BandpassFilter {
     int dec_count;
 
 public:
-    BandpassFilter(double freq, double bandwidth, int taps = 127) {
+    BandpassFilter(double freq, double bandwidth, int taps = 0) {
+        if (taps == 0) taps = SAMPLE_RATE / (int)bandwidth * 4 + 1; // auto-size
+        if (taps > 2047) taps = 2047;
+        if (taps < 31) taps = 31;
         carrier_freq = freq;
         ntaps = taps | 1;  // make odd
         phase = 0;
@@ -121,11 +125,15 @@ public:
         delete[] outbuf;
     }
 
-    // Process one sample. Returns filtered+decimated envelope value, or -1 if no output yet.
-    double process(double sample) {
-        // Mix to baseband
-        double si = sample * cos(phase);
-        double sq = sample * sin(phase);
+    // Process one sample (real mono or complex IQ). Returns envelope or -1.
+    double process(double sample_i, double sample_q = 0.0) {
+        // Complex mix: shift signal at carrier_freq to baseband
+        // For complex IQ input: z_in = (I + jQ), multiply by e^(-j*2pi*f*t)
+        // For real input: sample_q=0, this creates analytic signal from real
+        double cos_p = cos(phase);
+        double sin_p = sin(phase);
+        double si = sample_i * cos_p + sample_q * sin_p;   // Real part of mixed
+        double sq = -sample_i * sin_p + sample_q * cos_p;  // Imag part of mixed
         phase += TWOPI * carrier_freq / SAMPLE_RATE;
         if (phase > TWOPI) phase -= TWOPI;
 
@@ -248,14 +256,18 @@ class CWDecoder {
 
 public:
     CWDecoder(double freq, int speed, double bandwidth = 60.0) {
-        two_dots = 2 * KWPM / speed;
+        two_dots = 2 * KWPM() / speed;
         state = IDLE; smpl_ctr = 0;
         tone_start = tone_end = 0;
         last_element = 0; space_sent = true;
         agc_peak = 0.001; noise_floor = 0; sig_avg = 0;
 
         trackfilter = new Avg(16);
-        bitfilter = new Avg(4);
+        // bitfilter length: ~8ms at decimated rate
+        int bf_len = DEC_RATE() * 8 / 1000;
+        if (bf_len < 2) bf_len = 2;
+        if (bf_len > 32) bf_len = 32;
+        bitfilter = new Avg(bf_len);
         bpf = new BandpassFilter(freq, bandwidth);
 
         for (int i = 0; i < 16; i++)
@@ -269,9 +281,9 @@ public:
         delete bpf;
     }
 
-    char process(double sample) {
+    char process(double sample_i, double sample_q = 0.0) {
         // Bandpass filter + decimate + envelope
-        double value = bpf->process(sample);
+        double value = bpf->process(sample_i, sample_q);
         if (value < 0) return 0;  // decimation — no output yet
 
         smpl_ctr++;
@@ -279,15 +291,19 @@ public:
         // Smooth envelope
         value = bitfilter->run(value);
 
-        // AGC
-        sig_avg = decay(sig_avg, value, 1000);
+        // AGC — scale constants to decimated rate
+        // fldigi calibrated at 500 Hz decimated rate, scale proportionally
+        double rate_scale = DEC_RATE() / 500.0;
+        double agc_attack = 200 * rate_scale;   // ~400ms at any rate
+        double agc_decay = 1000 * rate_scale;    // ~2000ms at any rate
+        sig_avg = decay(sig_avg, value, agc_decay);
         if (value < sig_avg) {
             noise_floor = decay(noise_floor, value,
-                value < noise_floor ? 200 : 1000);
+                value < noise_floor ? agc_attack : agc_decay);
         }
         if (value > sig_avg) {
             agc_peak = decay(agc_peak, value,
-                value > agc_peak ? 200 : 1000);
+                value > agc_peak ? agc_attack : agc_decay);
         }
 
         // Normalize
@@ -328,36 +344,47 @@ int main(int argc, char *argv[]) {
     double freq = 600;
     int speed = 25;
     double bandwidth = 60;
+    bool iq_mode = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f") && i+1 < argc) freq = atof(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i+1 < argc) speed = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-b") && i+1 < argc) bandwidth = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-r") && i+1 < argc) SAMPLE_RATE = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-q")) iq_mode = true;
         else if (!strcmp(argv[i], "-h")) {
             fprintf(stderr,
                 "fldigi_cw — Standalone CW decoder (fldigi-derived, GPL-3)\n"
-                "Reads 8kHz 16-bit signed mono from stdin\n"
-                "  -f freq      Tone frequency in Hz (default 600)\n"
+                "Reads 16-bit signed audio from stdin\n"
+                "  -r rate      Sample rate in Hz (default 8000)\n"
+                "  -f freq      Signal frequency offset in Hz (default 600)\n"
                 "  -s speed     Initial WPM (default 25, adapts)\n"
-                "  -b bandwidth Filter bandwidth in Hz (default 60)\n");
+                "  -b bandwidth Filter bandwidth in Hz (default 60)\n"
+                "  -q           IQ input mode (interleaved I,Q int16 pairs)\n");
             return 0;
         }
     }
 
-    fprintf(stderr, "fldigi_cw: f=%.0f Hz, %d WPM, bw=%.0f Hz\n",
-            freq, speed, bandwidth);
+    fprintf(stderr, "fldigi_cw: f=%.0f Hz, %d WPM, bw=%.0f Hz, %s\n",
+            freq, speed, bandwidth, iq_mode ? "IQ" : "mono");
 
     CWDecoder dec(freq, speed, bandwidth);
-    short sample;
     int count = 0;
 
-    while (fread(&sample, sizeof(short), 1, stdin) == 1) {
-        char ch = dec.process(sample / 32768.0);
-        if (ch) {
-            putchar(ch);
-            fflush(stdout);
+    if (iq_mode) {
+        short iq[2];
+        while (fread(iq, sizeof(short), 2, stdin) == 2) {
+            char ch = dec.process(iq[0] / 32768.0, iq[1] / 32768.0);
+            if (ch) { putchar(ch); fflush(stdout); }
+            count++;
         }
-        count++;
+    } else {
+        short sample;
+        while (fread(&sample, sizeof(short), 1, stdin) == 1) {
+            char ch = dec.process(sample / 32768.0);
+            if (ch) { putchar(ch); fflush(stdout); }
+            count++;
+        }
     }
 
     fprintf(stderr, "Processed %d samples (%.1f s)\n",
