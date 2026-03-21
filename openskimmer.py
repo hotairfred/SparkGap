@@ -2,77 +2,57 @@
 """
 openskimmer.py — OpenSkimmer live CW skimmer daemon.
 
-Buffer-and-decode architecture:
-    1. Accumulate 30s of IQ per band in ring buffers
-    2. Every 30s: find signals via complex FFT, channelize each
-    3. Run multi-speed bmorse + threshold decoder on each channel
-    4. Merge all output through MASTER.SCP validation
-    5. Emit validated spots on DX cluster telnet port
+Streaming architecture with dynamic decoder instances:
+    1. Continuous IQ stream from Red Pitaya via HPSDR Protocol 1
+    2. Periodic FFT signal detection (every 5 seconds)
+    3. One fldigi_cw process per detected signal, running continuously
+    4. Wideband IQ piped to all decoder instances simultaneously
+    5. Decoded text collected, validated against MASTER.SCP
+    6. Spots served on DX cluster telnet port
 
 Usage:
     python3 openskimmer.py
     python3 openskimmer.py --config skimmer.json
-    python3 openskimmer.py --ip 192.168.1.54 --bands 20m
 """
 
 import argparse
 import asyncio
 import json
 import logging
-import math
 import os
 import re
+import select
 import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import wave
 from collections import defaultdict
 from datetime import datetime, timezone
 
 import numpy as np
-from scipy.signal import firwin, lfilter
 
 from hpsdr_receiver import HPSDRReceiver, discover, SAMPLE_RATE
 from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('openskimmer')
 
-# --- Callsign validation ---
-
 CALL_RE = re.compile(
-    r'(?<![A-Z0-9])'
-    r'([A-Z0-9]{1,2}\d{1,2}[A-Z]{1,3}(?:/[A-Z0-9]+)?)'
-    r'(?![A-Z0-9])'
+    r'(?<![A-Z0-9])([A-Z0-9]{1,2}\d{1,2}[A-Z]{1,3}(?:/[A-Z0-9]+)?)(?![A-Z0-9])'
 )
-NOISE_RE = re.compile(r'\b[EI]\b')
-CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|CWT|SST|TU|UP|DE)\b', re.IGNORECASE)
 FALSE_POSITIVES = {
     'CQ', 'TEST', 'QRZ', 'DE', 'TU', '5NN', '599', 'RST',
     'QSL', 'QTH', 'QRL', 'CFM', 'PSE', 'TNX', 'TKS',
     'BT', 'AR', 'SK', 'KN', 'AS', 'EE5E', 'TT5T',
 }
-MIN_CALL_LEN = 4
+CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|CWT|SST|TU|UP|DE)\b', re.IGNORECASE)
 
-# Band centers — CW sub-band, adjusted per Grayline's note
 BANDS = {
-    '160m': 1820000,
-    '80m':  3530000,
-    '40m':  7020000,
-    '30m':  10120000,
-    '20m':  14030000,  # shifted down to catch 14009+
-    '17m':  18080000,
-    '15m':  21040000,
-    '12m':  24900000,
-    '10m':  28040000,
+    '160m': 1820000, '80m': 3530000, '40m': 7020000, '30m': 10120000,
+    '20m': 14030000, '17m': 18080000, '15m': 21040000, '12m': 24900000,
+    '10m': 28040000,
 }
-
-BMORSE_BIN = '/home/fred/morse-wip/src/bmorse'
-CHANNEL_RATE = 4000  # per-channel audio sample rate for bmorse
-CW_PITCH = 600       # Hz — standard CW sidetone
 
 
 def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
@@ -101,204 +81,239 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
     return calls, blacklist
 
 
-class IQBuffer:
-    """Thread-safe ring buffer for IQ samples per band."""
+class DecoderInstance:
+    """One fldigi_cw process tracking one CW signal."""
 
-    def __init__(self, band_name, center_freq, buffer_seconds=30):
-        self.band_name = band_name
-        self.center_freq = center_freq
-        self.max_samples = SAMPLE_RATE * buffer_seconds
-        self._lock = threading.Lock()
-        self._samples = []  # list of (i, q) tuples
-        self.total_received = 0
+    def __init__(self, freq_offset, rf_khz, sample_rate, snr,
+                 decoder_bin='./fldigi_cw', bandwidth=100):
+        self.freq_offset = freq_offset
+        self.rf_khz = rf_khz
+        self.snr = snr
+        self.created = time.time()
+        self.last_seen = time.time()
+        self.last_output = time.time()
+        self.decoded_text = ''
+        self.total_chars = 0
 
-    def append(self, iq_samples):
-        with self._lock:
-            self._samples.extend(iq_samples)
-            self.total_received += len(iq_samples)
-            # Trim to max
-            if len(self._samples) > self.max_samples:
-                self._samples = self._samples[-self.max_samples:]
-
-    def snapshot(self):
-        """Return a copy of the buffer and clear it."""
-        with self._lock:
-            data = list(self._samples)
-            self._samples.clear()
-            return data
-
-
-def find_signals(iq, sample_rate, min_snr=10):
-    """Find CW signal frequencies via complex FFT.
-
-    Returns list of (offset_hz, snr_db) sorted by SNR descending.
-    """
-    n = min(len(iq), 65536)
-    if n < 1024:
-        return []
-
-    fft = np.fft.fft(iq[:n])
-    psd = np.abs(fft) ** 2
-    psd_db = 10 * np.log10(psd + 1e-20)
-    noise = np.median(psd_db)
-
-    # Find peaks above threshold
-    peaks = []
-    for i in range(len(fft)):
-        if psd_db[i] > noise + min_snr:
-            f = (i if i < len(fft) // 2 else i - len(fft)) * sample_rate / len(fft)
-            peaks.append((f, psd_db[i] - noise))
-
-    # Cluster nearby peaks (within 200 Hz)
-    clustered = []
-    for freq, snr in sorted(peaks, key=lambda x: x[0]):
-        if not clustered or abs(freq - clustered[-1][0]) > 200:
-            clustered.append((freq, snr))
-        elif snr > clustered[-1][1]:
-            clustered[-1] = (freq, snr)
-
-    return sorted(clustered, key=lambda x: -x[1])
-
-
-def channelize_signal(iq, sample_rate, offset_hz, target_rate=CHANNEL_RATE,
-                      cw_pitch=CW_PITCH):
-    """Extract one CW signal from IQ, place tone at cw_pitch Hz.
-
-    Returns float32 audio at target_rate.
-    """
-    n = len(iq)
-    t = np.arange(n, dtype=np.float64) / sample_rate
-
-    # Mix signal from offset_hz to cw_pitch
-    mix_freq = offset_hz - cw_pitch
-    lo = np.exp(-2j * np.pi * mix_freq * t)
-    mixed = np.real(iq * lo)
-
-    # FIR lowpass + decimate
-    decim = int(sample_rate) // target_rate
-    if decim < 1:
-        decim = 1
-    nyq = sample_rate / 2.0
-    cutoff = target_rate / 2.0 * 0.8
-    numtaps = int(min(255, decim * 20 + 1))
-    if numtaps % 2 == 0:
-        numtaps += 1
-    fir = firwin(numtaps, cutoff / nyq)
-    filtered = lfilter(fir, 1.0, mixed)
-    decimated = filtered[::decim].astype(np.float32)
-
-    # Normalize
-    peak = np.max(np.abs(decimated))
-    if peak > 1e-6:
-        decimated = decimated / peak * 0.9
-
-    return decimated
-
-
-def run_bmorse(audio, speed=20):
-    """Run bmorse on audio array. Returns decoded text string."""
-    # Write temp WAV
-    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-    try:
-        wf = wave.open(tmp.name, 'wb')
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(CHANNEL_RATE)
-        for v in audio:
-            wf.writeframes(struct.pack('<h', max(-32768, min(32767, int(v * 32767)))))
-        wf.close()
-
-        result = subprocess.run(
-            [BMORSE_BIN, '-txt', '-agc', '-frq', str(CW_PITCH),
-             '-spd', str(speed), tmp.name],
-            capture_output=True, text=True, timeout=30,
+        cmd = [
+            decoder_bin,
+            '-r', str(sample_rate),
+            '-f', str(int(round(freq_offset))),
+            '-s', '25',
+            '-b', str(bandwidth),
+            '-q',  # IQ mode
+        ]
+        self.process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0,
         )
-        return result.stdout.strip()
-    except (subprocess.TimeoutExpired, Exception) as e:
-        log.debug("bmorse error: %s", e)
-        return ''
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+
+    def feed(self, iq_pcm_bytes):
+        """Feed IQ audio to the decoder."""
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.stdin.write(iq_pcm_bytes)
+            except (BrokenPipeError, OSError):
+                pass
+
+    def read(self):
+        """Non-blocking read of decoded characters."""
+        if not self.process:
+            return ''
+        chars = ''
+        while True:
+            ready, _, _ = select.select([self.process.stdout], [], [], 0)
+            if not ready:
+                break
+            data = self.process.stdout.read(256)
+            if not data:
+                break
+            chars += data.decode('latin-1', errors='replace')
+        if chars:
+            self.decoded_text += chars
+            self.total_chars += len(chars)
+            self.last_output = time.time()
+        return chars
+
+    def kill(self):
+        if self.process:
+            try:
+                self.process.stdin.close()
+            except:
+                pass
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            self.process = None
+
+
+class InstanceManager:
+    """Manages dynamic decoder instances per detected signal."""
+
+    def __init__(self, sample_rate, decoder_bin='./fldigi_cw',
+                 max_instances=50, signal_timeout=30, bandwidth=100):
+        self.sample_rate = sample_rate
+        self.decoder_bin = decoder_bin
+        self.max_instances = max_instances
+        self.signal_timeout = signal_timeout
+        self.bandwidth = bandwidth
+        self.instances = {}  # freq_key -> DecoderInstance
+        self.center_khz = 0
+
+    def update_signals(self, signals, center_khz):
+        """Update instance list based on detected signals.
+
+        signals: list of (offset_hz, snr_db) from FFT
+        """
+        self.center_khz = center_khz
+        now = time.time()
+
+        # Mark existing instances as seen if signal still present
+        for offset, snr in signals:
+            key = int(round(offset / 100)) * 100  # 100 Hz bins
+            if key in self.instances:
+                self.instances[key].last_seen = now
+                self.instances[key].snr = snr
+
+        # Spawn new instances for new signals
+        for offset, snr in sorted(signals, key=lambda x: -x[1]):
+            key = int(round(offset / 100)) * 100
+            if key in self.instances:
+                continue
+            if len(self.instances) >= self.max_instances:
+                break
+            if abs(offset) < 100:  # skip DC
+                continue
+
+            rf_khz = center_khz + offset / 1000
+            inst = DecoderInstance(
+                offset, rf_khz, self.sample_rate, snr,
+                self.decoder_bin, self.bandwidth,
+            )
+            self.instances[key] = inst
+            log.info("Spawned decoder: %.1f kHz (offset %+.0f Hz, +%.0f dB)",
+                     rf_khz, offset, snr)
+
+        # Kill instances for signals gone > timeout
+        dead = []
+        for key, inst in self.instances.items():
+            if now - inst.last_seen > self.signal_timeout:
+                dead.append(key)
+        for key in dead:
+            inst = self.instances.pop(key)
+            log.info("Killed decoder: %.1f kHz (gone %.0fs, %d chars decoded)",
+                     inst.rf_khz, now - inst.last_seen, inst.total_chars)
+            inst.kill()
+
+    def feed_all(self, iq_pcm_bytes):
+        """Feed IQ audio to ALL running decoder instances."""
+        for inst in list(self.instances.values()):
+            inst.feed(iq_pcm_bytes)
+
+    def collect_all(self):
+        """Read decoded text from all instances.
+
+        Returns list of (rf_khz, snr, new_text) for instances with new output.
+        """
+        results = []
+        for inst in list(self.instances.values()):
+            text = inst.read()
+            if text:
+                results.append((inst.rf_khz, inst.snr, text))
+        return results
+
+    def kill_all(self):
+        for inst in self.instances.values():
+            inst.kill()
+        self.instances.clear()
+
+    @property
+    def count(self):
+        return len(self.instances)
 
 
 class SpotTracker:
-    """Tracks callsign sightings and decides when to emit a spot."""
+    """Validates and deduplicates spots."""
 
-    def __init__(self, valid_calls, blacklist, min_sightings=1,
-                 respot_interval=120):
+    def __init__(self, valid_calls, blacklist, respot_interval=120):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
-        self.min_sightings = min_sightings
         self.respot_interval = respot_interval
         self._tracking = defaultdict(lambda: {
-            'freq': 0, 'count': 0, 'last_spotted': 0, 'best_snr': 0
+            'freq': 0, 'count': 0, 'last_spotted': 0, 'snr': 0
         })
+        # Cross-channel hallucination filter
+        self._cycle_calls = defaultdict(set)
 
-    def process_decode(self, freq_hz, snr, text):
-        """Process decoded text. Returns list of spot dicts."""
+    def process(self, freq_khz, snr, text):
+        """Process decoded text. Returns spot dict or None."""
+        clean = re.sub(r'\b[EIT]\b', '', text.upper())
         spots = []
-        clean = NOISE_RE.sub('', text.upper())
 
         for m in CALL_RE.finditer(clean):
             call = m.group(1)
-            if len(call) < MIN_CALL_LEN or call in FALSE_POSITIVES:
+            if len(call) < 4 or call in FALSE_POSITIVES:
                 continue
             if call in self.blacklist or call not in self.valid_calls:
                 continue
 
+            self._cycle_calls[call].add(int(freq_khz * 10))
+
             info = self._tracking[call]
             info['count'] += 1
-            info['freq'] = freq_hz
-            info['best_snr'] = max(info['best_snr'], snr)
+            info['freq'] = freq_khz
+            info['snr'] = max(info['snr'], snr)
 
             now = time.time()
             has_context = bool(CQ_PATTERNS.search(clean))
-            should_spot = (has_context or info['count'] >= self.min_sightings)
 
-            if should_spot and (now - info['last_spotted']) >= self.respot_interval:
+            if (has_context or info['count'] >= 2) and \
+               (now - info['last_spotted']) >= self.respot_interval:
+                # Hallucination check: same call on 3+ freqs = fake
+                if len(self._cycle_calls[call]) >= 3:
+                    continue
                 info['last_spotted'] = now
                 spots.append({
                     'call': call,
-                    'freq_khz': freq_hz / 1000.0,
-                    'snr': info['best_snr'],
+                    'freq_khz': freq_khz,
+                    'snr': info['snr'],
                 })
+
         return spots
+
+    def reset_cycle(self):
+        """Reset per-cycle hallucination tracking."""
+        self._cycle_calls.clear()
 
 
 class OpenSkimmer:
-    """Main daemon — buffer-and-decode architecture."""
+    """Main daemon — streaming architecture with dynamic decoder instances."""
 
     def __init__(self, config):
         self.cfg = config
         self.receiver = None
-        self.buffers = {}       # rx_index -> IQBuffer
-        self.band_info = []     # [(name, freq_hz), ...]
+        self.manager = None
         self.tracker = None
         self.telnet = None
         self.running = False
         self.spot_count = 0
-        self.decode_cycles = 0
         self.start_time = None
+        self._iq_lock = threading.Lock()
+        self._iq_buffer = []
 
     async def start(self):
         self.start_time = time.time()
 
-        # Database
         calls, blacklist = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
             self.cfg.get('add_calls', 'add_calls.txt'),
             self.cfg.get('blacklist', 'blacklist.txt'),
         )
-        self.tracker = SpotTracker(
-            calls, blacklist,
-            min_sightings=self.cfg.get('min_sightings', 1),
-            respot_interval=self.cfg.get('respot_interval', 120),
-        )
+        self.tracker = SpotTracker(calls, blacklist,
+                                   self.cfg.get('respot_interval', 120))
 
-        # Telnet server
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
             callsign=self.cfg.get('callsign', 'WF8Z-2'),
@@ -306,191 +321,165 @@ class OpenSkimmer:
         )
         await self.telnet.start()
 
-        # Parse bands
-        band_list = self.cfg.get('bands', ['20m'])
-        for b in band_list:
-            if isinstance(b, str) and b in BANDS:
-                self.band_info.append((b, BANDS[b]))
-            else:
-                try:
-                    f = int(float(b) * 1000) if isinstance(b, str) else int(b)
-                    self.band_info.append((f'{f/1e6:.3f}', f))
-                except ValueError:
-                    log.warning("Unknown band: %s", b)
+        band = self.cfg.get('bands', ['20m'])[0]
+        if isinstance(band, str) and band in BANDS:
+            center = BANDS[band]
+        else:
+            center = int(band)
 
-        n_rx = min(len(self.band_info), self.cfg.get('max_receivers', 8))
-        self.band_info = self.band_info[:n_rx]
-
-        # HPSDR receiver
-        sdr_ip = self.cfg.get('sdr_ip', '192.168.1.54')
         devices = discover()
         if not devices:
             log.error("No HPSDR devices found")
             return False
-        log.info("Found: %s MAC=%s RX=%d", devices[0]['ip'],
-                 devices[0]['mac'], devices[0]['receivers'])
 
-        self.receiver = HPSDRReceiver(sdr_ip, n_receivers=n_rx)
-        buffer_secs = self.cfg.get('buffer_seconds', 30)
+        self.receiver = HPSDRReceiver(devices[0]['ip'], n_receivers=1)
+        self.receiver.set_frequency(0, center)
+        self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
 
-        for i, (name, freq) in enumerate(self.band_info):
-            self.receiver.set_frequency(i, freq)
-            self.buffers[i] = IQBuffer(name, freq, buffer_secs)
+        self.manager = InstanceManager(
+            sample_rate=SAMPLE_RATE,
+            decoder_bin=self.cfg.get('decoder_bin', './fldigi_cw'),
+            max_instances=self.cfg.get('max_instances', 30),
+            signal_timeout=self.cfg.get('signal_timeout', 30),
+            bandwidth=self.cfg.get('decoder_bandwidth', 100),
+        )
 
-        # Start IQ stream
         self.receiver.start()
         self.running = True
 
-        log.info("OpenSkimmer LIVE: %d bands, %ds buffer, telnet :%d",
-                 n_rx, buffer_secs, self.cfg.get('telnet_port', 7300))
-        for i, (name, freq) in enumerate(self.band_info):
-            log.info("  RX%d: %s (%d Hz, ±%d kHz)",
-                     i, name, freq, SAMPLE_RATE // n_rx // 2000)
+        cal_center = center * 0.9999961
+        log.info("OpenSkimmer LIVE: %s (%.3f kHz), telnet :%d",
+                 band, cal_center / 1000, self.cfg.get('telnet_port', 7300))
         return True
 
     async def stop(self):
         self.running = False
         if self.receiver:
             self.receiver.close()
+        if self.manager:
+            self.manager.kill_all()
         if self.telnet:
             await self.telnet.stop()
         elapsed = time.time() - self.start_time if self.start_time else 0
-        log.info("Stopped: %d spots, %d cycles in %.0fs",
-                 self.spot_count, self.decode_cycles, elapsed)
+        log.info("Stopped: %d spots in %.0fs", self.spot_count, elapsed)
 
     def _iq_callback(self, rx_index, iq_samples):
-        """Called by HPSDR receiver thread — just buffer the IQ."""
-        if rx_index in self.buffers:
-            self.buffers[rx_index].append(iq_samples)
+        """Called from HPSDR receiver thread."""
+        with self._iq_lock:
+            self._iq_buffer.extend(iq_samples)
+            max_buf = SAMPLE_RATE * 10
+            if len(self._iq_buffer) > max_buf:
+                del self._iq_buffer[:len(self._iq_buffer) - max_buf]
 
-    def _decode_band(self, band_name, center_freq, iq_data):
-        """Decode one band's buffered IQ. Returns list of (freq_hz, snr, text)."""
-        if len(iq_data) < 4000:
-            return []
-
-        # Convert to complex numpy array (raw 24-bit int scale)
-        iq = np.array([complex(i * 8388608, q * 8388608) for i, q in iq_data])
-
-        # Compute actual sample rate (may differ from SAMPLE_RATE with multi-rx)
-        actual_rate = len(iq_data) / self.cfg.get('buffer_seconds', 30)
-        if actual_rate < 1000:
-            actual_rate = SAMPLE_RATE  # fallback
-
-        # Find signals
-        min_snr = self.cfg.get('signal_min_snr', 10)
-        signals = find_signals(iq, actual_rate, min_snr=min_snr)
-
-        if not signals:
-            log.debug("%s: no signals above %d dB", band_name, min_snr)
-            return []
-
-        log.info("%s: %d signals found (strongest +%.0f dB)",
-                 band_name, len(signals), signals[0][1] if signals else 0)
-
-        # Decode each signal with bmorse at multiple speeds
-        bmorse_speeds = self.cfg.get('bmorse_speeds', [20, 25, 30])
-        max_channels = self.cfg.get('max_channels', 15)
-        results = []
-
-        for sig_idx, (offset_hz, snr) in enumerate(signals[:max_channels]):
-            actual_freq = center_freq + offset_hz
-            actual_khz = actual_freq / 1000.0
-
-            # Channelize
-            audio = channelize_signal(iq, actual_rate, offset_hz)
-            if len(audio) < 1000:
-                continue
-
-            # Run bmorse at each speed
-            for speed in bmorse_speeds:
-                decoded = run_bmorse(audio, speed=speed)
-                if decoded and len(decoded) > 1:
-                    results.append((actual_freq, int(snr), decoded))
-                    log.debug("  %.1f kHz spd=%d: %s",
-                              actual_khz, speed, decoded[:60])
-
-        return results
+        # Convert to PCM and feed to all decoders
+        pk = 8388608.0
+        pcm = bytearray(len(iq_samples) * 4)
+        for i, (iv, qv) in enumerate(iq_samples):
+            i16 = max(-32768, min(32767, int(iv * pk * 4)))  # gain factor
+            q16 = max(-32768, min(32767, int(qv * pk * 4)))
+            struct.pack_into('<hh', pcm, i * 4, i16, q16)
+        self.manager.feed_all(bytes(pcm))
 
     async def run(self):
-        """Main loop — buffer IQ, periodically decode, emit spots."""
-        # IQ receiver in background thread
         rx_thread = threading.Thread(
             target=self.receiver.receive,
             args=(self._iq_callback,),
             daemon=True,
         )
         rx_thread.start()
-        log.info("IQ receiver thread started, buffering...")
+        log.info("IQ stream started")
 
-        buffer_secs = self.cfg.get('buffer_seconds', 30)
+        scan_interval = self.cfg.get('scan_interval', 5)
         status_interval = self.cfg.get('status_interval', 30)
-        last_status = time.time()
-
-        # Wait for first buffer to fill
-        await asyncio.sleep(buffer_secs + 2)
+        last_scan = 0
+        last_status = 0
 
         while self.running:
-            cycle_start = time.time()
-            self.decode_cycles += 1
-            log.info("=== Decode cycle %d ===", self.decode_cycles)
+            now = time.time()
 
-            # Snapshot all buffers
-            snapshots = {}
-            for rx_idx, buf in self.buffers.items():
-                data = buf.snapshot()
-                if data:
-                    snapshots[rx_idx] = data
-                    log.info("  %s: %d samples (%.1fs)",
-                             buf.band_name, len(data),
-                             len(data) / (SAMPLE_RATE / len(self.buffers)))
+            # Periodic signal scan
+            if now - last_scan >= scan_interval:
+                last_scan = now
+                self.tracker.reset_cycle()
 
-            # Decode each band (sequential — bmorse is CPU-heavy)
-            for rx_idx, iq_data in snapshots.items():
-                buf = self.buffers[rx_idx]
-                results = self._decode_band(
-                    buf.band_name, buf.center_freq, iq_data
-                )
+                with self._iq_lock:
+                    if len(self._iq_buffer) >= 65536:
+                        iq = np.array([complex(i * 8388608, q * 8388608)
+                                       for i, q in self._iq_buffer[-65536:]])
+                    else:
+                        iq = None
 
-                # Process through spot tracker
-                for freq_hz, snr, text in results:
-                    spots = self.tracker.process_decode(freq_hz, snr, text)
-                    for spot in spots:
-                        self.spot_count += 1
-                        self.telnet.broadcast_spot(
-                            freq_khz=spot['freq_khz'],
-                            dx_call=spot['call'],
-                            snr=spot['snr'],
-                        )
-                        log.info("*** SPOT: %10.1f  %-12s  %d dB ***",
-                                 spot['freq_khz'], spot['call'], spot['snr'])
+                if iq is not None:
+                    fft = np.fft.fft(iq)
+                    psd_db = 10 * np.log10(np.abs(fft) ** 2 + 1e-20)
+                    noise = np.median(psd_db)
+                    min_snr = self.cfg.get('signal_min_snr', 12)
 
-            # Timing
-            cycle_time = time.time() - cycle_start
-            log.info("Cycle %d done in %.1fs, %d spots total",
-                     self.decode_cycles, cycle_time, self.spot_count)
+                    signals = []
+                    N = len(fft)
+                    for i in range(1, N - 1):
+                        if psd_db[i] > noise + min_snr and \
+                           psd_db[i] > psd_db[i - 1] and psd_db[i] > psd_db[i + 1]:
+                            delta = 0.5 * (psd_db[i-1] - psd_db[i+1]) / \
+                                    (psd_db[i-1] - 2*psd_db[i] + psd_db[i+1])
+                            exact = i + delta
+                            if exact >= N / 2:
+                                exact -= N
+                            f = exact * SAMPLE_RATE / N
+                            signals.append((f, psd_db[i] - noise))
 
-            # Wait for next buffer window (minus decode time)
-            wait = max(1, buffer_secs - cycle_time)
-            log.info("Next cycle in %.0fs", wait)
-            await asyncio.sleep(wait)
+                    # Cluster
+                    clustered = []
+                    for freq, snr in sorted(signals):
+                        if not clustered or abs(freq - clustered[-1][0]) > 200:
+                            clustered.append((freq, snr))
+                        elif snr > clustered[-1][1]:
+                            clustered[-1] = (freq, snr)
+
+                    center_khz = self.receiver.frequencies[0] * 0.9999961 / 1000
+                    self.manager.update_signals(clustered, center_khz)
+
+            # Collect decoder output
+            results = self.manager.collect_all()
+            for rf_khz, snr, text in results:
+                spots = self.tracker.process(rf_khz, snr, text)
+                for spot in spots:
+                    self.spot_count += 1
+                    self.telnet.broadcast_spot(
+                        freq_khz=spot['freq_khz'],
+                        dx_call=spot['call'],
+                        snr=spot['snr'],
+                    )
+                    log.info("*** SPOT: %10.1f  %-12s  %d dB ***",
+                             spot['freq_khz'], spot['call'], spot['snr'])
+
+            # Status
+            if now - last_status >= status_interval:
+                last_status = now
+                elapsed = now - self.start_time
+                log.info("Status: %d spots, %d decoders, %d clients, %.0fs",
+                         self.spot_count, self.manager.count,
+                         self.telnet.client_count, elapsed)
+
+            await asyncio.sleep(0.1)
 
 
 def load_config(path):
     defaults = {
         'callsign': 'WF8Z-2',
-        'grid': 'EM79sm',
         'node_call': 'SPARK-2',
         'sdr_ip': '192.168.1.54',
-        'max_receivers': 8,
         'bands': ['20m'],
-        'buffer_seconds': 30,
-        'bmorse_speeds': [20, 25, 30],
-        'signal_min_snr': 10,
-        'max_channels': 15,
+        'lna_gain': 20,
+        'decoder_bin': './fldigi_cw',
+        'decoder_bandwidth': 100,
+        'max_instances': 30,
+        'signal_timeout': 30,
+        'signal_min_snr': 12,
+        'scan_interval': 5,
         'master_scp': 'MASTER.SCP',
         'add_calls': 'add_calls.txt',
         'blacklist': 'blacklist.txt',
-        'min_sightings': 1,
         'respot_interval': 120,
         'telnet_port': 7300,
         'status_interval': 30,
@@ -505,7 +494,7 @@ async def async_main(config):
     skimmer = OpenSkimmer(config)
 
     def handle_signal():
-        log.info("Signal received, shutting down...")
+        log.info("Shutting down...")
         skimmer.running = False
 
     loop = asyncio.get_event_loop()
@@ -514,7 +503,6 @@ async def async_main(config):
 
     if not await skimmer.start():
         return 1
-
     try:
         await skimmer.run()
     except asyncio.CancelledError:
@@ -531,32 +519,24 @@ def main():
     )
     parser.add_argument('--config', default='skimmer.json', help='Config JSON')
     parser.add_argument('--ip', help='SDR IP override')
-    parser.add_argument('--bands', nargs='+', help='Band list override')
+    parser.add_argument('--band', help='Band override (e.g., 20m)')
     parser.add_argument('--port', type=int, help='Telnet port override')
-    parser.add_argument('--callsign', help='Spotter callsign override')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+        format='%(asctime)s %(levelname)s %(message)s',
         datefmt='%H:%M:%S',
     )
 
     config = load_config(args.config if os.path.exists(args.config) else None)
     if args.ip:
         config['sdr_ip'] = args.ip
-    if args.bands:
-        config['bands'] = args.bands
+    if args.band:
+        config['bands'] = [args.band]
     if args.port:
         config['telnet_port'] = args.port
-    if args.callsign:
-        config['callsign'] = args.callsign
-
-    log.info("OpenSkimmer — %s @ %s, %d bands, %ds buffer, telnet :%d",
-             config['callsign'], config['sdr_ip'],
-             len(config['bands']), config['buffer_seconds'],
-             config['telnet_port'])
 
     sys.exit(asyncio.run(async_main(config)))
 
