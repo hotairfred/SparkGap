@@ -32,6 +32,7 @@ static int KWPM() { return 12 * DEC_RATE() / 10; }
 #define INITIAL_SPEED   20
 
 typedef std::complex<double> cmplx;
+bool debug_timing = false;
 
 // --- Morse table ---
 static const struct { const char *p; char c; } morse[] = {
@@ -219,13 +220,18 @@ class CWDecoder {
                 return -1;
             }
             if (last_element > 0) {
-                if (dur > 2*last_element && dur < 4*last_element)
+                // Accept wider ratio range (1.5x-5x) for speed tracking
+                // Original fldigi used 2x-4x but that's too strict for noisy signals
+                if (dur > 1.5*last_element && dur < 5*last_element)
                     update_tracking(last_element, dur);
-                if (last_element > 2*dur && last_element < 4*dur)
+                if (last_element > 1.5*dur && last_element < 5*dur)
                     update_tracking(dur, last_element);
             }
             last_element = dur;
             rep += (dur <= two_dots) ? '.' : '-';
+            if (debug_timing)
+                fprintf(stderr, "%c dur=%d 2dot=%ld dot=%ld\n",
+                        (dur <= two_dots) ? '.' : '-', dur, two_dots, dot_len);
             if (rep.length() > MAX_MORSE) {
                 state = IDLE; rep.clear();
                 return -1;
@@ -255,6 +261,47 @@ class CWDecoder {
     }
 
 public:
+    // Speed estimation from keying envelope FFT
+    double *speed_buf;
+    int speed_buf_ptr, speed_buf_len;
+    bool speed_measured;
+
+    void measure_speed() {
+        if (speed_buf_ptr < speed_buf_len) return;
+        int N = speed_buf_len;
+        // DFT to find dit repetition frequency
+        int dec_rate = DEC_RATE();
+        int lo = (int)(2.0 * N / dec_rate);   // 5 WPM
+        int hi = (int)(25.0 * N / dec_rate);   // 60 WPM
+        if (lo < 1) lo = 1;
+        if (hi > N/2-1) hi = N/2-1;
+
+        double best_mag = 0;
+        int best_k = lo;
+        for (int k = lo; k <= hi; k++) {
+            double re = 0, im = 0;
+            for (int n = 0; n < N; n++) {
+                double angle = TWOPI * k * n / N;
+                re += speed_buf[n] * cos(angle);
+                im -= speed_buf[n] * sin(angle);
+            }
+            double mag = re*re + im*im;
+            if (mag > best_mag) { best_mag = mag; best_k = k; }
+        }
+
+        double peak_freq = (double)best_k * dec_rate / N;
+        int est_wpm = (int)(peak_freq * 2.4);
+        if (est_wpm < 10) est_wpm = 10;
+        if (est_wpm > 50) est_wpm = 50;
+
+        two_dots = 2 * KWPM() / est_wpm;
+        for (int i = 0; i < 8; i++) trackfilter->run(two_dots);
+        sync_params();
+
+        fprintf(stderr, "Speed: %d WPM (peak %.1f Hz)\n", est_wpm, peak_freq);
+        speed_measured = true;
+    }
+
     CWDecoder(double freq, int speed, double bandwidth = 60.0) {
         two_dots = 2 * KWPM() / speed;
         state = IDLE; smpl_ctr = 0;
@@ -262,15 +309,20 @@ public:
         last_element = 0; space_sent = true;
         agc_peak = 0.001; noise_floor = 0; sig_avg = 0;
 
-        trackfilter = new Avg(16);
-        // bitfilter length: ~8ms at decimated rate
+        trackfilter = new Avg(8);
         int bf_len = DEC_RATE() * 8 / 1000;
         if (bf_len < 2) bf_len = 2;
         if (bf_len > 32) bf_len = 32;
         bitfilter = new Avg(bf_len);
         bpf = new BandpassFilter(freq, bandwidth);
 
-        for (int i = 0; i < 16; i++)
+        // Speed estimation buffer — 2 seconds
+        speed_buf_len = DEC_RATE() * 2;
+        speed_buf = new double[speed_buf_len]();
+        speed_buf_ptr = 0;
+        speed_measured = false;
+
+        for (int i = 0; i < 8; i++)
             trackfilter->run(two_dots);
         sync_params();
     }
@@ -279,6 +331,7 @@ public:
         delete trackfilter;
         delete bitfilter;
         delete bpf;
+        delete[] speed_buf;
     }
 
     char process(double sample_i, double sample_q = 0.0) {
@@ -290,6 +343,14 @@ public:
 
         // Smooth envelope
         value = bitfilter->run(value);
+
+        // Speed estimation from first 2 seconds of envelope
+        if (!speed_measured) {
+            if (speed_buf_ptr < speed_buf_len)
+                speed_buf[speed_buf_ptr++] = value;
+            else
+                measure_speed();
+        }
 
         // AGC — scale constants to decimated rate
         // fldigi calibrated at 500 Hz decimated rate, scale proportionally
@@ -352,6 +413,10 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "-b") && i+1 < argc) bandwidth = atof(argv[++i]);
         else if (!strcmp(argv[i], "-r") && i+1 < argc) SAMPLE_RATE = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q")) iq_mode = true;
+        else if (!strcmp(argv[i], "-d")) {  // debug — show timing to stderr
+            extern bool debug_timing;
+            debug_timing = true;
+        }
         else if (!strcmp(argv[i], "-h")) {
             fprintf(stderr,
                 "fldigi_cw — Standalone CW decoder (fldigi-derived, GPL-3)\n"
