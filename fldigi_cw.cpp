@@ -10,9 +10,9 @@
  * Outputs decoded characters to stdout.
  *
  * Usage: cat audio.raw | ./fldigi_cw [-f freq] [-s speed]
- *        sox input.wav -t raw -r 8000 -e signed -b 16 -c 1 - | ./fldigi_cw
+ *        Pipe wideband I-channel audio, specify tone frequency with -f.
  *
- * Build: g++ -O2 -o fldigi_cw fldigi_cw.cpp -lm -lfftw3
+ * Build: g++ -O2 -o fldigi_cw fldigi_cw.cpp -lm
  */
 
 #include <cstdio>
@@ -21,348 +21,273 @@
 #include <cmath>
 #include <string>
 #include <complex>
-#include <fftw3.h>
 
-// Constants
 #define SAMPLE_RATE     8000
-#define KWPM            (12 * SAMPLE_RATE / 10 / DEC_RATIO)  // 600 at decimated rate
-#define DEC_RATIO       16
-#define CW_FFT_SIZE     2048
-#define MAX_MORSE_ELEMENTS 6
-#define WGT_SIZE        7
-#define TRACKING_FILTER_SIZE 16
-#define INITIAL_SPEED   20
+#define DEC_RATIO       16          // Decimation ratio
+#define DEC_RATE        (SAMPLE_RATE / DEC_RATIO)  // 500 Hz decimated rate
+#define KWPM            (12 * DEC_RATE / 10)       // 600 at decimated rate
+#define MAX_MORSE       6
 #define TWOPI           (2.0 * M_PI)
+#define INITIAL_SPEED   20
 
 typedef std::complex<double> cmplx;
 
-// --- Morse lookup table ---
-struct MorseEntry {
-    const char *pattern;  // e.g. ".-"
-    char ch;
+// --- Morse table ---
+static const struct { const char *p; char c; } morse[] = {
+    {".-",'A'},    {"-...",'B'},  {"-.-.",'C'},  {"-..",'D'},
+    {".",'E'},     {"..-.",'F'},  {"--.",'G'},   {"....",'H'},
+    {"..",'I'},    {".---",'J'},  {"-.-",'K'},   {".-..",'L'},
+    {"--",'M'},    {"-.",'N'},    {"---",'O'},    {".--.",'P'},
+    {"--.-",'Q'},  {".-.",'R'},   {"...",'S'},    {"-",'T'},
+    {"..-",'U'},   {"...-",'V'},  {".--",'W'},    {"-..-",'X'},
+    {"-.--",'Y'},  {"--..",'Z'},
+    {"-----",'0'}, {".----",'1'}, {"..---",'2'}, {"...--",'3'},
+    {"....-",'4'}, {".....",'5'}, {"-....",'6'}, {"--...",'7'},
+    {"---..",'8'}, {"----.",'9'},
+    {".-.-.-",'.'}, {"--..--",','}, {"..--.."},
+    {NULL,0}
 };
 
-static const MorseEntry morse_table[] = {
-    {".-",    'A'}, {"-...",  'B'}, {"-.-.",  'C'}, {"-..",   'D'},
-    {".",     'E'}, {"..-.",  'F'}, {"--.",   'G'}, {"....",  'H'},
-    {"..",    'I'}, {".---",  'J'}, {"-.-",   'K'}, {".-..",  'L'},
-    {"--",    'M'}, {"-.",    'N'}, {"---",   'O'}, {".--.",  'P'},
-    {"--.-",  'Q'}, {".-.",   'R'}, {"...",   'S'}, {"-",     'T'},
-    {"..-",   'U'}, {"...-",  'V'}, {".--",   'W'}, {"-..-",  'X'},
-    {"-.--",  'Y'}, {"--..",  'Z'},
-    {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
-    {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'},
-    {"---..", '8'}, {"----.", '9'},
-    {".-.-.-",'.'}, {"--..--",','}, {"..--..",'?'}, {"-..-.", '/'},
-    {NULL, 0}
-};
-
-static char morse_lookup(const std::string &rep) {
-    for (int i = 0; morse_table[i].pattern; i++) {
-        if (rep == morse_table[i].pattern)
-            return morse_table[i].ch;
-    }
-    return '*';  // unknown
+static char lookup(const std::string &rep) {
+    for (int i = 0; morse[i].p; i++)
+        if (rep == morse[i].p) return morse[i].c;
+    return '*';
 }
 
-// --- Moving average filter ---
-class MovAvg {
-    double *buf;
-    int len, ptr;
-    double sum;
+// --- Moving average ---
+class Avg {
+    double *b; int n, p; double s;
 public:
-    MovAvg(int n) : len(n), ptr(0), sum(0) {
-        buf = new double[n]();
-    }
-    ~MovAvg() { delete[] buf; }
+    Avg(int len) : n(len), p(0), s(0) { b = new double[n](); }
+    ~Avg() { delete[] b; }
     double run(double v) {
-        sum -= buf[ptr];
-        buf[ptr] = v;
-        sum += v;
-        if (++ptr >= len) ptr = 0;
-        return sum / len;
+        s -= b[p]; b[p] = v; s += v;
+        if (++p >= n) p = 0;
+        return s / n;
     }
 };
 
-// --- FFT bandpass filter ---
-class FFTFilter {
-    fftwf_plan fwd, rev;
-    fftwf_complex *freq;
-    float *timebuf;
-    int fftlen, filterlen;
-    cmplx *ovlbuf;
-    int inptr;
+// --- Overlap-save bandpass filter (simplified fftfilt) ---
+// Uses brute-force FIR instead of FFT for simplicity and no FFTW dependency
+class BandpassFilter {
+    double *coeffs_i, *coeffs_q;  // Complex FIR taps
+    double *delay_i, *delay_q;
+    int ntaps, ptr;
+    double carrier_freq;
+    double phase;
+    // Output buffer for decimation
+    double *outbuf;
+    int outptr, outlen;
+    int dec_count;
+
 public:
-    FFTFilter(double f1, double f2, int len) : fftlen(len), filterlen(len/2) {
-        freq = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (fftlen/2+1));
-        timebuf = (float *)fftwf_malloc(sizeof(float) * fftlen);
-        ovlbuf = new cmplx[filterlen]();
-        inptr = 0;
+    BandpassFilter(double freq, double bandwidth, int taps = 127) {
+        carrier_freq = freq;
+        ntaps = taps | 1;  // make odd
+        phase = 0;
+        dec_count = 0;
 
-        // Create filter kernel
-        float *kernel = (float *)calloc(fftlen, sizeof(float));
-        int lo = (int)(f1 * fftlen / SAMPLE_RATE);
-        int hi = (int)(f2 * fftlen / SAMPLE_RATE);
-        if (lo < 0) lo = 0;
-        if (hi > fftlen/2) hi = fftlen/2;
-        fftwf_complex *fk = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (fftlen/2+1));
+        coeffs_i = new double[ntaps]();
+        coeffs_q = new double[ntaps]();
+        delay_i = new double[ntaps]();
+        delay_q = new double[ntaps]();
+        ptr = 0;
 
-        // Simple rectangular bandpass in frequency domain
-        memset(fk, 0, sizeof(fftwf_complex) * (fftlen/2+1));
-        for (int i = lo; i <= hi; i++) {
-            fk[i][0] = 1.0f;
-            fk[i][1] = 0.0f;
+        // Design complex bandpass centered at carrier_freq with given bandwidth
+        // This is a lowpass FIR at bandwidth/2, shifted to carrier_freq
+        double bw_norm = bandwidth / SAMPLE_RATE;
+        int center = ntaps / 2;
+        for (int i = 0; i < ntaps; i++) {
+            // Sinc lowpass
+            double h;
+            if (i == center)
+                h = bw_norm;
+            else
+                h = sin(M_PI * bw_norm * (i - center)) / (M_PI * (i - center));
+            // Blackman window
+            h *= 0.42 - 0.5 * cos(2*M_PI*i/(ntaps-1)) + 0.08 * cos(4*M_PI*i/(ntaps-1));
+            coeffs_i[i] = h;
+            coeffs_q[i] = h;
         }
 
-        // We'll just use the frequency domain filter directly
-        memcpy(freq, fk, sizeof(fftwf_complex) * (fftlen/2+1));
-        fftwf_free(fk);
-        free(kernel);
+        outbuf = new double[SAMPLE_RATE]();  // 1 second max
+        outptr = 0;
+        outlen = 0;
+    }
 
-        fwd = fftwf_plan_dft_r2c_1d(fftlen, timebuf, freq, FFTW_ESTIMATE);
-        rev = fftwf_plan_dft_c2r_1d(fftlen, freq, timebuf, FFTW_ESTIMATE);
+    ~BandpassFilter() {
+        delete[] coeffs_i; delete[] coeffs_q;
+        delete[] delay_i; delete[] delay_q;
+        delete[] outbuf;
     }
-    ~FFTFilter() {
-        fftwf_destroy_plan(fwd);
-        fftwf_destroy_plan(rev);
-        fftwf_free(freq);
-        fftwf_free(timebuf);
-        delete[] ovlbuf;
+
+    // Process one sample. Returns filtered+decimated envelope value, or -1 if no output yet.
+    double process(double sample) {
+        // Mix to baseband
+        double si = sample * cos(phase);
+        double sq = sample * sin(phase);
+        phase += TWOPI * carrier_freq / SAMPLE_RATE;
+        if (phase > TWOPI) phase -= TWOPI;
+
+        // FIR filter (complex)
+        delay_i[ptr] = si;
+        delay_q[ptr] = sq;
+
+        double sum_i = 0, sum_q = 0;
+        int idx = ptr;
+        for (int k = 0; k < ntaps; k++) {
+            sum_i += coeffs_i[k] * delay_i[idx];
+            sum_q += coeffs_q[k] * delay_q[idx];
+            if (--idx < 0) idx = ntaps - 1;
+        }
+
+        if (++ptr >= ntaps) ptr = 0;
+
+        // Decimation
+        if (++dec_count < DEC_RATIO)
+            return -1.0;
+        dec_count = 0;
+
+        // Envelope = magnitude of complex output
+        return sqrt(sum_i * sum_i + sum_q * sum_q);
     }
-    // Not using the full overlap-save — simplified for standalone use
 };
 
-// --- CW Decoder (fldigi-derived) ---
+// --- CW Decoder ---
 class CWDecoder {
-    // State
-    enum { RS_IDLE, RS_IN_TONE, RS_AFTER_TONE } rx_state;
+    enum { IDLE, IN_TONE, AFTER_TONE } state;
     unsigned int smpl_ctr;
-    unsigned int start_timestamp, end_timestamp;
+    unsigned int tone_start, tone_end;
 
-    // AGC
     double agc_peak, noise_floor, sig_avg;
-
-    // Thresholds
     double upper_thresh, lower_thresh;
 
-    // Timing
     long two_dots;
-    long dot_len, dash_len;
-    long noise_threshold;
+    long dot_len;
+    long noise_thresh;
     int last_element;
     bool space_sent;
 
-    // Tracking filter
-    MovAvg *trackfilter;
+    Avg *trackfilter;
+    Avg *bitfilter;
+    BandpassFilter *bpf;
 
-    // Decode buffer
-    std::string rep_buf;
+    std::string rep;
 
-    // Signal processing
-    double phase;
-    double carrier_freq;
-    MovAvg *bitfilter;
-
-    // FFT bandpass
-    fftwf_complex *fft_in, *fft_out;
-    fftwf_plan fft_fwd, fft_rev;
-    float *fft_buf;
-    int fft_ptr;
-
-    // Decimation
-    int dec_count;
-
-    // Config
-    int initial_speed;
-
-    double decayavg(double avg, double val, double weight) {
-        if (weight <= 1.0) return val;
-        return avg * (1.0 - 1.0/weight) + val * (1.0/weight);
+    double decay(double avg, double val, double w) {
+        return w <= 1 ? val : avg * (1.0 - 1.0/w) + val / w;
     }
 
-    double clamp(double v, double lo, double hi) {
-        return v < lo ? lo : v > hi ? hi : v;
-    }
-
-    void sync_parameters() {
+    void sync_params() {
         dot_len = two_dots / 2;
-        dash_len = 3 * dot_len;
-        noise_threshold = dot_len / 2;
+        noise_thresh = dot_len / 2;
     }
 
     void update_tracking(int dot, int dash) {
         two_dots = (long)trackfilter->run((dot + dash) / 2.0);
-        sync_parameters();
+        sync_params();
     }
 
-    int handle_event(int event, std::string &sc) {
-        int element_usec;
-
-        switch (event) {
+    int handle_event(int ev, char &ch) {
+        int dur;
+        switch (ev) {
         case 0: // RESET
-            rx_state = RS_IDLE;
-            smpl_ctr = 0;
-            rep_buf.clear();
-            space_sent = true;
-            last_element = 0;
+            state = IDLE; smpl_ctr = 0; rep.clear();
+            space_sent = true; last_element = 0;
             break;
-
         case 1: // KEYDOWN
-            if (rx_state == RS_IN_TONE) return -1;
-            if (rx_state == RS_IDLE) {
-                smpl_ctr = 0;
-                rep_buf.clear();
-            }
-            start_timestamp = smpl_ctr;
-            rx_state = RS_IN_TONE;
+            if (state == IN_TONE) return -1;
+            if (state == IDLE) { smpl_ctr = 0; rep.clear(); }
+            tone_start = smpl_ctr;
+            state = IN_TONE;
             return -1;
-
         case 2: // KEYUP
-            if (rx_state != RS_IN_TONE) return -1;
-            end_timestamp = smpl_ctr;
-            element_usec = (start_timestamp < end_timestamp) ?
-                           (end_timestamp - start_timestamp) : 0;
-
-            sync_parameters();
-
-            // Noise spike filter
-            if (noise_threshold > 0 && element_usec < noise_threshold) {
-                rx_state = RS_IDLE;
+            if (state != IN_TONE) return -1;
+            tone_end = smpl_ctr;
+            dur = (tone_start < tone_end) ? (tone_end - tone_start) : 0;
+            sync_params();
+            if (noise_thresh > 0 && dur < noise_thresh) {
+                state = IDLE;
                 return -1;
             }
-
-            // Speed tracking from dot-dash pairs
             if (last_element > 0) {
-                if (element_usec > 2 * last_element && element_usec < 4 * last_element)
-                    update_tracking(last_element, element_usec);
-                if (last_element > 2 * element_usec && last_element < 4 * element_usec)
-                    update_tracking(element_usec, last_element);
+                if (dur > 2*last_element && dur < 4*last_element)
+                    update_tracking(last_element, dur);
+                if (last_element > 2*dur && last_element < 4*dur)
+                    update_tracking(dur, last_element);
             }
-            last_element = element_usec;
-
-            // Dot or dash?
-            if (element_usec <= two_dots)
-                rep_buf += '.';
-            else
-                rep_buf += '-';
-
-            // Buffer overflow = noise
-            if (rep_buf.length() > MAX_MORSE_ELEMENTS) {
-                rx_state = RS_IDLE;
-                rep_buf.clear();
+            last_element = dur;
+            rep += (dur <= two_dots) ? '.' : '-';
+            if (rep.length() > MAX_MORSE) {
+                state = IDLE; rep.clear();
                 return -1;
             }
-
-            rx_state = RS_AFTER_TONE;
+            state = AFTER_TONE;
             return -1;
-
         case 3: // QUERY
-            if (rx_state == RS_IN_TONE) return -1;
-
-            sync_parameters();
-            element_usec = (end_timestamp < smpl_ctr) ?
-                           (smpl_ctr - end_timestamp) : 0;
-
-            // Too short — wait
-            if (element_usec < 2 * dot_len) return -1;
-
-            // Character space (2-4 dot lengths)
-            if (element_usec >= 2 * dot_len &&
-                element_usec <= 4 * dot_len &&
-                rx_state == RS_AFTER_TONE) {
-                char ch = morse_lookup(rep_buf);
-                sc = std::string(1, ch);
-                rep_buf.clear();
-                rx_state = RS_IDLE;
+            if (state == IN_TONE) return -1;
+            sync_params();
+            dur = (tone_end < smpl_ctr) ? (smpl_ctr - tone_end) : 0;
+            if (dur < 2 * dot_len) return -1;
+            if (dur >= 2*dot_len && dur <= 4*dot_len && state == AFTER_TONE) {
+                ch = lookup(rep);
+                rep.clear();
+                state = IDLE;
                 space_sent = false;
-                return 0;  // SUCCESS
+                return 0;
             }
-
-            // Word space (>4 dot lengths)
-            if (element_usec > 4 * dot_len && !space_sent) {
-                sc = " ";
+            if (dur > 4*dot_len && !space_sent) {
+                ch = ' ';
                 space_sent = true;
                 return 0;
             }
-
             return -1;
         }
         return -1;
     }
 
 public:
-    CWDecoder(double freq = 600.0, int speed = INITIAL_SPEED) {
-        carrier_freq = freq;
-        initial_speed = speed;
-        phase = 0;
-        dec_count = 0;
-
-        // Initialize timing
+    CWDecoder(double freq, int speed, double bandwidth = 60.0) {
         two_dots = 2 * KWPM / speed;
-        rx_state = RS_IDLE;
-        smpl_ctr = 0;
-        start_timestamp = end_timestamp = 0;
-        last_element = 0;
-        space_sent = true;
+        state = IDLE; smpl_ctr = 0;
+        tone_start = tone_end = 0;
+        last_element = 0; space_sent = true;
+        agc_peak = 0.001; noise_floor = 0; sig_avg = 0;
 
-        // AGC
-        agc_peak = 0.001;
-        noise_floor = 0.0;
-        sig_avg = 0.0;
+        trackfilter = new Avg(16);
+        bitfilter = new Avg(4);
+        bpf = new BandpassFilter(freq, bandwidth);
 
-        // Filters
-        bitfilter = new MovAvg(8);
-        trackfilter = new MovAvg(TRACKING_FILTER_SIZE);
-
-        // Pre-seed tracking filter
-        for (int i = 0; i < TRACKING_FILTER_SIZE; i++)
+        for (int i = 0; i < 16; i++)
             trackfilter->run(two_dots);
-
-        sync_parameters();
+        sync_params();
     }
 
     ~CWDecoder() {
-        delete bitfilter;
         delete trackfilter;
+        delete bitfilter;
+        delete bpf;
     }
 
-    // Process one audio sample. Returns decoded character or 0.
-    char process_sample(double sample) {
-        // Mix to baseband
-        cmplx z(sample * cos(phase), sample * sin(phase));
-        phase += TWOPI * carrier_freq / SAMPLE_RATE;
-        if (phase > TWOPI) phase -= TWOPI;
+    char process(double sample) {
+        // Bandpass filter + decimate + envelope
+        double value = bpf->process(sample);
+        if (value < 0) return 0;  // decimation — no output yet
 
-        // Decimation counter — only process every DEC_RATIO samples
-        if (++dec_count < DEC_RATIO)
-            return 0;
-        dec_count = 0;
-
-        // Timing counter increments at decimated rate (500 Hz)
         smpl_ctr++;
 
-        // Demodulate — take magnitude
-        double value = std::abs(z);
+        // Smooth envelope
         value = bitfilter->run(value);
 
         // AGC
-        int attack, decay;
-        attack = 200;  // samples at decimated rate
-        decay = 1000;
-
-        sig_avg = decayavg(sig_avg, value, decay);
-
+        sig_avg = decay(sig_avg, value, 1000);
         if (value < sig_avg) {
-            if (value < noise_floor)
-                noise_floor = decayavg(noise_floor, value, attack);
-            else
-                noise_floor = decayavg(noise_floor, value, decay);
+            noise_floor = decay(noise_floor, value,
+                value < noise_floor ? 200 : 1000);
         }
         if (value > sig_avg) {
-            if (value > agc_peak)
-                agc_peak = decayavg(agc_peak, value, attack);
-            else
-                agc_peak = decayavg(agc_peak, value, decay);
+            agc_peak = decay(agc_peak, value,
+                value > agc_peak ? 200 : 1000);
         }
 
         // Normalize
@@ -372,70 +297,62 @@ public:
             value = 0;
 
         // Dynamic thresholds
-        double norm_noise = noise_floor / (agc_peak > 1e-6 ? agc_peak : 1.0);
-        double norm_sig = sig_avg / (agc_peak > 1e-6 ? agc_peak : 1.0);
-        double diff = norm_sig - norm_noise;
+        double nn = noise_floor / (agc_peak > 1e-6 ? agc_peak : 1.0);
+        double ns = sig_avg / (agc_peak > 1e-6 ? agc_peak : 1.0);
+        double diff = ns - nn;
+        upper_thresh = ns - 0.2 * diff;
+        lower_thresh = nn + 0.7 * diff;
 
-        upper_thresh = norm_sig - 0.2 * diff;
-        lower_thresh = norm_noise + 0.7 * diff;
-
-        // SNR check (simple squelch)
+        // SNR gate
         double metric = 0;
         if (noise_floor > 1e-6 && noise_floor < sig_avg)
-            metric = clamp(2.5 * (20 * log10(sig_avg / noise_floor)), 0, 100);
+            metric = 20 * log10(sig_avg / noise_floor);
+        if (metric < 3.0) return 0;  // too weak
 
-        std::string sc;
+        // Hysteresis keying
+        char ch = 0;
+        if (value > upper_thresh && state != IN_TONE)
+            handle_event(1, ch);
+        if (value < lower_thresh && state == IN_TONE)
+            handle_event(2, ch);
 
-        if (metric > 5.0) {  // minimum SNR to attempt decode
-            // Hysteresis keying detector
-            if (value > upper_thresh && rx_state != RS_IN_TONE) {
-                handle_event(1, sc);  // KEYDOWN
-            }
-            if (value < lower_thresh && rx_state == RS_IN_TONE) {
-                handle_event(2, sc);  // KEYUP
-            }
-        }
-
-        // Check for completed character
-        if (handle_event(3, sc) == 0) {  // QUERY
-            if (!sc.empty())
-                return sc[0];
-        }
+        // Check for character
+        if (handle_event(3, ch) == 0)
+            return ch;
 
         return 0;
     }
 };
 
-// --- Main ---
 int main(int argc, char *argv[]) {
-    double freq = 600.0;
-    int speed = 20;
+    double freq = 600;
+    int speed = 25;
+    double bandwidth = 60;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-f") == 0 && i+1 < argc)
-            freq = atof(argv[++i]);
-        else if (strcmp(argv[i], "-s") == 0 && i+1 < argc)
-            speed = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-h") == 0) {
-            fprintf(stderr, "fldigi_cw — Standalone CW decoder (fldigi-derived)\n");
-            fprintf(stderr, "Reads 8kHz 16-bit signed mono from stdin\n");
-            fprintf(stderr, "Usage: %s [-f freq_hz] [-s initial_wpm]\n", argv[0]);
-            fprintf(stderr, "  -f freq   CW tone frequency in Hz (default 600)\n");
-            fprintf(stderr, "  -s speed  Initial WPM (default 20, adapts automatically)\n");
+        if (!strcmp(argv[i], "-f") && i+1 < argc) freq = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-s") && i+1 < argc) speed = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-b") && i+1 < argc) bandwidth = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-h")) {
+            fprintf(stderr,
+                "fldigi_cw — Standalone CW decoder (fldigi-derived, GPL-3)\n"
+                "Reads 8kHz 16-bit signed mono from stdin\n"
+                "  -f freq      Tone frequency in Hz (default 600)\n"
+                "  -s speed     Initial WPM (default 25, adapts)\n"
+                "  -b bandwidth Filter bandwidth in Hz (default 60)\n");
             return 0;
         }
     }
 
-    fprintf(stderr, "fldigi_cw: freq=%.0f Hz, initial speed=%d WPM\n", freq, speed);
+    fprintf(stderr, "fldigi_cw: f=%.0f Hz, %d WPM, bw=%.0f Hz\n",
+            freq, speed, bandwidth);
 
-    CWDecoder decoder(freq, speed);
-
+    CWDecoder dec(freq, speed, bandwidth);
     short sample;
     int count = 0;
 
     while (fread(&sample, sizeof(short), 1, stdin) == 1) {
-        double s = sample / 32768.0;
-        char ch = decoder.process_sample(s);
+        char ch = dec.process(sample / 32768.0);
         if (ch) {
             putchar(ch);
             fflush(stdout);
@@ -443,8 +360,7 @@ int main(int argc, char *argv[]) {
         count++;
     }
 
-    fprintf(stderr, "Processed %d samples (%.1f seconds)\n",
+    fprintf(stderr, "Processed %d samples (%.1f s)\n",
             count, (double)count / SAMPLE_RATE);
-
     return 0;
 }
