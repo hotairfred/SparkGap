@@ -403,17 +403,29 @@ class SpotTracker:
     def process(self, freq_khz, snr, text, context_text=None):
         """Process decoded text. Returns list of spot dicts.
 
-        text: new text (for fragment accumulation — ignored, we use context_text)
+        text: new text fragment (1-2 chars in streaming mode)
         context_text: full accumulated text from the decoder instance
         """
-        # Use full accumulated text for all matching — this is the key
-        # difference from batch mode. In streaming, we get 1-2 chars at a time
-        # but need to match against the full decoded output.
+        # Track processed length per frequency to avoid re-processing
+        freq_bin = int(round(freq_khz * 10))
+        if not hasattr(self, '_processed_len'):
+            self._processed_len = {}
+
         full_text = context_text or text
-        clean = re.sub(r'\b[EIT]\b', '', full_text.upper())
-        context_clean = clean
+        prev_len = self._processed_len.get(freq_bin, 0)
+
+        # Only re-scan when we have 10+ new chars (avoid per-character overhead)
+        if len(full_text) - prev_len < 10:
+            return []
+
+        self._processed_len[freq_bin] = len(full_text)
+
+        # Only process the NEW portion for fragment accumulation
+        new_text = full_text[max(0, prev_len - 10):]  # overlap 10 chars for boundary
+        clean = re.sub(r'\b[EIT]\b', '', new_text.upper())
+        # Full text for context matching (CQ/TEST detection)
+        context_clean = re.sub(r'\b[EIT]\b', '', full_text.upper())
         spots = []
-        freq_bin = int(round(freq_khz * 10))  # 100 Hz resolution
         now = time.time()
 
         # --- Path 1: Exact SCP match ---
@@ -495,7 +507,7 @@ class SpotTracker:
                 consensus_str = ''.join(c for c, _ in consensus)
                 avg_confidence = sum(conf for _, conf in consensus) / len(consensus)
 
-                if avg_confidence < 0.4:  # need at least 40% agreement
+                if avg_confidence < 0.6:  # need at least 60% agreement
                     continue
 
                 # Check consensus against SCP — exact first, then fuzzy
@@ -520,7 +532,7 @@ class SpotTracker:
                 else:
                     # Fuzzy SCP match on consensus
                     fuzzy = self._fuzzy_match(consensus_str, max_dist=1)
-                    if fuzzy and avg_confidence >= 0.5:
+                    if fuzzy and avg_confidence >= 0.7:
                         best_call, best_dist = min(fuzzy, key=lambda x: x[1])
                         info = self._tracking[best_call]
                         if (now - info['last_spotted']) >= self.respot_interval:
@@ -783,7 +795,10 @@ async def async_main(config):
 
 
 def read_24bit_iq_chunk(filename, start_sec, duration_sec, rate=192000):
-    """Read a chunk of 24-bit stereo IQ from WAV extensible format."""
+    """Read a chunk of 24-bit stereo IQ from WAV extensible format.
+
+    Uses numpy vectorized operations for fast 24-bit unpacking.
+    """
     channels = 2
     bytes_per_sample = 3
     bytes_per_frame = bytes_per_sample * channels
@@ -803,14 +818,22 @@ def read_24bit_iq_chunk(filename, start_sec, duration_sec, rate=192000):
         f.seek(data_offset + start_frame * bytes_per_frame)
         raw = f.read(n_frames * bytes_per_frame)
 
-    n_samples = len(raw) // 3
-    samples = np.zeros(n_samples, dtype=np.float64)
-    for i in range(n_samples):
-        b = raw[i*3:(i+1)*3]
-        val = int.from_bytes(b, byteorder='little', signed=False)
-        if val >= 0x800000:
-            val -= 0x1000000
-        samples[i] = val
+    # Fast 24-bit to int32 conversion using numpy
+    raw_bytes = np.frombuffer(raw, dtype=np.uint8)
+    n_samples = len(raw_bytes) // 3
+
+    # Pad each 3-byte sample to 4 bytes (little-endian: add zero high byte)
+    padded = np.zeros(n_samples * 4, dtype=np.uint8)
+    padded[0::4] = raw_bytes[0::3]  # low byte
+    padded[1::4] = raw_bytes[1::3]  # mid byte
+    padded[2::4] = raw_bytes[2::3]  # high byte
+    # padded[3::4] stays 0
+
+    samples = padded.view(np.int32).copy()
+    # Sign-extend: if bit 23 is set, subtract 2^24
+    samples = samples.astype(np.float64)
+    sign_mask = samples >= 0x800000
+    samples[sign_mask] -= 0x1000000
 
     i_ch = samples[0::2]
     q_ch = samples[1::2]

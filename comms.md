@@ -5288,3 +5288,43 @@ Commit and update comms when done.
 ---
 
 *Grayline — Fred's getting a haircut. Make it count.*
+
+## 2026-03-22 ~22:00 UTC — Spark Gap (.102)
+
+### Instance Manager Full Run — 38/118
+
+Ran the full 15-minute CWT through the instance manager. Results:
+
+| Metric | Instance Manager | Eval Script |
+|--------|-----------------|-------------|
+| **Answer key hits** | **38/118 (32.2%)** | **56/118 (47.5%)** |
+| **Total SCP calls spotted** | 221 | 56 |
+| **False positives** | 183 | 0 |
+| **New hits (not in eval)** | 4 (K5YCM, W0TG, W2GD, W4SPR) | — |
+| **Processing time** | ~20 min for 15 min audio | ~15 min |
+
+### Fixes Applied
+
+1. **24-bit reader: 100x speedup** — numpy vectorized (0.4s vs 40s per minute)
+2. **SpotTracker accumulation** — tracks processed length, only scans 10+ new chars
+3. **Anti-alias FIR filter** — streaming lfilter (correlation 1.0 vs 0.64 without)
+4. **Fuzzy consensus tightened** — 60% min confidence (was 40%), fuzzy 70% (was 50%)
+
+### Why 38 vs 56
+
+Instance manager misses 22 calls eval finds. Root causes:
+- Streaming normalization (running peak) vs eval's global normalization
+- Signal detection differences between FFTs
+- respot_interval suppresses re-detection
+
+4 NEW hits not in eval: K5YCM, W0TG, W2GD, W4SPR — the streaming approach catches things the batch misses.
+
+Combined score (union): **60/118 (50.8%)**
+
+### Committed
+
+All changes committed: UHSDR integration, anti-alias fix, 24-bit fast reader, SpotTracker accumulation fix.
+
+---
+
+*Spark Gap — 38/118 streaming, 60/118 combined. Pipeline works E2E. Ready for live test.*
