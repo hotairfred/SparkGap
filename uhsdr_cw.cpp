@@ -123,8 +123,6 @@ typedef struct {
 	uint8_t noisecancel_enable;
 	uint8_t spikecancel;
 #define CW_SPIKECANCEL_MODE_OFF 0
-#define 0 1
-#define 0 2
 
     float32_t raw_signal_buffer[CW_DECODER_BLOCKSIZE_MAX];  // audio signal buffer
     Goertzel goertzel;
@@ -177,6 +175,10 @@ typedef struct {
 cw_decoder_t cw_decoder[MAX_RX_CHANS];
 
 static void CW_Decode(cw_decoder_t *cw);
+static void CodeGenFunc(cw_decoder_t *cw);
+static void PrintCharFunc(cw_decoder_t *cw, uint8_t c);
+static void WordSpaceFunc(cw_decoder_t *cw, uint8_t c);
+static uint8_t CwGen_CharacterIdFunc(uint32_t code);
 
 #define N_CW_ELEM   8
 
@@ -477,13 +479,24 @@ static void CW_Decode_exe(cw_decoder_t *cw)
 		newstate = (siglevel >= cw->threshold_linear)? true:false;
 	}
 
-	//    4c.) fixed threshold
+	//    4c.) relative threshold — tracks this signal's own peak
 	else
 	{
 	    // lowpass
 		siglevel = siglevel * SIGNAL_TAU + ONEM_SIGNAL_TAU * cw->old_siglevel;
 		cw->old_siglevel = magnitudeSquared;
-		newstate = (siglevel >= cw->threshold_linear)? true:false;
+
+		// Track signal peak with fast attack, slow decay
+		if (siglevel > cw->CW_env)
+			cw->CW_env = siglevel;  // instant attack
+		else
+			cw->CW_env *= 0.999;   // slow decay
+
+		// Relative threshold with hysteresis
+		if (cw->state == false)
+			newstate = (siglevel >= cw->CW_env * 0.4)? true : false;  // key down at 50% of peak
+		else
+			newstate = (siglevel >= cw->CW_env * 0.2)? true : false;  // key up at 30% of peak
 	}
 
 	//    5.) signal state determination
@@ -839,6 +852,18 @@ static bool cw_DataRecognition(cw_decoder_t *cw, bool* new_char_p)
 
 				cw->data[cw->data_len].time = (uint32_t) t;     // Store associated time
 				cw->data_len++;                                 // Increment by one dot/dash
+
+				// Force character break if too many elements accumulated
+				// Max valid Morse character is 7 elements (some prosigns)
+				// Anything longer is noise merging multiple characters
+				if (cw->data_len >= 7) {
+					CodeGenFunc(cw);
+					uint8_t ch = CwGen_CharacterIdFunc(cw->code);
+					PrintCharFunc(cw, ch);
+					if (ch != 0xff && ch != 0xfe)
+						WordSpaceFunc(cw, ch);
+				}
+
                 if (cw->b.track)
 				    cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0; // scaled up for 5-element chars // Update pulse_avg (e.q. 4.3)
 			}
