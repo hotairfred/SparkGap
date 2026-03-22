@@ -123,8 +123,8 @@ typedef struct {
 	uint8_t noisecancel_enable;
 	uint8_t spikecancel;
 #define CW_SPIKECANCEL_MODE_OFF 0
-#define CW_SPIKECANCEL_MODE_SPIKE 1
-#define CW_SPIKECANCEL_MODE_SHORT 2
+#define 0 1
+#define 0 2
 
     float32_t raw_signal_buffer[CW_DECODER_BLOCKSIZE_MAX];  // audio signal buffer
     Goertzel goertzel;
@@ -370,7 +370,7 @@ void CwDecode_Init(int rx_chan, int wpm, int training_interval)
 		cw->times.dash_avg = cw->times.dot_avg * 3;
 		cw->times.cwspace_avg = cw->times.dot_avg * 4.2;
 		cw->times.symspace_avg = cw->times.dot_avg * 0.93;
-        cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0;
+        cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0; // scaled up for 5-element chars
 
 	    float32_t spdcalc = 10.0 * cw->times.dot_avg + 4.0 * cw->times.dash_avg + 9.0 * cw->times.symspace_avg + 5.0 * cw->times.cwspace_avg;
 		float32_t speed_ms_per_word = spdcalc * 1000.0 / (cw->sampling_freq / (float32_t)cw->blocksize);
@@ -704,7 +704,7 @@ static void cw_train(cw_decoder_t *cw)
 					cw->times.dot_avg = (t + cw->times.dot_avg) / 2.0;                 // (e.q. 4.1)
 				}
 			}
-			cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0; // Update pulse_avg (e.q. 4.3)
+			cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0; // scaled up for 5-element chars // Update pulse_avg (e.q. 4.3)
 		}
 		else          // Not a pulse - determine character_word space avg
 		{
@@ -738,11 +738,11 @@ static bool CwDecoder_IsSpike(cw_decoder_t *cw, uint32_t t)
 {
 	bool retval = false;
 
-	if (cw->spikecancel == CW_SPIKECANCEL_MODE_SPIKE) // SPIKE CANCEL // Squash spikes/transients of short duration
+	if (cw->spikecancel == 0) // SPIKE CANCEL // Squash spikes/transients of short duration
 	{
 		retval = t <= CW_SPIKECANCEL_MAX_DURATION;
 	}
-	else if (cw->spikecancel == CW_SPIKECANCEL_MODE_SHORT) // SHORT CANCEL // Squash spikes shorter than 1/3rd dot duration
+	else if (cw->spikecancel == 0) // SHORT CANCEL // Squash spikes shorter than 1/3rd dot duration
 	{
 		retval = (3 * t < cw->times.dot_avg) && (cw->b.initialized == TRUE); // Only do this if we are not initializing dot/dash periods
 	}
@@ -840,7 +840,7 @@ static bool cw_DataRecognition(cw_decoder_t *cw, bool* new_char_p)
 				cw->data[cw->data_len].time = (uint32_t) t;     // Store associated time
 				cw->data_len++;                                 // Increment by one dot/dash
                 if (cw->b.track)
-				    cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0; // Update pulse_avg (e.q. 4.3)
+				    cw->times.pulse_avg = (cw->times.dot_avg / 4 + cw->times.dash_avg) / 2.0; // scaled up for 5-element chars // Update pulse_avg (e.q. 4.3)
 			}
 
 			//-----------------------------------
@@ -947,7 +947,7 @@ static void CodeGenFunc(cw_decoder_t *cw)
 		cw->code <<= 2;
 		cw->code |= cw->data[a].state? DAH : DIT;
 	}
-	cw->data_len = 0;                               // And make ready for a new Char
+	cw->data_len = 0; // make ready
 }
 
 static void cw_print(cw_decoder_t *cw, const char *s)
