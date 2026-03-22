@@ -1041,7 +1041,6 @@ def run_file_mode(args, config):
                         decoded_calls[call] = (inst.rf_khz, inst.snr, text[:80])
             # Method 2: sliding window — catches calls embedded in
             # noise like "TUCY0S" where regex finds "UCY0S" instead
-            # Require 2+ occurrences to reduce false positives
             collapsed = re.sub(r'[^A-Z0-9]', '', text)
             for wlen in range(4, 8):
                 for i in range(len(collapsed) - wlen + 1):
@@ -1049,6 +1048,27 @@ def run_file_mode(args, config):
                     if frag in calls and frag not in FALSE_POS_EVAL:
                         if frag not in decoded_calls or inst.snr > decoded_calls[frag][1]:
                             decoded_calls[frag] = (inst.rf_khz, inst.snr, text[:80])
+
+            # Method 3: fuzzy SCP — fragment NOT in SCP but edit distance 1
+            # from an SCP call. Catches AD4EB→AD4UB, K0II→K0IS etc.
+            for m in CALL_RE_EVAL.finditer(text):
+                frag = m.group(0)
+                if len(frag) < 4 or frag in FALSE_POS_EVAL or frag in calls:
+                    continue
+                # Not in SCP — try edit distance 1 match
+                # Build candidates by substituting each character
+                for pos in range(len(frag)):
+                    for ch in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789':
+                        if ch == frag[pos]:
+                            continue
+                        candidate = frag[:pos] + ch + frag[pos+1:]
+                        if candidate in calls and candidate not in FALSE_POS_EVAL:
+                            if candidate not in decoded_calls or inst.snr > decoded_calls[candidate][1]:
+                                decoded_calls[candidate] = (inst.rf_khz, inst.snr, text[:80])
+                            break
+                    else:
+                        continue
+                    break
 
     manager.kill_all()
 
