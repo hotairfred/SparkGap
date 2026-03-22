@@ -197,10 +197,15 @@ class InstanceManager:
             log.info("Spawned decoder: %.1f kHz (offset %+.0f Hz, +%.0f dB)",
                      rf_khz, offset, snr)
 
-        # Kill instances for signals gone > timeout
+        # Kill instances only when signal is truly gone:
+        # - Signal not in FFT AND decoder not producing output
+        # - Use the LATER of last_seen (FFT) and last_output (decoder)
+        # A station calling CQ transmits 10s, listens 20s — signal
+        # disappears from FFT during listen but decoder should persist
         dead = []
         for key, inst in self.instances.items():
-            if now - inst.last_seen > self.signal_timeout:
+            last_activity = max(inst.last_seen, inst.last_output)
+            if now - last_activity > self.signal_timeout:
                 dead.append(key)
         for key in dead:
             inst = self.instances.pop(key)
