@@ -33,6 +33,7 @@ static int KWPM() { return 12 * DEC_RATE() / 10; }
 
 typedef std::complex<double> cmplx;
 bool debug_timing = false;
+double preset_snr = -1;  // -1 = not set, use normal AGC warmup
 
 // --- Morse table ---
 static const struct { const char *p; char c; } morse[] = {
@@ -382,6 +383,17 @@ public:
         sync_params();
     }
 
+    void preseed_agc(double snr_db) {
+        // Pre-seed AGC from known SNR so decoder starts locked
+        // Signal at snr_db above noise → set peak/noise ratio
+        double ratio = pow(10, snr_db / 20.0);
+        noise_floor = 0.01;
+        agc_peak = noise_floor * ratio;
+        sig_avg = (agc_peak + noise_floor) / 2;
+        fprintf(stderr, "AGC pre-seeded: SNR=%.0f dB, peak=%.4f, noise=%.4f\n",
+                snr_db, agc_peak, noise_floor);
+    }
+
     ~CWDecoder() {
         delete trackfilter;
         delete bitfilter;
@@ -476,6 +488,14 @@ int main(int argc, char *argv[]) {
             extern bool debug_timing;
             debug_timing = true;
         }
+        else if (!strcmp(argv[i], "--snr") && i+1 < argc) {
+            // Pre-seed AGC from known SNR (dB above noise)
+            // This eliminates the 60-second warmup period
+            double snr_db = atof(argv[++i]);
+            // Will be applied after decoder construction
+            extern double preset_snr;
+            preset_snr = snr_db;
+        }
         else if (!strcmp(argv[i], "-h")) {
             fprintf(stderr,
                 "fldigi_cw — Standalone CW decoder (fldigi-derived, GPL-3)\n"
@@ -493,6 +513,9 @@ int main(int argc, char *argv[]) {
             freq, speed, bandwidth, iq_mode ? "IQ" : "mono");
 
     CWDecoder dec(freq, speed, bandwidth);
+    if (preset_snr >= 0) {
+        dec.preseed_agc(preset_snr);
+    }
     int count = 0;
 
     if (iq_mode) {
