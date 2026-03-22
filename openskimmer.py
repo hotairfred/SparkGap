@@ -99,9 +99,10 @@ class DecoderInstance:
             decoder_bin,
             '-r', str(sample_rate),
             '-f', str(int(round(freq_offset))),
-            '-s', '25',
+            '-s', '30',    # default 30 WPM (most common per SkimSrv data)
             '-b', str(bandwidth),
-            '-q',  # IQ mode
+            '-q',           # IQ mode
+            '--snr', str(int(snr)),  # pre-seed AGC from known signal level
         ]
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
