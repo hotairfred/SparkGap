@@ -235,51 +235,167 @@ class InstanceManager:
 
 
 class SpotTracker:
-    """Validates and deduplicates spots."""
+    """Validates spots using temporal consistency + fuzzy SCP matching.
 
-    def __init__(self, valid_calls, blacklist, respot_interval=120):
+    Two paths to a spot:
+    1. Exact SCP match with context (CQ/TEST) → immediate spot
+    2. Fuzzy SCP match (distance ≤ 1) + temporal consistency (3+ cycles
+       at same frequency) → confident spot
+
+    This is the streaming equivalent of the offline multi-sighting filter.
+    """
+
+    def __init__(self, valid_calls, blacklist, respot_interval=120,
+                 fuzzy_min_cycles=3):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
+        self.fuzzy_min_cycles = fuzzy_min_cycles
+
+        # Exact match tracking
         self._tracking = defaultdict(lambda: {
             'freq': 0, 'count': 0, 'last_spotted': 0, 'snr': 0
         })
+
+        # Temporal fragment accumulation per frequency bin (100 Hz resolution)
+        # freq_bin -> {fragment: count}
+        self._freq_fragments = defaultdict(lambda: defaultdict(int))
+        self._freq_last_seen = defaultdict(float)
+
         # Cross-channel hallucination filter
         self._cycle_calls = defaultdict(set)
 
+        # Build SCP prefix index for fast fuzzy matching
+        self._scp_by_len = defaultdict(list)
+        for call in valid_calls:
+            self._scp_by_len[len(call)].append(call)
+
+    def _fuzzy_match(self, fragment, max_dist=1):
+        """Find SCP callsigns within edit distance max_dist of fragment.
+
+        Optimized: first check if first 2 chars match (prefix filter),
+        then compute full Levenshtein only on prefix matches.
+        """
+        matches = []
+        prefix = fragment[:2]  # first 2 chars must match for distance ≤ 1
+        for delta in [0, 1, -1]:
+            target_len = len(fragment) + delta
+            if target_len < 4 or target_len > 8:
+                continue
+            for call in self._scp_by_len.get(target_len, []):
+                # Prefix filter: at least first char must match
+                if call[0] != prefix[0] and (max_dist < 1 or call[0] != fragment[0]):
+                    continue
+                d = self._levenshtein(fragment, call)
+                if d <= max_dist:
+                    matches.append((call, d))
+        return matches
+
+    @staticmethod
+    def _levenshtein(s1, s2):
+        if len(s1) < len(s2):
+            return SpotTracker._levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr = [i + 1]
+            for j, c2 in enumerate(s2):
+                curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(c1 != c2)))
+            prev = curr
+        return prev[-1]
+
     def process(self, freq_khz, snr, text):
-        """Process decoded text. Returns spot dict or None."""
+        """Process decoded text. Returns list of spot dicts."""
         clean = re.sub(r'\b[EIT]\b', '', text.upper())
         spots = []
+        freq_bin = int(round(freq_khz * 10))  # 100 Hz resolution
+        now = time.time()
 
+        # --- Path 1: Exact SCP match ---
         for m in CALL_RE.finditer(clean):
             call = m.group(1)
             if len(call) < 4 or call in FALSE_POSITIVES:
                 continue
-            if call in self.blacklist or call not in self.valid_calls:
+            if call in self.blacklist:
                 continue
 
-            self._cycle_calls[call].add(int(freq_khz * 10))
+            if call in self.valid_calls:
+                self._cycle_calls[call].add(freq_bin)
+                info = self._tracking[call]
+                info['count'] += 1
+                info['freq'] = freq_khz
+                info['snr'] = max(info['snr'], snr)
 
-            info = self._tracking[call]
-            info['count'] += 1
-            info['freq'] = freq_khz
-            info['snr'] = max(info['snr'], snr)
+                has_context = bool(CQ_PATTERNS.search(clean))
+                if (has_context or info['count'] >= 2) and \
+                   (now - info['last_spotted']) >= self.respot_interval:
+                    if len(self._cycle_calls[call]) < 3:  # hallucination check
+                        info['last_spotted'] = now
+                        spots.append({
+                            'call': call,
+                            'freq_khz': freq_khz,
+                            'snr': snr,
+                            'method': 'exact',
+                        })
 
-            now = time.time()
-            has_context = bool(CQ_PATTERNS.search(clean))
+        # --- Path 2: Fragment accumulation + fuzzy match ---
+        # Extract callsign-shaped fragments from collapsed text
+        # (spaces in decoded text break up callsigns — collapse them)
+        collapsed = re.sub(r'[^A-Z0-9]', '', clean)
 
-            if (has_context or info['count'] >= 2) and \
-               (now - info['last_spotted']) >= self.respot_interval:
-                # Hallucination check: same call on 3+ freqs = fake
-                if len(self._cycle_calls[call]) >= 3:
+        # Regex on collapsed text
+        for m in CALL_RE.finditer(collapsed):
+            frag = m.group(1)
+            if len(frag) < 4 or frag in FALSE_POSITIVES:
+                continue
+            self._freq_fragments[freq_bin][frag] += 1
+            self._freq_last_seen[freq_bin] = now
+
+        # Also slide a window to catch fragments the regex misses
+        for wlen in range(4, 7):
+            for i in range(len(collapsed) - wlen + 1):
+                frag = collapsed[i:i+wlen]
+                # Must look like a callsign: has both letters and digits
+                if not re.match(r'[A-Z0-9]{1,2}\d[A-Z]', frag):
                     continue
-                info['last_spotted'] = now
-                spots.append({
-                    'call': call,
-                    'freq_khz': freq_khz,
-                    'snr': info['snr'],
-                })
+                if frag in FALSE_POSITIVES:
+                    continue
+                self._freq_fragments[freq_bin][frag] += 1
+                self._freq_last_seen[freq_bin] = now
+
+        # Check if any fragment at this frequency has enough consistency
+        for frag, count in list(self._freq_fragments[freq_bin].items()):
+            if count < self.fuzzy_min_cycles:
+                continue
+            # This fragment appeared N+ times at the same frequency — try fuzzy SCP
+            fuzzy = self._fuzzy_match(frag, max_dist=1)
+            if fuzzy:
+                best_call, best_dist = min(fuzzy, key=lambda x: x[1])
+                # Don't re-spot if already spotted this call recently
+                info = self._tracking[best_call]
+                if (now - info['last_spotted']) >= self.respot_interval:
+                    if best_call not in self.blacklist:
+                        info['last_spotted'] = now
+                        info['freq'] = freq_khz
+                        info['snr'] = snr
+                        spots.append({
+                            'call': best_call,
+                            'freq_khz': freq_khz,
+                            'snr': snr,
+                            'method': f'fuzzy(d={best_dist},n={count})',
+                        })
+                        log.info("Fuzzy match: '%s' × %d → %s (distance %d)",
+                                 frag, count, best_call, best_dist)
+                # Clear the fragment counter after spotting
+                self._freq_fragments[freq_bin][frag] = 0
+
+        # Expire old frequency bins (>60s since last seen)
+        expired = [fb for fb, t in self._freq_last_seen.items()
+                   if now - t > 60]
+        for fb in expired:
+            del self._freq_fragments[fb]
+            del self._freq_last_seen[fb]
 
         return spots
 
@@ -365,20 +481,23 @@ class OpenSkimmer:
 
     def _iq_callback(self, rx_index, iq_samples):
         """Called from HPSDR receiver thread."""
-        with self._iq_lock:
-            self._iq_buffer.extend(iq_samples)
-            max_buf = SAMPLE_RATE * 10
-            if len(self._iq_buffer) > max_buf:
-                del self._iq_buffer[:len(self._iq_buffer) - max_buf]
+        try:
+            with self._iq_lock:
+                self._iq_buffer.extend(iq_samples)
+                max_buf = SAMPLE_RATE * 10
+                if len(self._iq_buffer) > max_buf:
+                    del self._iq_buffer[:len(self._iq_buffer) - max_buf]
 
-        # Convert to PCM and feed to all decoders
-        pk = 8388608.0
-        pcm = bytearray(len(iq_samples) * 4)
-        for i, (iv, qv) in enumerate(iq_samples):
-            i16 = max(-32768, min(32767, int(iv * pk * 4)))  # gain factor
-            q16 = max(-32768, min(32767, int(qv * pk * 4)))
-            struct.pack_into('<hh', pcm, i * 4, i16, q16)
-        self.manager.feed_all(bytes(pcm))
+            # Convert to PCM and feed to all decoders
+            pk = 8388608.0
+            pcm = bytearray(len(iq_samples) * 4)
+            for i, (iv, qv) in enumerate(iq_samples):
+                i16 = max(-32768, min(32767, int(iv * pk * 4)))  # gain factor
+                q16 = max(-32768, min(32767, int(qv * pk * 4)))
+                struct.pack_into('<hh', pcm, i * 4, i16, q16)
+            self.manager.feed_all(bytes(pcm))
+        except Exception as e:
+            pass  # Don't let decoder errors kill the receiver thread
 
     async def run(self):
         rx_thread = threading.Thread(
@@ -450,8 +569,9 @@ class OpenSkimmer:
                         dx_call=spot['call'],
                         snr=spot['snr'],
                     )
-                    log.info("*** SPOT: %10.1f  %-12s  %d dB ***",
-                             spot['freq_khz'], spot['call'], spot['snr'])
+                    method = spot.get('method', 'exact')
+                    log.info("*** SPOT: %10.1f  %-12s  %d dB  [%s] ***",
+                             spot['freq_khz'], spot['call'], spot['snr'], method)
 
             # Status
             if now - last_status >= status_interval:

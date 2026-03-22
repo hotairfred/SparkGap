@@ -242,15 +242,24 @@ class CWDecoder {
             if (state == IN_TONE) return -1;
             sync_params();
             dur = (tone_end < smpl_ctr) ? (smpl_ctr - tone_end) : 0;
-            if (dur < 2 * dot_len) return -1;
-            if (dur >= 2*dot_len && dur <= 4*dot_len && state == AFTER_TONE) {
+            // Standard Morse timing:
+            //   inter-element gap = 1 dit (within character)
+            //   inter-character gap = 3 dits
+            //   inter-word gap = 7 dits
+            // Use 2.5 dits as character break (was 2 — too aggressive,
+            // split 5-element digit patterns into multiple characters)
+            if (dur < (long)(2.5 * dot_len)) return -1;
+            if (dur >= (long)(2.5*dot_len) && dur <= (long)(5*dot_len) && state == AFTER_TONE) {
                 ch = lookup(rep);
+                if (debug_timing)
+                    fprintf(stderr, "CHAR: '%s' → '%c' (gap=%d, dot=%ld)\n",
+                            rep.c_str(), ch, dur, dot_len);
                 rep.clear();
                 state = IDLE;
                 space_sent = false;
                 return 0;
             }
-            if (dur > 4*dot_len && !space_sent) {
+            if (dur > (long)(5*dot_len) && !space_sent) {
                 ch = ' ';
                 space_sent = true;
                 return 0;
