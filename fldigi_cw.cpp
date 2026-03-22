@@ -290,6 +290,26 @@ public:
         }
 
         double peak_freq = (double)best_k * dec_rate / N;
+
+        // Check harmonics — the peak might be a subharmonic of the real dit rate
+        // CW has strong energy at half the dit rate (dit-space periodicity)
+        // If 2× the peak freq also has significant energy, use the harmonic
+        int harm_k = best_k * 2;
+        if (harm_k < hi) {
+            double harm_re = 0, harm_im = 0;
+            for (int n = 0; n < N; n++) {
+                double angle = TWOPI * harm_k * n / N;
+                harm_re += speed_buf[n] * cos(angle);
+                harm_im -= speed_buf[n] * sin(angle);
+            }
+            double harm_mag = harm_re*harm_re + harm_im*harm_im;
+            // If harmonic is at least 40% as strong, it's likely the real dit rate
+            if (harm_mag > best_mag * 0.4) {
+                peak_freq = (double)harm_k * dec_rate / N;
+                fprintf(stderr, "Harmonic detected: using %.1f Hz (2x)\n", peak_freq);
+            }
+        }
+
         int est_wpm = (int)(peak_freq * 2.4);
         if (est_wpm < 10) est_wpm = 10;
         if (est_wpm > 50) est_wpm = 50;
@@ -298,7 +318,33 @@ public:
         for (int i = 0; i < 8; i++) trackfilter->run(two_dots);
         sync_params();
 
+        // Also report the top 5 peaks for debugging
         fprintf(stderr, "Speed: %d WPM (peak %.1f Hz)\n", est_wpm, peak_freq);
+        if (debug_timing) {
+            // Quick sort of top 5 by magnitude
+            struct { int k; double mag; } top[5] = {};
+            for (int k2 = lo; k2 <= hi; k2++) {
+                double re2 = 0, im2 = 0;
+                for (int n = 0; n < N; n++) {
+                    double angle = TWOPI * k2 * n / N;
+                    re2 += speed_buf[n] * cos(angle);
+                    im2 -= speed_buf[n] * sin(angle);
+                }
+                double m2 = re2*re2 + im2*im2;
+                for (int t = 0; t < 5; t++) {
+                    if (m2 > top[t].mag) {
+                        for (int u = 4; u > t; u--) top[u] = top[u-1];
+                        top[t] = {k2, m2};
+                        break;
+                    }
+                }
+            }
+            for (int t = 0; t < 5; t++) {
+                double f2 = (double)top[t].k * dec_rate / N;
+                fprintf(stderr, "  peak %d: %.1f Hz (%.0f WPM) mag=%.0f\n",
+                        t+1, f2, f2*2.4, sqrt(top[t].mag));
+            }
+        }
         speed_measured = true;
     }
 
@@ -345,12 +391,16 @@ public:
         value = bitfilter->run(value);
 
         // Speed estimation from first 2 seconds of envelope
-        if (!speed_measured) {
-            if (speed_buf_ptr < speed_buf_len)
-                speed_buf[speed_buf_ptr++] = value;
-            else
-                measure_speed();
-        }
+        // DISABLED — the estimate picks up subharmonics and interference
+        // patterns instead of the actual dit rate. Better to let the
+        // adaptive tracker converge from the initial speed guess.
+        // TODO: improve speed estimation to handle crowded bands
+        //if (!speed_measured) {
+        //    if (speed_buf_ptr < speed_buf_len)
+        //        speed_buf[speed_buf_ptr++] = value;
+        //    else
+        //        measure_speed();
+        //}
 
         // AGC — scale constants to decimated rate
         // fldigi calibrated at 500 Hz decimated rate, scale proportionally
