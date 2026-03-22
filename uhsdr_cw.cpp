@@ -355,7 +355,7 @@ void CwDecode_Init(int rx_chan, int wpm, int training_interval)
     cw->old_siglevel = 0.001;
     cw->timer_stepsize = 1;
     cw->sampling_freq = snd_rate;
-    cw->isAutoThreshold = false;
+    cw->isAutoThreshold = true;
     cw->blocksize = CW_DECODER_BLOCKSIZE_DEFAULT;
     cw->noisecancel_enable = 1;
     cw->spikecancel = 0;
@@ -400,7 +400,7 @@ void CwDecode_pboff(int rx_chan, u4_t pboff)
 	//fprintf(stderr, "CwDecode_pboff %d\n", pboff);
 	AudioFilter_CalcGoertzel(&cw->goertzel, pboff, cw->blocksize, 1.0, cw->sampling_freq);
 	cw->process_samples = true;
-    cw->isAutoThreshold = false;
+    cw->isAutoThreshold = true;
     cw->weight_linear = AUTO_WEIGHT_LINEAR;
     cw->threshold_linear = 500;  // medium fixed threshold  // low fixed threshold
 }
@@ -1328,7 +1328,7 @@ int main(int argc, char *argv[]) {
     // Enable processing
     cw_decoder_t *cw = &cw_decoder[0];
     cw->process_samples = true;
-    cw->isAutoThreshold = false;
+    cw->isAutoThreshold = true;
     cw->weight_linear = AUTO_WEIGHT_LINEAR;
     cw->threshold_linear = 500;  // medium fixed threshold  // low fixed threshold
     
