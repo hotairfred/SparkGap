@@ -364,31 +364,76 @@ class SpotTracker:
                 self._freq_fragments[freq_bin][frag] += 1
                 self._freq_last_seen[freq_bin] = now
 
-        # Check if any fragment at this frequency has enough consistency
-        for frag, count in list(self._freq_fragments[freq_bin].items()):
-            if count < self.fuzzy_min_cycles:
-                continue
-            # This fragment appeared N+ times at the same frequency — try fuzzy SCP
-            fuzzy = self._fuzzy_match(frag, max_dist=1)
-            if fuzzy:
-                best_call, best_dist = min(fuzzy, key=lambda x: x[1])
-                # Don't re-spot if already spotted this call recently
-                info = self._tracking[best_call]
-                if (now - info['last_spotted']) >= self.respot_interval:
-                    if best_call not in self.blacklist:
-                        info['last_spotted'] = now
-                        info['freq'] = freq_khz
-                        info['snr'] = snr
-                        spots.append({
-                            'call': best_call,
-                            'freq_khz': freq_khz,
-                            'snr': snr,
-                            'method': f'fuzzy(d={best_dist},n={count})',
-                        })
-                        log.info("Fuzzy match: '%s' × %d → %s (distance %d)",
-                                 frag, count, best_call, best_dist)
-                # Clear the fragment counter after spotting
-                self._freq_fragments[freq_bin][frag] = 0
+        # --- Path 3: Fragment clustering + consensus + SCP match ---
+        # Group fragments at this frequency, find consensus via majority vote
+        frags_at_freq = self._freq_fragments[freq_bin]
+        if len(frags_at_freq) >= 3:
+            # Group fragments by length, find most common length
+            by_len = defaultdict(list)
+            for frag, count in frags_at_freq.items():
+                for _ in range(count):
+                    by_len[len(frag)].append(frag)
+
+            for frag_len, frag_list in by_len.items():
+                if len(frag_list) < 3 or frag_len < 4:
+                    continue
+
+                # Majority vote per character position
+                consensus = []
+                for pos in range(frag_len):
+                    chars = defaultdict(int)
+                    for f in frag_list:
+                        chars[f[pos]] += 1
+                    best_char = max(chars, key=chars.get)
+                    confidence = chars[best_char] / len(frag_list)
+                    consensus.append((best_char, confidence))
+
+                consensus_str = ''.join(c for c, _ in consensus)
+                avg_confidence = sum(conf for _, conf in consensus) / len(consensus)
+
+                if avg_confidence < 0.4:  # need at least 40% agreement
+                    continue
+
+                # Check consensus against SCP — exact first, then fuzzy
+                if consensus_str in self.valid_calls:
+                    info = self._tracking[consensus_str]
+                    if (now - info['last_spotted']) >= self.respot_interval:
+                        if consensus_str not in self.blacklist:
+                            info['last_spotted'] = now
+                            info['freq'] = freq_khz
+                            info['snr'] = snr
+                            spots.append({
+                                'call': consensus_str,
+                                'freq_khz': freq_khz,
+                                'snr': snr,
+                                'method': f'consensus(n={len(frag_list)},conf={avg_confidence:.0%})',
+                            })
+                            log.info("Consensus: %s (n=%d, %.0f%% conf) @ %.1f kHz",
+                                     consensus_str, len(frag_list),
+                                     avg_confidence * 100, freq_khz)
+                            # Clear fragments for this freq after spotting
+                            frags_at_freq.clear()
+                else:
+                    # Fuzzy SCP match on consensus
+                    fuzzy = self._fuzzy_match(consensus_str, max_dist=1)
+                    if fuzzy and avg_confidence >= 0.5:
+                        best_call, best_dist = min(fuzzy, key=lambda x: x[1])
+                        info = self._tracking[best_call]
+                        if (now - info['last_spotted']) >= self.respot_interval:
+                            if best_call not in self.blacklist:
+                                info['last_spotted'] = now
+                                info['freq'] = freq_khz
+                                info['snr'] = snr
+                                spots.append({
+                                    'call': best_call,
+                                    'freq_khz': freq_khz,
+                                    'snr': snr,
+                                    'method': f'fuzzy_consensus(d={best_dist},n={len(frag_list)},conf={avg_confidence:.0%})',
+                                })
+                                log.info("Fuzzy consensus: '%s' → %s (d=%d, n=%d, %.0f%%)",
+                                         consensus_str, best_call, best_dist,
+                                         len(frag_list), avg_confidence * 100)
+                                frags_at_freq.clear()
 
         # Expire old frequency bins (>60s since last seen)
         expired = [fb for fb, t in self._freq_last_seen.items()
