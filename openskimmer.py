@@ -893,16 +893,63 @@ def run_file_mode(args, config):
                     break
                 f.seek(chunk_size, 1)
 
+    # Signal detection: scan the FULL recording once to find all signals
+    # then feed continuous audio to each decoder for the entire duration.
+    # This matches how eval works — one uninterrupted stream per signal.
+    log.info("Scanning full recording for signals...")
+    scan_dur = min(60, end_sec - start_sec)  # scan first 60s for signal detection
+    if file_bits == 24:
+        scan_i, scan_q = read_24bit_iq_chunk(args.file, start_sec, scan_dur, file_rate)
+    else:
+        import wave
+        w = wave.open(args.file, 'rb')
+        w.setpos(int(start_sec * file_rate))
+        frames = w.readframes(int(scan_dur * file_rate))
+        w.close()
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64)
+        scan_i = samples[0::2] if file_channels == 2 else samples
+        scan_q = samples[1::2] if file_channels == 2 else np.zeros_like(samples)
+
+    fft_size = 8192
+    n_ffts = min(len(scan_i) // fft_size, 200)
+    avg_spectrum = np.zeros(fft_size)
+    for fi in range(n_ffts):
+        chunk = scan_i[fi*fft_size:(fi+1)*fft_size] + \
+                1j * scan_q[fi*fft_size:(fi+1)*fft_size]
+        avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
+    avg_spectrum /= max(n_ffts, 1)
+    avg_db = 10 * np.log10(avg_spectrum + 1e-20)
+    freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
+    noise = np.median(avg_db)
+    min_snr = config.get('signal_min_snr', 8)
+
+    signals = []
+    for i in range(1, fft_size - 1):
+        if avg_db[i] > noise + min_snr and \
+           avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
+            signals.append((freqs[i], avg_db[i] - noise))
+
+    clustered = []
+    for freq, snr in sorted(signals):
+        if not clustered or abs(freq - clustered[-1][0]) > 200:
+            clustered.append((freq, snr))
+        elif snr > clustered[-1][1]:
+            clustered[-1] = (freq, snr)
+
+    log.info("  %d signals detected — spawning decoders once", len(clustered))
+    manager.update_signals(clustered, center_khz)
+    del scan_i, scan_q
+
+    # Feed continuous audio chunks — same decoder instances for entire recording
     for t_start in np.arange(start_sec, end_sec, chunk_sec):
         t_end = min(t_start + chunk_sec, end_sec)
         dur = t_end - t_start
-        log.info("Processing %.0f-%.0fs (%.1f-%.1f min)...",
+        log.info("Feeding %.0f-%.0fs (%.1f-%.1f min)...",
                  t_start, t_end, t_start/60, t_end/60)
 
         if file_bits == 24:
             i_data, q_data = read_24bit_iq_chunk(args.file, t_start, dur, file_rate)
         else:
-            # 16-bit standard WAV
             import wave
             w = wave.open(args.file, 'rb')
             w.setpos(int(t_start * file_rate))
@@ -915,38 +962,6 @@ def run_file_mode(args, config):
             else:
                 i_data = samples
                 q_data = np.zeros_like(samples)
-
-        # FFT signal detection
-        fft_size = 8192
-        n_ffts = min(len(i_data) // fft_size, 200)
-        avg_spectrum = np.zeros(fft_size)
-        for fi in range(n_ffts):
-            chunk = i_data[fi*fft_size:(fi+1)*fft_size] + \
-                    1j * q_data[fi*fft_size:(fi+1)*fft_size]
-            avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
-        avg_spectrum /= max(n_ffts, 1)
-        avg_db = 10 * np.log10(avg_spectrum + 1e-20)
-        freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
-        noise = np.median(avg_db)
-        min_snr = config.get('signal_min_snr', 8)
-
-        # Find peaks
-        signals = []
-        for i in range(1, fft_size - 1):
-            if avg_db[i] > noise + min_snr and \
-               avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
-                signals.append((freqs[i], avg_db[i] - noise))
-
-        # Cluster signals (200 Hz min spacing)
-        clustered = []
-        for freq, snr in sorted(signals):
-            if not clustered or abs(freq - clustered[-1][0]) > 200:
-                clustered.append((freq, snr))
-            elif snr > clustered[-1][1]:
-                clustered[-1] = (freq, snr)
-
-        log.info("  %d signals detected", len(clustered))
-        manager.update_signals(clustered, center_khz)
 
         # Feed IQ in blocks
         block_size = file_rate // 10  # 100ms blocks
