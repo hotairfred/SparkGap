@@ -17,10 +17,11 @@
     "master_scp": "MASTER.SCP",
     "add_calls": "add_calls.txt",
     "blacklist": "blacklist.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "decoder_speeds": [0, 25, 30, 35],
     "min_sightings": 1,
     "respot_interval": 120,
     "telnet_port": 7300,
     "status_interval": 30,
-    "max_instances": 20,
-    "decoder_bandwidth": 80
+    "max_instances": 150
 }

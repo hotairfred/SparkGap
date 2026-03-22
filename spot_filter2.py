@@ -13,14 +13,27 @@ import re
 import sys
 from collections import defaultdict
 
-CALL_RE = re.compile(
-    r'(?<![A-Z0-9])'   # negative lookbehind — don't match inside longer strings
-    r'('
+_CALL_BASE = (
     r'[A-Z0-9]{1,2}\d{1,2}[A-Z]{1,3}'
     r'|\d[A-Z]\d[A-Z]{1,3}'
     r'|\d[A-Z]{2}\d[A-Z]{1,3}'
-    r')'
-    r'(?![A-Z0-9])'    # negative lookahead
+)
+
+# Standard callsigns (no slash)
+CALL_RE = re.compile(
+    r'(?<![A-Z0-9/])'
+    r'(' + _CALL_BASE + r')'
+    r'(?![A-Z0-9/])'
+)
+
+# Slash calls: PREFIX/CALL or CALL/SUFFIX
+# e.g., PJ2/AG3I, F/DL3HAH, W1AW/4, JA0XQO/1, IT9/DK6XZ
+# PREFIX can be 1-4 chars (F, DL, PJ2, IT9), SUFFIX can be call or 1-4 chars
+CALL_SLASH_RE = re.compile(
+    r'(?<![A-Z0-9])'
+    r'([A-Z0-9]{1,4}/(?:' + _CALL_BASE + r')'   # PREFIX/CALL
+    r'|(?:' + _CALL_BASE + r')/[A-Z0-9]{1,4})'   # CALL/SUFFIX
+    r'(?![A-Z0-9])'
 )
 
 # 1x1 special event calls: W1A, K3I, N4B etc. (letter + digit + letter)
@@ -99,6 +112,11 @@ def load_master_scp(filename='MASTER.SCP', supplement='add_calls.txt'):
 def extract_callsigns(text):
     found = set()
     text = text.upper()
+    # Slash calls first (PREFIX/CALL or CALL/SUFFIX)
+    for match in CALL_SLASH_RE.finditer(text):
+        call = match.group(1)
+        if len(call) >= 5:  # minimum: X1X/X = 5 chars
+            found.add(call)
     # Standard callsigns (4+ chars)
     for match in CALL_RE.finditer(text):
         call = match.group(1)
