@@ -311,6 +311,20 @@ class CWDecoder {
                 state = IDLE;
                 return -1;
             }
+            // Trailing element rejection: if the gap before this tone
+            // was > 5× dot_len (after a word break), this element is
+            // phantom AGC noise — discard it. The character was already
+            // emitted by the QUERY handler's word break detection.
+            if (rep.length() == 0 && last_element == 0) {
+                // First element after reset/idle — check if we arrived
+                // here after a long silence (phantom trailing element)
+                // Use tone_start relative to smpl_ctr baseline
+                // If tone_start > 5 * dot_len from last activity, reject
+                if (tone_start > (unsigned)(5 * dot_len) && dot_len > 0) {
+                    state = AFTER_TONE;
+                    return -1;  // discard this phantom element
+                }
+            }
             if (last_element > 0) {
                 // Accept wider ratio range (1.5x-5x) for speed tracking
                 // Original fldigi used 2x-4x but that's too strict for noisy signals
@@ -529,6 +543,7 @@ public:
         double rate_scale = DEC_RATE() / 500.0;
         double agc_attack = 200 * rate_scale;   // ~400ms at any rate
         double agc_decay = 1000 * rate_scale;    // ~2000ms at any rate
+
         sig_avg = decay(sig_avg, value, agc_decay);
         if (value < sig_avg) {
             noise_floor = decay(noise_floor, value,
