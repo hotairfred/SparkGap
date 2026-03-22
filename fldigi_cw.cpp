@@ -163,6 +163,95 @@ public:
     }
 };
 
+// --- SOM Table (from fldigi) ---
+#define WGT_SIZE 7
+struct SOMEntry {
+    const char *pattern;
+    char ch;
+    float wgt[WGT_SIZE];
+};
+
+static const SOMEntry som_table[] = {
+    {".-",    'A', {0.33,1.0, 0,0,0,0,0}},
+    {"-...",  'B', {1.0,0.33,0.33,0.33, 0,0,0}},
+    {"-.-.",  'C', {1.0,0.33,1.0,0.33, 0,0,0}},
+    {"-..",   'D', {1.0,0.33,0.33, 0,0,0,0}},
+    {".",     'E', {0.33, 0,0,0,0,0,0}},
+    {"..-.",  'F', {0.33,0.33,1.0,0.33, 0,0,0}},
+    {"--.",   'G', {1.0,1.0,0.33, 0,0,0,0}},
+    {"....",  'H', {0.33,0.33,0.33,0.33, 0,0,0}},
+    {"..",    'I', {0.33,0.33, 0,0,0,0,0}},
+    {".---",  'J', {0.33,1.0,1.0,1.0, 0,0,0}},
+    {"-.-",   'K', {1.0,0.33,1.0, 0,0,0,0}},
+    {".-..",  'L', {0.33,1.0,0.33,0.33, 0,0,0}},
+    {"--",    'M', {1.0,1.0, 0,0,0,0,0}},
+    {"-.",    'N', {1.0,0.33, 0,0,0,0,0}},
+    {"---",   'O', {1.0,1.0,1.0, 0,0,0,0}},
+    {".--.",  'P', {0.33,1.0,1.0,0.33, 0,0,0}},
+    {"--.-",  'Q', {1.0,1.0,0.33,1.0, 0,0,0}},
+    {".-.",   'R', {0.33,1.0,0.33, 0,0,0,0}},
+    {"...",   'S', {0.33,0.33,0.33, 0,0,0,0}},
+    {"-",     'T', {1.0, 0,0,0,0,0,0}},
+    {"..-",   'U', {0.33,0.33,1.0, 0,0,0,0}},
+    {"...-",  'V', {0.33,0.33,0.33,1.0, 0,0,0}},
+    {".--",   'W', {0.33,1.0,1.0, 0,0,0,0}},
+    {"-..-",  'X', {1.0,0.33,0.33,1.0, 0,0,0}},
+    {"-.--",  'Y', {1.0,0.33,1.0,1.0, 0,0,0}},
+    {"--..",  'Z', {1.0,1.0,0.33,0.33, 0,0,0}},
+    {"-----", '0', {1.0,1.0,1.0,1.0,1.0, 0,0}},
+    {".----", '1', {0.33,1.0,1.0,1.0,1.0, 0,0}},
+    {"..---", '2', {0.33,0.33,1.0,1.0,1.0, 0,0}},
+    {"...--", '3', {0.33,0.33,0.33,1.0,1.0, 0,0}},
+    {"....-", '4', {0.33,0.33,0.33,0.33,1.0, 0,0}},
+    {".....", '5', {0.33,0.33,0.33,0.33,0.33, 0,0}},
+    {"-....", '6', {1.0,0.33,0.33,0.33,0.33, 0,0}},
+    {"--...", '7', {1.0,1.0,0.33,0.33,0.33, 0,0}},
+    {"---..", '8', {1.0,1.0,1.0,0.33,0.33, 0,0}},
+    {"----.", '9', {1.0,1.0,1.0,1.0,0.33, 0,0}},
+    {".-.-.-",'.',{0.33,1.0,0.33,1.0,0.33,1.0,0}},
+    {"--..--",',',{1.0,1.0,0.33,0.33,1.0,1.0,0}},
+    {"..--.."},  // ? — empty char will be handled
+    {"-..-.", '/', {1.0,0.33,0.33,1.0,0.33, 0,0}},
+    {NULL, 0, {0}}
+};
+
+static char som_decode(float *elements, int n_elements, long two_dots) {
+    // Normalize element durations to 0-1 weights
+    // Short (< two_dots) → weight proportional to 0.33
+    // Long (> two_dots) → weight proportional to 1.0
+    // Borderline → proportional value between 0.33 and 1.0
+    float wgt[WGT_SIZE] = {0};
+    float max_dur = 0;
+    for (int i = 0; i < n_elements && i < WGT_SIZE; i++)
+        if (elements[i] > max_dur) max_dur = elements[i];
+
+    if (max_dur <= 0) return '*';
+
+    float scale = (max_dur > two_dots) ? 1.0f / max_dur : 0.33f / max_dur;
+    for (int i = 0; i < n_elements && i < WGT_SIZE; i++)
+        wgt[i] = elements[i] * scale;
+
+    // Find closest SOM entry by Euclidean distance
+    float best_dist = 1e9;
+    int best = -1;
+    for (int n = 0; som_table[n].pattern; n++) {
+        float dist = 0;
+        for (int i = 0; i < WGT_SIZE; i++) {
+            float d = wgt[i] - som_table[n].wgt[i];
+            dist += d * d;
+            if (dist > best_dist) break;  // early exit
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = n;
+        }
+    }
+
+    if (best >= 0 && som_table[best].ch)
+        return som_table[best].ch;
+    return '*';
+}
+
 // --- CW Decoder ---
 class CWDecoder {
     enum { IDLE, IN_TONE, AFTER_TONE } state;
@@ -183,6 +272,8 @@ class CWDecoder {
     BandpassFilter *bpf;
 
     std::string rep;
+    float elem_buf[WGT_SIZE];  // raw element durations for SOM
+    int elem_count;
 
     double decay(double avg, double val, double w) {
         return w <= 1 ? val : avg * (1.0 - 1.0/w) + val / w;
@@ -202,12 +293,12 @@ class CWDecoder {
         int dur;
         switch (ev) {
         case 0: // RESET
-            state = IDLE; smpl_ctr = 0; rep.clear();
+            state = IDLE; smpl_ctr = 0; rep.clear(); elem_count = 0;
             space_sent = true; last_element = 0;
             break;
         case 1: // KEYDOWN
             if (state == IN_TONE) return -1;
-            if (state == IDLE) { smpl_ctr = 0; rep.clear(); }
+            if (state == IDLE) { smpl_ctr = 0; rep.clear(); elem_count = 0; }
             tone_start = smpl_ctr;
             state = IN_TONE;
             return -1;
@@ -230,11 +321,14 @@ class CWDecoder {
             }
             last_element = dur;
             rep += (dur <= two_dots) ? '.' : '-';
+            // Store raw duration for SOM matching
+            if (elem_count < WGT_SIZE)
+                elem_buf[elem_count++] = (float)dur;
             if (debug_timing)
                 fprintf(stderr, "%c dur=%d 2dot=%ld dot=%ld\n",
                         (dur <= two_dots) ? '.' : '-', dur, two_dots, dot_len);
             if (rep.length() > MAX_MORSE) {
-                state = IDLE; rep.clear();
+                state = IDLE; rep.clear(); elem_count = 0;
                 return -1;
             }
             state = AFTER_TONE;
@@ -251,11 +345,16 @@ class CWDecoder {
             // split 5-element digit patterns into multiple characters)
             if (dur < (long)(2.5 * dot_len)) return -1;
             if (dur >= (long)(2.5*dot_len) && dur <= (long)(5*dot_len) && state == AFTER_TONE) {
-                ch = lookup(rep);
+                // SOM decode: use raw element durations for distance matching
+                // Falls back to string lookup if SOM produces '*'
+                ch = som_decode(elem_buf, elem_count, two_dots);
+                if (ch == '*')
+                    ch = lookup(rep);  // fallback to hard threshold
                 if (debug_timing)
-                    fprintf(stderr, "CHAR: '%s' → '%c' (gap=%d, dot=%ld)\n",
-                            rep.c_str(), ch, dur, dot_len);
+                    fprintf(stderr, "CHAR: '%s' → '%c' (gap=%d, dot=%ld, som=%d elems)\n",
+                            rep.c_str(), ch, dur, dot_len, elem_count);
                 rep.clear();
+                elem_count = 0;
                 state = IDLE;
                 space_sent = false;
                 return 0;
@@ -363,6 +462,8 @@ public:
         state = IDLE; smpl_ctr = 0;
         tone_start = tone_end = 0;
         last_element = 0; space_sent = true;
+        elem_count = 0;
+        memset(elem_buf, 0, sizeof(elem_buf));
         agc_peak = 0.001; noise_floor = 0; sig_avg = 0;
 
         trackfilter = new Avg(8);
