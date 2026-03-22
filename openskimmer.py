@@ -169,14 +169,10 @@ class DecoderInstance:
         decimated = self._dec_buf[:usable:self.dec_factor]  # downsample
         self._dec_buf = self._dec_buf[usable:]
 
-        # Normalize using running peak (fast attack, slow decay)
-        block_peak = np.max(np.abs(decimated))
-        if block_peak > self._peak:
-            self._peak = block_peak  # fast attack
-        else:
-            self._peak = self._peak * 0.9999 + block_peak * 0.0001  # slow decay
-        if self._peak > 0:
-            decimated = decimated / self._peak * 16000
+        # Fixed gain normalization — let the UHSDR decoder's internal
+        # Goertzel + auto-threshold handle signal levels
+        # Scale so typical 24-bit signal peaks fill 16-bit range
+        decimated = np.clip(decimated * 0.2, -32000, 32000)
         pcm = decimated.astype(np.int16).tobytes()
 
         try:
@@ -231,7 +227,7 @@ class InstanceManager:
         self.decoder_bin = decoder_bin
         self.max_instances = max_instances
         self.signal_timeout = signal_timeout
-        self.speeds = speeds or [0, 25, 30, 35]  # auto + fixed speeds
+        self.speeds = speeds or [0, 30]  # auto + 30 WPM
         # freq_key -> list of DecoderInstance (one per speed)
         self.instances = {}
         self.center_khz = 0
@@ -1020,6 +1016,7 @@ def run_file_mode(args, config):
             if not text:
                 continue
             # Extract callsigns from accumulated text
+            # Method 1: regex extraction
             for m in CALL_RE_EVAL.finditer(text):
                 call = m.group(0)
                 if len(call) < 4 or call in FALSE_POS_EVAL:
@@ -1027,6 +1024,16 @@ def run_file_mode(args, config):
                 if call in calls:  # SCP match
                     if call not in decoded_calls or inst.snr > decoded_calls[call][1]:
                         decoded_calls[call] = (inst.rf_khz, inst.snr, text[:80])
+            # Method 2: sliding window — catches calls embedded in
+            # noise like "TUCY0S" where regex finds "UCY0S" instead
+            # Require 2+ occurrences to reduce false positives
+            collapsed = re.sub(r'[^A-Z0-9]', '', text)
+            for wlen in range(4, 8):
+                for i in range(len(collapsed) - wlen + 1):
+                    frag = collapsed[i:i+wlen]
+                    if frag in calls and frag not in FALSE_POS_EVAL:
+                        if frag not in decoded_calls or inst.snr > decoded_calls[frag][1]:
+                            decoded_calls[frag] = (inst.rf_khz, inst.snr, text[:80])
 
     manager.kill_all()
 
