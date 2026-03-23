@@ -53,7 +53,7 @@ for win_start in range(0, len(i_ch), window_samples):
     noise = np.median(avg_db)
 
     for i in range(1, fft_size - 1):
-        if avg_db[i] > noise + 8 and avg_db[i] > avg_db[i - 1] and avg_db[i] > avg_db[i + 1]:
+        if avg_db[i] > noise + 5 and avg_db[i] > avg_db[i - 1] and avg_db[i] > avg_db[i + 1]:
             key = int(round(freqs[i] / 200)) * 200  # 200 Hz bins
             snr = avg_db[i] - noise
             if key not in all_signals or snr > all_signals[key][1]:
