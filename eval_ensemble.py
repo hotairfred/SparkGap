@@ -72,20 +72,47 @@ t = np.arange(len(iq)) / rate
 uhsdr_calls = {}
 ml_calls = {}
 
+def detect_pitch(audio, sample_rate, pitches=[500, 550, 600, 650, 700, 750, 800]):
+    """FFT-based pitch detection on first 2 seconds of audio."""
+    n = min(len(audio), sample_rate * 2)
+    chunk = audio[:n]
+    # Simple FFT, find peak in the pitch range
+    spectrum = np.abs(np.fft.rfft(chunk * np.hanning(n)))
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    # Mask to pitch range
+    mask = (freqs >= pitches[0] - 25) & (freqs <= pitches[-1] + 25)
+    if not np.any(mask):
+        return 600
+    peak_idx = np.argmax(spectrum[mask])
+    peak_freq = freqs[mask][peak_idx]
+    # Snap to nearest pitch candidate
+    best_pitch = min(pitches, key=lambda p: abs(p - peak_freq))
+    return best_pitch
+
 for si, (freq_hz, snr) in enumerate(clustered):
     rf_khz = 7090 + freq_hz / 1000
 
-    # Channelize
+    # Channelize at nominal 600 Hz first
     mixed = iq * np.exp(-1j * 2 * np.pi * (freq_hz - 600) * t)
     audio = mixed.real
 
-    # UHSDR: decimate to 12kHz
+    # Auto pitch detection on decimated audio
     audio_12k = decimate(audio, 16, ftype='fir', n=63)
+    actual_pitch = detect_pitch(audio_12k, 12000)
+
+    # If pitch differs from 600, re-channelize to center the tone
+    if actual_pitch != 600:
+        pitch_offset = actual_pitch - 600
+        mixed = iq * np.exp(-1j * 2 * np.pi * (freq_hz - actual_pitch) * t)
+        audio = mixed.real
+        audio_12k = decimate(audio, 16, ftype='fir', n=63)
+
+    # UHSDR: feed with detected pitch
     peak = np.max(np.abs(audio_12k))
     if peak > 0:
         audio_12k_norm = np.clip(audio_12k * 0.2, -32000, 32000)
     pcm = audio_12k_norm.astype(np.int16).tobytes()
-    proc = subprocess.run(['./uhsdr_cw', '-r', '12000', '-f', '600'],
+    proc = subprocess.run(['./uhsdr_cw', '-r', '12000', '-f', str(actual_pitch)],
                           input=pcm, capture_output=True, timeout=30)
     uhsdr_text = proc.stdout.decode('utf-8', errors='replace').upper()
     for m in CALL_RE.finditer(uhsdr_text):
@@ -94,7 +121,7 @@ for si, (freq_hz, snr) in enumerate(clustered):
             if call not in uhsdr_calls:
                 uhsdr_calls[call] = rf_khz
 
-    # ML: decimate to 4kHz
+    # ML: decimate to 4kHz (uses same re-channelized audio)
     audio_4k = decimate(audio, 48, ftype='fir', n=127)
     peak = np.max(np.abs(audio_4k))
     if peak > 0:

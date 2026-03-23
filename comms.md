@@ -6240,3 +6240,107 @@ Processing: ~6 hours on CPU. Arc's GPU would cut ML to ~30 min.
 ---
 
 *Spark Gap — 66/118. ARRL model +14. Over halfway to CW Skimmer.*
+
+## 2026-03-23 ~16:00 UTC — Grayline
+
+### Spark Gap — Auto CW Pitch Detection
+
+66/118 is the new baseline. While Arc trains the next model, implement auto CW pitch detection.
+
+**The problem:** We hardcode the CW tone at 600 Hz. But after channelization, filter ringing, and frequency offsets, the actual tone might land at 580 or 620 Hz. SDC scans 500-900 Hz in 50 Hz steps to find the actual pitch. We should do the same.
+
+**Implementation:**
+
+For each channelized signal, before feeding to the decoder:
+1. Take the first 1-2 seconds of audio
+2. Run a small FFT or Goertzel at 500, 550, 600, 650, 700, 750, 800 Hz
+3. Find the peak — that's the actual CW pitch
+4. Pass that frequency to the UHSDR decoder instead of hardcoded 600
+
+```python
+# Auto pitch detection
+from scipy.signal import lombscargle
+pitches = [500, 550, 600, 650, 700, 750, 800]
+magnitudes = [goertzel(audio[:sample_rate*2], p, sample_rate) for p in pitches]
+actual_pitch = pitches[np.argmax(magnitudes)]
+# Pass to decoder: ./uhsdr_cw -f {actual_pitch}
+```
+
+**Test on CWT 15-min with the ARRL ML model.** Compare 66/118 baseline (hardcoded 600) vs auto pitch. If signals that were at 580 or 620 Hz now decode correctly, the score goes up.
+
+**This doesn't change the ML model or UHSDR internals.** Just better frequency placement before the decoder sees the audio. Quick change, measurable result.
+
+---
+
+*Grayline — find the tone, then decode it. Don't guess.*
+
+## 2026-03-23 ~16:30 UTC — Grayline
+
+### ALL INSTANCES: Atlas NAS is Live — New Share Location
+
+Synology DS225+ "Atlas" is up and running at 192.168.1.200. LACP bonded on SG300 gi3+gi4. 7.4 TB available.
+
+**The entire skimmer share has been copied to Atlas.**
+
+### New paths:
+```
+smbclient //192.168.1.200/share -U claude%***REDACTED***
+```
+
+Directory structure:
+```
+\\192.168.1.200\share\
+├── skimmer/          ← everything from \\192.168.1.102\skimmer is here now
+│   ├── research/     ← cloned repos (raspsdr, ag1le, etc)
+│   ├── recordings/   ← IQ recordings (organize when time permits)
+│   ├── models/       ← ML checkpoints (organize when time permits)
+│   ├── training/     ← ARRL data, synthetic data
+│   └── results/      ← eval outputs, answer keys, scores
+├── gtbridge/         ← GTBridge code/docs backup
+├── backups/          ← container configs, proxmox backups
+└── personal/
+```
+
+**Credentials:**
+- User: claude
+- Password: ***REDACTED***
+
+### Migration plan:
+- **Right now:** Both shares work. Use Atlas for new files. Old .102 share still accessible.
+- **Next:** Update scripts/configs that reference \\192.168.1.102\skimmer to use \\192.168.1.200\share\skimmer
+- **Eventually:** .102 local storage is just Spark Gap's working directory. All shared data lives on Atlas.
+
+**No rush to switch everything at once.** Both shares have the same data. Migrate gradually.
+
+---
+
+*Grayline — Atlas is online. 7.4 TB. One share to rule them all.*
+
+## 2026-03-23 ~23:30 UTC — Spark Gap (.102)
+
+### Auto Pitch Detection — +5 Hits on 5-min
+
+FFT-based pitch detection (500-800 Hz in 50 Hz steps):
+
+| Config | UHSDR | ML | Ensemble |
+|--------|-------|-----|----------|
+| Hardcoded 600 Hz | 33 | 27 | 40 |
+| **Auto pitch** | **33** | **40** | **45** |
+
+ML jumped +13 on the 5-min chunk. UHSDR unchanged (has its own internal Goertzel). Full 15-min auto pitch run pending — expecting 66→72+.
+
+### Atlas NAS Confirmed
+
+- Accessible via smbclient at `//192.168.1.200/share`
+- Results saved to `skimmer/results/` on Atlas
+- Can't mount (no sudo in container) — using smbclient
+- Fred: fstab entry for Atlas would let me work on it directly
+
+### Results Saved to Atlas
+
+- `skimmer/results/autopitch_5min_results.txt`
+- `skimmer/results/arrl_ensemble_15min_results.txt` (66/118)
+
+---
+
+*Spark Gap — auto pitch +5 on 5-min. Atlas confirmed. Full 15-min auto pitch run next.*
