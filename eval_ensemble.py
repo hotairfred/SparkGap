@@ -33,30 +33,34 @@ i_ch, q_ch = read_24bit_iq_chunk('B1_20260319_030000_7090kHz.wav', start_min * 6
 rate = 192000
 iq = i_ch + 1j * q_ch
 
-# Find signals
+# Find signals — scan across full duration in 60s windows, merge all detections
 fft_size = 8192
-n_ffts = min(len(i_ch) // fft_size, 200)
-avg_spectrum = np.zeros(fft_size)
-for fi in range(n_ffts):
-    chunk = iq[fi * fft_size:(fi + 1) * fft_size]
-    avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
-avg_spectrum /= n_ffts
-avg_db = 10 * np.log10(avg_spectrum + 1e-20)
 freqs = np.fft.fftfreq(fft_size, 1.0 / rate)
-noise = np.median(avg_db)
+all_signals = {}  # freq_key -> (freq_hz, best_snr)
+window_samples = 60 * rate  # 60-second scan windows
 
-signals = []
-for i in range(1, fft_size - 1):
-    if avg_db[i] > noise + 8 and avg_db[i] > avg_db[i - 1] and avg_db[i] > avg_db[i + 1]:
-        signals.append((freqs[i], avg_db[i] - noise))
-clustered = []
-for freq, snr in sorted(signals):
-    if not clustered or abs(freq - clustered[-1][0]) > 200:
-        clustered.append((freq, snr))
-    elif snr > clustered[-1][1]:
-        clustered[-1] = (freq, snr)
+for win_start in range(0, len(i_ch), window_samples):
+    win_iq = iq[win_start:win_start + window_samples]
+    n_ffts = min(len(win_iq) // fft_size, 500)
+    if n_ffts < 10:
+        continue
+    avg_spectrum = np.zeros(fft_size)
+    for fi in range(n_ffts):
+        chunk = win_iq[fi * fft_size:(fi + 1) * fft_size]
+        avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
+    avg_spectrum /= n_ffts
+    avg_db = 10 * np.log10(avg_spectrum + 1e-20)
+    noise = np.median(avg_db)
 
-print(f"{len(clustered)} signals detected", flush=True)
+    for i in range(1, fft_size - 1):
+        if avg_db[i] > noise + 8 and avg_db[i] > avg_db[i - 1] and avg_db[i] > avg_db[i + 1]:
+            key = int(round(freqs[i] / 200)) * 200  # 200 Hz bins
+            snr = avg_db[i] - noise
+            if key not in all_signals or snr > all_signals[key][1]:
+                all_signals[key] = (freqs[i], snr)
+
+clustered = sorted(all_signals.values())
+print(f"{len(clustered)} signals detected (full-duration scan)", flush=True)
 
 # Load ML model
 model = CWDecoder()
