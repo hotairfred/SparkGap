@@ -451,7 +451,7 @@ static void CW_Decode_exe(cw_decoder_t *cw)
                         :
                             (cw->weight_linear /1000 * 16)  // (CW_ONE_BIT_SAMPLE_COUNT * 16)
                     );
-    
+
         cw->CW_noise = decayavg(
                             cw->CW_noise,   // average
                             cw->CW_mag,     // input
@@ -460,12 +460,8 @@ static void CW_Decode_exe(cw_decoder_t *cw)
                             :
                                 (cw->weight_linear /1000 * 48)  // (CW_ONE_BIT_SAMPLE_COUNT * 48)
                         );
-    
-        CW_clipped = CLAMP(cw->CW_env, cw->CW_noise, cw->CW_mag);
 
-        //float32_t CW_env_to_noise = cw->CW_env - cw->CW_noise;
-        //float32_t v1 = (CW_clipped - cw->CW_noise) * CW_env_to_noise -
-        //                0.8 * (CW_env_to_noise * CW_env_to_noise);
+        CW_clipped = CLAMP(cw->CW_env, cw->CW_noise, cw->CW_mag);
 
         float32_t CW_env_to_noise = CW_clipped - cw->CW_noise;
         float32_t v1 = (CW_clipped - cw->CW_noise) * CW_env_to_noise -
@@ -475,8 +471,8 @@ static void CW_Decode_exe(cw_decoder_t *cw)
         // lowpass
         siglevel = v1 * SIGNAL_TAU + ONEM_SIGNAL_TAU * cw->old_siglevel;
         cw->old_siglevel = v1;
-        //newstate = (siglevel >= 0)? true:false;
-		newstate = (siglevel >= cw->threshold_linear)? true:false;
+
+        newstate = (siglevel >= cw->threshold_linear)? true:false;
 	}
 
 	//    4c.) relative threshold — tracks this signal's own peak
