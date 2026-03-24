@@ -673,6 +673,23 @@ Of the 44 SkimSrv exclusives: 41 never decoded in any pass (decoder quality ceil
 | Mar 19 | + bmorse Bayesian decoder | 109/118 (CWT) |
 | **Mar 20** | **+ ML domain-adapted** | **115/118 (97.5%)** |
 
+### Segment 2 Validation (minutes 30-45, 03:30-03:45 UTC)
+Answer key from RBN (WF8Z-2 spots): 35 calls
+
+| Decoder | Seg 2 (35 calls) | Seg 1 (118 calls) |
+|---------|-----------------|-------------------|
+| Threshold (108 passes) | 26/35 (74%) | 74/118 (63%) |
+| ML (domain-adapted) | 14/35 (40%) | 41/118 (35%) |
+| bmorse (4 speeds) | 17/35 (49%) | 35/118 (30%) |
+| **COMBINED** | **27/35 (77%)** | **115/118 (97.5%)** |
+
+Segment 1 was peak CWT activity (118 calls, strong signals). Segment 2 was CWT winding
+down (35 calls, weaker signals). The ensemble approach holds across both, but the absolute
+percentage varies with signal conditions: **77-97% depending on activity level.**
+
+Missing from segment 2: 2 slash calls (regex limitation), 3 weak DX, 3 weak domestic.
+bmorse found HA9RE that neither threshold nor ML decoded — the ensemble is complementary.
+
 ### Architecture: Three-Decoder Ensemble
 ```
 Input IQ (192kHz from Red Pitaya)

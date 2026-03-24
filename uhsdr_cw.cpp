@@ -462,7 +462,7 @@ static void CW_Decode_exe(cw_decoder_t *cw)
                         );
     
         CW_clipped = CLAMP(cw->CW_env, cw->CW_noise, cw->CW_mag);
-    
+
         //float32_t CW_env_to_noise = cw->CW_env - cw->CW_noise;
         //float32_t v1 = (CW_clipped - cw->CW_noise) * CW_env_to_noise -
         //                0.8 * (CW_env_to_noise * CW_env_to_noise);
@@ -471,7 +471,7 @@ static void CW_Decode_exe(cw_decoder_t *cw)
         float32_t v1 = (CW_clipped - cw->CW_noise) * CW_env_to_noise -
                         0.8 * (CW_env_to_noise * CW_env_to_noise);
         v1 = sqrtf(fabsf(v1)) * ((v1 < 0)? -1:1);
-    
+
         // lowpass
         siglevel = v1 * SIGNAL_TAU + ONEM_SIGNAL_TAU * cw->old_siglevel;
         cw->old_siglevel = v1;
