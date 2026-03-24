@@ -51,7 +51,7 @@
 //#define SIGNAL_TAU			0.01
 #define SIGNAL_TAU			    0.1
 #define	ONEM_SIGNAL_TAU         (1.0 - SIGNAL_TAU)
-#define AUTO_WEIGHT_LINEAR      32000   // ~45 dB
+#define AUTO_WEIGHT_LINEAR      16000   // ~42 dB (slower AGC, +1 hit)
 #define AUTO_THRESHOLD_LINEAR   15849   // ~42 dB
 
 #define TRAINING_STABLE     32
@@ -1355,8 +1355,8 @@ int main(int argc, char *argv[]) {
     cw->process_samples = true;
     cw->isAutoThreshold = true;
     cw->weight_linear = AUTO_WEIGHT_LINEAR;
-    cw->threshold_linear = 500;  // medium fixed threshold  // low fixed threshold
-    
+    cw->threshold_linear = 500;  // medium fixed threshold
+
     // Read and process
     int16_t sample;
     int count = 0;
