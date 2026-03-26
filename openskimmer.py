@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 import numpy as np
 from scipy.signal import decimate as scipy_decimate
 
-from hpsdr_receiver import HPSDRReceiver, discover, SAMPLE_RATE
+from hpsdr_receiver import HPSDRReceiver, discover
 from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('openskimmer')
@@ -1136,7 +1136,7 @@ class OpenSkimmer:
         try:
             with self._iq_lock:
                 self._iq_buffer.extend(iq_samples)
-                max_buf = SAMPLE_RATE * 10
+                max_buf = self.cfg.get('sample_rate', 48000) * 10
                 if len(self._iq_buffer) > max_buf:
                     del self._iq_buffer[:len(self._iq_buffer) - max_buf]
 
@@ -1173,21 +1173,29 @@ class OpenSkimmer:
                 last_scan = now
                 self.tracker.reset_cycle()
 
+                live_rate = self.cfg.get('sample_rate', 48000)
+                fft_size = 8192
+                n_avg = max(1, int(live_rate * 2 / fft_size))  # ~2 seconds
+                needed = fft_size * n_avg
                 with self._iq_lock:
-                    if len(self._iq_buffer) >= 65536:
-                        iq = np.array([complex(i * 8388608, q * 8388608)
-                                       for i, q in self._iq_buffer[-65536:]])
+                    if len(self._iq_buffer) >= needed:
+                        buf = list(self._iq_buffer[-needed:])
                     else:
-                        iq = None
+                        buf = None
 
-                if iq is not None:
-                    fft = np.fft.fft(iq)
-                    psd_db = 10 * np.log10(np.abs(fft) ** 2 + 1e-20)
+                if buf is not None:
+                    iq_arr = np.array([complex(i, q) for i, q in buf])
+                    avg_psd = np.zeros(fft_size)
+                    for fi in range(n_avg):
+                        chunk = iq_arr[fi*fft_size:(fi+1)*fft_size]
+                        avg_psd += np.abs(np.fft.fft(chunk)) ** 2
+                    avg_psd /= n_avg
+                    psd_db = 10 * np.log10(avg_psd + 1e-20)
                     noise = np.median(psd_db)
                     min_snr = self.cfg.get('signal_min_snr', 12)
 
                     signals = []
-                    N = len(fft)
+                    N = fft_size
                     for i in range(1, N - 1):
                         if psd_db[i] > noise + min_snr and \
                            psd_db[i] > psd_db[i - 1] and psd_db[i] > psd_db[i + 1]:
@@ -1196,7 +1204,7 @@ class OpenSkimmer:
                             exact = i + delta
                             if exact >= N / 2:
                                 exact -= N
-                            f = exact * SAMPLE_RATE / N
+                            f = exact * live_rate / N
                             signals.append((f, psd_db[i] - noise))
 
                     # Cluster
@@ -1219,6 +1227,11 @@ class OpenSkimmer:
             results = self.manager.collect_all()
             for rf_khz, snr, text, ctx in results:
                 log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
+                # Skip pure noise: require at least one token of 3+ chars
+                # This filters digital mode garbage (PSK, WSPR) and speed mismatches
+                tokens = text.split()
+                if not any(len(t) >= 3 for t in tokens):
+                    continue
                 spots = self.tracker.process(rf_khz, snr, text, ctx)
                 for spot in spots:
                     self.spot_count += 1
