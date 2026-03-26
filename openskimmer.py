@@ -1210,7 +1210,7 @@ class OpenSkimmer:
                     # Cluster
                     clustered = []
                     for freq, snr in sorted(signals):
-                        if not clustered or abs(freq - clustered[-1][0]) > 200:
+                        if not clustered or abs(freq - clustered[-1][0]) > 100:
                             clustered.append((freq, snr))
                         elif snr > clustered[-1][1]:
                             clustered[-1] = (freq, snr)
