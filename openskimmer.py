@@ -29,7 +29,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict
+import itertools
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 import numpy as np
@@ -51,8 +52,8 @@ FALSE_POSITIVES = {
 CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|CWT|SST|TU|UP|DE)\b', re.IGNORECASE)
 
 BANDS = {
-    '160m': 1820000, '80m': 3530000, '40m': 7020000, '30m': 10120000,
-    '20m': 14030000, '17m': 18080000, '15m': 21040000, '12m': 24900000,
+    '160m': 1891000, '80m': 3591000, '40m': 7100000, '30m': 10191000,
+    '20m': 14091000, '17m': 18159000, '15m': 21091000, '12m': 24981000,
     '10m': 28040000,
 }
 
@@ -83,7 +84,7 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
     return calls, blacklist
 
 
-CW_TONE = 600       # Hz — UHSDR decoder expects tone here
+CW_TONE = 700       # Hz — matches natural tone placement from channelizer
 DECODER_RATE = 12000  # UHSDR decoder sample rate
 BMORSE_RATE = 4000    # bmorse input sample rate
 
@@ -117,7 +118,7 @@ class DecoderInstance:
         # Tap count scales with dec_factor so stopband attenuation stays good
         # at higher sample rates (65 taps @ 48kHz, 257 taps @ 192kHz)
         from scipy.signal import firwin
-        n_taps = self.dec_factor * 16 + 1  # always odd
+        n_taps = self.dec_factor * 4 + 1  # always odd
         self._fir_taps = firwin(n_taps, DECODER_RATE / 2, fs=sample_rate)
         self._fir_state = np.zeros(len(self._fir_taps) - 1)
         self._dec_buf = np.zeros(0, dtype=np.float64)
@@ -131,6 +132,15 @@ class DecoderInstance:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, bufsize=0,
         )
+        # WAV capture: dump first 10s of audio for diagnostic
+        self._wav_writer = None
+        if wpm == 0 and not os.path.exists('/tmp/decoder_audio.wav'):
+            import wave as _wave
+            self._wav_writer = _wave.open('/tmp/decoder_audio.wav', 'wb')
+            self._wav_writer.setnchannels(1)
+            self._wav_writer.setsampwidth(2)
+            self._wav_writer.setframerate(DECODER_RATE)
+            self._wav_samples = 0
 
     def feed_iq(self, i_samples, q_samples):
         """SSB channelize IQ and feed mono audio to decoder.
@@ -175,13 +185,22 @@ class DecoderInstance:
         # Fixed gain normalization — let the UHSDR decoder's internal
         # Goertzel + auto-threshold handle signal levels
         # Scale so typical 24-bit signal peaks fill 16-bit range
-        decimated = np.clip(decimated * 0.2, -32000, 32000)
+        decimated = np.clip(decimated * 10.0, -32000, 32000)
         pcm = decimated.astype(np.int16).tobytes()
 
         try:
             self.process.stdin.write(pcm)
         except (BrokenPipeError, OSError):
             pass
+
+        # WAV capture for diagnostic — first 10 seconds
+        if getattr(self, '_wav_writer', None):
+            self._wav_samples += len(decimated)
+            self._wav_writer.writeframes(pcm)
+            if self._wav_samples >= DECODER_RATE * 10:
+                self._wav_writer.close()
+                self._wav_writer = None
+                log.info("WAV capture complete: /tmp/decoder_audio.wav (%.1f kHz)", self.rf_khz)
 
     def read(self):
         """Non-blocking read of decoded characters."""
@@ -242,7 +261,7 @@ class BmorseInstance:
         self.dec_factor = sample_rate // BMORSE_RATE
 
         from scipy.signal import firwin
-        n_taps = self.dec_factor * 16 + 1
+        n_taps = self.dec_factor * 4 + 1
         self._fir_taps = firwin(n_taps, BMORSE_RATE / 2, fs=sample_rate)
         self._fir_state = np.zeros(len(self._fir_taps) - 1)
         self._dec_buf = np.zeros(0, dtype=np.float64)
@@ -362,7 +381,7 @@ class HamFistInstance:
         self.dec_factor = sample_rate // BMORSE_RATE  # BMORSE_RATE = 4000
 
         from scipy.signal import firwin
-        n_taps = self.dec_factor * 16 + 1
+        n_taps = self.dec_factor * 4 + 1
         self._fir_taps = firwin(n_taps, BMORSE_RATE / 2, fs=sample_rate)
         self._fir_state = np.zeros(len(self._fir_taps) - 1)
         self._dec_buf = np.zeros(0, dtype=np.float64)
@@ -455,13 +474,18 @@ class HamFistInstance:
 
 
 class Channelizer:
-    """SSB mix + FIR lowpass + decimate: IQ → mono PCM at output_rate.
+    """SSB mix + IIR lowpass + decimate: IQ → mono PCM at output_rate.
+
+    Optionally applies a post-decimation FIR bandpass around CW_TONE to
+    reduce noise bandwidth. Used for bmorse (no internal narrow filter).
+    NOT used for uhsdr (has internal 47 Hz Goertzel — FIR breaks its AGC).
 
     Shared across all decoder processes at the same frequency so the
-    expensive FIR filter runs once per signal instead of once per decoder.
+    filter runs once per signal instead of once per decoder.
     """
 
-    def __init__(self, freq_offset, input_rate, output_rate, normalize='fixed'):
+    def __init__(self, freq_offset, input_rate, output_rate, normalize='fixed',
+                 cw_fir_bw=0):
         self.mix_freq = freq_offset - CW_TONE
         self.phase = 0.0
         self.input_rate = input_rate
@@ -469,16 +493,34 @@ class Channelizer:
         self.dec_factor = input_rate // output_rate
         self.normalize = normalize  # 'fixed' for UHSDR, 'peak' for bmorse/HamFist
 
-        from scipy.signal import firwin
-        n_taps = self.dec_factor * 16 + 1
-        self._fir_taps = firwin(n_taps, output_rate / 2, fs=input_rate)
-        self._fir_state = np.zeros(len(self._fir_taps) - 1)
+        self._pitch_detected = False
+        self._pitch = CW_TONE
+        self._pitch_buf = np.zeros(0, dtype=np.float64)
+
+        from scipy.signal import butter, sosfilt_zi
+        # IIR lowpass for anti-alias before decimation
+        self._sos = butter(6, output_rate / 2, btype='low', fs=input_rate, output='sos')
+        self._zi = sosfilt_zi(self._sos) * 0
         self._dec_buf = np.zeros(0, dtype=np.float64)
-        self._peak = 1.0
+        self._peak = 0.0  # 0 so fast-attack triggers on first block; avoids ~2min ramp-up
+
+        # Optional FIR bandpass (post-decimation, at output_rate)
+        self._fir_taps = None
+        self._fir_zi = None
+        if cw_fir_bw > 0:
+            from scipy.signal import firwin, lfilter_zi
+            lo = max(50, CW_TONE - cw_fir_bw / 2)
+            hi = min(output_rate / 2 - 50, CW_TONE + cw_fir_bw / 2)
+            self._fir_taps = firwin(256, [lo, hi], fs=output_rate, pass_zero=False)
+            self._fir_zi = lfilter_zi(self._fir_taps, 1.0) * 0
+
+    @property
+    def detected_pitch(self):
+        return self._pitch
 
     def process(self, i_samples, q_samples):
         """Mix, filter, decimate IQ → int16 PCM bytes. Returns None if no output yet."""
-        from scipy.signal import lfilter
+        from scipy.signal import sosfilt
         n = len(i_samples)
         if n == 0:
             return None
@@ -489,8 +531,9 @@ class Channelizer:
         self.phase = (phases[-1] + phase_inc / self.input_rate) % (2 * np.pi)
 
         mixed = i_samples * np.cos(phases) + q_samples * np.sin(phases)
-        filtered, self._fir_state = lfilter(self._fir_taps, 1.0, mixed,
-                                            zi=self._fir_state)
+
+        # IIR lowpass for anti-alias before decimation
+        filtered, self._zi = sosfilt(self._sos, mixed, zi=self._zi)
         self._dec_buf = np.concatenate([self._dec_buf, filtered])
 
         n_out = len(self._dec_buf) // self.dec_factor
@@ -501,6 +544,31 @@ class Channelizer:
         decimated = self._dec_buf[:usable:self.dec_factor]
         self._dec_buf = self._dec_buf[usable:]
 
+        # Auto pitch detection: accumulate ~15s, find actual CW tone
+        if not self._pitch_detected:
+            self._pitch_buf = np.concatenate([self._pitch_buf, decimated])
+            needed = self.output_rate * 15
+            if len(self._pitch_buf) >= needed:
+                n_det = self.output_rate * 2
+                spectrum = np.abs(np.fft.rfft(
+                    self._pitch_buf[:n_det] * np.hanning(n_det)))
+                freqs = np.fft.rfftfreq(n_det, 1.0 / self.output_rate)
+                mask = (freqs >= 475) & (freqs <= 825)
+                if np.any(mask):
+                    peak_freq = freqs[mask][np.argmax(spectrum[mask])]
+                    self._pitch = max(450, min(850, int(round(peak_freq))))
+                    if abs(self._pitch - CW_TONE) > 5:
+                        log.info("Auto pitch: %d Hz (expected %d Hz)",
+                                 self._pitch, CW_TONE)
+                self._pitch_detected = True
+                self._pitch_buf = np.zeros(0)
+
+        # Optional FIR bandpass (bmorse path only)
+        if self._fir_taps is not None:
+            from scipy.signal import lfilter
+            decimated, self._fir_zi = lfilter(self._fir_taps, 1.0, decimated,
+                                               zi=self._fir_zi)
+
         if self.normalize == 'peak':
             peak = np.max(np.abs(decimated)) if len(decimated) > 0 else 0.0
             if peak > self._peak:
@@ -508,10 +576,10 @@ class Channelizer:
             else:
                 self._peak = 0.9999 * self._peak + 0.0001 * peak
             if self._peak > 0:
-                decimated = decimated / self._peak * 0.8
+                decimated = decimated / self._peak * 0.3
             pcm = np.clip(decimated * 32767, -32767, 32767).astype(np.int16).tobytes()
         else:  # fixed
-            pcm = np.clip(decimated * 0.2, -32000, 32000).astype(np.int16).tobytes()
+            pcm = np.clip(decimated * 10.0, -32000, 32000).astype(np.int16).tobytes()
 
         return pcm
 
@@ -522,15 +590,18 @@ class _SubprocessDecoder:
     Accepts pre-channelized PCM bytes from a shared Channelizer.
     """
 
-    def __init__(self, rf_khz, snr, cmd):
+    def __init__(self, rf_khz, snr, cmd, capture_wpm=False):
         self.rf_khz = rf_khz
         self.snr = snr
         self.decoded_text = ''
         self.total_chars = 0
         self.last_output = time.time()
+        self.detected_wpm = 0  # WPM from decoder (if capture_wpm=True)
+        self._capture_wpm = capture_wpm
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, bufsize=0,
+            stderr=subprocess.PIPE if capture_wpm else subprocess.DEVNULL,
+            bufsize=0,
         )
 
     def feed_pcm(self, pcm_bytes):
@@ -556,6 +627,21 @@ class _SubprocessDecoder:
             self.decoded_text += chars
             self.total_chars += len(chars)
             self.last_output = time.time()
+        # Read WPM from stderr (non-blocking)
+        if self._capture_wpm and self.process and self.process.stderr:
+            while True:
+                ready, _, _ = select.select([self.process.stderr], [], [], 0)
+                if not ready:
+                    break
+                line = self.process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode('latin-1', errors='replace').strip()
+                if text.startswith('WPM:'):
+                    try:
+                        self.detected_wpm = int(text[4:])
+                    except ValueError:
+                        pass
         return chars
 
     def kill(self):
@@ -591,37 +677,89 @@ class SignalGroup:
         self.last_seen = time.time()
         self.last_output = time.time()
 
-        # Shared channelizers — one FIR per output rate
+        # Shared channelizers — one filter per output rate
+        # NO FIR on uhsdr — breaks its AGC on isolated signals
         self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
-                                     normalize='fixed')
+                                     normalize='peak')
         self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
-                                  normalize='peak') if (bmorse_bin or hamfist_bin) else None
+                                  normalize='peak',
+                                  cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
 
-        # Decoder processes
+        # Two-pass decoder spawn:
+        #   Immediately: start uhsdr at default pitch (600 Hz) — no buffering
+        #   After pitch detection (~15s) + uhsdr WPM (or 10s timeout): start bmorse
+        self._decoder_bin = decoder_bin
+        self._speeds = speeds
+        self._bmorse_bin = bmorse_bin
+        self._hamfist_bin = hamfist_bin
+        self._hamfist_scp = hamfist_scp
+        self._wpm = wpm  # default WPM fallback
+        self._bmorse_started = False
+        self._bmorse_spawn_time = 0
+        self._pcm_buffer_4k = b''
+
+        # Start uhsdr immediately — no pitch wait, no buffering
         self.decoders = []
         for spd in speeds:
             cmd = [decoder_bin, '-r', str(DECODER_RATE), '-f', str(CW_TONE)]
             if spd > 0:
                 cmd += ['-s', str(spd)]
-            self.decoders.append(_SubprocessDecoder(rf_khz, snr, cmd))
+            self.decoders.append(_SubprocessDecoder(rf_khz, snr, cmd,
+                                                     capture_wpm=True))
 
         self.bmorse = None
-        if bmorse_bin:
-            cmd = [bmorse_bin, '-stdin', '-txt', '-agc',
-                   '-spd', str(wpm), '-frq', str(CW_TONE), '-rate', str(BMORSE_RATE)]
-            self.bmorse = _SubprocessDecoder(rf_khz, snr, cmd)
-
         self.hamfist = None
-        if hamfist_bin:
-            cmd = [hamfist_bin, '-stdin', '-frq', str(CW_TONE),
+
+    @property
+    def _decoders_started(self):
+        """Backwards compat — uhsdr starts immediately now."""
+        return True
+
+    def _start_bmorse(self, wpm, pitch):
+        """Start bmorse/hamfist with detected WPM and pitch.
+        Also respawn uhsdr at the detected pitch if it differs from CW_TONE."""
+        # Respawn uhsdr at detected pitch (was started at CW_TONE initially)
+        if pitch != CW_TONE:
+            for d in self.decoders:
+                d.kill()
+            self.decoders = []
+            for spd in self._speeds:
+                cmd = [self._decoder_bin, '-r', str(DECODER_RATE), '-f', str(pitch)]
+                if spd > 0:
+                    cmd += ['-s', str(spd)]
+                self.decoders.append(_SubprocessDecoder(self.rf_khz, self.snr, cmd,
+                                                         capture_wpm=True))
+            log.info("Respawned uhsdr at pitch=%d Hz for %.1f kHz", pitch, self.rf_khz)
+
+        if self._bmorse_bin:
+            cmd = [self._bmorse_bin, '-stdin', '-txt', '-agc',
+                   '-spd', str(wpm), '-frq', str(pitch), '-rate', str(BMORSE_RATE)]
+            self.bmorse = _SubprocessDecoder(self.rf_khz, self.snr, cmd)
+
+        if self._hamfist_bin:
+            cmd = [self._hamfist_bin, '-stdin', '-frq', str(pitch),
                    '-rate', str(BMORSE_RATE), '-spd', str(wpm)]
-            if hamfist_scp:
-                cmd += ['-scp', hamfist_scp]
-            self.hamfist = _SubprocessDecoder(rf_khz, snr, cmd)
+            if self._hamfist_scp:
+                cmd += ['-scp', self._hamfist_scp]
+            self.hamfist = _SubprocessDecoder(self.rf_khz, self.snr, cmd)
+
+        # Feed buffered 4kHz PCM
+        if self._pcm_buffer_4k:
+            if self.bmorse:
+                self.bmorse.feed_pcm(self._pcm_buffer_4k)
+            if self.hamfist:
+                self.hamfist.feed_pcm(self._pcm_buffer_4k)
+        self._pcm_buffer_4k = b''
+
+        self._bmorse_started = True
+        log.info("bmorse spawned: pitch=%d Hz, spd=%d for %.1f kHz",
+                 pitch, wpm, self.rf_khz)
 
     @property
     def count(self):
-        return (len(self.decoders)
+        # Include pending bmorse/hamfist (before they're spawned)
+        pending_aux = ((1 if self._bmorse_bin else 0) + (1 if self._hamfist_bin else 0)) if not self._bmorse_started else 0
+        return (pending_aux + len(self.decoders)
                 + (1 if self.bmorse else 0)
                 + (1 if self.hamfist else 0))
 
@@ -631,28 +769,73 @@ class SignalGroup:
                 + (self.bmorse.total_chars if self.bmorse else 0)
                 + (self.hamfist.total_chars if self.hamfist else 0))
 
+    @property
+    def uhsdr_wpm(self):
+        """WPM detected by uhsdr decoder (0 if not yet available)."""
+        for d in self.decoders:
+            if d.detected_wpm > 0:
+                return d.detected_wpm
+        return 0
+
     def feed_iq(self, i_samples, q_samples):
         pcm_12k = self._ch_uhsdr.process(i_samples, q_samples)
+
+        if self._ch_4k:
+            pcm_4k = self._ch_4k.process(i_samples, q_samples)
+        else:
+            pcm_4k = None
+
+        # uhsdr runs immediately — feed it always
         if pcm_12k:
             for d in self.decoders:
                 d.feed_pcm(pcm_12k)
 
-        if self._ch_4k:
-            pcm_4k = self._ch_4k.process(i_samples, q_samples)
+        # Two-pass: bmorse waits for pitch detection (~15s) + uhsdr WPM (or timeout)
+        if not self._bmorse_started:
             if pcm_4k:
-                if self.bmorse:
-                    self.bmorse.feed_pcm(pcm_4k)
-                if self.hamfist:
-                    self.hamfist.feed_pcm(pcm_4k)
+                self._pcm_buffer_4k += pcm_4k
+
+            # Wait for pitch detection first
+            pitch_ch = self._ch_4k if self._ch_4k else self._ch_uhsdr
+            if not pitch_ch._pitch_detected:
+                return
+
+            # Pitch ready — start WPM timeout if not already set
+            if self._bmorse_spawn_time == 0:
+                self._bmorse_spawn_time = time.time() + 10
+
+            pitch = pitch_ch.detected_pitch
+            uhsdr_wpm = self.uhsdr_wpm
+            if uhsdr_wpm > 0:
+                self._start_bmorse(uhsdr_wpm, pitch)
+            elif time.time() >= self._bmorse_spawn_time:
+                self._start_bmorse(self._wpm, pitch)  # fallback
+            return
+
+        # Steady state: feed bmorse/hamfist
+        if pcm_4k:
+            if self.bmorse:
+                self.bmorse.feed_pcm(pcm_4k)
+            if self.hamfist:
+                self.hamfist.feed_pcm(pcm_4k)
 
     def read(self):
-        """Returns list of (rf_khz, snr, new_text, accumulated_text)."""
+        """Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type)."""
         results = []
-        for d in self.decoders + ([self.bmorse] if self.bmorse else []) + \
-                                  ([self.hamfist] if self.hamfist else []):
+        for d in self.decoders:
             text = d.read()
             if text:
-                results.append((self.rf_khz, self.snr, text, d.decoded_text))
+                # Suppress uhsdr output before pitch respawn — pre-respawn
+                # output is noise from wrong pitch that generates false positives
+                if not self._bmorse_started:
+                    continue  # pitch not confirmed yet, discard
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
+                self.last_output = time.time()
+        for d in ([self.bmorse] if self.bmorse else []) + \
+                 ([self.hamfist] if self.hamfist else []):
+            text = d.read()
+            if text:
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
                 self.last_output = time.time()
         return results
 
@@ -696,6 +879,8 @@ class InstanceManager:
         # freq_key -> SignalGroup
         self.instances = {}
         self.center_khz = 0
+        # WPM cache: freq_key -> last known WPM (survives signal eviction)
+        self._wpm_cache = {}
 
     def update_signals(self, signals, center_khz, wpm_hint=0):
         """Update instance list based on detected signals.
@@ -711,21 +896,38 @@ class InstanceManager:
             key = int(round(offset / 100)) * 100
             if key in self.instances:
                 self.instances[key].last_seen = now
-                self.instances[key].snr = snr
+                self.instances[key].snr = max(self.instances[key].snr, snr)
 
-        spd = wpm_hint if wpm_hint > 0 else 30
+        spd = wpm_hint if wpm_hint > 0 else 25  # default 25 (contest CW center)
 
         # Spawn new SignalGroup for new signals
         for offset, snr in sorted(signals, key=lambda x: -x[1]):
             key = int(round(offset / 100)) * 100
             if key in self.instances:
                 continue
-            if self.count >= self.max_instances:
-                break
             if abs(offset) < 100:  # skip DC
                 continue
+            if self.count >= self.max_instances:
+                # Evict the lowest-SNR group if new signal is stronger
+                if not self.instances:
+                    break
+                weakest_key = min(self.instances, key=lambda k: self.instances[k].snr)
+                if snr <= self.instances[weakest_key].snr + 5:
+                    break  # new signal not significantly stronger, stop
+                evicted = self.instances.pop(weakest_key)
+                # Cache WPM from evicted signal for future respawns
+                evicted_wpm = evicted.uhsdr_wpm
+                if evicted_wpm > 0:
+                    self._wpm_cache[weakest_key] = evicted_wpm
+                log.info("Evicted %.1f kHz (%+.0f dB) for %.1f kHz (%+.0f dB)",
+                         center_khz + weakest_key/1000, evicted.snr,
+                         center_khz + offset/1000, snr)
+                evicted.kill()
 
             rf_khz = center_khz + offset / 1000
+            # Use cached WPM if available, otherwise default
+            cached_wpm = self._wpm_cache.get(key, 0)
+            signal_wpm = cached_wpm if cached_wpm > 0 else spd
             group = SignalGroup(
                 offset, rf_khz, self.sample_rate, snr,
                 decoder_bin=self.decoder_bin,
@@ -733,7 +935,7 @@ class InstanceManager:
                 bmorse_bin=self.bmorse_bin,
                 hamfist_bin=self.hamfist_bin,
                 hamfist_scp=self.hamfist_scp,
-                wpm=spd,
+                wpm=signal_wpm,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
@@ -750,6 +952,10 @@ class InstanceManager:
                 dead.append(key)
         for key in dead:
             group = self.instances.pop(key)
+            # Cache WPM for future respawns
+            dead_wpm = group.uhsdr_wpm
+            if dead_wpm > 0:
+                self._wpm_cache[key] = dead_wpm
             log.info("Killed %d decoders: %.1f kHz (%d chars total)",
                      group.count, group.rf_khz, group.total_chars)
             group.kill()
@@ -850,25 +1056,40 @@ class SpotTracker:
             prev = curr
         return prev[-1]
 
-    def process(self, freq_khz, snr, text, context_text=None):
+    def process(self, freq_khz, snr, text, context_text=None, decoder_id=0,
+                dec_type='primary'):
         """Process decoded text. Returns list of spot dicts.
 
         text: new text fragment (1-2 chars in streaming mode)
         context_text: full accumulated text from the decoder instance
+        dec_type: 'primary' (uhsdr) or 'secondary' (bmorse/hamfist).
+            Secondary decoders only contribute at frequencies where no primary
+            decoder has produced an exact SCP match.
         """
-        # Track processed length per frequency to avoid re-processing
+        # Track processed length per (frequency, decoder_id) to avoid re-processing.
+        # decoder_id is id(d) from SignalGroup.read() — stable for the decoder's
+        # lifetime, unique across concurrent decoders on the same frequency.
         freq_bin = int(round(freq_khz * 10))
+        cache_key = (freq_bin, decoder_id)
+
+        # Track which frequencies have primary exact matches
+        if not hasattr(self, '_primary_matched'):
+            self._primary_matched = set()  # freq_bins with primary exact SCP match
+
+        # Skip secondary decoder output at frequencies where primary already matched
+        if dec_type == 'secondary' and freq_bin in self._primary_matched:
+            return []
         if not hasattr(self, '_processed_len'):
             self._processed_len = {}
 
         full_text = context_text or text
-        prev_len = self._processed_len.get(freq_bin, 0)
+        prev_len = self._processed_len.get(cache_key, 0)
 
         # Only re-scan when we have 10+ new chars (avoid per-character overhead)
         if len(full_text) - prev_len < 10:
             return []
 
-        self._processed_len[freq_bin] = len(full_text)
+        self._processed_len[cache_key] = len(full_text)
 
         # Only process the NEW portion for fragment accumulation
         new_text = full_text[max(0, prev_len - 10):]  # overlap 10 chars for boundary
@@ -890,6 +1111,9 @@ class SpotTracker:
 
             if call in self.valid_calls:
                 seen_p1.add(call)
+                # Primary decoder exact match — suppress secondary decoders here
+                if dec_type == 'primary':
+                    self._primary_matched.add(freq_bin)
                 self._cycle_calls[call].add(freq_bin)
                 info = self._tracking[call]
                 info['count'] += 1
@@ -925,8 +1149,7 @@ class SpotTracker:
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
 
-                has_context = bool(CQ_PATTERNS.search(context_clean))
-                if (has_context or info['count'] >= 3) and \
+                if info['count'] >= 2 and \
                    (now - info['last_spotted']) >= self.respot_interval:
                     if len(self._cycle_calls[frag]) < 3:
                         info['last_spotted'] = now
@@ -989,7 +1212,7 @@ class SpotTracker:
                 consensus_str = ''.join(c for c, _ in consensus)
                 avg_confidence = sum(conf for _, conf in consensus) / len(consensus)
 
-                if avg_confidence < 0.70:  # need at least 70% agreement
+                if avg_confidence < 0.70 or len(frag_list) < 3:
                     continue
 
                 # Check consensus against SCP — exact first, then fuzzy
@@ -1014,7 +1237,7 @@ class SpotTracker:
                 else:
                     # Fuzzy SCP match on consensus
                     fuzzy = self._fuzzy_match(consensus_str, max_dist=1)
-                    if fuzzy and avg_confidence >= 0.80:
+                    if fuzzy and avg_confidence >= 0.90:
                         best_call, best_dist = min(fuzzy, key=lambda x: x[1])
                         info = self._tracking[best_call]
                         if (now - info['last_spotted']) >= self.respot_interval:
@@ -1060,7 +1283,9 @@ class OpenSkimmer:
         self.spot_count = 0
         self.start_time = None
         self._iq_lock = threading.Lock()
-        self._iq_buffer = []
+        self._iq_buffer = deque()  # (i,q) tuples for FFT scan, O(1) append/trim
+        self._feed_i = []          # numpy chunks for decoder feeding
+        self._feed_q = []
 
     async def start(self):
         self.start_time = time.time()
@@ -1094,9 +1319,13 @@ class OpenSkimmer:
         rx_sample_rate = self.cfg.get('sample_rate', 48000)
         sdr_port = self.cfg.get('sdr_port', 1024)
         listen_port = self.cfg.get('hpsdr_listen_port', sdr_port)
+        passive = self.cfg.get('passive', False)
+        rx_filter = self.cfg.get('rx_filter', None)
+        n_rx = self.cfg.get('max_receivers', 1)
         self.receiver = HPSDRReceiver(devices[0]['ip'], port=sdr_port,
-                                      n_receivers=1, sample_rate=rx_sample_rate,
-                                      listen_port=listen_port)
+                                      n_receivers=n_rx, sample_rate=rx_sample_rate,
+                                      listen_port=listen_port,
+                                      passive=passive, rx_filter=rx_filter)
         self.receiver.set_frequency(0, center)
         self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
 
@@ -1132,24 +1361,20 @@ class OpenSkimmer:
         log.info("Stopped: %d spots in %.0fs", self.spot_count, elapsed)
 
     def _iq_callback(self, rx_index, iq_samples):
-        """Called from HPSDR receiver thread."""
+        """Called from HPSDR receiver thread — buffer only, no processing."""
         try:
+            iq_arr = np.asarray(iq_samples, dtype=np.float64)
+            i_chunk = iq_arr[:, 0] * 8388608.0
+            q_chunk = iq_arr[:, 1] * 8388608.0
             with self._iq_lock:
                 self._iq_buffer.extend(iq_samples)
                 max_buf = self.cfg.get('sample_rate', 48000) * 10
-                if len(self._iq_buffer) > max_buf:
-                    del self._iq_buffer[:len(self._iq_buffer) - max_buf]
-
-            # Convert to numpy arrays and feed to all decoders
-            n = len(iq_samples)
-            i_arr = np.array([s[0] for s in iq_samples], dtype=np.float64)
-            q_arr = np.array([s[1] for s in iq_samples], dtype=np.float64)
-            # Scale from normalized floats to signal range
-            i_arr *= 8388608.0
-            q_arr *= 8388608.0
-            self.manager.feed_all_iq(i_arr, q_arr)
-        except Exception as e:
-            pass  # Don't let decoder errors kill the receiver thread
+                while len(self._iq_buffer) > max_buf:
+                    self._iq_buffer.popleft()
+                self._feed_i.append(i_chunk)
+                self._feed_q.append(q_chunk)
+        except Exception:
+            pass  # Don't let errors kill the receiver thread
 
     async def run(self):
         rx_thread = threading.Thread(
@@ -1168,6 +1393,22 @@ class OpenSkimmer:
         while self.running:
             now = time.time()
 
+            # Drain feed buffer and push to decoders (200ms cap to stay real-time)
+            # Cap CHUNKS before concatenate — avoids building huge arrays from backlogs
+            with self._iq_lock:
+                feed_i, feed_q = self._feed_i, self._feed_q
+                self._feed_i, self._feed_q = [], []
+            if feed_i:
+                live_rate = self.cfg.get('sample_rate', 48000)
+                chunk_size = len(feed_i[0]) if feed_i else 126
+                max_chunks = max(1, live_rate // 5 // chunk_size)  # ~200ms of chunks
+                if len(feed_i) > max_chunks:
+                    feed_i = feed_i[-max_chunks:]
+                    feed_q = feed_q[-max_chunks:]
+                i_cat = np.concatenate(feed_i)
+                q_cat = np.concatenate(feed_q)
+                self.manager.feed_all_iq(i_cat, q_cat)
+
             # Periodic signal scan
             if now - last_scan >= scan_interval:
                 last_scan = now
@@ -1175,22 +1416,20 @@ class OpenSkimmer:
 
                 live_rate = self.cfg.get('sample_rate', 48000)
                 fft_size = 8192
-                n_avg = max(1, int(live_rate * 2 / fft_size))  # ~2 seconds
-                needed = fft_size * n_avg
+                needed = fft_size
                 with self._iq_lock:
                     if len(self._iq_buffer) >= needed:
-                        buf = list(self._iq_buffer[-needed:])
+                        buf = list(itertools.islice(self._iq_buffer, len(self._iq_buffer) - needed, None))
                     else:
                         buf = None
 
                 if buf is not None:
                     iq_arr = np.array([complex(i, q) for i, q in buf])
-                    avg_psd = np.zeros(fft_size)
-                    for fi in range(n_avg):
-                        chunk = iq_arr[fi*fft_size:(fi+1)*fft_size]
-                        avg_psd += np.abs(np.fft.fft(chunk)) ** 2
-                    avg_psd /= n_avg
-                    psd_db = 10 * np.log10(avg_psd + 1e-20)
+                    # Blackman window — critical for CW burst signals
+                    # n_avg averaging without window destroys SNR for transient bursts
+                    window = np.blackman(fft_size)
+                    psd = np.abs(np.fft.fft(iq_arr * window)) ** 2
+                    psd_db = 10 * np.log10(psd + 1e-20)
                     noise = np.median(psd_db)
                     min_snr = self.cfg.get('signal_min_snr', 12)
 
@@ -1216,6 +1455,16 @@ class OpenSkimmer:
                             clustered[-1] = (freq, snr)
 
                     center_khz = self.receiver.frequencies[0] / 1000
+
+                    if True:  # log every scan for debugging
+                        log.info("noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
+                                 noise, noise + min_snr, len(self._iq_buffer))
+                        top = sorted(signals, key=lambda x: -x[1])[:10]
+                        for f, s in top:
+                            log.info("  PEAK %.3f kHz %.1f dB", center_khz + f/1000, s)
+                        if not top:
+                            log.info("  (no peaks above threshold)")
+
                     cw_min = self.cfg.get('cw_min_khz', 0)
                     cw_max = self.cfg.get('cw_max_khz', 99999)
                     if cw_min or cw_max < 99999:
@@ -1225,14 +1474,17 @@ class OpenSkimmer:
 
             # Collect decoder output
             results = self.manager.collect_all()
-            for rf_khz, snr, text, ctx in results:
+            for rf_khz, snr, text, ctx, dec_id, dec_type in results:
                 log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
-                # Skip pure noise: require at least one token of 3+ chars
-                # This filters digital mode garbage (PSK, WSPR) and speed mismatches
-                tokens = text.split()
-                if not any(len(t) >= 3 for t in tokens):
+                # Skip pure noise until enough alphanumeric chars have accumulated
+                # for a callsign to be present. Streaming decoders (fldigi_cw)
+                # output one char at a time with spaces between — splitting never
+                # yields multi-char tokens, so check collapsed alnum length instead.
+                alnum = re.sub(r'[^A-Z0-9]', '', (ctx or text).upper())
+                if len(alnum) < 4:
                     continue
-                spots = self.tracker.process(rf_khz, snr, text, ctx)
+                spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                             dec_type=dec_type)
                 for spot in spots:
                     self.spot_count += 1
                     self.telnet.broadcast_spot(
@@ -1255,7 +1507,7 @@ class OpenSkimmer:
                          self.spot_count, self.manager.count,
                          self.telnet.client_count, total_chars, elapsed)
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.025)
 
 
 def load_config(path):
@@ -1490,10 +1742,11 @@ def run_file_mode(args, config):
 
             # Collect output periodically
             results = manager.collect_all()
-            for rf_khz, snr, text, ctx in results:
+            for rf_khz, snr, text, ctx, dec_id, dec_type in results:
                 total_chars += len(text)
                 total_results += 1
-                spots = tracker.process(rf_khz, snr, text, ctx)
+                spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                        dec_type=dec_type)
                 for spot in spots:
                     all_spots.append(spot)
                     log.info("SPOT: %.1f kHz %s %d dB [%s]",
@@ -1504,10 +1757,11 @@ def run_file_mode(args, config):
         import time as _time
         _time.sleep(0.5)
         results = manager.collect_all()
-        for rf_khz, snr, text, ctx in results:
+        for rf_khz, snr, text, ctx, dec_id, dec_type in results:
             total_chars += len(text)
             total_results += 1
-            spots = tracker.process(rf_khz, snr, text, ctx)
+            spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                    dec_type=dec_type)
             for spot in spots:
                 all_spots.append(spot)
 

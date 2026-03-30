@@ -1336,10 +1336,16 @@ int main(int argc, char *argv[]) {
     
     fprintf(stderr, "uhsdr_cw: rate=%.0f freq=%.0f wpm=%d\n", snd_rate, freq, wpm);
     
-    // Set output callback
+    // Set output callback — also emit WPM on stderr when speed changes
     cw_output_callback = [](char ch, int wpm) {
+        static int last_wpm = 0;
         putchar(ch);
         fflush(stdout);
+        if (wpm > 0 && wpm != last_wpm) {
+            fprintf(stderr, "WPM:%d\n", wpm);
+            fflush(stderr);
+            last_wpm = wpm;
+        }
     };
     
     // Initialize decoder
