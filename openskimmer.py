@@ -658,6 +658,89 @@ class _SubprocessDecoder:
             self.process = None
 
 
+# Load uhsdr library once at module level
+_uhsdr_lib = None
+def _get_uhsdr_lib():
+    global _uhsdr_lib
+    if _uhsdr_lib is None:
+        import ctypes as _ct
+        try:
+            _uhsdr_lib = _ct.CDLL('./libuhsdr_cw.so')
+            _uhsdr_lib.uhsdr_init.restype = _ct.c_void_p
+            _uhsdr_lib.uhsdr_init.argtypes = [_ct.c_float, _ct.c_float, _ct.c_int]
+            _uhsdr_lib.uhsdr_feed.restype = _ct.c_int
+            _uhsdr_lib.uhsdr_feed.argtypes = [_ct.c_void_p, _ct.POINTER(_ct.c_int16),
+                                               _ct.c_int, _ct.c_char_p, _ct.c_int]
+            _uhsdr_lib.uhsdr_get_wpm.restype = _ct.c_int
+            _uhsdr_lib.uhsdr_get_wpm.argtypes = [_ct.c_void_p]
+            _uhsdr_lib.uhsdr_free.restype = None
+            _uhsdr_lib.uhsdr_free.argtypes = [_ct.c_void_p]
+            log.info("Loaded libuhsdr_cw.so")
+        except OSError:
+            log.warning("libuhsdr_cw.so not found — falling back to subprocess decoders")
+    return _uhsdr_lib
+
+
+class _LibDecoder:
+    """In-process CW decoder via libuhsdr_cw.so (ctypes).
+
+    Same interface as _SubprocessDecoder: feed_pcm(), read(), kill().
+    No subprocess, no pipe — direct function calls.
+    """
+
+    def __init__(self, rf_khz, snr, freq, sample_rate=12000, wpm=0):
+        import ctypes as _ct
+        self.rf_khz = rf_khz
+        self.snr = snr
+        self.decoded_text = ''
+        self.total_chars = 0
+        self.last_output = time.time()
+        self.detected_wpm = 0
+        self._outbuf = _ct.create_string_buffer(4096)
+        self._pending = ''
+
+        lib = _get_uhsdr_lib()
+        self._lib = lib
+        self._handle = lib.uhsdr_init(_ct.c_float(freq),
+                                       _ct.c_float(sample_rate),
+                                       _ct.c_int(wpm)) if lib else None
+
+    def feed_pcm(self, pcm_bytes):
+        if not self._handle:
+            return
+        import ctypes as _ct
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if len(samples) == 0:
+            return
+        # Ensure contiguous memory
+        if not samples.flags['C_CONTIGUOUS']:
+            samples = np.ascontiguousarray(samples)
+        n = self._lib.uhsdr_feed(
+            self._handle,
+            samples.ctypes.data_as(_ct.POINTER(_ct.c_int16)),
+            len(samples),
+            self._outbuf, 4096)
+        if n > 0:
+            chars = self._outbuf.value[:n].decode('latin-1', errors='replace')
+            self._pending += chars
+            self.decoded_text += chars
+            self.total_chars += n
+            self.last_output = time.time()
+            wpm = self._lib.uhsdr_get_wpm(self._handle)
+            if wpm > 0:
+                self.detected_wpm = wpm
+
+    def read(self):
+        text = self._pending
+        self._pending = ''
+        return text
+
+    def kill(self):
+        if self._handle:
+            self._lib.uhsdr_free(self._handle)
+            self._handle = None
+
+
 class SignalGroup:
     """One CW signal: shared channelization + all decoder processes.
 
@@ -700,12 +783,17 @@ class SignalGroup:
 
         # Start uhsdr immediately — no pitch wait, no buffering
         self.decoders = []
+        lib = _get_uhsdr_lib()
         for spd in speeds:
-            cmd = [decoder_bin, '-r', str(DECODER_RATE), '-f', str(CW_TONE)]
-            if spd > 0:
-                cmd += ['-s', str(spd)]
-            self.decoders.append(_SubprocessDecoder(rf_khz, snr, cmd,
-                                                     capture_wpm=True))
+            if lib:
+                dec = _LibDecoder(rf_khz, snr, freq=CW_TONE,
+                                  sample_rate=DECODER_RATE, wpm=spd)
+            else:
+                cmd = [decoder_bin, '-r', str(DECODER_RATE), '-f', str(CW_TONE)]
+                if spd > 0:
+                    cmd += ['-s', str(spd)]
+                dec = _SubprocessDecoder(rf_khz, snr, cmd, capture_wpm=True)
+            self.decoders.append(dec)
 
         self.bmorse = None
         self.hamfist = None
@@ -723,12 +811,17 @@ class SignalGroup:
             for d in self.decoders:
                 d.kill()
             self.decoders = []
+            lib = _get_uhsdr_lib()
             for spd in self._speeds:
-                cmd = [self._decoder_bin, '-r', str(DECODER_RATE), '-f', str(pitch)]
-                if spd > 0:
-                    cmd += ['-s', str(spd)]
-                self.decoders.append(_SubprocessDecoder(self.rf_khz, self.snr, cmd,
-                                                         capture_wpm=True))
+                if lib:
+                    dec = _LibDecoder(self.rf_khz, self.snr, freq=pitch,
+                                      sample_rate=DECODER_RATE, wpm=spd)
+                else:
+                    cmd = [self._decoder_bin, '-r', str(DECODER_RATE), '-f', str(pitch)]
+                    if spd > 0:
+                        cmd += ['-s', str(spd)]
+                    dec = _SubprocessDecoder(self.rf_khz, self.snr, cmd, capture_wpm=True)
+                self.decoders.append(dec)
             log.info("Respawned uhsdr at pitch=%d Hz for %.1f kHz", pitch, self.rf_khz)
 
         if self._bmorse_bin:
