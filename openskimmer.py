@@ -721,14 +721,14 @@ class _LibDecoder:
             len(samples),
             self._outbuf, 4096)
         if n > 0:
+            wpm = self._lib.uhsdr_get_wpm(self._handle)
+            if wpm > 0:
+                self.detected_wpm = wpm
             chars = self._outbuf.value[:n].decode('latin-1', errors='replace')
             self._pending += chars
             self.decoded_text += chars
             self.total_chars += n
             self.last_output = time.time()
-            wpm = self._lib.uhsdr_get_wpm(self._handle)
-            if wpm > 0:
-                self.detected_wpm = wpm
 
     def read(self):
         text = self._pending
