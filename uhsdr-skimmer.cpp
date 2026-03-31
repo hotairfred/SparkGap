@@ -223,7 +223,55 @@ float *channelize(float *i_samples, float *q_samples, int n, int sampleRate,
     return out;
 }
 
-// Find exact signal frequency using FFT peak detection
+// Find exact signal frequency using complex IQ FFT peak detection
+// Handles negative frequencies (signals below center)
+float findPeakFreqIQ(float *i_samp, float *q_samp, int n, int sampleRate,
+                     float approxFreq, float tolerance) {
+    int fftSize = 8192;
+    if (n < fftSize) fftSize = n;
+
+    fftw_complex *in = (fftw_complex *)fftw_malloc(fftSize * sizeof(fftw_complex));
+    fftw_complex *out = (fftw_complex *)fftw_malloc(fftSize * sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(fftSize, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+
+    // Window + copy IQ
+    for (int i = 0; i < fftSize; i++) {
+        double w = 0.5 * (1.0 - cos(2.0 * M_PI * i / (fftSize - 1)));
+        in[i][0] = i_samp[i] * w;  // real = I
+        in[i][1] = q_samp[i] * w;  // imag = Q
+    }
+    fftw_execute(plan);
+
+    // Complex FFT: bin k = k * sampleRate / fftSize for k < N/2
+    //              bin k = (k - N) * sampleRate / fftSize for k >= N/2
+    float freqRes = (float)sampleRate / fftSize;
+
+    // Convert approxFreq to bin range (handle negative frequencies)
+    float loFreq = approxFreq - tolerance;
+    float hiFreq = approxFreq + tolerance;
+
+    float maxMag = 0;
+    int maxBin = 0;
+    for (int k = 0; k < fftSize; k++) {
+        float f = (k < fftSize / 2) ? k * freqRes : (k - fftSize) * freqRes;
+        if (f >= loFreq && f <= hiFreq) {
+            float mag = sqrt(out[k][0] * out[k][0] + out[k][1] * out[k][1]);
+            if (mag > maxMag) {
+                maxMag = mag;
+                maxBin = k;
+            }
+        }
+    }
+
+    fftw_destroy_plan(plan);
+    fftw_free(in);
+    fftw_free(out);
+
+    float result = (maxBin < fftSize / 2) ? maxBin * freqRes : (maxBin - fftSize) * freqRes;
+    return result;
+}
+
+// Find peak in real-valued audio (for pitch detection in channelized audio)
 float findPeakFreq(float *samples, int n, int sampleRate, float approxFreq, float tolerance) {
     int fftSize = 8192;
     if (n < fftSize) fftSize = n;
@@ -232,14 +280,12 @@ float findPeakFreq(float *samples, int n, int sampleRate, float approxFreq, floa
     fftw_complex *out = (fftw_complex *)fftw_malloc((fftSize / 2 + 1) * sizeof(fftw_complex));
     fftw_plan plan = fftw_plan_dft_r2c_1d(fftSize, in, out, FFTW_ESTIMATE);
 
-    // Window + copy
     for (int i = 0; i < fftSize; i++) {
         double w = 0.5 * (1.0 - cos(2.0 * M_PI * i / (fftSize - 1)));
         in[i] = samples[i] * w;
     }
     fftw_execute(plan);
 
-    // Find peak near approxFreq
     float freqRes = (float)sampleRate / fftSize;
     int lobin = (int)((approxFreq - tolerance) / freqRes);
     int hibin = (int)((approxFreq + tolerance) / freqRes);
@@ -340,12 +386,29 @@ int main(int argc, char *argv[]) {
     for (int ch = 0; ch < numChannels; ch++) {
         float freq = channelFreqs[ch];
 
-        // Find exact peak (use I channel for FFT)
-        float exactFreq = findPeakFreq(i_samples, n, sr, freq, chanWidth / 2);
+        // Find exact peak using complex IQ FFT
+        float exactFreq = findPeakFreqIQ(i_samples, q_samples, n, sr, freq, chanWidth / 2);
 
-        // Channelize (IQ)
+        // Step 1: Channelize first 15s at default pitch for pitch detection
+        int pitchSamples = (n < sr * 15) ? n : sr * 15;
+        int pitchOutLen;
+        float *pitchAudio = channelize(i_samples, q_samples, pitchSamples, sr,
+                                        exactFreq, cwPitch, targetRate, &pitchOutLen);
+
+        if (pitchOutLen < 1000) {
+            free(pitchAudio);
+            continue;
+        }
+
+        // Step 2: Find actual tone frequency in channelized audio
+        float actualPitch = findPeakFreq(pitchAudio, pitchOutLen, targetRate, cwPitch, 200);
+        free(pitchAudio);
+
+        // Step 3: Re-channelize full signal with corrected center
+        float correctedCenter = exactFreq + (actualPitch - cwPitch);
         int outLen;
-        float *chanAudio = channelize(i_samples, q_samples, n, sr, exactFreq, cwPitch, targetRate, &outLen);
+        float *chanAudio = channelize(i_samples, q_samples, n, sr,
+                                       correctedCenter, cwPitch, targetRate, &outLen);
 
         if (outLen < 1000) {
             free(chanAudio);
@@ -361,6 +424,10 @@ int main(int argc, char *argv[]) {
             pcm[i] = (int16_t)v;
         }
         free(chanAudio);
+
+        if (fabs(actualPitch - cwPitch) > 5.0f)
+            fprintf(stderr, "  ch %d: %.0f Hz → pitch %.0f → corrected %.0f Hz\n",
+                    ch, exactFreq, actualPitch, correctedCenter);
 
         // Decode in-process via uhsdr library
         uhsdr_handle_t decoder = uhsdr_init(cwPitch, (float)targetRate, wpm);
