@@ -741,6 +741,86 @@ class _LibDecoder:
             self._handle = None
 
 
+# Load bmorse library
+_bmorse_lib = None
+def _get_bmorse_lib():
+    global _bmorse_lib
+    if _bmorse_lib is None:
+        import ctypes as _ct
+        try:
+            _bmorse_lib = _ct.CDLL('./libbmorse.so')
+            _bmorse_lib.bmorse_create.restype = _ct.c_void_p
+            _bmorse_lib.bmorse_create.argtypes = [_ct.c_float, _ct.c_float, _ct.c_int]
+            _bmorse_lib.bmorse_feed.restype = _ct.c_int
+            _bmorse_lib.bmorse_feed.argtypes = [_ct.c_void_p, _ct.POINTER(_ct.c_int16),
+                                                 _ct.c_int, _ct.c_char_p, _ct.c_int]
+            _bmorse_lib.bmorse_get_wpm.restype = _ct.c_int
+            _bmorse_lib.bmorse_get_wpm.argtypes = [_ct.c_void_p]
+            _bmorse_lib.bmorse_destroy.restype = None
+            _bmorse_lib.bmorse_destroy.argtypes = [_ct.c_void_p]
+            log.info("Loaded libbmorse.so")
+        except OSError:
+            pass  # bmorse library not available
+    return _bmorse_lib
+
+
+class _LibBmorseDecoder:
+    """In-process Bayesian CW decoder via libbmorse.so.
+
+    Same interface as _LibDecoder. Used as second-pass fallback
+    on signals uhsdr couldn't decode.
+    """
+
+    def __init__(self, rf_khz, snr, freq, sample_rate=4000, wpm=25):
+        import ctypes as _ct
+        self.rf_khz = rf_khz
+        self.snr = snr
+        self.decoded_text = ''
+        self.total_chars = 0
+        self.last_output = time.time()
+        self.detected_wpm = 0
+        self._outbuf = _ct.create_string_buffer(4096)
+        self._pending = ''
+
+        lib = _get_bmorse_lib()
+        self._lib = lib
+        self._handle = lib.bmorse_create(_ct.c_float(freq),
+                                          _ct.c_float(sample_rate),
+                                          _ct.c_int(wpm)) if lib else None
+
+    def feed_pcm(self, pcm_bytes):
+        if not self._handle:
+            return
+        import ctypes as _ct
+        # bmorse library needs ctypes array, not numpy (segfaults with -O1+)
+        n_samples = len(pcm_bytes) // 2
+        if n_samples == 0:
+            return
+        SampArr = _ct.c_int16 * n_samples
+        samples = SampArr.from_buffer_copy(pcm_bytes)
+        n = self._lib.bmorse_feed(self._handle, samples, n_samples,
+                                   self._outbuf, 4096)
+        if n > 0:
+            chars = self._outbuf.value[:n].decode('latin-1', errors='replace')
+            self._pending += chars
+            self.decoded_text += chars
+            self.total_chars += n
+            self.last_output = time.time()
+            wpm = self._lib.bmorse_get_wpm(self._handle)
+            if wpm > 0:
+                self.detected_wpm = wpm
+
+    def read(self):
+        text = self._pending
+        self._pending = ''
+        return text
+
+    def kill(self):
+        if self._handle:
+            self._lib.bmorse_destroy(self._handle)
+            self._handle = None
+
+
 class SignalGroup:
     """One CW signal: shared channelization + all decoder processes.
 
@@ -764,6 +844,8 @@ class SignalGroup:
         # NO FIR on uhsdr — breaks its AGC on isolated signals
         self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
                                      normalize='peak')
+        # 4kHz channelizer: only if bmorse subprocess configured (not for library fallback)
+        # Library fallback creates its own channelizer lazily when triggered
         self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
                                   normalize='peak',
                                   cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
@@ -780,6 +862,11 @@ class SignalGroup:
         self._bmorse_started = False
         self._bmorse_spawn_time = 0
         self._pcm_buffer_4k = b''
+
+        # Second-pass bmorse fallback (spawned when uhsdr produces little)
+        self._bmorse_fallback = None
+        self._bmorse_fallback_time = 0  # when to check if uhsdr failed
+        self._bmorse_fallback_started = False
 
         # Start uhsdr immediately — no pitch wait, no buffering
         self.decoders = []
@@ -905,12 +992,42 @@ class SignalGroup:
                 self._start_bmorse(self._wpm, pitch)  # fallback
             return
 
-        # Steady state: feed bmorse/hamfist
+        # Steady state: feed bmorse/hamfist (subprocess, if configured)
         if pcm_4k:
             if self.bmorse:
                 self.bmorse.feed_pcm(pcm_4k)
             if self.hamfist:
                 self.hamfist.feed_pcm(pcm_4k)
+
+        # Second-pass bmorse fallback: spawn libbmorse when uhsdr hasn't decoded
+        if not self._bmorse_fallback_started:
+            if self._bmorse_fallback_time == 0 and self._bmorse_started:
+                self._bmorse_fallback_time = time.time() + 30  # check after 30s
+            if self._bmorse_fallback_time > 0 and time.time() >= self._bmorse_fallback_time:
+                # Check if uhsdr produced enough useful output
+                uhsdr_chars = sum(d.total_chars for d in self.decoders)
+                clean_chars = uhsdr_chars  # rough proxy — includes [err] tags
+                if clean_chars < 50:  # uhsdr struggling on this signal
+                    bmlib = _get_bmorse_lib()
+                    if bmlib:
+                        pitch_ch = self._ch_4k if self._ch_4k else self._ch_uhsdr
+                        pitch = pitch_ch.detected_pitch if pitch_ch._pitch_detected else CW_TONE
+                        wpm = self.uhsdr_wpm if self.uhsdr_wpm > 0 else 25
+                        self._bmorse_fallback = _LibBmorseDecoder(
+                            self.rf_khz, self.snr, freq=pitch,
+                            sample_rate=BMORSE_RATE, wpm=wpm)
+                        # Create lazy 4kHz channelizer for bmorse fallback
+                        if self._ch_4k is None:
+                            self._ch_4k = Channelizer(
+                                self.freq_offset, self._ch_uhsdr.input_rate,
+                                BMORSE_RATE, normalize='peak', cw_fir_bw=400)
+                        log.info("bmorse fallback: pitch=%d wpm=%d for %.1f kHz (uhsdr had %d chars)",
+                                 pitch, wpm, self.rf_khz, uhsdr_chars)
+                self._bmorse_fallback_started = True
+
+        # Feed bmorse fallback if active
+        if pcm_4k and self._bmorse_fallback:
+            self._bmorse_fallback.feed_pcm(pcm_4k)
 
     def read(self):
         """Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type)."""
@@ -925,7 +1042,8 @@ class SignalGroup:
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
                 self.last_output = time.time()
         for d in ([self.bmorse] if self.bmorse else []) + \
-                 ([self.hamfist] if self.hamfist else []):
+                 ([self.hamfist] if self.hamfist else []) + \
+                 ([self._bmorse_fallback] if self._bmorse_fallback else []):
             text = d.read()
             if text:
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
@@ -939,6 +1057,9 @@ class SignalGroup:
             self.bmorse.kill()
         if self.hamfist:
             self.hamfist.kill()
+        if self._bmorse_fallback:
+            self._bmorse_fallback.kill()
+            self._bmorse_fallback = None
 
     def all_processes(self):
         """Yield all subprocess decoders with (rf_khz, snr, process) tuples."""
