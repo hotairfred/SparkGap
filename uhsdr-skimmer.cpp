@@ -381,8 +381,11 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "bmorse: %d WPM, %.0f Hz pitch, %d cores\n", wpm, cwPitch, numCores);
 
     int processed = 0;
-    char tmpPath[] = "/tmp/bmorse_ch.wav";
 
+    omp_set_num_threads(numCores);
+    fprintf(stderr, "Running with %d OpenMP threads\n", numCores);
+
+    #pragma omp parallel for schedule(dynamic) reduction(+:processed)
     for (int ch = 0; ch < numChannels; ch++) {
         float freq = channelFreqs[ch];
 
@@ -425,12 +428,18 @@ int main(int argc, char *argv[]) {
         }
         free(chanAudio);
 
-        if (fabs(actualPitch - cwPitch) > 5.0f)
+        if (fabs(actualPitch - cwPitch) > 5.0f) {
+            #pragma omp critical
             fprintf(stderr, "  ch %d: %.0f Hz → pitch %.0f → corrected %.0f Hz\n",
                     ch, exactFreq, actualPitch, correctedCenter);
+        }
 
-        // Decode in-process via uhsdr library
-        uhsdr_handle_t decoder = uhsdr_init(cwPitch, (float)targetRate, wpm);
+        // Decode in-process via uhsdr library (init uses globals, needs critical section)
+        uhsdr_handle_t decoder;
+        #pragma omp critical
+        {
+            decoder = uhsdr_init(cwPitch, (float)targetRate, wpm);
+        }
         if (decoder) {
             char outBuf[4096];
             // Feed in 1-second chunks
@@ -440,8 +449,11 @@ int main(int argc, char *argv[]) {
                 int nchars = uhsdr_feed(decoder, pcm + pos, feedLen, outBuf, sizeof(outBuf));
                 if (nchars > 0) {
                     outBuf[nchars] = '\0';
-                    printf("%.1f:%.0f:%d:%s\n", exactFreq, cwPitch, uhsdr_get_wpm(decoder), outBuf);
-                    fflush(stdout);
+                    #pragma omp critical
+                    {
+                        printf("%.1f:%.0f:%d:%s\n", exactFreq, cwPitch, uhsdr_get_wpm(decoder), outBuf);
+                        fflush(stdout);
+                    }
                 }
             }
             uhsdr_free(decoder);
