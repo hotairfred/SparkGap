@@ -1002,12 +1002,16 @@ class SignalGroup:
         # Second-pass bmorse fallback: spawn libbmorse when uhsdr hasn't decoded
         if not self._bmorse_fallback_started:
             if self._bmorse_fallback_time == 0 and self._bmorse_started:
-                self._bmorse_fallback_time = time.time() + 30  # check after 30s
+                self._bmorse_fallback_time = time.time() + 20  # check after 20s
             if self._bmorse_fallback_time > 0 and time.time() >= self._bmorse_fallback_time:
-                # Check if uhsdr produced enough useful output
-                uhsdr_chars = sum(d.total_chars for d in self.decoders)
-                clean_chars = uhsdr_chars  # rough proxy — includes [err] tags
-                if clean_chars < 50:  # uhsdr struggling on this signal
+                # Count REAL decoded chars (exclude [err] and bracket tags)
+                real_chars = 0
+                for d in self.decoders:
+                    text = d.decoded_text
+                    # Strip [err], [?], <xx> tags — count only real letters/digits/spaces
+                    clean = re.sub(r'\[.*?\]|<.*?>', '', text)
+                    real_chars += sum(1 for c in clean if c.isalnum())
+                if real_chars < 20:  # uhsdr struggling on this signal
                     bmlib = _get_bmorse_lib()
                     if bmlib:
                         pitch_ch = self._ch_4k if self._ch_4k else self._ch_uhsdr
@@ -1021,8 +1025,8 @@ class SignalGroup:
                             self._ch_4k = Channelizer(
                                 self.freq_offset, self._ch_uhsdr.input_rate,
                                 BMORSE_RATE, normalize='peak', cw_fir_bw=400)
-                        log.info("bmorse fallback: pitch=%d wpm=%d for %.1f kHz (uhsdr had %d chars)",
-                                 pitch, wpm, self.rf_khz, uhsdr_chars)
+                        log.info("bmorse fallback: pitch=%d wpm=%d for %.1f kHz (uhsdr had %d real chars)",
+                                 pitch, wpm, self.rf_khz, real_chars)
                 self._bmorse_fallback_started = True
 
         # Feed bmorse fallback if active
