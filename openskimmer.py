@@ -1100,6 +1100,8 @@ class SpotTracker:
         self._tracking = defaultdict(lambda: {
             'freq': 0, 'count': 0, 'last_spotted': 0, 'snr': 0
         })
+        # Per-frequency sighting counts: (call, freq_bin) → count
+        self._freq_sightings = defaultdict(int)
 
         # Temporal fragment accumulation per frequency bin (100 Hz resolution)
         # freq_bin -> {fragment: count}
@@ -1254,6 +1256,12 @@ class SpotTracker:
                         })
 
         # --- Path 2: Fragment accumulation + fuzzy match ---
+        # Secondary decoders (bmorse) skip fragment accumulation — their noise
+        # output pollutes the accumulator and generates false positives.
+        # They only contribute via Path 1 exact SCP matches above.
+        if dec_type == 'secondary':
+            return spots
+
         # Extract callsign-shaped fragments from collapsed text
         # (spaces in decoded text break up callsigns — collapse them)
         collapsed = re.sub(r'[^A-Z0-9]', '', clean)
