@@ -44,10 +44,18 @@ struct bmorse_state {
     double fft_phase;
     int nominal_wpm;
 
-    // Noise estimation
-    float noise_buf[200];    // 1-second circular buffer
-    int noise_pos;
-    float noise_estimate;
+    // AGC state
+    double agc_peak;
+
+    // Envelope smoothing filter (sliding window average, matches bmorse's filter())
+    double env_filter_buf[100];
+    double env_filter_sum;
+    int env_filter_pos;
+    int env_filter_len;
+    int env_filter_init;
+
+    // Noise estimation (handled by morse::noise_() method)
+    float rn;  // noise estimate from morse::noise_()
 
     // Speed tracking
     float speed_wpm;
@@ -88,20 +96,7 @@ static float detect_envelope_fft(bmorse_state *s, float sample) {
     return 0.0f;
 }
 
-// Update noise estimate (running minimum of windowed averages)
-static void update_noise(bmorse_state *s, float env) {
-    s->noise_buf[s->noise_pos] = env;
-    s->noise_pos = (s->noise_pos + 1) % 200;
-
-    // Simple noise floor: percentile of buffer
-    // Full sort is expensive — use running min of recent window
-    float mn = 1e10f;
-    for (int i = 0; i < 200; i++) {
-        if (s->noise_buf[i] < mn) mn = s->noise_buf[i];
-    }
-    // Smooth noise estimate
-    s->noise_estimate = 0.99f * s->noise_estimate + 0.01f * (mn + 0.001f);
-}
+// Noise estimation handled by morse::noise_() — no separate function needed
 
 
 extern "C" {
@@ -117,15 +112,27 @@ bmorse_handle_t bmorse_create(float freq, float sample_rate, int wpm)
     if (s->dec_ratio < 1) s->dec_ratio = 1;
     s->dec_counter = 0;
 
+    // Set global params to match (process_data uses globals)
+    params.sample_rate = sample_rate;
+    params.frequency = freq;
+    params.speed = wpm;
+    params.dec_ratio = s->dec_ratio;
+    params.agc = TRUE;
+    params.print_text = TRUE;
+
     // Envelope detection via FFT filter
     s->nominal_wpm = wpm > 0 ? wpm : 25;
     s->fft_phase = 0.0;
     init_fft_filter(s);
 
-    // Noise
-    memset(s->noise_buf, 0, sizeof(s->noise_buf));
-    s->noise_pos = 0;
-    s->noise_estimate = 0.001f;
+    // AGC + envelope filter + noise
+    s->agc_peak = 0.0;
+    s->rn = 0.1f;
+    s->env_filter_len = 10;
+    s->env_filter_sum = 0.0;
+    s->env_filter_pos = 0;
+    s->env_filter_init = 1;
+    memset(s->env_filter_buf, 0, sizeof(s->env_filter_buf));
 
     // Create decoder
     s->decoder = new morse();
@@ -168,10 +175,39 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
             if (s->dec_counter % s->dec_ratio != 0) continue;  // decimate
 
             // Demodulate: magnitude = envelope
-            float env = (float)zp[fi].mag();
+            double x = zp[fi].mag();
 
-            // Update noise estimate
-            update_noise(s, env);
+            // Envelope smoothing filter (same as bmorse's filter() function)
+            if (s->env_filter_init) {
+                s->env_filter_init = 0;
+                for (int k = 0; k < s->env_filter_len; k++)
+                    s->env_filter_buf[k] = x;
+                s->env_filter_sum = x * s->env_filter_len;
+                s->env_filter_pos = 0;
+            }
+            s->env_filter_sum = s->env_filter_sum - s->env_filter_buf[s->env_filter_pos] + x;
+            s->env_filter_buf[s->env_filter_pos] = x;
+            if (++s->env_filter_pos >= s->env_filter_len) s->env_filter_pos = 0;
+            x = s->env_filter_sum / s->env_filter_len;
+
+            // AGC (same as bmorse's process_data)
+            if (x > s->agc_peak)
+                s->agc_peak = s->agc_peak * (1.0 - 1.0/10.0) + x * (1.0/10.0);   // fast attack
+            else
+                s->agc_peak = s->agc_peak * (1.0 - 1.0/800.0) + x * (1.0/800.0);  // slow decay
+            if (s->agc_peak > 0.0) {
+                x /= s->agc_peak;
+                if (x > 1.0) x = 1.0;
+                if (x < 0.0) x = 0.0;
+            } else {
+                x = 0.0;
+            }
+
+            // Noise estimation + signal conditioning via morse::noise_()
+            float zout;
+            s->decoder->noise_((float)x, &s->rn, &zout);
+            if (zout > 1.0f) zout = 1.0f;
+            if (zout < 0.0f) zout = 0.0f;
 
             // Feed to Bayesian decoder
             long int xhat, elmhat, imax;
@@ -179,8 +215,8 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
             char buf[64] = {0};
 
             int result = s->decoder->proces_(
-                env,                    // z: envelope sample
-                s->noise_estimate,      // rn: noise estimate
+                zout,                   // z: noise-corrected envelope
+                s->rn,                  // rn: noise estimate
                 &xhat,                  // keystate estimate
                 &px,                    // keystate probability
                 &elmhat,               // element estimate
