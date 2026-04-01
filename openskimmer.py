@@ -844,8 +844,8 @@ class SignalGroup:
         # NO FIR on uhsdr — breaks its AGC on isolated signals
         self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
                                      normalize='peak')
-        # 4kHz channelizer: only if bmorse subprocess configured (not for library fallback)
-        # Library fallback creates its own channelizer lazily when triggered
+        # 4kHz channelizer: only if bmorse subprocess configured
+        # Always-on 4kHz doubles CPU per slot — proven to degrade at 50 slots
         self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
                                   normalize='peak',
                                   cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
