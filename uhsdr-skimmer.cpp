@@ -462,6 +462,7 @@ int main(int argc, char *argv[]) {
         free(pcm);
 
         // Also run bmorse (Bayesian) at 4kHz on the same signal
+        // bmorse globals are NOT thread-safe — entire bmorse block must be critical
         {
             int bmRate = 4000;
             int bmOutLen;
@@ -476,27 +477,23 @@ int main(int argc, char *argv[]) {
                     bmPcm[i] = (int16_t)v;
                 }
 
-                bmorse_handle_t bm;
-                #pragma omp critical
+                #pragma omp critical (bmorse_section)
                 {
-                    bm = bmorse_create(cwPitch, (float)bmRate, wpm);
-                }
-                if (bm) {
-                    char bmOut[4096];
-                    int bmChunk = bmRate;  // 1s chunks
-                    for (int pos = 0; pos < bmOutLen; pos += bmChunk) {
-                        int feedLen = (pos + bmChunk <= bmOutLen) ? bmChunk : bmOutLen - pos;
-                        int nc = bmorse_feed(bm, bmPcm + pos, feedLen, bmOut, sizeof(bmOut));
-                        if (nc > 0) {
-                            bmOut[nc] = '\0';
-                            #pragma omp critical
-                            {
+                    bmorse_handle_t bm = bmorse_create(cwPitch, (float)bmRate, wpm);
+                    if (bm) {
+                        char bmOut[4096];
+                        int bmChunk = bmRate;
+                        for (int pos = 0; pos < bmOutLen; pos += bmChunk) {
+                            int feedLen = (pos + bmChunk <= bmOutLen) ? bmChunk : bmOutLen - pos;
+                            int nc = bmorse_feed(bm, bmPcm + pos, feedLen, bmOut, sizeof(bmOut));
+                            if (nc > 0) {
+                                bmOut[nc] = '\0';
                                 printf("B:%.1f:%.0f:%d:%s\n", exactFreq, cwPitch, bmorse_get_wpm(bm), bmOut);
                                 fflush(stdout);
                             }
                         }
+                        bmorse_destroy(bm);
                     }
-                    bmorse_destroy(bm);
                 }
                 free(bmPcm);
             }
