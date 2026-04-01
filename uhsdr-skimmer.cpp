@@ -23,6 +23,7 @@
 #include <fftw3.h>
 #include <omp.h>
 #include "uhsdr_cw_lib.h"
+#include "libbmorse.h"
 
 // WAV header parser (16/24-bit PCM, mono or stereo)
 struct WavHeader {
@@ -459,6 +460,48 @@ int main(int argc, char *argv[]) {
             uhsdr_free(decoder);
         }
         free(pcm);
+
+        // Also run bmorse (Bayesian) at 4kHz on the same signal
+        {
+            int bmRate = 4000;
+            int bmOutLen;
+            float *bmAudio = channelize(i_samples, q_samples, n, sr,
+                                         correctedCenter, cwPitch, bmRate, &bmOutLen);
+            if (bmAudio && bmOutLen > 1000) {
+                int16_t *bmPcm = (int16_t *)malloc(bmOutLen * sizeof(int16_t));
+                for (int i = 0; i < bmOutLen; i++) {
+                    float v = bmAudio[i] * 32767.0f * 0.3f;
+                    if (v > 32767.0f) v = 32767.0f;
+                    if (v < -32768.0f) v = -32768.0f;
+                    bmPcm[i] = (int16_t)v;
+                }
+
+                bmorse_handle_t bm;
+                #pragma omp critical
+                {
+                    bm = bmorse_create(cwPitch, (float)bmRate, wpm);
+                }
+                if (bm) {
+                    char bmOut[4096];
+                    int bmChunk = bmRate;  // 1s chunks
+                    for (int pos = 0; pos < bmOutLen; pos += bmChunk) {
+                        int feedLen = (pos + bmChunk <= bmOutLen) ? bmChunk : bmOutLen - pos;
+                        int nc = bmorse_feed(bm, bmPcm + pos, feedLen, bmOut, sizeof(bmOut));
+                        if (nc > 0) {
+                            bmOut[nc] = '\0';
+                            #pragma omp critical
+                            {
+                                printf("B:%.1f:%.0f:%d:%s\n", exactFreq, cwPitch, bmorse_get_wpm(bm), bmOut);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                    bmorse_destroy(bm);
+                }
+                free(bmPcm);
+            }
+            free(bmAudio);
+        }
 
         processed++;
 
