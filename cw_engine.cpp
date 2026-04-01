@@ -222,10 +222,8 @@ channel_t channel_create(float offset_hz, float sample_rate)
     ch->uhsdr_dec_factor = (int)(sample_rate / UHSDR_RATE);
     ch->bmorse_dec_factor = (int)(sample_rate / BMORSE_RATE);
 
-    /* uhsdr FIR: cutoff at UHSDR_RATE/2 * 0.8, taps proportional to decimation */
-    ch->uhsdr_fir_len = ch->uhsdr_dec_factor * 4 + 1;
-    if (ch->uhsdr_fir_len > 255) ch->uhsdr_fir_len = 255;
-    if (ch->uhsdr_fir_len % 2 == 0) ch->uhsdr_fir_len++;
+    /* uhsdr FIR: 255 taps for 16× decimation (192k→12k needs strong stopband) */
+    ch->uhsdr_fir_len = 255;
     ch->uhsdr_fir = design_fir(ch->uhsdr_fir_len, UHSDR_RATE / 2.0f * 0.8f, sample_rate);
     ch->uhsdr_fir_buf = (float *)calloc(ch->uhsdr_fir_len, sizeof(float));
     ch->uhsdr_fir_pos = 0;
