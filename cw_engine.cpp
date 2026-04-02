@@ -95,12 +95,17 @@ struct channel_state {
     float  detected_pitch;
 
     /* Ring buffers for deferred replay (first 15s) */
-    int16_t *uhsdr_ring;       /* 12kHz int16 buffer */
+    int16_t *uhsdr_ring;
     int      uhsdr_ring_len;
-    int      uhsdr_ring_cap;   /* UHSDR_RATE * 15 */
-    int16_t *bmorse_ring;      /* 4kHz int16 buffer */
+    int      uhsdr_ring_cap;
+    int16_t *bmorse_ring;
     int      bmorse_ring_len;
-    int      bmorse_ring_cap;  /* BMORSE_RATE * 15 */
+    int      bmorse_ring_cap;
+
+    /* Amortized replay cursors */
+    int      uhsdr_replay_pos;
+    int      bmorse_replay_pos;
+    bool     replaying;
 
     /* Decoder handles (created after pitch detection) */
     uhsdr_handle_t uhsdr;
@@ -267,6 +272,9 @@ channel_t channel_create(float offset_hz, float sample_rate)
     ch->bmorse_ring_cap = BMORSE_RATE * 15;
     ch->bmorse_ring = (int16_t *)calloc(ch->bmorse_ring_cap, sizeof(int16_t));
     ch->bmorse_ring_len = 0;
+    ch->uhsdr_replay_pos = 0;
+    ch->bmorse_replay_pos = 0;
+    ch->replaying = false;
 
     ch->uhsdr_text_len = 0;
     ch->bmorse_text_len = 0;
@@ -426,34 +434,51 @@ int channel_feed_iq(channel_t h,
         ch->uhsdr = uhsdr_init(ch->detected_pitch, (float)UHSDR_RATE, 0);
         ch->bmorse = bmorse_create(ch->detected_pitch, (float)BMORSE_RATE, 0);
 
-        /* Replay buffered audio through decoders (in chunks to avoid blocking) */
-        {
-            int chunk = 1200;  /* ~100ms at 12kHz */
-            for (int k = 0; k < ch->uhsdr_ring_len; k += chunk) {
-                int len = (k + chunk <= ch->uhsdr_ring_len) ? chunk : ch->uhsdr_ring_len - k;
-                int nc = uhsdr_feed(ch->uhsdr, &ch->uhsdr_ring[k], len, dec_buf, sizeof(dec_buf));
-                if (nc > 0 && ch->uhsdr_text_len + nc < 8191) {
-                    memcpy(ch->uhsdr_text + ch->uhsdr_text_len, dec_buf, nc);
-                    ch->uhsdr_text_len += nc;
-                }
+        /* Start amortized replay — will feed one chunk per feed_iq call */
+        ch->uhsdr_replay_pos = 0;
+        ch->bmorse_replay_pos = 0;
+        ch->replaying = true;
+        ch->decoders_started = true;
+    }
+
+    /* Amortized replay: feed one chunk of buffered audio per call */
+    if (ch->replaying) {
+        /* Replay uhsdr buffer (~100ms per call = 1200 samples at 12kHz) */
+        int u_chunk = 1200;
+        if (ch->uhsdr_replay_pos < ch->uhsdr_ring_len) {
+            int len = ch->uhsdr_ring_len - ch->uhsdr_replay_pos;
+            if (len > u_chunk) len = u_chunk;
+            int nc = uhsdr_feed(ch->uhsdr, &ch->uhsdr_ring[ch->uhsdr_replay_pos],
+                                len, dec_buf, sizeof(dec_buf));
+            if (nc > 0 && ch->uhsdr_text_len + nc < 8191) {
+                memcpy(ch->uhsdr_text + ch->uhsdr_text_len, dec_buf, nc);
+                ch->uhsdr_text_len += nc;
             }
-        }
-        {
-            int chunk = 400;  /* ~100ms at 4kHz */
-            for (int k = 0; k < ch->bmorse_ring_len; k += chunk) {
-                int len = (k + chunk <= ch->bmorse_ring_len) ? chunk : ch->bmorse_ring_len - k;
-                int nc = bmorse_feed(ch->bmorse, &ch->bmorse_ring[k], len, dec_buf, sizeof(dec_buf));
-                if (nc > 0 && ch->bmorse_text_len + nc < 8191) {
-                    memcpy(ch->bmorse_text + ch->bmorse_text_len, dec_buf, nc);
-                    ch->bmorse_text_len += nc;
-                }
-            }
+            ch->uhsdr_replay_pos += len;
         }
 
-        /* Free ring buffers */
-        free(ch->uhsdr_ring); ch->uhsdr_ring = NULL;
-        free(ch->bmorse_ring); ch->bmorse_ring = NULL;
-        ch->decoders_started = true;
+        /* Replay bmorse buffer (~100ms per call = 400 samples at 4kHz) */
+        int b_chunk = 400;
+        if (ch->bmorse_replay_pos < ch->bmorse_ring_len) {
+            int len = ch->bmorse_ring_len - ch->bmorse_replay_pos;
+            if (len > b_chunk) len = b_chunk;
+            int nc = bmorse_feed(ch->bmorse, &ch->bmorse_ring[ch->bmorse_replay_pos],
+                                 len, dec_buf, sizeof(dec_buf));
+            if (nc > 0 && ch->bmorse_text_len + nc < 8191) {
+                memcpy(ch->bmorse_text + ch->bmorse_text_len, dec_buf, nc);
+                ch->bmorse_text_len += nc;
+            }
+            ch->bmorse_replay_pos += len;
+        }
+
+        /* Done replaying? Free buffers */
+        if (ch->uhsdr_replay_pos >= ch->uhsdr_ring_len &&
+            ch->bmorse_replay_pos >= ch->bmorse_ring_len) {
+            free(ch->uhsdr_ring); ch->uhsdr_ring = NULL;
+            free(ch->bmorse_ring); ch->bmorse_ring = NULL;
+            ch->replaying = false;
+        }
+        return spot_count;  /* skip new IQ processing during replay */
     }
 
     /* Extract spots from accumulated text — with per-channel dedup */
