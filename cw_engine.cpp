@@ -255,7 +255,7 @@ channel_t channel_create(float offset_hz, float sample_rate)
     ch->recent_count = 0;
 
     /* Pitch detection: 15s of 12kHz audio = 180000 samples */
-    ch->pitch_buf_cap = UHSDR_RATE * 15;
+    ch->pitch_buf_cap = 0;
     ch->pitch_buf = (float *)calloc(ch->pitch_buf_cap, sizeof(float));
     ch->pitch_buf_len = 0;
     ch->pitch_detected = false;
