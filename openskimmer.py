@@ -821,6 +821,124 @@ class _LibBmorseDecoder:
             self._handle = None
 
 
+# Load cw_engine library (C++ channelizer + dual decoder)
+_cw_engine_lib = None
+_cw_engine_initialized = False
+
+def _get_cw_engine():
+    global _cw_engine_lib, _cw_engine_initialized
+    if _cw_engine_lib is not None:
+        return _cw_engine_lib
+    if _cw_engine_initialized:
+        return None  # already tried, not available
+    _cw_engine_initialized = True
+    import ctypes as _ct
+    try:
+        _cw_engine_lib = _ct.CDLL('./libcw_engine.so')
+
+        class _CWSpot(_ct.Structure):
+            _fields_ = [('callsign', _ct.c_char * 16), ('freq_offset_hz', _ct.c_float),
+                        ('snr_db', _ct.c_float), ('wpm', _ct.c_int), ('decoder', _ct.c_int)]
+
+        _cw_engine_lib._CWSpot = _CWSpot
+        _cw_engine_lib.cw_engine_init.restype = _ct.c_int
+        _cw_engine_lib.cw_engine_init.argtypes = [_ct.c_char_p]
+        _cw_engine_lib.channel_create.restype = _ct.c_void_p
+        _cw_engine_lib.channel_create.argtypes = [_ct.c_float, _ct.c_float]
+        _cw_engine_lib.channel_set_pitch.restype = None
+        _cw_engine_lib.channel_set_pitch.argtypes = [_ct.c_void_p, _ct.c_float]
+        _cw_engine_lib.channel_feed_iq.restype = _ct.c_int
+        _cw_engine_lib.channel_feed_iq.argtypes = [_ct.c_void_p,
+            _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
+            _ct.c_int, _ct.POINTER(_CWSpot), _ct.c_int]
+        _cw_engine_lib.channel_get_wpm.restype = _ct.c_int
+        _cw_engine_lib.channel_get_wpm.argtypes = [_ct.c_void_p]
+        _cw_engine_lib.channel_destroy.restype = None
+        _cw_engine_lib.channel_destroy.argtypes = [_ct.c_void_p]
+        _cw_engine_lib.cw_engine_shutdown.restype = None
+
+        # Init SCP database
+        scp_path = 'COMBINED.SCP' if os.path.exists('COMBINED.SCP') else 'MASTER.SCP'
+        ret = _cw_engine_lib.cw_engine_init(scp_path.encode())
+        if ret != 0:
+            log.warning("cw_engine_init failed")
+            _cw_engine_lib = None
+            return None
+
+        log.info("Loaded libcw_engine.so (C++ channelizer + dual decoder)")
+    except OSError:
+        pass
+    return _cw_engine_lib
+
+
+class _CWEngineChannel:
+    """Per-signal channel using C++ cw_engine (channelizer + uhsdr + bmorse).
+
+    Replaces Channelizer + _LibDecoder. Feeds raw IQ directly to C++.
+    Returns decoded spot dicts compatible with SpotTracker.
+    """
+
+    def __init__(self, freq_offset, rf_khz, snr, sample_rate):
+        import ctypes as _ct
+        self.rf_khz = rf_khz
+        self.snr = snr
+        self.freq_offset = freq_offset
+        self.decoded_text = ''
+        self.total_chars = 0
+        self.last_output = time.time()
+        self.detected_wpm = 0
+
+        eng = _get_cw_engine()
+        self._eng = eng
+        self._handle = eng.channel_create(
+            _ct.c_float(freq_offset), _ct.c_float(sample_rate)) if eng else None
+        self._spot_buf = (eng._CWSpot * 100)() if eng else None
+        self._pending_spots = []
+
+    def feed_iq(self, i_samples, q_samples):
+        """Feed raw IQ (float arrays) — C++ does channelization + decode."""
+        if not self._handle or len(i_samples) == 0:
+            return
+        import ctypes as _ct
+        i_f = np.ascontiguousarray(i_samples, dtype=np.float32)
+        q_f = np.ascontiguousarray(q_samples, dtype=np.float32)
+        n = self._eng.channel_feed_iq(
+            self._handle,
+            i_f.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+            q_f.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+            len(i_f), self._spot_buf, 100)
+        if n > 0:
+            for si in range(n):
+                call = self._spot_buf[si].callsign.decode('latin-1').strip('\x00')
+                dec = 'uhsdr' if self._spot_buf[si].decoder == 0 else 'bmorse'
+                wpm = self._spot_buf[si].wpm
+                self._pending_spots.append({
+                    'call': call,
+                    'freq_khz': self.rf_khz,
+                    'snr': self.snr,
+                    'method': f'cw_engine_{dec}',
+                    'wpm': wpm,
+                })
+            self.last_output = time.time()
+            self.detected_wpm = self._eng.channel_get_wpm(self._handle)
+
+    def set_pitch(self, pitch_hz):
+        if self._handle:
+            import ctypes as _ct
+            self._eng.channel_set_pitch(self._handle, _ct.c_float(pitch_hz))
+
+    def read_spots(self):
+        """Return pending spots and clear buffer."""
+        spots = self._pending_spots
+        self._pending_spots = []
+        return spots
+
+    def kill(self):
+        if self._handle:
+            self._eng.channel_destroy(self._handle)
+            self._handle = None
+
+
 class SignalGroup:
     """One CW signal: shared channelization + all decoder processes.
 
@@ -840,15 +958,22 @@ class SignalGroup:
         self.last_seen = time.time()
         self.last_output = time.time()
 
-        # Shared channelizers — one filter per output rate
-        # NO FIR on uhsdr — breaks its AGC on isolated signals
-        self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
-                                     normalize='peak')
-        # 4kHz channelizer: only if bmorse subprocess configured
-        # Always-on 4kHz doubles CPU per slot — proven to degrade at 50 slots
-        self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
-                                  normalize='peak',
-                                  cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
+        # Try C++ cw_engine first (owns channelization + both decoders)
+        self._cw_engine = None
+        eng = _get_cw_engine()
+        if eng:
+            self._cw_engine = _CWEngineChannel(freq_offset, rf_khz, snr, sample_rate)
+
+        # Fallback: Python channelizers (only if cw_engine not available)
+        if not self._cw_engine:
+            self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
+                                         normalize='peak')
+            self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
+                                      normalize='peak',
+                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
+        else:
+            self._ch_uhsdr = None
+            self._ch_4k = None
 
         # Two-pass decoder spawn:
         #   Immediately: start uhsdr at default pitch (600 Hz) — no buffering
@@ -937,7 +1062,8 @@ class SignalGroup:
 
     @property
     def count(self):
-        # Include pending bmorse/hamfist (before they're spawned)
+        if self._cw_engine:
+            return 2  # uhsdr + bmorse in C++
         pending_aux = ((1 if self._bmorse_bin else 0) + (1 if self._hamfist_bin else 0)) if not self._bmorse_started else 0
         return (pending_aux + len(self.decoders)
                 + (1 if self.bmorse else 0)
@@ -958,6 +1084,12 @@ class SignalGroup:
         return 0
 
     def feed_iq(self, i_samples, q_samples):
+        # C++ cw_engine path: feed raw IQ directly, skip Python channelizer
+        if self._cw_engine:
+            self._cw_engine.feed_iq(i_samples, q_samples)
+            return
+
+        # Fallback: Python channelizer path
         pcm_12k = self._ch_uhsdr.process(i_samples, q_samples)
 
         if self._ch_4k:
@@ -1033,9 +1165,17 @@ class SignalGroup:
         if pcm_4k and self._bmorse_fallback:
             self._bmorse_fallback.feed_pcm(pcm_4k)
 
+    def read_engine_spots(self):
+        """Return spots from C++ cw_engine (already SCP-validated)."""
+        if self._cw_engine:
+            return self._cw_engine.read_spots()
+        return []
+
     def read(self):
         """Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type)."""
         results = []
+        if self._cw_engine:
+            return results  # cw_engine spots handled via read_engine_spots()
         for d in self.decoders:
             text = d.read()
             if text:
@@ -1055,6 +1195,10 @@ class SignalGroup:
         return results
 
     def kill(self):
+        if self._cw_engine:
+            self._cw_engine.kill()
+            self._cw_engine = None
+            return
         for d in self.decoders:
             d.kill()
         if self.bmorse:
@@ -1186,12 +1330,19 @@ class InstanceManager:
     def collect_all(self):
         """Read decoded text from all groups.
 
-        Returns list of (rf_khz, snr, new_text, accumulated_text).
+        Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type).
         """
         results = []
         for group in list(self.instances.values()):
             results.extend(group.read())
         return results
+
+    def collect_engine_spots(self):
+        """Read pre-validated spots from C++ cw_engine channels."""
+        spots = []
+        for group in list(self.instances.values()):
+            spots.extend(group.read_engine_spots())
+        return spots
 
     def kill_all(self):
         for group in self.instances.values():
@@ -1698,7 +1849,20 @@ class OpenSkimmer:
                                      if cw_min <= center_khz + f/1000 <= cw_max]
                     self.manager.update_signals(clustered, center_khz)
 
-            # Collect decoder output
+            # Collect C++ engine spots (pre-validated, bypass SpotTracker)
+            engine_spots = self.manager.collect_engine_spots()
+            for spot in engine_spots:
+                self.spot_count += 1
+                self.telnet.broadcast_spot(
+                    freq_khz=spot['freq_khz'],
+                    dx_call=spot['call'],
+                    snr=spot['snr'],
+                )
+                method = spot.get('method', 'cw_engine')
+                log.info("*** SPOT: %10.1f  %-12s  %d dB  [%s] ***",
+                         spot['freq_khz'], spot['call'], spot['snr'], method)
+
+            # Collect Python decoder output (fallback path)
             results = self.manager.collect_all()
             for rf_khz, snr, text, ctx, dec_id, dec_type in results:
                 log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
