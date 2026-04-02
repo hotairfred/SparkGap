@@ -106,6 +106,11 @@ struct channel_state {
     int    pitch_buf_cap;
     bool   pitch_detected;
 
+    /* Speed-adaptive bmorse (respawn with correct WPM) */
+    bool   bmorse_fir_adapted;
+    int    last_wpm;
+    long   samples_fed;
+
     /* Per-channel spot dedup (wall clock) */
     recent_spot recent[MAX_RECENT_SPOTS];
     int recent_count;
@@ -254,11 +259,16 @@ channel_t channel_create(float offset_hz, float sample_rate)
     ch->bmorse_text_len = 0;
     ch->recent_count = 0;
 
-    /* Pitch detection: 15s of 12kHz audio = 180000 samples */
+    /* Pitch detection: disabled for now */
     ch->pitch_buf_cap = 0;
-    ch->pitch_buf = (float *)calloc(ch->pitch_buf_cap, sizeof(float));
+    ch->pitch_buf = NULL;
     ch->pitch_buf_len = 0;
-    ch->pitch_detected = false;
+    ch->pitch_detected = true;  /* skip pitch detection */
+
+    /* Speed-adaptive bmorse */
+    ch->bmorse_fir_adapted = true; // disabled — respawn hurts
+    ch->last_wpm = 0;
+    ch->samples_fed = 0;
 
     return (channel_t)ch;
 }
@@ -291,6 +301,7 @@ int channel_feed_iq(channel_t h,
 
     int spot_count = 0;
     char dec_buf[4096];
+    ch->samples_fed += n;
 
     for (int i = 0; i < n; i++) {
         /* SSB mix: I*cos + Q*sin → mono audio with CW tone at pitch_hz */
@@ -413,6 +424,30 @@ int channel_feed_iq(channel_t h,
                 memcpy(ch->bmorse_text + ch->bmorse_text_len, dec_buf, nc);
                 ch->bmorse_text_len += nc;
             }
+        }
+    }
+
+    /* Speed-adaptive bmorse narrow bandpass (after decimation, before bmorse) */
+    /* NOTE: This does NOT touch the bmorse anti-alias FIR (that stays for decimation).
+       Instead, we apply an additional narrow CW bandpass on the decimated 4kHz audio.
+       The bandpass is implemented inline in the bmorse feed path above — but we need
+       a separate filter state. For now, leave this as TODO and test if the basic
+       approach of narrowing at the bmorse.so's internal FFT filter level works instead.
+       bmorse already has an internal FFT filter (fftfilt) — its bandwidth was set at
+       bmorse_create time. A simpler approach: destroy and recreate bmorse with a
+       tighter bandwidth when WPM stabilizes. */
+    if (!ch->bmorse_fir_adapted && ch->uhsdr) {
+        int wpm = uhsdr_get_wpm(ch->uhsdr);
+        if (wpm > 0) ch->last_wpm = wpm;
+
+        /* After 30s (enough for uhsdr to lock), recreate bmorse with tight BW */
+        if (ch->last_wpm > 0 && ch->samples_fed > (int)(ch->sample_rate * 30)) {
+            if (ch->bmorse) bmorse_destroy(ch->bmorse);
+            ch->bmorse = bmorse_create(ch->pitch_hz, (float)BMORSE_RATE, ch->last_wpm);
+            ch->bmorse_text_len = 0;
+            ch->bmorse_fir_adapted = true;
+            fprintf(stderr, "  bmorse respawn: WPM=%d for offset %.0f\n",
+                    ch->last_wpm, ch->offset_hz);
         }
     }
 
