@@ -888,6 +888,8 @@ class _CWEngineChannel:
         self.last_output = time.time()
         self.detected_wpm = 0
 
+        self._sample_rate = sample_rate
+
         eng = _get_cw_engine()
         self._eng = eng
         self._handle = eng.channel_create(
@@ -895,10 +897,46 @@ class _CWEngineChannel:
         self._spot_buf = (eng._CWSpot * 100)() if eng else None
         self._pending_spots = []
 
+        # Pitch detection state
+        self._pitch_detected = False
+        self._pitch_buf = np.zeros(0, dtype=np.float64)
+        self._mix_phase = 0.0
+
     def feed_iq(self, i_samples, q_samples):
-        """Feed raw IQ (float arrays) — C++ does channelization + decode."""
+        """Feed raw IQ (float arrays) — C++ does channelization + decode.
+        Also runs pitch detection on first 15s and retunes if needed."""
         if not self._handle or len(i_samples) == 0:
             return
+
+        # Pitch detection disabled — Python SSB mix doesn't match C++ FIR path
+        # TODO: add pitch detection inside cw_engine.cpp instead
+        if False and not self._pitch_detected:
+            # Quick SSB mix to find tone (same as Channelizer)
+            n = len(i_samples)
+            t = np.arange(n) / self._sample_rate
+            mix_freq = self.freq_offset - CW_TONE
+            mixed = i_samples * np.cos(2 * np.pi * mix_freq * t + self._mix_phase)  \
+                  + q_samples * np.sin(2 * np.pi * mix_freq * t + self._mix_phase)
+            self._mix_phase += 2 * np.pi * mix_freq * n / self._sample_rate
+            # Decimate to ~12kHz for pitch analysis
+            dec = int(self._sample_rate / 12000)
+            if dec > 1:
+                decimated = mixed[::dec]
+            else:
+                decimated = mixed
+            self._pitch_buf = np.concatenate([self._pitch_buf, decimated])
+            if len(self._pitch_buf) >= 12000 * 15:  # 15s at 12kHz
+                spec = np.abs(np.fft.rfft(self._pitch_buf[:24000] * np.hanning(24000)))
+                freqs = np.fft.rfftfreq(24000, 1.0 / 12000)
+                mask = (freqs >= 475) & (freqs <= 825)
+                if np.any(mask):
+                    peak_freq = freqs[mask][np.argmax(spec[mask])]
+                    pitch = max(450, min(850, int(round(peak_freq))))
+                    if abs(pitch - CW_TONE) > 5:
+                        self.set_pitch(pitch)
+                        log.info("cw_engine pitch: %d Hz for %.1f kHz", pitch, self.rf_khz)
+                self._pitch_detected = True
+                self._pitch_buf = np.zeros(0)  # free memory
         import ctypes as _ct
         i_f = np.ascontiguousarray(i_samples, dtype=np.float32)
         q_f = np.ascontiguousarray(q_samples, dtype=np.float32)

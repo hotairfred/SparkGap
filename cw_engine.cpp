@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <set>
 #include <string>
+#include <chrono>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -57,7 +58,7 @@ static float *design_fir(int ntaps, float cutoff, float sample_rate) {
 
 struct recent_spot {
     char callsign[16];
-    double emit_time;
+    std::chrono::steady_clock::time_point emit_time;
 };
 
 struct channel_state {
@@ -98,11 +99,9 @@ struct channel_state {
     char bmorse_text[8192];
     int  bmorse_text_len;
 
-    /* Per-channel spot dedup */
+    /* Per-channel spot dedup (wall clock) */
     recent_spot recent[MAX_RECENT_SPOTS];
     int recent_count;
-    double channel_time;       /* seconds of audio processed */
-    int    samples_fed;
 };
 
 /* ─── SCP matching ─────────────────────────────────────────────── */
@@ -247,8 +246,6 @@ channel_t channel_create(float offset_hz, float sample_rate)
     ch->uhsdr_text_len = 0;
     ch->bmorse_text_len = 0;
     ch->recent_count = 0;
-    ch->channel_time = 0.0;
-    ch->samples_fed = 0;
 
     return (channel_t)ch;
 }
@@ -281,9 +278,6 @@ int channel_feed_iq(channel_t h,
 
     int spot_count = 0;
     char dec_buf[4096];
-
-    ch->samples_fed += n;
-    ch->channel_time = (double)ch->samples_fed / ch->sample_rate;
 
     for (int i = 0; i < n; i++) {
         /* SSB mix: I*cos + Q*sin → mono audio with CW tone at pitch_hz */
@@ -368,13 +362,17 @@ int channel_feed_iq(channel_t h,
                 if (strcmp(frag, "TEST") == 0) continue;
                 if (!g_scp.count(std::string(frag))) continue;
 
-                /* Per-channel dedup: skip if emitted in last 60s */
+                /* Per-channel dedup: skip if emitted in last 60s (wall clock) */
+                auto now = std::chrono::steady_clock::now();
                 bool recently_emitted = false;
                 for (int k = 0; k < ch->recent_count; k++) {
-                    if (strcmp(ch->recent[k].callsign, frag) == 0 &&
-                        ch->channel_time - ch->recent[k].emit_time < DEDUP_WINDOW_SEC) {
-                        recently_emitted = true;
-                        break;
+                    if (strcmp(ch->recent[k].callsign, frag) == 0) {
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                            now - ch->recent[k].emit_time).count();
+                        if (elapsed < (int)DEDUP_WINDOW_SEC) {
+                            recently_emitted = true;
+                            break;
+                        }
                     }
                 }
                 if (recently_emitted) continue;
@@ -388,12 +386,12 @@ int channel_feed_iq(channel_t h,
                 spots[spot_count].decoder = decoder_id;
                 spot_count++;
 
-                /* Record in dedup list */
-                if (ch->recent_count < MAX_RECENT_SPOTS) {
-                    strncpy(ch->recent[ch->recent_count].callsign, frag, 15);
-                    ch->recent[ch->recent_count].emit_time = ch->channel_time;
-                    ch->recent_count++;
-                }
+                /* Record in dedup list (circular overwrite if full) */
+                int slot = ch->recent_count < MAX_RECENT_SPOTS ?
+                           ch->recent_count++ :
+                           (ch->recent_count++ % MAX_RECENT_SPOTS);
+                strncpy(ch->recent[slot].callsign, frag, 15);
+                ch->recent[slot].emit_time = now;
             }
         }
     };
