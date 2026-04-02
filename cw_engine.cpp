@@ -90,7 +90,19 @@ struct channel_state {
     /* Peak normalization */
     float peak;
 
-    /* Decoder handles */
+    /* Deferred decoder spawn state */
+    bool   decoders_started;
+    float  detected_pitch;
+
+    /* Ring buffers for deferred replay (first 15s) */
+    int16_t *uhsdr_ring;       /* 12kHz int16 buffer */
+    int      uhsdr_ring_len;
+    int      uhsdr_ring_cap;   /* UHSDR_RATE * 15 */
+    int16_t *bmorse_ring;      /* 4kHz int16 buffer */
+    int      bmorse_ring_len;
+    int      bmorse_ring_cap;  /* BMORSE_RATE * 15 */
+
+    /* Decoder handles (created after pitch detection) */
     uhsdr_handle_t uhsdr;
     bmorse_handle_t bmorse;
 
@@ -100,15 +112,6 @@ struct channel_state {
     char bmorse_text[8192];
     int  bmorse_text_len;
 
-    /* Pitch detection (runs on uhsdr FIR output after 15s) */
-    float *pitch_buf;          /* accumulate 12kHz decimated audio */
-    int    pitch_buf_len;
-    int    pitch_buf_cap;
-    bool   pitch_detected;
-
-    /* Speed-adaptive bmorse (respawn with correct WPM) */
-    bool   bmorse_fir_adapted;
-    int    last_wpm;
     long   samples_fed;
 
     /* Per-channel spot dedup (wall clock) */
@@ -251,23 +254,23 @@ channel_t channel_create(float offset_hz, float sample_rate)
 
     ch->peak = 0.0f;
 
-    /* Create decoders */
-    ch->uhsdr = uhsdr_init(CW_TONE, (float)UHSDR_RATE, 0);
-    ch->bmorse = bmorse_create(CW_TONE, (float)BMORSE_RATE, 0);
+    /* Deferred spawn: no decoders yet, accumulate audio first */
+    ch->decoders_started = false;
+    ch->detected_pitch = CW_TONE;
+    ch->uhsdr = NULL;
+    ch->bmorse = NULL;
+
+    /* Ring buffers for 15s of decimated audio */
+    ch->uhsdr_ring_cap = UHSDR_RATE * 15;
+    ch->uhsdr_ring = (int16_t *)calloc(ch->uhsdr_ring_cap, sizeof(int16_t));
+    ch->uhsdr_ring_len = 0;
+    ch->bmorse_ring_cap = BMORSE_RATE * 15;
+    ch->bmorse_ring = (int16_t *)calloc(ch->bmorse_ring_cap, sizeof(int16_t));
+    ch->bmorse_ring_len = 0;
 
     ch->uhsdr_text_len = 0;
     ch->bmorse_text_len = 0;
     ch->recent_count = 0;
-
-    /* Pitch detection: disabled for now */
-    ch->pitch_buf_cap = 0;
-    ch->pitch_buf = NULL;
-    ch->pitch_buf_len = 0;
-    ch->pitch_detected = true;  /* skip pitch detection */
-
-    /* Speed-adaptive bmorse */
-    ch->bmorse_fir_adapted = true; // disabled — respawn hurts
-    ch->last_wpm = 0;
     ch->samples_fed = 0;
 
     return (channel_t)ch;
@@ -317,78 +320,11 @@ int channel_feed_iq(channel_t h,
         ch->uhsdr_dec_count++;
         if (ch->uhsdr_dec_count >= ch->uhsdr_dec_factor) {
             ch->uhsdr_dec_count = 0;
-            /* Convolve */
             float sum = 0;
             for (int j = 0; j < ch->uhsdr_fir_len; j++) {
                 int idx = (ch->uhsdr_fir_pos + j) % ch->uhsdr_fir_len;
                 sum += ch->uhsdr_fir_buf[idx] * ch->uhsdr_fir[j];
             }
-
-            /* Pitch detection: accumulate FIR output for 15s */
-            if (!ch->pitch_detected && ch->pitch_buf_len < ch->pitch_buf_cap) {
-                ch->pitch_buf[ch->pitch_buf_len++] = sum;
-                if (ch->pitch_buf_len >= ch->pitch_buf_cap) {
-                    /* FFT on full 15s of 12kHz audio for reliable pitch */
-                    int fft_n = ch->pitch_buf_len;
-
-                    /* Use FFTW for fast computation */
-                    double *fft_in = (double *)fftw_malloc(fft_n * sizeof(double));
-                    fftw_complex *fft_out = (fftw_complex *)fftw_malloc((fft_n/2+1) * sizeof(fftw_complex));
-                    for (int k = 0; k < fft_n; k++) {
-                        double win = 0.5 - 0.5 * cos(2.0 * M_PI * k / (fft_n-1));
-                        fft_in[k] = ch->pitch_buf[k] * win;
-                    }
-                    fftw_plan p = fftw_plan_dft_r2c_1d(fft_n, fft_in, fft_out, FFTW_ESTIMATE);
-                    fftw_execute(p);
-                    fftw_destroy_plan(p);
-
-                    /* Find peak in 450-850 Hz range */
-                    float freq_res = (float)UHSDR_RATE / fft_n;
-                    int lo_bin = (int)(450.0f / freq_res);
-                    int hi_bin = (int)(850.0f / freq_res);
-                    float peak_mag = 0;
-                    int peak_bin = lo_bin;
-                    float total_mag = 0;
-                    int n_bins = 0;
-
-                    for (int b = lo_bin; b <= hi_bin && b < fft_n/2; b++) {
-                        float mag = (float)(fft_out[b][0]*fft_out[b][0] + fft_out[b][1]*fft_out[b][1]);
-                        total_mag += mag;
-                        n_bins++;
-                        if (mag > peak_mag) {
-                            peak_mag = mag;
-                            peak_bin = b;
-                        }
-                    }
-                    fftw_free(fft_in);
-                    fftw_free(fft_out);
-
-                    /* SNR check: peak must be 10dB above mean */
-                    float mean_mag = (n_bins > 1) ? (total_mag - peak_mag) / (n_bins - 1) : 1e-10f;
-                    float snr_db = 10.0f * log10f(peak_mag / (mean_mag + 1e-20f));
-
-                    float detected_pitch = peak_bin * freq_res;
-                    int pitch_int = (int)(detected_pitch + 0.5f);
-                    if (pitch_int < 450) pitch_int = 450;
-                    if (pitch_int > 850) pitch_int = 850;
-
-                    if (snr_db >= 10.0f && abs(pitch_int - (int)ch->pitch_hz) > 5) {
-                        /* Confident retune: update mixer + reinit uhsdr only */
-                        ch->pitch_hz = (float)pitch_int;
-                        ch->phase_inc = 2.0 * M_PI * (ch->offset_hz - pitch_int) / ch->sample_rate;
-                        if (ch->uhsdr) uhsdr_free(ch->uhsdr);
-                        ch->uhsdr = uhsdr_init((float)pitch_int, (float)UHSDR_RATE, 0);
-                        ch->uhsdr_text_len = 0;
-                        /* Keep bmorse running (less pitch-sensitive) */
-                        fprintf(stderr, "  pitch: %.0f → %d Hz (SNR %.1f dB) for offset %.0f\n",
-                                CW_TONE, pitch_int, snr_db, ch->offset_hz);
-                    }
-                    ch->pitch_detected = true;
-                    free(ch->pitch_buf);
-                    ch->pitch_buf = NULL;
-                }
-            }
-
             /* Peak normalize */
             float absv = fabsf(sum);
             if (absv > ch->peak) ch->peak = absv;
@@ -396,10 +332,18 @@ int channel_feed_iq(channel_t h,
             if (ch->peak > 0) sum = sum / ch->peak * 0.3f;
             int16_t s = (int16_t)(sum * 32767.0f);
             if (s > 32767) s = 32767; if (s < -32767) s = -32767;
-            int nc = uhsdr_feed(ch->uhsdr, &s, 1, dec_buf, sizeof(dec_buf));
-            if (nc > 0 && ch->uhsdr_text_len + nc < 8191) {
-                memcpy(ch->uhsdr_text + ch->uhsdr_text_len, dec_buf, nc);
-                ch->uhsdr_text_len += nc;
+
+            if (!ch->decoders_started) {
+                /* Buffer for later replay */
+                if (ch->uhsdr_ring_len < ch->uhsdr_ring_cap)
+                    ch->uhsdr_ring[ch->uhsdr_ring_len++] = s;
+            } else {
+                /* Feed uhsdr */
+                int nc = uhsdr_feed(ch->uhsdr, &s, 1, dec_buf, sizeof(dec_buf));
+                if (nc > 0 && ch->uhsdr_text_len + nc < 8191) {
+                    memcpy(ch->uhsdr_text + ch->uhsdr_text_len, dec_buf, nc);
+                    ch->uhsdr_text_len += nc;
+                }
             }
         }
 
@@ -419,36 +363,97 @@ int channel_feed_iq(channel_t h,
             if (ch->peak > 0) sum = sum / ch->peak * 0.3f;
             int16_t s = (int16_t)(sum * 32767.0f);
             if (s > 32767) s = 32767; if (s < -32767) s = -32767;
-            int nc = bmorse_feed(ch->bmorse, &s, 1, dec_buf, sizeof(dec_buf));
-            if (nc > 0 && ch->bmorse_text_len + nc < 8191) {
-                memcpy(ch->bmorse_text + ch->bmorse_text_len, dec_buf, nc);
-                ch->bmorse_text_len += nc;
+
+            if (!ch->decoders_started) {
+                if (ch->bmorse_ring_len < ch->bmorse_ring_cap)
+                    ch->bmorse_ring[ch->bmorse_ring_len++] = s;
+            } else {
+                int nc = bmorse_feed(ch->bmorse, &s, 1, dec_buf, sizeof(dec_buf));
+                if (nc > 0 && ch->bmorse_text_len + nc < 8191) {
+                    memcpy(ch->bmorse_text + ch->bmorse_text_len, dec_buf, nc);
+                    ch->bmorse_text_len += nc;
+                }
             }
         }
     }
 
-    /* Speed-adaptive bmorse narrow bandpass (after decimation, before bmorse) */
-    /* NOTE: This does NOT touch the bmorse anti-alias FIR (that stays for decimation).
-       Instead, we apply an additional narrow CW bandpass on the decimated 4kHz audio.
-       The bandpass is implemented inline in the bmorse feed path above — but we need
-       a separate filter state. For now, leave this as TODO and test if the basic
-       approach of narrowing at the bmorse.so's internal FFT filter level works instead.
-       bmorse already has an internal FFT filter (fftfilt) — its bandwidth was set at
-       bmorse_create time. A simpler approach: destroy and recreate bmorse with a
-       tighter bandwidth when WPM stabilizes. */
-    if (!ch->bmorse_fir_adapted && ch->uhsdr) {
-        int wpm = uhsdr_get_wpm(ch->uhsdr);
-        if (wpm > 0) ch->last_wpm = wpm;
-
-        /* After 30s (enough for uhsdr to lock), recreate bmorse with tight BW */
-        if (ch->last_wpm > 0 && ch->samples_fed > (int)(ch->sample_rate * 30)) {
-            if (ch->bmorse) bmorse_destroy(ch->bmorse);
-            ch->bmorse = bmorse_create(ch->pitch_hz, (float)BMORSE_RATE, ch->last_wpm);
-            ch->bmorse_text_len = 0;
-            ch->bmorse_fir_adapted = true;
-            fprintf(stderr, "  bmorse respawn: WPM=%d for offset %.0f\n",
-                    ch->last_wpm, ch->offset_hz);
+    /* Deferred decoder spawn: after 15s of audio, detect pitch and create decoders */
+    if (!ch->decoders_started && ch->uhsdr_ring_len >= ch->uhsdr_ring_cap) {
+        /* Pitch detection on 15s of 12kHz FIR output */
+        int fft_n = ch->uhsdr_ring_len;
+        double *fft_in = (double *)fftw_malloc(fft_n * sizeof(double));
+        fftw_complex *fft_out = (fftw_complex *)fftw_malloc((fft_n/2+1) * sizeof(fftw_complex));
+        for (int k = 0; k < fft_n; k++) {
+            double win = 0.5 - 0.5 * cos(2.0 * M_PI * k / (fft_n-1));
+            fft_in[k] = (double)ch->uhsdr_ring[k] * win;
         }
+        fftw_plan p = fftw_plan_dft_r2c_1d(fft_n, fft_in, fft_out, FFTW_ESTIMATE);
+        fftw_execute(p);
+        fftw_destroy_plan(p);
+
+        float freq_res = (float)UHSDR_RATE / fft_n;
+        int lo_bin = (int)(450.0f / freq_res);
+        int hi_bin = (int)(850.0f / freq_res);
+        float peak_mag = 0, total_mag = 0;
+        int peak_bin = lo_bin, n_bins = 0;
+
+        for (int b = lo_bin; b <= hi_bin && b < fft_n/2; b++) {
+            float mag = (float)(fft_out[b][0]*fft_out[b][0] + fft_out[b][1]*fft_out[b][1]);
+            total_mag += mag; n_bins++;
+            if (mag > peak_mag) { peak_mag = mag; peak_bin = b; }
+        }
+        fftw_free(fft_in); fftw_free(fft_out);
+
+        float mean_mag = (n_bins > 1) ? (total_mag - peak_mag) / (n_bins - 1) : 1e-10f;
+        float snr_db = 10.0f * log10f(peak_mag / (mean_mag + 1e-20f));
+        float pitch = peak_bin * freq_res;
+        int pitch_int = (int)(pitch + 0.5f);
+        if (pitch_int < 450) pitch_int = 450;
+        if (pitch_int > 850) pitch_int = 850;
+
+        /* Use detected pitch if confident, else keep CW_TONE */
+        if (snr_db >= 10.0f) {
+            ch->detected_pitch = (float)pitch_int;
+            /* Update mixer for correct pitch */
+            ch->phase_inc = 2.0 * M_PI * (ch->offset_hz - pitch_int) / ch->sample_rate;
+            fprintf(stderr, "  deferred pitch: %d Hz (SNR %.1f dB) for offset %.0f\n",
+                    pitch_int, snr_db, ch->offset_hz);
+        } else {
+            ch->detected_pitch = CW_TONE;
+        }
+
+        /* Create decoders at detected pitch */
+        ch->uhsdr = uhsdr_init(ch->detected_pitch, (float)UHSDR_RATE, 0);
+        ch->bmorse = bmorse_create(ch->detected_pitch, (float)BMORSE_RATE, 0);
+
+        /* Replay buffered audio through decoders (in chunks to avoid blocking) */
+        {
+            int chunk = 1200;  /* ~100ms at 12kHz */
+            for (int k = 0; k < ch->uhsdr_ring_len; k += chunk) {
+                int len = (k + chunk <= ch->uhsdr_ring_len) ? chunk : ch->uhsdr_ring_len - k;
+                int nc = uhsdr_feed(ch->uhsdr, &ch->uhsdr_ring[k], len, dec_buf, sizeof(dec_buf));
+                if (nc > 0 && ch->uhsdr_text_len + nc < 8191) {
+                    memcpy(ch->uhsdr_text + ch->uhsdr_text_len, dec_buf, nc);
+                    ch->uhsdr_text_len += nc;
+                }
+            }
+        }
+        {
+            int chunk = 400;  /* ~100ms at 4kHz */
+            for (int k = 0; k < ch->bmorse_ring_len; k += chunk) {
+                int len = (k + chunk <= ch->bmorse_ring_len) ? chunk : ch->bmorse_ring_len - k;
+                int nc = bmorse_feed(ch->bmorse, &ch->bmorse_ring[k], len, dec_buf, sizeof(dec_buf));
+                if (nc > 0 && ch->bmorse_text_len + nc < 8191) {
+                    memcpy(ch->bmorse_text + ch->bmorse_text_len, dec_buf, nc);
+                    ch->bmorse_text_len += nc;
+                }
+            }
+        }
+
+        /* Free ring buffers */
+        free(ch->uhsdr_ring); ch->uhsdr_ring = NULL;
+        free(ch->bmorse_ring); ch->bmorse_ring = NULL;
+        ch->decoders_started = true;
     }
 
     /* Extract spots from accumulated text — with per-channel dedup */
@@ -535,7 +540,8 @@ void channel_destroy(channel_t h)
     free(ch->uhsdr_fir_buf);
     free(ch->bmorse_fir);
     free(ch->bmorse_fir_buf);
-    free(ch->pitch_buf);
+    free(ch->uhsdr_ring);
+    free(ch->bmorse_ring);
     free(ch);
 }
 
