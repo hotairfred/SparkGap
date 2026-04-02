@@ -13,6 +13,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <fftw3.h>
 #include <set>
 #include <string>
 #include <chrono>
@@ -316,51 +317,60 @@ int channel_feed_iq(channel_t h,
             if (!ch->pitch_detected && ch->pitch_buf_len < ch->pitch_buf_cap) {
                 ch->pitch_buf[ch->pitch_buf_len++] = sum;
                 if (ch->pitch_buf_len >= ch->pitch_buf_cap) {
-                    /* FFT on 2s of 12kHz audio to find actual tone */
-                    int fft_n = UHSDR_RATE * 2;  /* 24000 samples */
-                    /* Use last 2s for best SNR (signal settled) */
-                    float *fft_data = ch->pitch_buf + ch->pitch_buf_len - fft_n;
+                    /* FFT on full 15s of 12kHz audio for reliable pitch */
+                    int fft_n = ch->pitch_buf_len;
 
-                    /* Windowed FFT */
-                    float peak_mag = 0;
-                    int peak_bin = 0;
-                    float fft_re[12001], fft_im[12001];
-                    /* Simple DFT on bins 475-825 Hz only (fast, ~350 bins) */
+                    /* Use FFTW for fast computation */
+                    double *fft_in = (double *)fftw_malloc(fft_n * sizeof(double));
+                    fftw_complex *fft_out = (fftw_complex *)fftw_malloc((fft_n/2+1) * sizeof(fftw_complex));
+                    for (int k = 0; k < fft_n; k++) {
+                        double win = 0.5 - 0.5 * cos(2.0 * M_PI * k / (fft_n-1));
+                        fft_in[k] = ch->pitch_buf[k] * win;
+                    }
+                    fftw_plan p = fftw_plan_dft_r2c_1d(fft_n, fft_in, fft_out, FFTW_ESTIMATE);
+                    fftw_execute(p);
+                    fftw_destroy_plan(p);
+
+                    /* Find peak in 450-850 Hz range */
                     float freq_res = (float)UHSDR_RATE / fft_n;
-                    int lo_bin = (int)(475.0f / freq_res);
-                    int hi_bin = (int)(825.0f / freq_res);
+                    int lo_bin = (int)(450.0f / freq_res);
+                    int hi_bin = (int)(850.0f / freq_res);
+                    float peak_mag = 0;
+                    int peak_bin = lo_bin;
+                    float total_mag = 0;
+                    int n_bins = 0;
+
                     for (int b = lo_bin; b <= hi_bin && b < fft_n/2; b++) {
-                        float re = 0, im = 0;
-                        float w = 2.0f * M_PI * b / fft_n;
-                        for (int k = 0; k < fft_n; k++) {
-                            float win = 0.5f - 0.5f * cosf(2.0f * M_PI * k / (fft_n-1));
-                            float v = fft_data[k] * win;
-                            re += v * cosf(w * k);
-                            im += v * sinf(w * k);
-                        }
-                        float mag = re*re + im*im;
+                        float mag = (float)(fft_out[b][0]*fft_out[b][0] + fft_out[b][1]*fft_out[b][1]);
+                        total_mag += mag;
+                        n_bins++;
                         if (mag > peak_mag) {
                             peak_mag = mag;
                             peak_bin = b;
                         }
                     }
+                    fftw_free(fft_in);
+                    fftw_free(fft_out);
+
+                    /* SNR check: peak must be 10dB above mean */
+                    float mean_mag = (n_bins > 1) ? (total_mag - peak_mag) / (n_bins - 1) : 1e-10f;
+                    float snr_db = 10.0f * log10f(peak_mag / (mean_mag + 1e-20f));
+
                     float detected_pitch = peak_bin * freq_res;
                     int pitch_int = (int)(detected_pitch + 0.5f);
                     if (pitch_int < 450) pitch_int = 450;
                     if (pitch_int > 850) pitch_int = 850;
 
-                    if (abs(pitch_int - (int)ch->pitch_hz) > 5) {
-                        /* Retune: update mixer + reinit decoders */
+                    if (snr_db >= 10.0f && abs(pitch_int - (int)ch->pitch_hz) > 5) {
+                        /* Confident retune: update mixer + reinit uhsdr only */
                         ch->pitch_hz = (float)pitch_int;
                         ch->phase_inc = 2.0 * M_PI * (ch->offset_hz - pitch_int) / ch->sample_rate;
                         if (ch->uhsdr) uhsdr_free(ch->uhsdr);
                         ch->uhsdr = uhsdr_init((float)pitch_int, (float)UHSDR_RATE, 0);
-                        if (ch->bmorse) bmorse_destroy(ch->bmorse);
-                        ch->bmorse = bmorse_create((float)pitch_int, (float)BMORSE_RATE, 0);
                         ch->uhsdr_text_len = 0;
-                        ch->bmorse_text_len = 0;
-                        fprintf(stderr, "  pitch: %.0f Hz → %d Hz for offset %.0f\n",
-                                CW_TONE, pitch_int, ch->offset_hz);
+                        /* Keep bmorse running (less pitch-sensitive) */
+                        fprintf(stderr, "  pitch: %.0f → %d Hz (SNR %.1f dB) for offset %.0f\n",
+                                CW_TONE, pitch_int, snr_db, ch->offset_hz);
                     }
                     ch->pitch_detected = true;
                     free(ch->pitch_buf);
