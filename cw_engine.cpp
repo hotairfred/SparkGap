@@ -99,6 +99,12 @@ struct channel_state {
     char bmorse_text[8192];
     int  bmorse_text_len;
 
+    /* Pitch detection (runs on uhsdr FIR output after 15s) */
+    float *pitch_buf;          /* accumulate 12kHz decimated audio */
+    int    pitch_buf_len;
+    int    pitch_buf_cap;
+    bool   pitch_detected;
+
     /* Per-channel spot dedup (wall clock) */
     recent_spot recent[MAX_RECENT_SPOTS];
     int recent_count;
@@ -247,6 +253,12 @@ channel_t channel_create(float offset_hz, float sample_rate)
     ch->bmorse_text_len = 0;
     ch->recent_count = 0;
 
+    /* Pitch detection: 15s of 12kHz audio = 180000 samples */
+    ch->pitch_buf_cap = UHSDR_RATE * 15;
+    ch->pitch_buf = (float *)calloc(ch->pitch_buf_cap, sizeof(float));
+    ch->pitch_buf_len = 0;
+    ch->pitch_detected = false;
+
     return (channel_t)ch;
 }
 
@@ -299,6 +311,63 @@ int channel_feed_iq(channel_t h,
                 int idx = (ch->uhsdr_fir_pos + j) % ch->uhsdr_fir_len;
                 sum += ch->uhsdr_fir_buf[idx] * ch->uhsdr_fir[j];
             }
+
+            /* Pitch detection: accumulate FIR output for 15s */
+            if (!ch->pitch_detected && ch->pitch_buf_len < ch->pitch_buf_cap) {
+                ch->pitch_buf[ch->pitch_buf_len++] = sum;
+                if (ch->pitch_buf_len >= ch->pitch_buf_cap) {
+                    /* FFT on 2s of 12kHz audio to find actual tone */
+                    int fft_n = UHSDR_RATE * 2;  /* 24000 samples */
+                    /* Use last 2s for best SNR (signal settled) */
+                    float *fft_data = ch->pitch_buf + ch->pitch_buf_len - fft_n;
+
+                    /* Windowed FFT */
+                    float peak_mag = 0;
+                    int peak_bin = 0;
+                    float fft_re[12001], fft_im[12001];
+                    /* Simple DFT on bins 475-825 Hz only (fast, ~350 bins) */
+                    float freq_res = (float)UHSDR_RATE / fft_n;
+                    int lo_bin = (int)(475.0f / freq_res);
+                    int hi_bin = (int)(825.0f / freq_res);
+                    for (int b = lo_bin; b <= hi_bin && b < fft_n/2; b++) {
+                        float re = 0, im = 0;
+                        float w = 2.0f * M_PI * b / fft_n;
+                        for (int k = 0; k < fft_n; k++) {
+                            float win = 0.5f - 0.5f * cosf(2.0f * M_PI * k / (fft_n-1));
+                            float v = fft_data[k] * win;
+                            re += v * cosf(w * k);
+                            im += v * sinf(w * k);
+                        }
+                        float mag = re*re + im*im;
+                        if (mag > peak_mag) {
+                            peak_mag = mag;
+                            peak_bin = b;
+                        }
+                    }
+                    float detected_pitch = peak_bin * freq_res;
+                    int pitch_int = (int)(detected_pitch + 0.5f);
+                    if (pitch_int < 450) pitch_int = 450;
+                    if (pitch_int > 850) pitch_int = 850;
+
+                    if (abs(pitch_int - (int)ch->pitch_hz) > 5) {
+                        /* Retune: update mixer + reinit decoders */
+                        ch->pitch_hz = (float)pitch_int;
+                        ch->phase_inc = 2.0 * M_PI * (ch->offset_hz - pitch_int) / ch->sample_rate;
+                        if (ch->uhsdr) uhsdr_free(ch->uhsdr);
+                        ch->uhsdr = uhsdr_init((float)pitch_int, (float)UHSDR_RATE, 0);
+                        if (ch->bmorse) bmorse_destroy(ch->bmorse);
+                        ch->bmorse = bmorse_create((float)pitch_int, (float)BMORSE_RATE, 0);
+                        ch->uhsdr_text_len = 0;
+                        ch->bmorse_text_len = 0;
+                        fprintf(stderr, "  pitch: %.0f Hz → %d Hz for offset %.0f\n",
+                                CW_TONE, pitch_int, ch->offset_hz);
+                    }
+                    ch->pitch_detected = true;
+                    free(ch->pitch_buf);
+                    ch->pitch_buf = NULL;
+                }
+            }
+
             /* Peak normalize */
             float absv = fabsf(sum);
             if (absv > ch->peak) ch->peak = absv;
@@ -421,6 +490,7 @@ void channel_destroy(channel_t h)
     free(ch->uhsdr_fir_buf);
     free(ch->bmorse_fir);
     free(ch->bmorse_fir_buf);
+    free(ch->pitch_buf);
     free(ch);
 }
 
