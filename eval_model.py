@@ -15,9 +15,10 @@ import sys
 import wave
 import struct
 import numpy as np
-from scipy.signal import firwin, lfilter, decimate
+from scipy.signal import firwin, lfilter, decimate, resample_poly
 
 import torch
+from scipy.signal import butter, filtfilt
 from train_model import CWDecoder, ctc_greedy_decode, compute_spectrogram, NUM_CLASSES
 from beam_decode import (CallsignTrie, ctc_beam_search, ctc_beam_search_constrained,
                          ctc_beam_search_nbest)
@@ -88,43 +89,36 @@ def find_active_channels(samples, sample_rate, bandwidth):
 
 
 def channelize(samples, sample_rate, center_freq, target_rate=4000, cw_pitch=600.0):
-    """Extract a single channel: mix to baseband, re-modulate to CW pitch, FIR filter, decimate.
+    """Extract a single channel: mix to baseband, polyphase decimate.
 
-    Output is real audio at target_rate with CW tone at cw_pitch Hz.
-    Works correctly for both real (mono) and complex (IQ) inputs at any sample rate.
+    Uses resample_poly (polyphase FIR) instead of lfilter — ~10x faster for
+    high decimation ratios (192kHz→4kHz = 48x). Float32 chunked mixing to
+    avoid float64 OOM on long recordings.
     """
     n = len(samples)
-    t = np.arange(n, dtype=np.float64) / sample_rate
+    mix_freq = float(center_freq - cw_pitch)
+    decim_factor = int(sample_rate) // int(target_rate)
 
-    # Step 1: Mix signal at center_freq down to baseband (DC)
-    # Step 2: Re-modulate to cw_pitch Hz so output has audible CW tone
-    # Combined: multiply by cos(2π × (center_freq - cw_pitch) × t) moves
-    # the signal from center_freq to cw_pitch in one step
-    mix_freq = center_freq - cw_pitch
+    # Mix in float32 chunks
+    chunk_size = 1 << 22  # 4M samples per chunk (~32 MB float32)
+    mixed = np.empty(n, dtype=np.float32)
+    phase_inc = -2.0 * np.pi * mix_freq / sample_rate
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        idx = np.arange(start, end, dtype=np.float32)
+        phases = (phase_inc * idx).astype(np.float32)
+        if np.iscomplexobj(samples):
+            lo_r = np.cos(phases)
+            lo_i = np.sin(phases)
+            mixed[start:end] = (samples[start:end].real * lo_r
+                                - samples[start:end].imag * lo_i) * 2.0
+        else:
+            mixed[start:end] = samples[start:end].real * np.cos(phases) * 2.0
 
-    if np.iscomplexobj(samples):
-        lo = np.exp(-2j * np.pi * mix_freq * t)
-        mixed = np.real(samples * lo) * 2.0
-    else:
-        lo = np.cos(2 * np.pi * mix_freq * t)
-        mixed = samples * lo * 2.0
+    # Polyphase decimate: internally uses a short anti-aliasing FIR, O(n) not O(n*taps)
+    decimated = resample_poly(mixed, 1, decim_factor).astype(np.float32)
+    del mixed
 
-    # Design FIR lowpass at target_rate/2
-    decim_factor = sample_rate // target_rate
-    nyq = sample_rate / 2.0
-    cutoff = target_rate / 2.0 * 0.8  # 80% of Nyquist after decimation
-    numtaps = min(255, decim_factor * 20 + 1)
-    if numtaps % 2 == 0:
-        numtaps += 1
-    fir = firwin(numtaps, cutoff / nyq)
-
-    # Filter
-    filtered = lfilter(fir, 1.0, mixed)
-
-    # Decimate
-    decimated = filtered[::decim_factor].astype(np.float32)
-
-    # Normalize to [-1, 1]
     peak = np.max(np.abs(decimated))
     if peak > 1e-6:
         decimated /= peak
@@ -132,14 +126,49 @@ def channelize(samples, sample_rate, center_freq, target_rate=4000, cw_pitch=600
     return decimated
 
 
-def run_model_on_channel(channel_audio, model, device, trie=None, use_beam=True, beam_width=10):
+def demodulate_envelope(audio, sample_rate=4000, cw_pitch=600.0, lowpass_hz=25.0):
+    """AG1LE-style AM demodulation: extract CW keying envelope.
+
+    Takes channelized audio with CW tone at cw_pitch Hz, AM demodulates
+    to extract the on/off keying envelope, lowpass filters, and decimates.
+
+    Output: clean envelope signal at ~125 Hz sample rate.
+    The neural network sees mark/space transitions instead of raw audio.
+    """
+    t = np.arange(len(audio), dtype=np.float64) / sample_rate
+
+    # AM demodulate: mix with tone, take magnitude
+    mixed = audio * ((1 + np.sin(2 * np.pi * cw_pitch * t)) / 2)
+    envelope = np.abs(mixed)
+
+    # Butterworth lowpass at 25 Hz (AG1LE's compromise: 20-40 Hz range)
+    wn = lowpass_hz / (sample_rate / 2.0)
+    if wn >= 1.0:
+        wn = 0.99  # clamp for very low sample rates
+    b, a = butter(3, wn)
+    filtered = filtfilt(b, a, envelope)
+
+    # Decimate to ~125 Hz (8ms per sample)
+    decim_factor = max(1, int(sample_rate / 125))
+    decimated = filtered[::decim_factor]
+
+    # Normalize to [0, 1]
+    peak = np.max(decimated)
+    if peak > 1e-6:
+        decimated = decimated / peak
+
+    return decimated.astype(np.float32)
+
+
+def run_model_on_channel(channel_audio, model, device, trie=None, use_beam=True, beam_width=10, use_demod=False):
     """Run the CTC model on a single channel's audio.
 
-    Beam search strategy: run greedy PLUS unconstrained n-best beam search.
-    Combine all decoded text for callsign extraction. The greedy result
-    provides the baseline, beam search finds alternatives the greedy missed.
-    No trie constraint during search — only used for post-validation.
+    If use_demod=True, applies AG1LE-style AM demodulation to extract the
+    keying envelope before computing the spectrogram. The model sees
+    mark/space transitions instead of raw modulated audio.
     """
+    if use_demod:
+        channel_audio = demodulate_envelope(channel_audio)
     spec = compute_spectrogram(channel_audio, fft_size=128, hop=32)
     if spec.shape[0] < 32:
         return ""
@@ -157,15 +186,15 @@ def run_model_on_channel(channel_audio, model, device, trie=None, use_beam=True,
         with torch.no_grad():
             output = model(tensor)
 
-            # Always run greedy
-            greedy = ctc_greedy_decode(output[0].cpu())
+            # Always run greedy (output is tuple (ctc, wpm); squeeze batch dim)
+            greedy = ctc_greedy_decode(output[0][0].cpu())
             if greedy and len(greedy.strip()) >= 2:
                 all_text.append(greedy.strip())
 
             # Also run beam search for additional candidates
             if use_beam and trie is not None:
                 candidates = ctc_beam_search_nbest(
-                    output[0].cpu(), trie, beam_width=beam_width,
+                    output[0][0].cpu(), trie, beam_width=beam_width,
                     n_best=5, lm_weight=0.0, callsign_bonus=0.0)
                 for cand_text, _ in candidates:
                     cand = cand_text.strip()
@@ -198,6 +227,8 @@ def main():
     parser.add_argument('--dump-channels', action='store_true', help='Save per-channel WAVs')
     parser.add_argument('--no-beam', action='store_true', help='Use greedy decode instead of beam search')
     parser.add_argument('--beam-width', type=int, default=50, help='Beam width for beam search')
+    parser.add_argument('--demod', action='store_true', help='AG1LE-style AM demodulation before spectrogram')
+    parser.add_argument('--max-duration', type=float, default=900, help='Max seconds to load (default 900)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -217,7 +248,7 @@ def main():
     model = CWDecoder().to(device)
     ckpt = torch.load(args.model, map_location=device, weights_only=True)
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
         print(f"  Epoch {ckpt.get('epoch', '?')}, char_acc={ckpt.get('char_acc', 0):.1f}%",
               file=sys.stderr)
     else:
@@ -228,25 +259,32 @@ def main():
     master_scp = load_master_scp()
     gold_calls = load_gold_standard(args.gold)
 
-    # Read WAV
+    # Read WAV (supports 24-bit WAVEX via soundfile, limits to max_duration to avoid OOM)
+    import soundfile as sf
     print(f"Reading: {args.wav}", file=sys.stderr)
-    w = wave.open(args.wav, 'rb')
-    nch = w.getnchannels()
-    sr = w.getframerate() if args.sample_rate == 0 else args.sample_rate
-    frames = w.readframes(w.getnframes())
-    w.close()
+    info = sf.info(args.wav)
+    sr = info.samplerate if args.sample_rate == 0 else args.sample_rate
+    nch = info.channels
+    max_frames = int(args.max_duration * sr) if args.max_duration else info.frames
+    n_frames = min(info.frames, max_frames)
 
-    raw = np.array(struct.unpack('<' + 'h' * (len(frames) // 2), frames), dtype=np.float32)
-    raw /= 32768.0
+    with sf.SoundFile(args.wav) as f:
+        block = f.read(n_frames, dtype='float32', always_2d=True)
 
-    if nch == 2:
-        i_ch = raw[0::2]
-        q_ch = raw[1::2]
-        samples = i_ch + 1j * q_ch
-        print(f"  Stereo IQ, {len(i_ch)} samples, {sr} Hz, {len(i_ch)/sr:.1f}s", file=sys.stderr)
+    if nch >= 2:
+        i_ch = block[:, 0]
+        q_ch = block[:, 1]
+        del block
+        # Force complex64 (not complex128) — halves memory and speeds mixing
+        samples = np.empty(len(i_ch), dtype=np.complex64)
+        samples.real[:] = i_ch
+        samples.imag[:] = q_ch
+        del i_ch, q_ch
+        print(f"  Stereo IQ, {len(samples)} samples, {sr} Hz, {len(samples)/sr:.1f}s", file=sys.stderr)
     else:
-        samples = raw
-        print(f"  Mono, {len(raw)} samples, {sr} Hz, {len(raw)/sr:.1f}s", file=sys.stderr)
+        samples = block[:, 0].copy()
+        del block
+        print(f"  Mono, {len(samples)} samples, {sr} Hz, {len(samples)/sr:.1f}s", file=sys.stderr)
 
     # Find active channels
     print(f"\nScanning for signals ({args.bandwidth} Hz channels)...", file=sys.stderr)
@@ -275,7 +313,7 @@ def main():
             wout.close()
 
         # Run ML model
-        decoded = run_model_on_channel(channel_audio, model, device, trie=trie, use_beam=use_beam, beam_width=args.beam_width)
+        decoded = run_model_on_channel(channel_audio, model, device, trie=trie, use_beam=use_beam, beam_width=args.beam_width, use_demod=args.demod)
         if not decoded:
             continue
 

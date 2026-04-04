@@ -118,16 +118,23 @@ def precompute_spectrograms(data_dir='training_data', output_dir='training_data'
         print(f"  {end}/{n} → {chunk_path} ({os.path.getsize(chunk_path)/1e6:.0f} MB)", file=sys.stderr)
         del chunk
 
-    # Save targets + metadata
+    # Save targets + WPM + metadata
     targets_padded = torch.zeros(n, max_target_len, dtype=torch.long)
     for i, target in enumerate(all_targets):
         targets_padded[i, :len(target)] = torch.tensor(target, dtype=torch.long)
     target_lens = torch.tensor(all_target_lens, dtype=torch.long)
 
+    # WPM labels — 0 means unknown (will be masked out of WPM loss)
+    wpm_values = torch.tensor(
+        [float(labels[i].get('wpm', 0) or 0) for i in range(n)],
+        dtype=torch.float32
+    )
+
     targets_path = os.path.join(output_dir, 'targets.pt')
     torch.save({
         'targets': targets_padded,
         'target_lens': target_lens,
+        'wpm': wpm_values,
         'n_samples': n,
         'n_chunks': chunk_idx,
         'target_frames': TARGET_FRAMES,
@@ -144,11 +151,12 @@ class ChunkedF16Dataset(Dataset):
     Peak RAM = largest single chunk (~938 MB) + overhead, not all chunks combined.
     """
 
-    def __init__(self, chunks, targets, target_lens, chunk_size):
+    def __init__(self, chunks, targets, target_lens, chunk_size, wpm=None):
         self.chunks = chunks        # list of (chunk_n, T, F) float16 tensors
         self.chunk_size = chunk_size
         self.targets = targets
         self.target_lens = target_lens
+        self.wpm = wpm  # (n,) float32 tensor of WPM labels, or None
         self.n_total = sum(c.size(0) for c in chunks)
 
     def __len__(self):
@@ -159,10 +167,12 @@ class ChunkedF16Dataset(Dataset):
         within_idx = idx % self.chunk_size
         spec = self.chunks[chunk_idx][within_idx].float().unsqueeze(0)  # (1, T, F)
         tlen = self.target_lens[idx].item()
+        wpm = self.wpm[idx].item() if self.wpm is not None else 0.0
         return (
             spec,
             self.targets[idx, :tlen],
             tlen,
+            wpm,
         )
 
 
@@ -199,26 +209,34 @@ class CWDataset(Dataset):
 
         text = info['text']
         target = text_to_indices(text)
+        wpm = float(info.get('wpm', 0) or 0)
 
         return (
             torch.tensor(spec).unsqueeze(0),  # (1, T, F)
             torch.tensor(target, dtype=torch.long),
             len(target),
+            wpm,
         )
 
 
 def collate_fn(batch):
     """Custom collate: pad spectrograms and targets to batch max."""
-    specs, targets, target_lens = zip(*batch)
+    specs, targets, target_lens, wpms = zip(*batch)
     specs = torch.stack(specs)  # all same size due to pad/truncate
     # Concatenate targets for CTC loss
     targets_cat = torch.cat(targets)
     target_lens = torch.tensor(target_lens, dtype=torch.long)
-    return specs, targets_cat, target_lens
+    wpm_tensor = torch.tensor(wpms, dtype=torch.float32)
+    return specs, targets_cat, target_lens, wpm_tensor
 
 
 class CWDecoder(nn.Module):
-    """CNN+BiGRU with CTC output for CW text decoding."""
+    """CNN+BiGRU with CTC output for CW text decoding.
+
+    Also outputs an auxiliary WPM estimate (regression head on mean-pooled
+    BiGRU output). At inference time, feed wpm_pred to bmorse -spd so it
+    starts the Bayesian trellis at the right speed.
+    """
 
     def __init__(self):
         super().__init__()
@@ -257,6 +275,9 @@ class CWDecoder(nn.Module):
 
         self.fc = nn.Linear(512, NUM_CLASSES)  # 256*2 bidir → classes
 
+        # Auxiliary WPM regression head: mean-pool BiGRU output → scalar WPM
+        self.wpm_head = nn.Linear(512, 1)
+
     def forward(self, x):
         # x: (batch, 1, T, F)
         features = self.cnn(x)  # (batch, 128, T', 4)
@@ -268,9 +289,13 @@ class CWDecoder(nn.Module):
         # RNN
         rnn_out, _ = self.rnn(features)  # (batch, T', 512)
 
-        # Per-timestep character probabilities
-        output = self.fc(rnn_out)  # (batch, T', NUM_CLASSES)
-        return output
+        # Per-timestep character probabilities (CTC)
+        ctc_output = self.fc(rnn_out)  # (batch, T', NUM_CLASSES)
+
+        # WPM estimate: global mean pool over time → scalar per sample
+        wpm_pred = self.wpm_head(rnn_out.mean(dim=1)).squeeze(-1)  # (batch,)
+
+        return ctc_output, wpm_pred
 
 
 def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0.001):
@@ -294,8 +319,10 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
             total_bytes += chunk.nelement() * 2
             print(f"  Loaded chunk {ci} ({chunk.shape})", file=sys.stderr)
         chunk_size = chunks[0].size(0)  # samples per chunk (10000)
-        dataset = ChunkedF16Dataset(chunks, data['targets'], data['target_lens'], chunk_size)
-        print(f"  {data['n_samples']} samples in {n_chunks} chunks ({total_bytes/1e9:.1f} GB float16)", file=sys.stderr)
+        wpm_data = data.get('wpm')  # None if old precomputed file (before WPM head)
+        dataset = ChunkedF16Dataset(chunks, data['targets'], data['target_lens'], chunk_size, wpm=wpm_data)
+        wpm_pct = (wpm_data > 0).float().mean().item() * 100 if wpm_data is not None else 0
+        print(f"  {data['n_samples']} samples in {n_chunks} chunks ({total_bytes/1e9:.1f} GB float16), {wpm_pct:.0f}% have WPM labels", file=sys.stderr)
     else:
         print("Loading training data from WAVs (slow — run --precompute first)...", file=sys.stderr)
         dataset = CWDataset(data_dir)
@@ -322,14 +349,19 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
     if resume and os.path.exists('cw_decoder_ctc.pth'):
         ckpt = torch.load('cw_decoder_ctc.pth', map_location=device, weights_only=True)
         if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
+            missing, _ = model.load_state_dict(ckpt['model_state_dict'], strict=False)
             start_epoch = ckpt.get('epoch', 0)
-            print(f"Resumed from epoch {start_epoch}", file=sys.stderr)
+            if missing:
+                print(f"Resumed from epoch {start_epoch} (new weights: {missing})", file=sys.stderr)
+            else:
+                print(f"Resumed from epoch {start_epoch}", file=sys.stderr)
         else:
-            model.load_state_dict(ckpt)
+            model.load_state_dict(ckpt, strict=False)
             print("Loaded weights (no epoch info)", file=sys.stderr)
 
     ctc_loss = nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
+    wpm_loss_fn = nn.MSELoss()
+    WPM_LOSS_WEIGHT = 0.01  # WPM auxiliary loss weight — small so CTC dominates
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 
@@ -346,18 +378,26 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
         train_loss = 0
         n_batches = 0
 
-        for specs, targets_cat, target_lens in train_loader:
+        for specs, targets_cat, target_lens, wpm_targets in train_loader:
             specs = specs.to(device)
+            wpm_targets = wpm_targets.to(device)
             optimizer.zero_grad()
-            output = model(specs)  # (batch, T', classes)
+            ctc_output, wpm_pred = model(specs)
 
             # CTC expects (T, batch, classes)
-            log_probs = output.permute(1, 0, 2).log_softmax(dim=2)
+            log_probs = ctc_output.permute(1, 0, 2).log_softmax(dim=2)
             T = log_probs.size(0)
             batch_size_actual = specs.size(0)
             input_lengths = torch.full((batch_size_actual,), T, dtype=torch.long)
 
             loss = ctc_loss(log_probs, targets_cat.to(device), input_lengths.to(device), target_lens.to(device))
+
+            # Auxiliary WPM loss — only on samples that have WPM labels
+            wpm_mask = wpm_targets > 0
+            if wpm_mask.any():
+                wpm_loss = wpm_loss_fn(wpm_pred[wpm_mask], wpm_targets[wpm_mask])
+                if torch.isfinite(wpm_loss):
+                    loss = loss + WPM_LOSS_WEIGHT * wpm_loss
 
             if torch.isfinite(loss):
                 loss.backward()
@@ -377,11 +417,14 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
         exact_match = 0
         total_samples = 0
 
+        wpm_abs_err = 0.0
+        wpm_count = 0
         with torch.no_grad():
-            for specs, targets_cat, target_lens in val_loader:
+            for specs, targets_cat, target_lens, wpm_targets in val_loader:
                 specs = specs.to(device)
-                output = model(specs)
-                log_probs = output.permute(1, 0, 2).log_softmax(dim=2)
+                wpm_targets = wpm_targets.to(device)
+                ctc_output, wpm_pred = model(specs)
+                log_probs = ctc_output.permute(1, 0, 2).log_softmax(dim=2)
                 T = log_probs.size(0)
                 batch_size_actual = specs.size(0)
                 input_lengths = torch.full((batch_size_actual,), T, dtype=torch.long)
@@ -391,10 +434,16 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
                     val_loss += loss.item()
                 val_batches += 1
 
+                # WPM MAE on labeled samples
+                wpm_mask = wpm_targets > 0
+                if wpm_mask.any():
+                    wpm_abs_err += (wpm_pred[wpm_mask] - wpm_targets[wpm_mask]).abs().sum().item()
+                    wpm_count += wpm_mask.sum().item()
+
                 # Decode and measure accuracy
                 offset = 0
                 for b in range(batch_size_actual):
-                    pred_text = ctc_greedy_decode(output[b].cpu())
+                    pred_text = ctc_greedy_decode(ctc_output[b].cpu())
                     tlen = target_lens[b].item()
                     true_indices = targets_cat[offset:offset + tlen].tolist()
                     true_text = ''.join(IDX_TO_CHAR[i] for i in true_indices)
@@ -414,6 +463,7 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
         avg_val_loss = val_loss / max(val_batches, 1)
         char_acc = char_correct / max(char_total, 1) * 100
         exact_acc = exact_match / max(total_samples, 1) * 100
+        wpm_mae = wpm_abs_err / max(wpm_count, 1)
 
         scheduler.step(avg_val_loss)
 
@@ -422,20 +472,22 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
             # Show a few sample predictions
             model.eval()
             with torch.no_grad():
-                sample_specs, sample_targets, sample_lens = next(iter(val_loader))
-                sample_out = model(sample_specs.to(device))
+                sample_specs, sample_targets, sample_lens, sample_wpms = next(iter(val_loader))
+                sample_ctc, sample_wpm_pred = model(sample_specs.to(device))
                 offset = 0
                 examples = []
                 for b in range(min(3, sample_specs.size(0))):
-                    pred = ctc_greedy_decode(sample_out[b].cpu())
+                    pred = ctc_greedy_decode(sample_ctc[b].cpu())
                     tlen = sample_lens[b].item()
                     true_idx = sample_targets[offset:offset + tlen].tolist()
                     true = ''.join(IDX_TO_CHAR[i] for i in true_idx)
                     offset += tlen
-                    examples.append(f'    "{true}" → "{pred}"')
+                    wpm_str = f" [{sample_wpm_pred[b].item():.0f} WPM]" if sample_wpms[b] > 0 else ""
+                    examples.append(f'    "{true}" → "{pred}"{wpm_str}')
 
+            wpm_str = f" wpm_mae={wpm_mae:.1f}" if wpm_count > 0 else ""
             print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} "
-                  f"char_acc={char_acc:.1f}% exact={exact_acc:.1f}% lr={optimizer.param_groups[0]['lr']:.6f}",
+                  f"char_acc={char_acc:.1f}% exact={exact_acc:.1f}%{wpm_str} lr={optimizer.param_groups[0]['lr']:.6f}",
                   file=sys.stderr)
             for ex in examples:
                 print(ex, file=sys.stderr)
@@ -452,6 +504,7 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
                 'epoch': epoch + 1,
                 'val_loss': avg_val_loss,
                 'char_acc': char_acc,
+                'wpm_mae': wpm_mae,
             }, save_path)
             if save_path.endswith('best.pth'):
                 print(f"  New best model saved (val_loss={avg_val_loss:.4f})", file=sys.stderr)
@@ -462,6 +515,7 @@ def train(data_dir='training_data', epochs=50, batch_size=16, resume=False, lr=0
         'epoch': epoch + 1,
         'val_loss': avg_val_loss,
         'char_acc': char_acc,
+        'wpm_mae': wpm_mae,
     }, 'cw_decoder_ctc.pth')
     print(f"\nTraining complete. Final: char_acc={char_acc:.1f}% exact={exact_acc:.1f}%", file=sys.stderr)
     print(f"Best model: cw_decoder_ctc_best.pth", file=sys.stderr)

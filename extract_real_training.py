@@ -14,14 +14,61 @@ import re
 import os
 import json
 import sys
-from eval_model import channelize
+import soundfile as sf
+from scipy.signal import firwin, lfilter
+
+
+def channelize(samples, sample_rate, center_freq, target_rate=4000, cw_pitch=600.0):
+    """Memory-efficient channelizer using float32 throughout.
+
+    Equivalent to eval_model.channelize() but avoids float64 intermediates
+    that balloon memory to 6+ GB on 900s IQ recordings.
+    """
+    n = len(samples)
+    mix_freq = float(center_freq - cw_pitch)
+    decim_factor = int(sample_rate) // int(target_rate)
+
+    # Process in chunks to limit peak intermediate memory
+    chunk_size = 1 << 22  # 4M samples ~= 16 MB per chunk
+    mixed = np.empty(n, dtype=np.float32)
+    phase = 0.0
+    phase_inc = -2.0 * np.pi * mix_freq / sample_rate
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        idx = np.arange(start, end, dtype=np.float32)
+        phases = (phase_inc * idx).astype(np.float32)
+        if np.iscomplexobj(samples):
+            lo_r = np.cos(phases)
+            lo_i = np.sin(phases)
+            mixed[start:end] = (samples[start:end].real * lo_r
+                                - samples[start:end].imag * lo_i) * 2.0
+        else:
+            mixed[start:end] = samples[start:end].real * np.cos(phases) * 2.0
+
+    # FIR lowpass + decimate
+    nyq = sample_rate / 2.0
+    cutoff = target_rate / 2.0 * 0.8
+    numtaps = min(255, decim_factor * 20 + 1)
+    if numtaps % 2 == 0:
+        numtaps += 1
+    fir = firwin(numtaps, cutoff / nyq).astype(np.float32)
+    filtered = lfilter(fir, 1.0, mixed).astype(np.float32)
+    del mixed
+    decimated = filtered[::decim_factor]
+    del filtered
+
+    peak = np.max(np.abs(decimated))
+    if peak > 1e-6:
+        decimated /= peak
+    return decimated
 
 CALL_RE = re.compile(r'(?<![A-Z0-9])([A-Z0-9]{1,2}\d{1,2}[A-Z]{1,3})(?![A-Z0-9])')
 
 
 def extract_training_samples(wav_path, bmorse_outputs, answer_key=None,
                               output_dir='training_data_real', target_rate=4000,
-                              segment_duration=4.0):
+                              segment_duration=4.0, max_duration=900):
     """Extract labeled audio segments from a real recording.
 
     For each frequency where bmorse found a valid callsign, extract the
@@ -29,15 +76,33 @@ def extract_training_samples(wav_path, bmorse_outputs, answer_key=None,
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Read recording
-    print(f"Loading {wav_path}...", file=sys.stderr)
-    w = wave.open(wav_path, 'rb')
-    sr = w.getframerate()
-    frames = w.readframes(w.getnframes())
-    w.close()
-    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    # Read recording (supports 24-bit extensible WAV via soundfile)
+    # Limit to max_duration seconds to avoid OOM on large recordings
+    print(f"Loading {wav_path} (max {max_duration}s)...", file=sys.stderr)
+    info = sf.info(wav_path)
+    stop_frame = min(info.frames, int(max_duration * info.samplerate)) if max_duration else None
+    info = sf.info(wav_path)
+    sr = info.samplerate
+    nch = info.channels
+    n_frames = min(info.frames, stop_frame) if stop_frame else info.frames
+    # Read channels individually to avoid holding raw + complex in memory at once
+    if nch >= 2:
+        i_ch = np.zeros(n_frames, dtype=np.float32)
+        q_ch = np.zeros(n_frames, dtype=np.float32)
+        with sf.SoundFile(wav_path) as f:
+            block = f.read(n_frames, dtype='float32', always_2d=True)
+            i_ch[:] = block[:, 0]
+            q_ch[:] = block[:, 1]
+            del block
+        samples = i_ch + 1j * q_ch
+        del i_ch, q_ch
+    else:
+        with sf.SoundFile(wav_path) as f:
+            block = f.read(n_frames, dtype='float32', always_2d=True)
+            samples = block[:, 0].copy()
+            del block
     duration = len(samples) / sr
-    print(f"  {len(samples)} samples, {sr} Hz, {duration:.1f}s", file=sys.stderr)
+    print(f"  {len(samples)} samples, {sr} Hz, {duration:.1f}s, {nch}ch", file=sys.stderr)
 
     # Load master.scp for validation
     master = set()
@@ -91,13 +156,14 @@ def extract_training_samples(wav_path, bmorse_outputs, answer_key=None,
     sample_idx = 0
     segment_samples = int(segment_duration * target_rate)
 
-    # PSD for peak finding
+    # PSD for peak finding (use real part for IQ input)
     fft_size = 8192
     window = np.hanning(fft_size)
+    real_samples = np.real(samples)
     psd = np.zeros(fft_size // 2 + 1)
-    n_frames = min(20, len(samples) // fft_size)
+    n_frames = min(20, len(real_samples) // fft_size)
     for i in range(n_frames):
-        frame = samples[i * fft_size:(i + 1) * fft_size] * window
+        frame = real_samples[i * fft_size:(i + 1) * fft_size] * window
         psd += np.abs(np.fft.rfft(frame)) ** 2
     psd /= n_frames
     freq_res = sr / fft_size
@@ -145,7 +211,7 @@ def extract_training_samples(wav_path, bmorse_outputs, answer_key=None,
         if smooth_len > 1:
             kernel = np.ones(smooth_len) / smooth_len
             envelope = np.convolve(envelope, kernel, mode='same')
-        env_threshold = np.median(envelope) + 0.5 * (np.max(envelope) - np.median(envelope))
+        env_threshold = np.median(envelope) + 0.2 * (np.max(envelope) - np.median(envelope))
 
         # Extract sliding windows — only keep windows with active signal
         hop = segment_samples // 2  # 50% overlap
@@ -160,7 +226,7 @@ def extract_training_samples(wav_path, bmorse_outputs, answer_key=None,
             # Skip if signal is active less than 20% of the window
             # (probably between transmissions, just noise)
             active_pct = np.sum(seg_envelope > env_threshold) / len(seg_envelope)
-            if active_pct < 0.10:
+            if active_pct < 0.03:
                 continue
 
             # Write as WAV
