@@ -138,6 +138,7 @@ struct cw_decoder_t {
     int32_t sig_timer;          // Elapsed time of current signal state, dependent
 
     sigbuf_t data[CW_DATA_BUFSIZE]; // Buffer containing decoded dot/dash and time information for assembly into a character
+    uint32_t data_gap[CW_DATA_BUFSIZE]; // Gap duration preceding each element (for trailing char suppression)
     uint8_t data_len;               // Length of incoming character data
     uint32_t code;                  // Decoded dot/dash info in pairs of bits, - is encoded as 11, and . is encoded as 10
 
@@ -835,6 +836,13 @@ static bool cw_DataRecognition(cw_decoder_t *cw, bool* new_char_p)
 			{
 				cw->processed = FALSE; // Indicate that incoming character is not processed
 
+				// Record the gap that preceded this element (for trailing char suppression)
+				// The previous sig[] entry was the space before this mark
+				{
+					int prev_idx = ring_idx_decrement(cw->sig_outcount, CW_SIG_BUFSIZE);
+					cw->data_gap[cw->data_len] = cw->sig[prev_idx].time;
+				}
+
 				// Determine if Dot or Dash (e.q. 4.10)
 				if ((cw->times.pulse_avg - t) >= 0)         // It is a Dot
 				{
@@ -1002,7 +1010,7 @@ static void PrintCharFunc(cw_decoder_t *cw, uint8_t c)
 
 	const char *s;
 	char s2[2] = { '\0', '\0' };
-	
+
     if (c >= 0x7f) {
         s = "[err]";
     } else
