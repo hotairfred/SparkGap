@@ -16,6 +16,9 @@ Usage:
     python3 openskimmer.py --file B1_recording.wav --start-min 15 --end-min 30
 """
 
+import faulthandler
+faulthandler.enable()
+
 import argparse
 import asyncio
 import json
@@ -764,106 +767,6 @@ def _get_bmorse_lib():
     return _bmorse_lib
 
 
-_ml_model = None
-_ml_device = None
-
-def _get_ml_model(model_path):
-    """Load ML CTC model once, reuse across all signal instances."""
-    global _ml_model, _ml_device
-    if _ml_model is not None:
-        return _ml_model, _ml_device
-    try:
-        import torch
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from train_model import CWDecoder
-        _ml_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        _ml_model = CWDecoder().to(_ml_device)
-        ckpt = torch.load(model_path, map_location=_ml_device, weights_only=True)
-        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-            _ml_model.load_state_dict(ckpt['model_state_dict'], strict=False)
-        else:
-            _ml_model.load_state_dict(ckpt, strict=False)
-        _ml_model.eval()
-        log.info("ML decoder loaded: %s on %s", model_path, _ml_device)
-    except Exception as e:
-        log.warning("ML decoder failed to load: %s", e)
-        _ml_model = None
-    return _ml_model, _ml_device
-
-
-class _MLDecoder:
-    """In-process CNN+BiGRU+CTC decoder for CW signals.
-
-    Accepts 16-bit PCM at BMORSE_RATE (4kHz), accumulates audio,
-    runs CTC inference every ~6s, appends decoded text.
-    Output tagged 'primary' — same weight as uhsdr in SpotTracker.
-    """
-
-    # 768 spectrogram frames × hop=32 samples = 24576 samples input,
-    # plus fft_size=128 for the last frame window
-    _WINDOW_SAMPLES = 768 * 32 + 128  # = 24704 samples (~6.18s at 4kHz)
-    _HOP_SAMPLES = 384 * 32            # = 12288 samples (~3.07s hop)
-
-    def __init__(self, rf_khz, snr, model_path):
-        self.rf_khz = rf_khz
-        self.snr = snr
-        self.decoded_text = ''
-        self.total_chars = 0
-        self.last_output = time.time()
-        self.detected_wpm = 0
-        self._pending = ''
-        self._audio_buf = np.zeros(0, dtype=np.float32)
-        self._model, self._device = _get_ml_model(model_path)
-
-    def feed_pcm(self, pcm_bytes):
-        if not self._model:
-            return
-        n = len(pcm_bytes) // 2
-        if n == 0:
-            return
-        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        self._audio_buf = np.concatenate([self._audio_buf, audio])
-
-        while len(self._audio_buf) >= self._WINDOW_SAMPLES:
-            chunk = self._audio_buf[:self._WINDOW_SAMPLES]
-            self._audio_buf = self._audio_buf[self._HOP_SAMPLES:]
-            text = self._decode_chunk(chunk)
-            if text:
-                self._pending += text + ' '
-                self.decoded_text += text + ' '
-                self.total_chars += len(text)
-                self.last_output = time.time()
-
-    def _decode_chunk(self, audio):
-        try:
-            import torch
-            from train_model import compute_spectrogram, ctc_greedy_decode
-            spec = compute_spectrogram(audio, fft_size=128, hop=32)
-            # Pad/truncate to exactly 768 frames
-            if spec.shape[0] < 768:
-                spec = np.pad(spec, ((0, 768 - spec.shape[0]), (0, 0)))
-            else:
-                spec = spec[:768]
-            tensor = torch.tensor(spec).unsqueeze(0).unsqueeze(0).to(self._device)
-            with torch.no_grad():
-                ctc_out, wpm_pred = self._model(tensor)
-                text = ctc_greedy_decode(ctc_out[0].cpu())
-                wpm = wpm_pred[0].item()
-                if wpm > 0:
-                    self.detected_wpm = int(round(wpm))
-            return text.strip() if text else ''
-        except Exception:
-            return ''
-
-    def read(self):
-        text = self._pending
-        self._pending = ''
-        return text
-
-    def kill(self):
-        pass  # model singleton, not owned by this instance
-
-
 class _LibBmorseDecoder:
     """In-process Bayesian CW decoder via libbmorse.so.
 
@@ -936,46 +839,44 @@ def _get_cw_engine():
     try:
         _cw_engine_lib = _ct.CDLL('./libcw_engine.so')
 
-        class _CWSpot(_ct.Structure):
-            _fields_ = [('callsign', _ct.c_char * 16), ('freq_offset_hz', _ct.c_float),
-                        ('snr_db', _ct.c_float), ('wpm', _ct.c_int), ('decoder', _ct.c_int)]
-
-        _cw_engine_lib._CWSpot = _CWSpot
         _cw_engine_lib.cw_engine_init.restype = _ct.c_int
         _cw_engine_lib.cw_engine_init.argtypes = [_ct.c_char_p]
         _cw_engine_lib.channel_create.restype = _ct.c_void_p
         _cw_engine_lib.channel_create.argtypes = [_ct.c_float, _ct.c_float]
-        _cw_engine_lib.channel_set_pitch.restype = None
-        _cw_engine_lib.channel_set_pitch.argtypes = [_ct.c_void_p, _ct.c_float]
-        _cw_engine_lib.channel_feed_iq.restype = _ct.c_int
+        _cw_engine_lib.channel_feed_iq.restype = None
         _cw_engine_lib.channel_feed_iq.argtypes = [_ct.c_void_p,
-            _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
-            _ct.c_int, _ct.POINTER(_CWSpot), _ct.c_int]
+            _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float), _ct.c_int]
+        _cw_engine_lib.channel_decoder_count.restype = _ct.c_int
+        _cw_engine_lib.channel_decoder_count.argtypes = [_ct.c_void_p]
+        _cw_engine_lib.channel_read_text.restype = _ct.c_int
+        _cw_engine_lib.channel_read_text.argtypes = [_ct.c_void_p, _ct.c_int,
+            _ct.c_char_p, _ct.c_int, _ct.POINTER(_ct.c_int)]
+        _cw_engine_lib.channel_decoder_speed.restype = _ct.c_int
+        _cw_engine_lib.channel_decoder_speed.argtypes = [_ct.c_void_p, _ct.c_int]
+        _cw_engine_lib.channel_get_pitch.restype = _ct.c_float
+        _cw_engine_lib.channel_get_pitch.argtypes = [_ct.c_void_p]
         _cw_engine_lib.channel_get_wpm.restype = _ct.c_int
         _cw_engine_lib.channel_get_wpm.argtypes = [_ct.c_void_p]
         _cw_engine_lib.channel_destroy.restype = None
         _cw_engine_lib.channel_destroy.argtypes = [_ct.c_void_p]
         _cw_engine_lib.cw_engine_shutdown.restype = None
 
-        # Init SCP database
-        scp_path = 'COMBINED.SCP' if os.path.exists('COMBINED.SCP') else 'MASTER.SCP'
-        ret = _cw_engine_lib.cw_engine_init(scp_path.encode())
+        ret = _cw_engine_lib.cw_engine_init(b"")
         if ret != 0:
             log.warning("cw_engine_init failed")
             _cw_engine_lib = None
             return None
 
-        log.info("Loaded libcw_engine.so (C++ channelizer + dual decoder)")
+        log.info("Loaded libcw_engine.so (C++ channelizer, text output mode)")
     except OSError:
         pass
     return _cw_engine_lib
 
 
 class _CWEngineChannel:
-    """Per-signal channel using C++ cw_engine (channelizer + uhsdr + bmorse).
+    """Per-signal channel using C++ cw_engine (channelizer + multi-speed uhsdr).
 
-    Replaces Channelizer + _LibDecoder. Feeds raw IQ directly to C++.
-    Returns decoded spot dicts compatible with SpotTracker.
+    Feeds raw IQ to C++. Returns raw decoded text per decoder for SpotTracker.
     """
 
     def __init__(self, freq_offset, rf_khz, snr, sample_rate):
@@ -983,93 +884,55 @@ class _CWEngineChannel:
         self.rf_khz = rf_khz
         self.snr = snr
         self.freq_offset = freq_offset
-        self.decoded_text = ''
         self.total_chars = 0
         self.last_output = time.time()
         self.detected_wpm = 0
 
         self._sample_rate = sample_rate
+        self._text_buf = _ct.create_string_buffer(8192)
+        self._wpm_out = _ct.c_int(0)
 
         eng = _get_cw_engine()
         self._eng = eng
         self._handle = eng.channel_create(
             _ct.c_float(freq_offset), _ct.c_float(sample_rate)) if eng else None
-        self._spot_buf = (eng._CWSpot * 100)() if eng else None
-        self._pending_spots = []
-
-        # Pitch detection state
-        self._pitch_detected = False
-        self._pitch_buf = np.zeros(0, dtype=np.float64)
-        self._mix_phase = 0.0
+        self._accumulated = {}  # decoder_idx → accumulated text
 
     def feed_iq(self, i_samples, q_samples):
-        """Feed raw IQ (float arrays) — C++ does channelization + decode.
-        Also runs pitch detection on first 15s and retunes if needed."""
+        """Feed raw IQ — C++ does channelization + multi-speed decode."""
         if not self._handle or len(i_samples) == 0:
             return
-
-        # Pitch detection disabled — Python SSB mix doesn't match C++ FIR path
-        # TODO: add pitch detection inside cw_engine.cpp instead
-        if False and not self._pitch_detected:
-            # Quick SSB mix to find tone (same as Channelizer)
-            n = len(i_samples)
-            t = np.arange(n) / self._sample_rate
-            mix_freq = self.freq_offset - CW_TONE
-            mixed = i_samples * np.cos(2 * np.pi * mix_freq * t + self._mix_phase)  \
-                  + q_samples * np.sin(2 * np.pi * mix_freq * t + self._mix_phase)
-            self._mix_phase += 2 * np.pi * mix_freq * n / self._sample_rate
-            # Decimate to ~12kHz for pitch analysis
-            dec = int(self._sample_rate / 12000)
-            if dec > 1:
-                decimated = mixed[::dec]
-            else:
-                decimated = mixed
-            self._pitch_buf = np.concatenate([self._pitch_buf, decimated])
-            if len(self._pitch_buf) >= 12000 * 15:  # 15s at 12kHz
-                spec = np.abs(np.fft.rfft(self._pitch_buf[:24000] * np.hanning(24000)))
-                freqs = np.fft.rfftfreq(24000, 1.0 / 12000)
-                mask = (freqs >= 475) & (freqs <= 825)
-                if np.any(mask):
-                    peak_freq = freqs[mask][np.argmax(spec[mask])]
-                    pitch = max(450, min(850, int(round(peak_freq))))
-                    if abs(pitch - CW_TONE) > 5:
-                        self.set_pitch(pitch)
-                        log.info("cw_engine pitch: %d Hz for %.1f kHz", pitch, self.rf_khz)
-                self._pitch_detected = True
-                self._pitch_buf = np.zeros(0)  # free memory
         import ctypes as _ct
         i_f = np.ascontiguousarray(i_samples, dtype=np.float32)
         q_f = np.ascontiguousarray(q_samples, dtype=np.float32)
-        n = self._eng.channel_feed_iq(
+        self._eng.channel_feed_iq(
             self._handle,
             i_f.ctypes.data_as(_ct.POINTER(_ct.c_float)),
             q_f.ctypes.data_as(_ct.POINTER(_ct.c_float)),
-            len(i_f), self._spot_buf, 100)
+            len(i_f))
+
+    @property
+    def decoder_count(self):
+        if not self._handle:
+            return 0
+        return self._eng.channel_decoder_count(self._handle)
+
+    def read_decoder_text(self, decoder_idx):
+        """Read new text from a specific decoder. Returns (text, wpm, speed)."""
+        if not self._handle:
+            return '', 0, 0
+        import ctypes as _ct
+        n = self._eng.channel_read_text(
+            self._handle, decoder_idx,
+            self._text_buf, 8192, _ct.byref(self._wpm_out))
         if n > 0:
-            for si in range(n):
-                call = self._spot_buf[si].callsign.decode('latin-1').strip('\x00')
-                dec = 'uhsdr' if self._spot_buf[si].decoder == 0 else 'bmorse'
-                wpm = self._spot_buf[si].wpm
-                self._pending_spots.append({
-                    'call': call,
-                    'freq_khz': self.rf_khz,
-                    'snr': self.snr,
-                    'method': f'cw_engine_{dec}',
-                    'wpm': wpm,
-                })
+            text = self._text_buf.value[:n].decode('latin-1', errors='replace')
+            self.total_chars += n
             self.last_output = time.time()
-            self.detected_wpm = self._eng.channel_get_wpm(self._handle)
-
-    def set_pitch(self, pitch_hz):
-        if self._handle:
-            import ctypes as _ct
-            self._eng.channel_set_pitch(self._handle, _ct.c_float(pitch_hz))
-
-    def read_spots(self):
-        """Return pending spots and clear buffer."""
-        spots = self._pending_spots
-        self._pending_spots = []
-        return spots
+            self.detected_wpm = self._wpm_out.value
+            speed = self._eng.channel_decoder_speed(self._handle, decoder_idx)
+            return text, self._wpm_out.value, speed
+        return '', 0, 0
 
     def kill(self):
         if self._handle:
@@ -1089,7 +952,7 @@ class SignalGroup:
     def __init__(self, freq_offset, rf_khz, sample_rate, snr,
                  decoder_bin, speeds,
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
-                 wpm=30, ml_model_path=None):
+                 wpm=30):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
@@ -1102,16 +965,12 @@ class SignalGroup:
         if eng:
             self._cw_engine = _CWEngineChannel(freq_offset, rf_khz, snr, sample_rate)
 
-        # Fallback: Python channelizers (only if cw_engine not available)
-        if not self._cw_engine:
-            self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
-                                         normalize='peak')
-            self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
-                                      normalize='peak',
-                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin or ml_model_path) else None
-        else:
-            self._ch_uhsdr = None
-            self._ch_4k = None
+        # Python channelizers — always create (runs in parallel with cw_engine)
+        self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
+                                     normalize='peak')
+        self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
+                                  normalize='peak',
+                                  cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
 
         # Two-pass decoder spawn:
         #   Immediately: start uhsdr at default pitch (600 Hz) — no buffering
@@ -1131,23 +990,23 @@ class SignalGroup:
         self._bmorse_fallback_time = 0  # when to check if uhsdr failed
         self._bmorse_fallback_started = False
 
-        # Start uhsdr immediately — no pitch wait, no buffering
+        # Start Python uhsdr decoders — always (runs in parallel with cw_engine)
         self.decoders = []
-        lib = _get_uhsdr_lib()
-        for spd in speeds:
-            if lib:
-                dec = _LibDecoder(rf_khz, snr, freq=CW_TONE,
-                                  sample_rate=DECODER_RATE, wpm=spd)
-            else:
-                cmd = [decoder_bin, '-r', str(DECODER_RATE), '-f', str(CW_TONE)]
-                if spd > 0:
-                    cmd += ['-s', str(spd)]
-                dec = _SubprocessDecoder(rf_khz, snr, cmd, capture_wpm=True)
-            self.decoders.append(dec)
+        if True:
+            lib = _get_uhsdr_lib()
+            for spd in speeds:
+                if lib:
+                    dec = _LibDecoder(rf_khz, snr, freq=CW_TONE,
+                                      sample_rate=DECODER_RATE, wpm=spd)
+                else:
+                    cmd = [decoder_bin, '-r', str(DECODER_RATE), '-f', str(CW_TONE)]
+                    if spd > 0:
+                        cmd += ['-s', str(spd)]
+                    dec = _SubprocessDecoder(rf_khz, snr, cmd, capture_wpm=True)
+                self.decoders.append(dec)
 
         self.bmorse = None
         self.hamfist = None
-        self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path) if ml_model_path else None
 
     @property
     def _decoders_started(self):
@@ -1201,16 +1060,17 @@ class SignalGroup:
 
     @property
     def count(self):
-        if self._cw_engine:
-            return 2  # uhsdr + bmorse in C++
+        engine_count = (self._cw_engine.decoder_count or 0) if self._cw_engine else 0
         pending_aux = ((1 if self._bmorse_bin else 0) + (1 if self._hamfist_bin else 0)) if not self._bmorse_started else 0
-        return (pending_aux + len(self.decoders)
+        return (engine_count + pending_aux + len(self.decoders)
                 + (1 if self.bmorse else 0)
                 + (1 if self.hamfist else 0))
 
     @property
     def total_chars(self):
-        return (sum(d.total_chars for d in self.decoders)
+        engine_chars = self._cw_engine.total_chars if self._cw_engine else 0
+        return (engine_chars
+                + sum(d.total_chars for d in self.decoders)
                 + (self.bmorse.total_chars if self.bmorse else 0)
                 + (self.hamfist.total_chars if self.hamfist else 0))
 
@@ -1223,12 +1083,11 @@ class SignalGroup:
         return 0
 
     def feed_iq(self, i_samples, q_samples):
-        # C++ cw_engine path: feed raw IQ directly, skip Python channelizer
+        # C++ cw_engine path: feed raw IQ (runs in parallel with Python)
         if self._cw_engine:
             self._cw_engine.feed_iq(i_samples, q_samples)
-            return
 
-        # Fallback: Python channelizer path
+        # Python channelizer path (always runs)
         pcm_12k = self._ch_uhsdr.process(i_samples, q_samples)
 
         if self._ch_4k:
@@ -1240,10 +1099,6 @@ class SignalGroup:
         if pcm_12k:
             for d in self.decoders:
                 d.feed_pcm(pcm_12k)
-
-        # ML decoder starts immediately alongside uhsdr — no pitch wait
-        if pcm_4k and self._ml_decoder:
-            self._ml_decoder.feed_pcm(pcm_4k)
 
         # Two-pass: bmorse waits for pitch detection (~15s) + uhsdr WPM (or timeout)
         if not self._bmorse_started:
@@ -1309,16 +1164,25 @@ class SignalGroup:
             self._bmorse_fallback.feed_pcm(pcm_4k)
 
     def read_engine_spots(self):
-        """Return spots from C++ cw_engine (already SCP-validated)."""
-        if self._cw_engine:
-            return self._cw_engine.read_spots()
+        """Legacy — cw_engine now returns text via read(), SpotTracker handles matching."""
         return []
 
     def read(self):
         """Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type)."""
         results = []
         if self._cw_engine:
-            return results  # cw_engine spots handled via read_engine_spots()
+            # Read text from each C++ decoder → feed into SpotTracker
+            for di in range(self._cw_engine.decoder_count):
+                text, wpm, speed = self._cw_engine.read_decoder_text(di)
+                if text:
+                    # Accumulate per-decoder text for SpotTracker context
+                    acc = self._cw_engine._accumulated
+                    acc[di] = acc.get(di, '') + text
+                    dec_type = 'primary'  # all uhsdr speeds are primary
+                    dec_id = id(self._cw_engine) + di
+                    results.append((self.rf_khz, self.snr, text, acc[di], dec_id, dec_type))
+                    self.last_output = time.time()
+            # Fall through to also collect Python decoder output
         for d in self.decoders:
             text = d.read()
             if text:
@@ -1333,13 +1197,7 @@ class SignalGroup:
                  ([self._bmorse_fallback] if self._bmorse_fallback else []):
             text = d.read()
             if text:
-                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
-                self.last_output = time.time()
-        if self._ml_decoder:
-            text = self._ml_decoder.read()
-            if text:
-                results.append((self.rf_khz, self.snr, text, self._ml_decoder.decoded_text,
-                                 id(self._ml_decoder), 'primary'))
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
                 self.last_output = time.time()
         return results
 
@@ -1347,7 +1205,6 @@ class SignalGroup:
         if self._cw_engine:
             self._cw_engine.kill()
             self._cw_engine = None
-            return
         for d in self.decoders:
             d.kill()
         if self.bmorse:
@@ -1378,13 +1235,12 @@ class InstanceManager:
     def __init__(self, sample_rate, decoder_bin='./uhsdr_cw',
                  max_instances=150, signal_timeout=90,
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
-                 hamfist_scp=None, ml_model_path=None):
+                 hamfist_scp=None):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
         self.hamfist_bin = hamfist_bin    # None = no HamFist
         self.hamfist_scp = hamfist_scp
-        self.ml_model_path = ml_model_path  # None = no ML decoder
         self.max_instances = max_instances
         self.signal_timeout = signal_timeout
         self.speeds = speeds or [0, 30]  # auto + 30 WPM
@@ -1448,12 +1304,10 @@ class InstanceManager:
                 hamfist_bin=self.hamfist_bin,
                 hamfist_scp=self.hamfist_scp,
                 wpm=signal_wpm,
-                ml_model_path=self.ml_model_path,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
-                     ('+hamfist' if self.hamfist_bin else '') + \
-                     ('+ml' if self.ml_model_path else '')
+                     ('+hamfist' if self.hamfist_bin else '')
             log.info("Spawned %d decoders: %.1f kHz (offset %+.0f Hz, +%.0f dB, speeds %s%s)",
                      group.count, rf_khz, offset, snr,
                      [s if s > 0 else 'auto' for s in self.speeds], extras)
@@ -1543,6 +1397,30 @@ class SpotTracker:
         self._scp_by_len = defaultdict(list)
         for call in valid_calls:
             self._scp_by_len[len(call)].append(call)
+
+    @staticmethod
+    def _min_sightings(call):
+        """Length-weighted sighting threshold: short calls need more confirmations."""
+        n = len(call)
+        if n <= 4:
+            return 4  # 4-char fragments are mostly noise — require 4 sightings
+        elif n == 5:
+            return 3
+        return 2  # 6+ chars: standard threshold
+
+    def _can_respot(self, call, freq_khz, now):
+        """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
+        if not hasattr(self, '_respot_times'):
+            self._respot_times = {}
+        key = (call, round(freq_khz))
+        last = self._respot_times.get(key, 0)
+        return (now - last) >= self.respot_interval
+
+    def _mark_spotted(self, call, freq_khz, now):
+        if not hasattr(self, '_respot_times'):
+            self._respot_times = {}
+        key = (call, round(freq_khz))
+        self._respot_times[key] = now
 
     def _fuzzy_match(self, fragment, max_dist=1):
         """Find SCP callsigns within edit distance max_dist of fragment.
@@ -1644,10 +1522,11 @@ class SpotTracker:
                 info['snr'] = max(info['snr'], snr)
 
                 has_context = bool(CQ_PATTERNS.search(context_clean))
-                if (has_context or info['count'] >= 2) and \
-                   (now - info['last_spotted']) >= self.respot_interval:
+                min_s = self._min_sightings(call)
+                if (has_context or info['count'] >= min_s) and \
+                   self._can_respot(call, freq_khz, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
-                        info['last_spotted'] = now
+                        self._mark_spotted(call, freq_khz, now)
                         spots.append({
                             'call': call,
                             'freq_khz': freq_khz,
@@ -1672,10 +1551,11 @@ class SpotTracker:
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
 
-                if info['count'] >= 2 and \
-                   (now - info['last_spotted']) >= self.respot_interval:
+                min_s = self._min_sightings(frag)
+                if info['count'] >= min_s and \
+                   self._can_respot(frag, freq_khz, now):
                     if len(self._cycle_calls[frag]) < 3:
-                        info['last_spotted'] = now
+                        self._mark_spotted(frag, freq_khz, now)
                         spots.append({
                             'call': frag,
                             'freq_khz': freq_khz,
@@ -1747,9 +1627,9 @@ class SpotTracker:
                 # Check consensus against SCP — exact first, then fuzzy
                 if consensus_str in self.valid_calls:
                     info = self._tracking[consensus_str]
-                    if (now - info['last_spotted']) >= self.respot_interval:
+                    if self._can_respot(consensus_str, freq_khz, now):
                         if consensus_str not in self.blacklist:
-                            info['last_spotted'] = now
+                            self._mark_spotted(consensus_str, freq_khz, now)
                             info['freq'] = freq_khz
                             info['snr'] = snr
                             spots.append({
@@ -1769,9 +1649,9 @@ class SpotTracker:
                     if fuzzy and avg_confidence >= 0.90:
                         best_call, best_dist = min(fuzzy, key=lambda x: x[1])
                         info = self._tracking[best_call]
-                        if (now - info['last_spotted']) >= self.respot_interval:
+                        if self._can_respot(best_call, freq_khz, now):
                             if best_call not in self.blacklist:
-                                info['last_spotted'] = now
+                                self._mark_spotted(best_call, freq_khz, now)
                                 info['freq'] = freq_khz
                                 info['snr'] = snr
                                 spots.append({
@@ -1840,13 +1720,13 @@ class OpenSkimmer:
         else:
             center = int(band)
 
-        devices = discover()
+        rx_sample_rate = self.cfg.get('sample_rate', 48000)
+        sdr_port = self.cfg.get('sdr_port', 1024)
+
+        devices = discover(port=sdr_port)
         if not devices:
             log.error("No HPSDR devices found")
             return False
-
-        rx_sample_rate = self.cfg.get('sample_rate', 48000)
-        sdr_port = self.cfg.get('sdr_port', 1024)
         listen_port = self.cfg.get('hpsdr_listen_port', sdr_port)
         passive = self.cfg.get('passive', False)
         rx_filter = self.cfg.get('rx_filter', None)
@@ -2001,20 +1881,7 @@ class OpenSkimmer:
                                      if cw_min <= center_khz + f/1000 <= cw_max]
                     self.manager.update_signals(clustered, center_khz)
 
-            # Collect C++ engine spots (pre-validated, bypass SpotTracker)
-            engine_spots = self.manager.collect_engine_spots()
-            for spot in engine_spots:
-                self.spot_count += 1
-                self.telnet.broadcast_spot(
-                    freq_khz=spot['freq_khz'],
-                    dx_call=spot['call'],
-                    snr=spot['snr'],
-                )
-                method = spot.get('method', 'cw_engine')
-                log.info("*** SPOT: %10.1f  %-12s  %d dB  [%s] ***",
-                         spot['freq_khz'], spot['call'], spot['snr'], method)
-
-            # Collect Python decoder output (fallback path)
+            # Collect all decoder output (C++ engine + Python fallback)
             results = self.manager.collect_all()
             for rf_khz, snr, text, ctx, dec_id, dec_type in results:
                 log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
@@ -2181,8 +2048,6 @@ def run_file_mode(args, config):
         max_instances=config.get('max_instances', 150),
         signal_timeout=9999,  # don't kill during file processing
         speeds=speeds,
-        bmorse_bin=config.get('bmorse_bin'),
-        ml_model_path=config.get('ml_model'),
     )
 
     center_khz = args.center_khz
@@ -2221,9 +2086,6 @@ def run_file_mode(args, config):
         samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64)
         scan_i = samples[0::2] if file_channels == 2 else samples
         scan_q = samples[1::2] if file_channels == 2 else np.zeros_like(samples)
-
-    if args.negate_q:
-        scan_q = -scan_q
 
     fft_size = 8192
     n_ffts = min(len(scan_i) // fft_size, 200)
@@ -2277,9 +2139,6 @@ def run_file_mode(args, config):
             else:
                 i_data = samples
                 q_data = np.zeros_like(samples)
-
-        if args.negate_q:
-            q_data = -q_data
 
         # Feed IQ in blocks
         block_size = file_rate // 10  # 100ms blocks
@@ -2402,7 +2261,6 @@ def main():
     parser.add_argument('--start-min', type=float, default=0, help='Start minute in file')
     parser.add_argument('--end-min', type=float, default=0, help='End minute in file (0=end)')
     parser.add_argument('--center-khz', type=float, default=7090, help='Center freq kHz for file mode')
-    parser.add_argument('--negate-q', action='store_true', help='Negate Q channel (IQ polarity fix)')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
