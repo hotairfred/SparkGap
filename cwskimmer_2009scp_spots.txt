@@ -1,0 +1,153 @@
+DX de WF8Z-#:      -10.1  E7HQ           19 dB  31 WPM                0000Z
+DX de WF8Z-#:       -7.7  LY2MM          24 dB  30 WPM                0000Z
+DX de WF8Z-#:       -2.2  LZ8E           18 dB  31 WPM                0000Z
+DX de WF8Z-#:       13.6  OK3C           11 dB  30 WPM                0000Z
+DX de WF8Z-#:       18.9  PA6HQ          31 dB  31 WPM                0000Z
+DX de WF8Z-#:       -3.8  HA7A           25 dB  34 WPM                0000Z
+DX de WF8Z-#:        0.7  OK1DOR         19 dB  29 WPM                0000Z
+DX de WF8Z-#:       10.8  TM0HQ          15 dB  31 WPM                0000Z
+DX de WF8Z-#:        8.1  UN1HQ          15 dB  31 WPM                0000Z
+DX de WF8Z-#:      -16.9  HA6NL          26 dB  29 WPM                0000Z
+DX de WF8Z-#:      -14.8  UW5U           14 dB  29 WPM                0000Z
+DX de WF8Z-#:        7.4  SP2GCJ         29 dB  31 WPM  DE            0000Z
+DX de WF8Z-#:        9.1  DL9GMC         33 dB  29 WPM                0000Z
+DX de WF8Z-#:      -18.0  IR3Z           46 dB  29 WPM                0000Z
+DX de WF8Z-#:      -16.3  UT7UJ          27 dB  38 WPM                0000Z
+DX de WF8Z-#:      -14.3  DL1NKS         29 dB  31 WPM                0000Z
+DX de WF8Z-#:       -1.1  9A0HQ          27 dB  32 WPM                0000Z
+DX de WF8Z-#:       16.9  G4AON           6 dB  29 WPM                0000Z
+DX de WF8Z-#:      -10.1  SP7JLH         23 dB  25 WPM                0000Z
+DX de WF8Z-#:       -3.2  LZ3FN          15 dB  33 WPM                0000Z
+DX de WF8Z-#:      -16.9  HA6NL          26 dB  28 WPM  CQ            0000Z
+DX de WF8Z-#:      -16.3  UT7UJ          27 dB  38 WPM  CQ            0000Z
+DX de WF8Z-#:       -0.8  OZ1HQ          27 dB  26 WPM  CQ            0000Z
+DX de WF8Z-#:       11.1  RK3ZZ          19 dB  29 WPM                0000Z
+DX de WF8Z-#:        1.5  YL4HQ          18 dB  33 WPM                0000Z
+DX de WF8Z-#:        2.4  SN7F           27 dB  31 WPM                0000Z
+DX de WF8Z-#:      -20.5  UT5ECZ         26 dB  28 WPM                0000Z
+DX de WF8Z-#:        2.0  HA8TP          21 dB  30 WPM                0000Z
+DX de WF8Z-#:      -12.3  LY2BKT         14 dB  26 WPM                0000Z
+DX de WF8Z-#:       -1.7  OH2HQ          21 dB  30 WPM                0000Z
+DX de WF8Z-#:       20.1  RA3CO          37 dB  40 WPM  CQ            0000Z
+DX de WF8Z-#:        5.3  YR0HQ          27 dB  34 WPM                0000Z
+DX de WF8Z-#:       12.0  RX3APM         18 dB  37 WPM                0000Z
+DX de WF8Z-#:       -2.9  OM6A           28 dB  37 WPM                0000Z
+DX de WF8Z-#:       10.5  LY0HQ          36 dB  28 WPM                0000Z
+DX de WF8Z-#:      -14.8  UW5U           13 dB  32 WPM  CQ            0000Z
+DX de WF8Z-#:       -8.1  UA6LCN         20 dB  36 WPM                0000Z
+DX de WF8Z-#:        5.8  4O3A           14 dB  38 WPM                0000Z
+DX de WF8Z-#:       13.1  YT3R           23 dB  29 WPM                0000Z
+DX de WF8Z-#:       16.3  UA9AYA         18 dB  32 WPM                0000Z
+DX de WF8Z-#:       19.3  DL9LM          13 dB  32 WPM                0000Z
+DX de WF8Z-#:      -19.4  HA3MU          14 dB  35 WPM  DE            0000Z
+DX de WF8Z-#:      -18.0  IR3Z           43 dB  24 WPM  CQ            0000Z
+DX de WF8Z-#:       10.8  TM0HQ          12 dB  30 WPM  CQ            0000Z
+DX de WF8Z-#:       -7.7  LY2MM          21 dB  31 WPM  CQ            0000Z
+DX de WF8Z-#:      -13.1  UA6EED         18 dB  28 WPM                0000Z
+DX de WF8Z-#:        6.9  ER7HQ          16 dB  34 WPM                0000Z
+DX de WF8Z-#:        2.0  HA8TP          20 dB  30 WPM  CQ            0000Z
+DX de WF8Z-#:       19.9  YR8A           18 dB  27 WPM                0000Z
+DX de WF8Z-#:      -20.5  UT5ECZ         26 dB  28 WPM  CQ            0000Z
+DX de WF8Z-#:       11.1  RK3ZZ          18 dB  29 WPM  CQ            0000Z
+DX de WF8Z-#:       12.7  RK4FWX         18 dB  29 WPM                0000Z
+DX de WF8Z-#:       -6.8  OL6P           13 dB  26 WPM                0000Z
+DX de WF8Z-#:       -4.4  RK3ER          27 dB  29 WPM                0000Z
+DX de WF8Z-#:       -5.1  SN0HQ          17 dB  34 WPM                0000Z
+DX de WF8Z-#:       -3.1  HA2QW          14 dB  29 WPM                0000Z
+DX de WF8Z-#:       -0.3  OL9HQ          37 dB  34 WPM                0000Z
+DX de WF8Z-#:       10.5  LY0HQ          35 dB  28 WPM  CQ            0000Z
+DX de WF8Z-#:       12.0  RX3APM         16 dB  36 WPM  CQ            0000Z
+DX de WF8Z-#:       -9.1  DK4A           21 dB  30 WPM  CQ            0000Z
+DX de WF8Z-#:       -0.3  OL9HQ          37 dB  34 WPM  CQ            0000Z
+DX de WF8Z-#:       -2.6  YT0HQ           9 dB  30 WPM                0000Z
+DX de WF8Z-#:        4.3  S50HQ          18 dB  35 WPM                0000Z
+DX de WF8Z-#:        8.5  HA2MN          10 dB  30 WPM                0000Z
+DX de WF8Z-#:      -21.4  RX3AEX         16 dB  31 WPM                0000Z
+DX de WF8Z-#:      -13.4  SN2F           39 dB  28 WPM                0000Z
+DX de WF8Z-#:      -15.2  RA2FN          14 dB  35 WPM                0000Z
+DX de WF8Z-#:      -11.8  RV1AT          16 dB  25 WPM                0000Z
+DX de WF8Z-#:       -2.8  OH0R           21 dB  31 WPM                0000Z
+DX de WF8Z-#:        2.2  YT2RX          18 dB  25 WPM                0000Z
+DX de WF8Z-#:       -2.3  LZ1PM           8 dB  24 WPM                0000Z
+DX de WF8Z-#:        3.9  YT1T           14 dB  31 WPM                0000Z
+DX de WF8Z-#:       -6.9  OK2MBP         12 dB  25 WPM                0000Z
+DX de WF8Z-#:       -4.4  RK3ER          29 dB  29 WPM  CQ            0000Z
+DX de WF8Z-#:        3.9  YT1T           14 dB  31 WPM  CQ            0000Z
+DX de WF8Z-#:        8.1  UN1HQ          15 dB  32 WPM  DE            0000Z
+DX de WF8Z-#:        1.5  RA9JM          12 dB  32 WPM                0000Z
+DX de WF8Z-#:       10.0  HG7HQ          22 dB  34 WPM                0000Z
+DX de WF8Z-#:       15.2  DK4RW          22 dB  32 WPM                0000Z
+DX de WF8Z-#:        5.7  OK1MKU         21 dB  23 WPM  DE            0000Z
+DX de WF8Z-#:      -17.4  UA6GF          14 dB  31 WPM                0000Z
+DX de WF8Z-#:       -6.0  IU2HQ          13 dB  37 WPM                0000Z
+DX de WF8Z-#:       17.3  DA0HQ          12 dB  36 WPM                0000Z
+DX de WF8Z-#:       -8.8  G5LP           21 dB  30 WPM                0000Z
+DX de WF8Z-#:       10.0  HG7HQ          22 dB  34 WPM  CQ            0000Z
+DX de WF8Z-#:       -8.8  G5LP           22 dB  31 WPM  CQ            0000Z
+DX de WF8Z-#:       -5.7  9A3SM          22 dB  35 WPM                0000Z
+DX de WF8Z-#:       15.1  SP3DIK         29 dB  29 WPM                0000Z
+DX de WF8Z-#:       -8.3  RX3ZX          23 dB  30 WPM  CQ            0000Z
+DX de WF8Z-#:        1.5  YL4HQ          15 dB  34 WPM  CQ            0000Z
+DX de WF8Z-#:      -13.7  TM7M            5 dB  26 WPM                0000Z
+DX de WF8Z-#:      -10.7  DL3KWF          9 dB  33 WPM                0000Z
+DX de WF8Z-#:      -14.3  OK1HX          31 dB  33 WPM  CQ            0000Z
+DX de WF8Z-#:      -11.8  RV1AT          16 dB  25 WPM  CQ            0000Z
+DX de WF8Z-#:       -3.8  HA7A           20 dB  34 WPM  CQ            0000Z
+DX de WF8Z-#:       -2.9  OM6A           28 dB  35 WPM  CQ            0000Z
+DX de WF8Z-#:       -3.6  UA3DGG          9 dB  30 WPM                0000Z
+DX de WF8Z-#:        3.3  YU09DW         18 dB  30 WPM  CQ            0000Z
+DX de WF8Z-#:        8.1  UN1HQ          14 dB  33 WPM  CQ            0000Z
+DX de WF8Z-#:        9.0  LZ9R            8 dB  29 WPM                0000Z
+DX de WF8Z-#:       11.6  UA6AK          12 dB  26 WPM                0000Z
+DX de WF8Z-#:        2.4  HG0HQ          19 dB  27 WPM                0000Z
+DX de WF8Z-#:        4.3  DL9GS          16 dB  34 WPM                0000Z
+DX de WF8Z-#:        3.2  F/DL3HAH       14 dB  28 WPM                0000Z
+DX de WF8Z-#:        7.7  GB7HQ          35 dB  31 WPM                0000Z
+DX de WF8Z-#:        7.7  GB7HQ          35 dB  31 WPM  CQ            0000Z
+DX de WF8Z-#:      -21.6  YO4KCC         18 dB  31 WPM                0000Z
+DX de WF8Z-#:        7.7  RG6G           17 dB  30 WPM                0000Z
+DX de WF8Z-#:       -1.1  LZ8E           23 dB  31 WPM                0000Z
+DX de WF8Z-#:       12.7  RK4FWX         33 dB  29 WPM  CQ            0000Z
+DX de WF8Z-#:       14.4  LN2HQ           9 dB  36 WPM  DE            0000Z
+DX de WF8Z-#:       -8.1  UA6LCN         20 dB  36 WPM  CQ            0001Z
+DX de WF8Z-#:       11.6  DL5YL          19 dB  26 WPM                0001Z
+DX de WF8Z-#:      -12.3  LY2BKT         18 dB  26 WPM  CQ            0001Z
+DX de WF8Z-#:        5.3  YR0HQ          29 dB  37 WPM  CQ            0001Z
+DX de WF8Z-#:       11.6  DL5YL          22 dB  26 WPM                0001Z
+DX de WF8Z-#:      -12.3  LY2BKT         18 dB  26 WPM  CQ            0001Z
+DX de WF8Z-#:      -11.1  OK2EA          17 dB  29 WPM                0001Z
+DX de WF8Z-#:        5.3  YR0HQ          29 dB  37 WPM  CQ            0001Z
+DX de WF8Z-#:       19.9  YR8A           14 dB  27 WPM  CQ            0001Z
+DX de WF8Z-#:      -17.3  UT5ZA          17 dB  27 WPM                0001Z
+DX de WF8Z-#:        5.6  5N0HQ          33 dB  32 WPM                0001Z
+DX de WF8Z-#:      -13.1  UA6EED         18 dB  28 WPM  CQ            0001Z
+DX de WF8Z-#:        5.5  RN1NW          12 dB  32 WPM                0001Z
+DX de WF8Z-#:        5.5  RA3UT          12 dB  33 WPM                0001Z
+DX de WF8Z-#:      -14.2  SN2F           41 dB  28 WPM                0001Z
+DX de WF8Z-#:       13.7  RK3FWE          8 dB  25 WPM                0001Z
+DX de WF8Z-#:       16.6  RN3AW          16 dB  32 WPM                0001Z
+DX de WF8Z-#:        3.1  9A0HQ           4 dB  29 WPM                0001Z
+DX de WF8Z-#:       18.9  PA6HQ          30 dB  32 WPM  CQ            0001Z
+DX de WF8Z-#:       10.5  SQ7B            7 dB  24 WPM                0001Z
+DX de WF8Z-#:       15.2  OH2BAH         24 dB  30 WPM                0001Z
+DX de WF8Z-#:      -14.6  SO9D           35 dB  23 WPM                0001Z
+DX de WF8Z-#:       -7.7  IR3Z           35 dB  24 WPM                0001Z
+DX de WF8Z-#:        9.9  HA5VJ          18 dB  29 WPM                0001Z
+DX de WF8Z-#:      -13.7  UT4WT           6 dB  30 WPM                0001Z
+DX de WF8Z-#:       -2.2  SP4NKS          3 dB  26 WPM  DE            0001Z
+DX de WF8Z-#:       17.8  RK3GYM         20 dB  32 WPM                0001Z
+DX de WF8Z-#:      -18.0  IR3Z           46 dB  30 WPM                0001Z
+DX de WF8Z-#:        8.4  US1IV          10 dB  30 WPM                0001Z
+DX de WF8Z-#:       -9.2  OK2PTS         26 dB  28 WPM                0001Z
+DX de WF8Z-#:       -6.8  OL6P           16 dB  27 WPM  CQ            0001Z
+DX de WF8Z-#:      -15.5  RK6CM          21 dB  24 WPM                0001Z
+DX de WF8Z-#:       -3.2  LZ3FN          19 dB  34 WPM  CQ            0001Z
+DX de WF8Z-#:       -8.9  YT2RX          19 dB  25 WPM                0001Z
+DX de WF8Z-#:      -15.8  UA3DLD         15 dB  28 WPM                0001Z
+DX de WF8Z-#:       -7.4  UT7MA          17 dB  34 WPM                0001Z
+DX de WF8Z-#:       -1.1  9A0HQ          25 dB  31 WPM                0001Z
+DX de WF8Z-#:        2.4  OH6LI          24 dB  32 WPM  CQ            0001Z
+DX de WF8Z-#:       16.1  LY2TS          11 dB  28 WPM                0001Z
+DX de WF8Z-#:       -4.5  OK2MBP         11 dB  23 WPM                0001Z
+DX de WF8Z-#:        5.9  RZ3ABF          9 dB  31 WPM                0001Z
+DX de WF8Z-#:       18.8  9A2TN           7 dB  31 WPM                0001Z

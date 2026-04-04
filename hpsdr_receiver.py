@@ -40,11 +40,10 @@ METIS_DISCOVERY = 0x02
 METIS_START = 0x04
 METIS_STOP = 0x04
 
-# Sample rate is fixed at 48000 for Protocol 1 with 1 receiver
-# With multiple receivers, the per-receiver rate drops:
-# 1 rx = 48000, 2 rx = 48000, 3 rx = 48000, 4 rx = 48000 (384kHz ADC / 8)
-# Pavel Demin's sdr_receiver_hpsdr uses 48kHz per receiver
+# Supported sample rates (C1 bits 1:0 speed field):
+# 00=48kHz, 01=96kHz, 10=192kHz, 11=384kHz
 SAMPLE_RATE = 48000
+_SPEED_BITS = {48000: 0, 96000: 1, 192000: 2, 384000: 3}
 
 # Default band frequencies (kHz) for 8-band skimmer
 DEFAULT_BANDS = [3500, 7000, 10100, 14000, 18068, 21000, 24890, 28000]
@@ -127,11 +126,15 @@ def build_c0_packet(receivers=8, duplex=True, speed=0):
 def build_freq_packet(rx_index, freq_hz):
     """Build frequency setting packet for receiver rx_index.
 
-    C0 byte indicates which receiver: 0x02=RX1, 0x04=RX2, etc.
+    HPSDR Protocol 1 C0 address map (C0 = address<<1 | MOX):
+      C0=0x00: general config (address 0)
+      C0=0x02: TX NCO frequency (address 1)  -- NOT RX
+      C0=0x04: RX1 NCO frequency (address 2)
+      C0=0x06: RX2 NCO frequency (address 3)
     C1-C4 = frequency in Hz (big-endian 32-bit)
     """
-    # RX1=0x02, RX2=0x04, RX3=0x06, ... RX8=0x10
-    c0 = bytes([(rx_index + 1) * 2])
+    # RX1=0x04, RX2=0x06, ... (address = rx_index+2, C0 = address<<1)
+    c0 = bytes([(rx_index + 2) * 2])
     freq_bytes = struct.pack('>I', int(freq_hz))
     return c0 + freq_bytes
 
@@ -208,7 +211,7 @@ def parse_iq_packet(data, n_receivers=8):
                 q_bytes = data[pos:pos + 3]
                 q_val = int.from_bytes(q_bytes, 'big', signed=True)
                 pos += 3
-                all_iq[rx].append((i_val / 8388608.0, q_val / 8388608.0))
+                all_iq[rx].append((i_val / 8388608.0, -(q_val / 8388608.0)))
 
             # Skip 2-byte mic sample
             pos += 2
@@ -218,24 +221,42 @@ def parse_iq_packet(data, n_receivers=8):
 
 
 class HPSDRReceiver:
-    """HPSDR Protocol 1 receiver for Red Pitaya."""
+    """HPSDR Protocol 1 receiver for Red Pitaya.
 
-    def __init__(self, ip, port=HPSDR_PORT, n_receivers=8):
+    In passive mode, the receiver listens to an existing IQ stream (e.g. from
+    hpsdr_proxy.py) without sending START/STOP or configuration commands.
+    Another application (e.g. SkimSrv) drives the hardware — we just ride along.
+
+    The rx_filter parameter selects which receiver channel(s) to deliver.
+    When set, only the specified receiver index is passed to the callback.
+    """
+
+    def __init__(self, ip, port=HPSDR_PORT, n_receivers=8, sample_rate=48000,
+                 listen_port=None, passive=False, rx_filter=None):
         self.ip = ip
-        self.port = port
+        self.port = port              # remote port (send to)
+        self.listen_port = listen_port or port  # local bind port (receive on)
         self.n_receivers = n_receivers
+        self.sample_rate = sample_rate if sample_rate in _SPEED_BITS else 48000
+        self.passive = passive
+        self.rx_filter = rx_filter    # None = all receivers, int = single receiver
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-        self.sock.bind(('', port))
+        self.sock.bind(('', self.listen_port))
         self.sock.setblocking(False)
         self.seq = 0
         self.frequencies = [7000000] * n_receivers  # Default 40m
 
     def set_frequency(self, rx_index, freq_hz):
-        """Set frequency for a receiver (in Hz)."""
+        """Set frequency for a receiver (in Hz).
+
+        Applies -3.9 ppm frequency calibration for the Red Pitaya STEMlab 125-14.
+        SkimSrv uses FreqCalibration=0.9999961 for the same correction.
+        """
         if 0 <= rx_index < self.n_receivers:
-            self.frequencies[rx_index] = int(freq_hz)
+            cal = getattr(self, 'freq_cal', 0.9999961)  # -3.9 ppm
+            self.frequencies[rx_index] = int(freq_hz * cal)
 
     def _send_packet(self, frame1_c0c4, frame2_c0c4):
         """Send a UDP packet with two EP2 frames."""
@@ -244,23 +265,47 @@ class HPSDRReceiver:
         self.seq += 1
 
     def start(self):
-        """Start the receiver — send configuration and start command."""
+        """Start the receiver — send configuration and start command.
+
+        In passive mode, skips all C&C commands — just listens for IQ packets
+        from an upstream source (proxy or direct).
+        """
+        if self.passive:
+            mode = f"PASSIVE (rx_filter={self.rx_filter})" if self.rx_filter is not None else "PASSIVE (all receivers)"
+            print(f"Starting HPSDR receiver at {self.ip}:{self.port} — {mode}", file=sys.stderr)
+            print(f"  {self.n_receivers} receivers at {self.sample_rate} Hz", file=sys.stderr)
+            print(f"  No C&C — listening only", file=sys.stderr)
+            return
+
         print(f"Starting HPSDR receiver at {self.ip}:{self.port}", file=sys.stderr)
-        print(f"  {self.n_receivers} receivers at {SAMPLE_RATE} Hz", file=sys.stderr)
+        print(f"  {self.n_receivers} receivers at {self.sample_rate} Hz", file=sys.stderr)
 
         # Send start command: 0xEF 0xFE 0x04 0x01 + zeros
         start_pkt = bytes([0xEF, 0xFE, 0x04, 0x01]) + bytes(60)
         self.sock.sendto(start_pkt, (self.ip, self.port))
+        print(f"  START pkt: {start_pkt[:8].hex(' ')}", file=sys.stderr)
         time.sleep(0.1)
 
         # Send initial configuration
         # C0=0x00: general config — speed, #receivers, duplex
+        # C1 bits 1:0 = speed: 0=48k, 1=96k, 2=192k, 3=384k
         n_rx_bits = (self.n_receivers - 1) & 0x07
-        config_c0c4 = bytes([0x00, 0x00, 0x00, 0x00, (1 << 2) | n_rx_bits])  # duplex + n_rx
+        speed_bits = _SPEED_BITS.get(self.sample_rate, 0)
+        config_c0c4 = bytes([0x00, speed_bits, 0x00, 0x00, (1 << 2) | n_rx_bits])  # duplex + n_rx
+
+        # Set LNA gain — C0 address 0x0A (sent as 0x14 = 0x0A << 1)
+        # Bits 6:0 = gain in dB (0-60), bit 7 = 0
+        lna_gain = getattr(self, 'lna_gain', 20)
+        gain_c0c4 = bytes([0x14, 0x00, 0x00, 0x00, lna_gain & 0x7F])
+        print(f"  config C0-C4: {config_c0c4.hex(' ')}  lna C0-C4: {gain_c0c4.hex(' ')}", file=sys.stderr)
+        self._send_packet(config_c0c4, gain_c0c4)
+        time.sleep(0.01)
+        print(f"  LNA gain: {lna_gain} dB", file=sys.stderr)
 
         # Send frequency for each receiver
         for i in range(self.n_receivers):
             freq_c0c4 = build_freq_packet(i, self.frequencies[i])
+            print(f"  freq C0-C4 RX{i}: {freq_c0c4.hex(' ')}  ({self.frequencies[i]/1000:.3f} kHz)", file=sys.stderr)
             self._send_packet(config_c0c4, freq_c0c4)
             time.sleep(0.01)
 
@@ -269,9 +314,10 @@ class HPSDRReceiver:
             print(f"    RX{i}: {self.frequencies[i] / 1000:.1f} kHz", file=sys.stderr)
 
     def stop(self):
-        """Stop the receiver."""
-        stop_pkt = bytes([0xEF, 0xFE, 0x04, 0x00]) + bytes(60)
-        self.sock.sendto(stop_pkt, (self.ip, self.port))
+        """Stop the receiver. In passive mode, just closes — no STOP command."""
+        if not self.passive:
+            stop_pkt = bytes([0xEF, 0xFE, 0x04, 0x00]) + bytes(60)
+            self.sock.sendto(stop_pkt, (self.ip, self.port))
         print("Receiver stopped", file=sys.stderr)
 
     def receive(self, callback, duration=None):
@@ -289,9 +335,10 @@ class HPSDRReceiver:
 
             ready = select.select([self.sock], [], [], 0.1)
             if not ready[0]:
-                # Send keepalive / freq update every second
-                if time.time() - last_report > 1.0:
-                    config_c0c4 = bytes([0x00, 0x00, 0x00, 0x00,
+                # Send keepalive / freq update every second (active mode only)
+                if not self.passive and time.time() - last_report > 1.0:
+                    speed_bits = _SPEED_BITS.get(self.sample_rate, 0)
+                    config_c0c4 = bytes([0x00, speed_bits, 0x00, 0x00,
                                          (1 << 2) | ((self.n_receivers - 1) & 0x07)])
                     freq_c0c4 = build_freq_packet(0, self.frequencies[0])
                     self._send_packet(config_c0c4, freq_c0c4)
@@ -314,6 +361,9 @@ class HPSDRReceiver:
 
             for rx in range(self.n_receivers):
                 if all_iq[rx]:
+                    # In filtered mode, only deliver the selected receiver
+                    if self.rx_filter is not None and rx != self.rx_filter:
+                        continue
                     callback(rx, all_iq[rx])
 
             # Progress report every 5 seconds

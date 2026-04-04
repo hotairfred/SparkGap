@@ -1,0 +1,35 @@
+{
+    "callsign": "WF8Z-2",
+    "grid": "EM79sm",
+    "node_call": "SPARK-2",
+    "sdr_ip": "192.168.1.102",
+    "sdr_port": 1024,
+    "hpsdr_listen_port": 1025,
+    "sample_rate": 192000,
+    "max_receivers": 1,
+    "bands": [
+        "20m"
+    ],
+    "buffer_seconds": 120,
+    "bmorse_speeds": [
+        25
+    ],
+    "cw_min_khz": 14000,
+    "cw_max_khz": 14060,
+    "signal_min_snr": 15,
+    "signal_timeout": 90,
+    "max_channels": 8,
+    "master_scp": "MASTER.SCP",
+    "add_calls": "add_calls.txt",
+    "blacklist": "blacklist.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "bmorse_bin": "/home/fred/morse-wip/src/bmorse",
+    "hamfist_bin": "/home/fred/csdr-skimmer/research/HamFist/hamfist",
+    "hamfist_scp": "/home/fred/csdr-skimmer/MASTER.SCP",
+    "decoder_speeds": [0, 25, 30, 35],
+    "min_sightings": 1,
+    "respot_interval": 120,
+    "telnet_port": 7300,
+    "status_interval": 30,
+    "max_instances": 60
+}
