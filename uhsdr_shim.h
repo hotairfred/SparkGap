@@ -13,7 +13,7 @@ typedef int16_t s2_t;
 typedef uint32_t u4_t;
 typedef int16_t TYPEMONO16;
 
-#define MAX_RX_CHANS 1
+#define MAX_RX_CHANS 512
 #define K_PI M_PI
 #define CLAMP(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
 #define SPACE_FOR_NULL 1
