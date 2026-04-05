@@ -272,7 +272,7 @@ class BmorseInstance:
         # Peak tracker for normalization (fast attack, slow decay)
         self._peak = 1.0
 
-        cmd = [bmorse_bin, '-stdin', '-txt', '-agc',
+        cmd = [bmorse_bin, '-stdin', '-txt',
                '-spd', str(wpm if wpm > 0 else 30),
                '-frq', str(CW_TONE),
                '-rate', str(BMORSE_RATE)]
@@ -1148,7 +1148,7 @@ class SignalGroup:
             log.info("Respawned uhsdr at pitch=%d Hz for %.1f kHz", pitch, self.rf_khz)
 
         if self._bmorse_bin:
-            cmd = [self._bmorse_bin, '-stdin', '-txt', '-agc',
+            cmd = [self._bmorse_bin, '-stdin', '-txt',
                    '-spd', str(wpm), '-frq', str(pitch), '-rate', str(BMORSE_RATE)]
             self.bmorse = _SubprocessDecoder(self.rf_khz, self.snr, cmd)
 
