@@ -1346,7 +1346,7 @@ class InstanceManager:
     """
 
     def __init__(self, sample_rate, decoder_bin='./uhsdr_cw',
-                 max_instances=150, signal_timeout=90,
+                 max_instances=150, max_channels=None, signal_timeout=90,
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
                  hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7):
         self.sample_rate = sample_rate
@@ -1356,7 +1356,10 @@ class InstanceManager:
         self.hamfist_scp = hamfist_scp
         self.ml_model_path = ml_model_path  # None = no ML decoder
         self.ml_min_confidence = ml_min_confidence
-        self.max_instances = max_instances
+        self.max_instances = max_instances  # total decoder process cap (legacy)
+        # max_channels: max simultaneous signals — decoupled from decoder count
+        # defaults to max_instances for backwards compat
+        self.max_channels = max_channels if max_channels is not None else max_instances
         self.signal_timeout = signal_timeout
         self.speeds = speeds or [0, 30]  # auto + 30 WPM
         # freq_key -> SignalGroup
@@ -1390,7 +1393,7 @@ class InstanceManager:
                 continue
             if abs(offset) < 100:  # skip DC
                 continue
-            if self.count >= self.max_instances:
+            if len(self.instances) >= self.max_channels:
                 # Evict the lowest-SNR group if new signal is stronger
                 if not self.instances:
                     break
@@ -1861,6 +1864,7 @@ class OpenSkimmer:
             sample_rate=rx_sample_rate,
             decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
             max_instances=self.cfg.get('max_instances', 150),
+            max_channels=self.cfg.get('max_channels', None),
             signal_timeout=self.cfg.get('signal_timeout', 90),
             speeds=speeds_cfg,
             bmorse_bin=self.cfg.get('bmorse_bin', None),
@@ -2166,6 +2170,7 @@ def run_file_mode(args, config):
         sample_rate=file_rate,
         decoder_bin=config.get('decoder_bin', './uhsdr_cw'),
         max_instances=config.get('max_instances', 150),
+        max_channels=config.get('max_channels', None),
         signal_timeout=9999,  # don't kill during file processing
         speeds=speeds,
         bmorse_bin=config.get('bmorse_bin'),
