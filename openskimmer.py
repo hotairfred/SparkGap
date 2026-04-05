@@ -1632,7 +1632,7 @@ class SpotTracker:
                 # Primary decoder exact match — suppress secondary decoders here
                 if dec_type == 'primary':
                     self._primary_matched.add(freq_bin)
-                self._cycle_calls[call].add(freq_bin)
+                    self._cycle_calls[call].add(freq_bin)
                 info = self._tracking[call]
                 info['count'] += 1
                 info['freq'] = freq_khz
@@ -1662,7 +1662,8 @@ class SpotTracker:
                 if frag not in self.valid_calls:
                     continue
                 seen_p1.add(frag)
-                self._cycle_calls[frag].add(freq_bin)
+                if dec_type == 'primary':
+                    self._cycle_calls[frag].add(freq_bin)
                 info = self._tracking[frag]
                 info['count'] += 1
                 info['freq'] = freq_khz
