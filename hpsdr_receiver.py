@@ -188,35 +188,48 @@ def parse_iq_packet(data, n_receivers=8):
         return None
 
     seq = struct.unpack('>I', data[4:8])[0]
-    samples_per_rx = {1: 63, 2: 36, 3: 25, 4: 19, 5: 15, 6: 13, 7: 11, 8: 10}
-    n_samples = samples_per_rx.get(n_receivers, 10)
 
-    # Each frame: 3 sync + 5 C&C + IQ data
-    # IQ data: repeating groups of (n_receivers * 6 bytes) + 2 bytes mic
-    # Each IQ sample: 3 bytes I (24-bit signed) + 3 bytes Q (24-bit signed)
-    all_iq = [[] for _ in range(n_receivers)]
+    # Each frame: 8-byte header (sync+C&C) + 504 bytes IQ data
+    # IQ data: repeating groups of (n_receivers * 6 bytes IQ) + 2 bytes mic
+    bytes_per_group = n_receivers * 6 + 2
+    all_i = [[] for _ in range(n_receivers)]
+    all_q = [[] for _ in range(n_receivers)]
 
     for frame_offset in [8, 520]:  # Two 512-byte frames per packet
-        pos = frame_offset + 8  # Skip sync + C&C
+        frame_bytes = np.frombuffer(data, dtype=np.uint8,
+                                    offset=frame_offset + 8, count=504)
+        n_groups = len(frame_bytes) // bytes_per_group
+        if n_groups == 0:
+            continue
 
-        bytes_per_group = n_receivers * 6 + 2  # +2 for mic sample
-        remaining = 504
-        while remaining >= bytes_per_group:
-            for rx in range(n_receivers):
-                # 24-bit signed I
-                i_bytes = data[pos:pos + 3]
-                i_val = int.from_bytes(i_bytes, 'big', signed=True)
-                pos += 3
-                # 24-bit signed Q
-                q_bytes = data[pos:pos + 3]
-                q_val = int.from_bytes(q_bytes, 'big', signed=True)
-                pos += 3
-                all_iq[rx].append((i_val / 8388608.0, -(q_val / 8388608.0)))
+        # Reshape to (n_groups, bytes_per_group), drop mic bytes (last 2 per group)
+        groups = frame_bytes[:n_groups * bytes_per_group].reshape(n_groups, bytes_per_group)
+        iq_data = groups[:, :n_receivers * 6].reshape(n_groups * n_receivers, 6)
 
-            # Skip 2-byte mic sample
-            pos += 2
-            remaining -= bytes_per_group
+        # Reconstruct 24-bit signed I from big-endian bytes [0,1,2]
+        i_vals = ((iq_data[:, 0].astype(np.int32) << 16) |
+                  (iq_data[:, 1].astype(np.int32) << 8) |
+                   iq_data[:, 2].astype(np.int32))
+        i_vals = np.where(i_vals >= 0x800000, i_vals - 0x1000000, i_vals)
 
+        # Reconstruct 24-bit signed Q from big-endian bytes [3,4,5]
+        q_vals = ((iq_data[:, 3].astype(np.int32) << 16) |
+                  (iq_data[:, 4].astype(np.int32) << 8) |
+                   iq_data[:, 5].astype(np.int32))
+        q_vals = np.where(q_vals >= 0x800000, q_vals - 0x1000000, q_vals)
+
+        i_f = i_vals.astype(np.float32) / 8388608.0
+        q_f = -q_vals.astype(np.float32) / 8388608.0
+
+        # Deinterleave: rows are [grp0_rx0, grp0_rx1, ..., grp0_rxN, grp1_rx0, ...]
+        i_by_rx = i_f.reshape(n_groups, n_receivers)
+        q_by_rx = q_f.reshape(n_groups, n_receivers)
+
+        for rx in range(n_receivers):
+            all_i[rx].extend(i_by_rx[:, rx].tolist())
+            all_q[rx].extend(q_by_rx[:, rx].tolist())
+
+    all_iq = [list(zip(all_i[rx], all_q[rx])) for rx in range(n_receivers)]
     return seq, all_iq
 
 
