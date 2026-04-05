@@ -1516,14 +1516,14 @@ class SpotTracker:
             self._scp_by_len[len(call)].append(call)
 
     @staticmethod
-    def _min_sightings(call):
-        """Length-weighted sighting threshold: short calls need more confirmations."""
+    def _min_sightings(call, snr=0):
+        """Length-weighted sighting threshold, SNR-gated for short calls."""
         n = len(call)
         if n <= 4:
-            return 4  # 4-char fragments are mostly noise — require 4 sightings
+            return 2 if snr >= 30 else 4  # strong 4-char: accept at 2
         elif n == 5:
             return 3
-        return 2  # 6+ chars: standard threshold
+        return 2
 
     def _can_respot(self, call, freq_khz, now):
         """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
@@ -1639,7 +1639,7 @@ class SpotTracker:
                 info['snr'] = max(info['snr'], snr)
 
                 has_context = bool(CQ_PATTERNS.search(context_clean))
-                min_s = self._min_sightings(call)
+                min_s = self._min_sightings(call, snr)
                 if (has_context or info['count'] >= min_s) and \
                    self._can_respot(call, freq_khz, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
@@ -1668,7 +1668,7 @@ class SpotTracker:
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
 
-                min_s = self._min_sightings(frag)
+                min_s = self._min_sightings(frag, snr)
                 if info['count'] >= min_s and \
                    self._can_respot(frag, freq_khz, now):
                     if len(self._cycle_calls[frag]) < 3:

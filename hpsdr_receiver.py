@@ -188,47 +188,44 @@ def parse_iq_packet(data, n_receivers=8):
 
     seq = struct.unpack('>I', data[4:8])[0]
 
-    # Each frame: 8-byte header (sync+C&C) + 504 bytes IQ data
-    # IQ data: repeating groups of (n_receivers * 6 bytes IQ) + 2 bytes mic
-    bytes_per_group = n_receivers * 6 + 2
-    all_i = [[] for _ in range(n_receivers)]
-    all_q = [[] for _ in range(n_receivers)]
+    bytes_per_group = n_receivers * 6 + 2  # +2 for mic sample
+    all_iq = [[] for _ in range(n_receivers)]
 
     for frame_offset in [8, 520]:  # Two 512-byte frames per packet
-        frame_bytes = np.frombuffer(data, dtype=np.uint8,
-                                    offset=frame_offset + 8, count=504)
-        n_groups = len(frame_bytes) // bytes_per_group
+        iq_start = frame_offset + 8  # Skip sync + C&C
+        iq_data = data[iq_start:iq_start + 504]
+
+        n_groups = len(iq_data) // bytes_per_group
         if n_groups == 0:
             continue
 
-        # Reshape to (n_groups, bytes_per_group), drop mic bytes (last 2 per group)
-        groups = frame_bytes[:n_groups * bytes_per_group].reshape(n_groups, bytes_per_group)
-        iq_data = groups[:, :n_receivers * 6].reshape(n_groups * n_receivers, 6)
+        # Extract IQ bytes as numpy array, strip mic samples
+        raw = np.frombuffer(iq_data[:n_groups * bytes_per_group], dtype=np.uint8)
+        raw = raw.reshape(n_groups, bytes_per_group)
+        # Drop last 2 bytes (mic) from each group
+        iq_only = raw[:, :n_receivers * 6].reshape(n_groups * n_receivers, 6)
 
-        # Reconstruct 24-bit signed I from big-endian bytes [0,1,2]
-        i_vals = ((iq_data[:, 0].astype(np.int32) << 16) |
-                  (iq_data[:, 1].astype(np.int32) << 8) |
-                   iq_data[:, 2].astype(np.int32))
+        # Reconstruct 24-bit signed I and Q from big-endian bytes
+        i_vals = (iq_only[:, 0].astype(np.int32) << 16 |
+                  iq_only[:, 1].astype(np.int32) << 8 |
+                  iq_only[:, 2].astype(np.int32))
         i_vals = np.where(i_vals >= 0x800000, i_vals - 0x1000000, i_vals)
 
-        # Reconstruct 24-bit signed Q from big-endian bytes [3,4,5]
-        q_vals = ((iq_data[:, 3].astype(np.int32) << 16) |
-                  (iq_data[:, 4].astype(np.int32) << 8) |
-                   iq_data[:, 5].astype(np.int32))
+        q_vals = (iq_only[:, 3].astype(np.int32) << 16 |
+                  iq_only[:, 4].astype(np.int32) << 8 |
+                  iq_only[:, 5].astype(np.int32))
         q_vals = np.where(q_vals >= 0x800000, q_vals - 0x1000000, q_vals)
 
         i_f = i_vals.astype(np.float32) / 8388608.0
-        q_f = -q_vals.astype(np.float32) / 8388608.0
+        q_f = -(q_vals.astype(np.float32) / 8388608.0)
 
-        # Deinterleave: rows are [grp0_rx0, grp0_rx1, ..., grp0_rxN, grp1_rx0, ...]
-        i_by_rx = i_f.reshape(n_groups, n_receivers)
-        q_by_rx = q_f.reshape(n_groups, n_receivers)
-
+        # Split by receiver
+        i_f = i_f.reshape(n_groups, n_receivers)
+        q_f = q_f.reshape(n_groups, n_receivers)
         for rx in range(n_receivers):
-            all_i[rx].extend(i_by_rx[:, rx].tolist())
-            all_q[rx].extend(q_by_rx[:, rx].tolist())
+            for g in range(n_groups):
+                all_iq[rx].append((float(i_f[g, rx]), float(q_f[g, rx])))
 
-    all_iq = [list(zip(all_i[rx], all_q[rx])) for rx in range(n_receivers)]
     return seq, all_iq
 
 
