@@ -1310,7 +1310,7 @@ class SignalGroup:
                  ([self._bmorse_fallback] if self._bmorse_fallback else []):
             text = d.read()
             if text:
-                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
                 self.last_output = time.time()
         return results
 
