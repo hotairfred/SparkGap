@@ -804,7 +804,7 @@ class _MLDecoder:
     _WINDOW_SAMPLES = 768 * 32 + 128  # = 24704 samples (~6.18s at 4kHz)
     _HOP_SAMPLES = 384 * 32            # = 12288 samples (~3.07s hop)
 
-    def __init__(self, rf_khz, snr, model_path):
+    def __init__(self, rf_khz, snr, model_path, min_confidence=0.7):
         self.rf_khz = rf_khz
         self.snr = snr
         self.decoded_text = ''
@@ -812,6 +812,7 @@ class _MLDecoder:
         self.last_output = time.time()
         self.detected_wpm = 0
         self._pending = ''
+        self._min_confidence = min_confidence
         self._audio_buf = np.zeros(0, dtype=np.float32)
         self._model, self._device = _get_ml_model(model_path)
 
@@ -837,7 +838,7 @@ class _MLDecoder:
     def _decode_chunk(self, audio):
         try:
             import torch
-            from train_model import compute_spectrogram, ctc_greedy_decode
+            from train_model import compute_spectrogram, BLANK_IDX, IDX_TO_CHAR
             spec = compute_spectrogram(audio, fft_size=128, hop=32)
             # Pad/truncate to exactly 768 frames
             if spec.shape[0] < 768:
@@ -847,10 +848,21 @@ class _MLDecoder:
             tensor = torch.tensor(spec).unsqueeze(0).unsqueeze(0).to(self._device)
             with torch.no_grad():
                 ctc_out, wpm_pred = self._model(tensor)
-                text = ctc_greedy_decode(ctc_out[0].cpu())
                 wpm = wpm_pred[0].item()
                 if wpm > 0:
                     self.detected_wpm = int(round(wpm))
+                # Confidence-gated greedy decode — only emit chars above threshold
+                probs = ctc_out[0].softmax(dim=-1).cpu()
+                conf, indices = probs.max(dim=-1)
+                decoded = []
+                prev = BLANK_IDX
+                for i in range(len(indices)):
+                    idx = indices[i].item()
+                    if idx != BLANK_IDX and idx != prev:
+                        if conf[i].item() >= self._min_confidence:
+                            decoded.append(IDX_TO_CHAR[idx])
+                    prev = idx
+                text = ''.join(decoded)
             return text.strip() if text else ''
         except Exception:
             return ''
@@ -1089,7 +1101,7 @@ class SignalGroup:
     def __init__(self, freq_offset, rf_khz, sample_rate, snr,
                  decoder_bin, speeds,
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
-                 wpm=30, ml_model_path=None):
+                 wpm=30, ml_model_path=None, ml_min_confidence=0.7):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
@@ -1147,7 +1159,7 @@ class SignalGroup:
 
         self.bmorse = None
         self.hamfist = None
-        self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path) if ml_model_path else None
+        self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path, min_confidence=ml_min_confidence) if ml_model_path else None
 
     @property
     def _decoders_started(self):
@@ -1378,13 +1390,14 @@ class InstanceManager:
     def __init__(self, sample_rate, decoder_bin='./uhsdr_cw',
                  max_instances=150, signal_timeout=90,
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
-                 hamfist_scp=None, ml_model_path=None):
+                 hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
         self.hamfist_bin = hamfist_bin    # None = no HamFist
         self.hamfist_scp = hamfist_scp
         self.ml_model_path = ml_model_path  # None = no ML decoder
+        self.ml_min_confidence = ml_min_confidence
         self.max_instances = max_instances
         self.signal_timeout = signal_timeout
         self.speeds = speeds or [0, 30]  # auto + 30 WPM
@@ -1449,6 +1462,7 @@ class InstanceManager:
                 hamfist_scp=self.hamfist_scp,
                 wpm=signal_wpm,
                 ml_model_path=self.ml_model_path,
+                ml_min_confidence=self.ml_min_confidence,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
@@ -1868,6 +1882,8 @@ class OpenSkimmer:
             bmorse_bin=self.cfg.get('bmorse_bin', None),
             hamfist_bin=self.cfg.get('hamfist_bin', None),
             hamfist_scp=self.cfg.get('hamfist_scp', None),
+            ml_model_path=self.cfg.get('ml_model', None),
+            ml_min_confidence=float(self.cfg.get('ml_min_confidence', 0.7)),
         )
 
         self.receiver.start()
@@ -2183,6 +2199,7 @@ def run_file_mode(args, config):
         speeds=speeds,
         bmorse_bin=config.get('bmorse_bin'),
         ml_model_path=config.get('ml_model'),
+        ml_min_confidence=float(config.get('ml_min_confidence', 0.7)),
     )
 
     center_khz = args.center_khz
