@@ -174,11 +174,10 @@ def build_udp_packet(seq, frame1_c0c4, frame2_c0c4):
 
 
 def parse_iq_packet(data, n_receivers=8):
-    """Parse a received IQ data packet.
+    """Parse a received IQ data packet (numpy vectorized).
 
     Returns list of (receiver_index, [(i, q), ...]) tuples.
     Each IQ sample is 24-bit signed (3 bytes I, 3 bytes Q).
-    With 8 receivers: each frame has 63 sets of 8 IQ pairs = 504 IQ samples.
     """
     if len(data) < 1032:
         return None
