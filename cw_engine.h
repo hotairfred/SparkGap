@@ -1,9 +1,8 @@
 /**
- * cw_engine.h — Streaming CW channelizer + dual decoder library
+ * cw_engine.h — Streaming CW channelizer + multi-speed decoder library
  *
- * Owns the entire hot path: IQ → channelize → uhsdr + bmorse → spots.
- * Python calls channel_feed_iq() with raw IQ per signal.
- * C++ does mix + FIR + decimate + both decoders internally.
+ * Hot path: IQ → SSB mix → FIR (VOLK) → decimate → uhsdr × N speeds
+ * Returns raw decoded text per decoder — Python SpotTracker handles matching.
  */
 
 #ifndef CW_ENGINE_H
@@ -15,71 +14,53 @@
 extern "C" {
 #endif
 
-/** Decoded spot from a decoder */
-typedef struct {
-    char callsign[16];       /* SCP-matched callsign */
-    float freq_offset_hz;    /* offset from center in Hz */
-    float snr_db;            /* signal SNR */
-    int wpm;                 /* decoder's WPM estimate */
-    int decoder;             /* 0=uhsdr, 1=bmorse */
-} cw_spot_t;
-
 /**
- * Initialize the engine — load SCP database once.
- *
- * @param scp_path  Path to MASTER.SCP or COMBINED.SCP
- * @return          0 on success, -1 on failure
+ * Initialize the engine (no SCP needed — matching done in Python).
+ * @return 0 on success
  */
 int cw_engine_init(const char *scp_path);
-
-/**
- * Shut down the engine — free SCP database.
- */
 void cw_engine_shutdown(void);
 
-/** Opaque handle to a per-signal channel */
 typedef void* channel_t;
 
 /**
  * Create a channel for one CW signal.
- *
- * @param offset_hz    Signal offset from center frequency (Hz)
- * @param sample_rate  IQ sample rate (e.g. 192000)
- * @return             Channel handle, or NULL on failure
+ * Internally creates multi-speed uhsdr decoders after pitch detection.
  */
 channel_t channel_create(float offset_hz, float sample_rate);
 
 /**
- * Set the CW pitch for this channel (after pitch detection).
- *
- * @param h        Channel handle
- * @param pitch_hz Detected CW tone frequency (e.g. 700)
+ * Feed IQ samples. Channelizes, decimates, feeds all decoders.
+ * No spots returned — use channel_read_text() to get decoded text.
  */
+void channel_feed_iq(channel_t h,
+                     const float *i_samples, const float *q_samples, int n);
+
+/**
+ * Get the number of decoder instances in this channel.
+ */
+int channel_decoder_count(channel_t h);
+
+/**
+ * Read new decoded text from a specific decoder instance.
+ * Returns number of new chars since last call. Text is null-terminated.
+ * @param decoder_idx  0..channel_decoder_count()-1
+ * @param buf          Output buffer for new text
+ * @param buflen       Size of output buffer
+ * @param wpm          Output: current WPM estimate for this decoder
+ * @return             Number of new chars written to buf
+ */
+int channel_read_text(channel_t h, int decoder_idx,
+                      char *buf, int buflen, int *wpm);
+
+/** Get the WPM speed setting for a decoder (0=auto, 15, 30, etc.) */
+int channel_decoder_speed(channel_t h, int decoder_idx);
+
+/** Get the detected pitch for this channel (after pitch detection). */
+float channel_get_pitch(channel_t h);
+
 void channel_set_pitch(channel_t h, float pitch_hz);
-
-/**
- * Feed IQ samples and get back decoded spots.
- *
- * @param h          Channel handle
- * @param i_samples  I channel samples (float, at sample_rate)
- * @param q_samples  Q channel samples (float, at sample_rate)
- * @param n          Number of samples
- * @param spots      Output array for decoded spots
- * @param max_spots  Size of spots array
- * @return           Number of spots written (0 if none)
- */
-int channel_feed_iq(channel_t h,
-                    const float *i_samples, const float *q_samples, int n,
-                    cw_spot_t *spots, int max_spots);
-
-/**
- * Get the current WPM estimate for this channel.
- */
 int channel_get_wpm(channel_t h);
-
-/**
- * Destroy a channel and free resources.
- */
 void channel_destroy(channel_t h);
 
 #ifdef __cplusplus
