@@ -174,11 +174,10 @@ def build_udp_packet(seq, frame1_c0c4, frame2_c0c4):
 
 
 def parse_iq_packet(data, n_receivers=8):
-    """Parse a received IQ data packet.
+    """Parse a received IQ data packet (numpy vectorized).
 
     Returns list of (receiver_index, [(i, q), ...]) tuples.
     Each IQ sample is 24-bit signed (3 bytes I, 3 bytes Q).
-    With 8 receivers: each frame has 63 sets of 8 IQ pairs = 504 IQ samples.
     """
     if len(data) < 1032:
         return None
@@ -188,34 +187,44 @@ def parse_iq_packet(data, n_receivers=8):
         return None
 
     seq = struct.unpack('>I', data[4:8])[0]
-    samples_per_rx = {1: 63, 2: 36, 3: 25, 4: 19, 5: 15, 6: 13, 7: 11, 8: 10}
-    n_samples = samples_per_rx.get(n_receivers, 10)
 
-    # Each frame: 3 sync + 5 C&C + IQ data
-    # IQ data: repeating groups of (n_receivers * 6 bytes) + 2 bytes mic
-    # Each IQ sample: 3 bytes I (24-bit signed) + 3 bytes Q (24-bit signed)
+    bytes_per_group = n_receivers * 6 + 2  # +2 for mic sample
     all_iq = [[] for _ in range(n_receivers)]
 
     for frame_offset in [8, 520]:  # Two 512-byte frames per packet
-        pos = frame_offset + 8  # Skip sync + C&C
+        iq_start = frame_offset + 8  # Skip sync + C&C
+        iq_data = data[iq_start:iq_start + 504]
 
-        bytes_per_group = n_receivers * 6 + 2  # +2 for mic sample
-        remaining = 504
-        while remaining >= bytes_per_group:
-            for rx in range(n_receivers):
-                # 24-bit signed I
-                i_bytes = data[pos:pos + 3]
-                i_val = int.from_bytes(i_bytes, 'big', signed=True)
-                pos += 3
-                # 24-bit signed Q
-                q_bytes = data[pos:pos + 3]
-                q_val = int.from_bytes(q_bytes, 'big', signed=True)
-                pos += 3
-                all_iq[rx].append((i_val / 8388608.0, -(q_val / 8388608.0)))
+        n_groups = len(iq_data) // bytes_per_group
+        if n_groups == 0:
+            continue
 
-            # Skip 2-byte mic sample
-            pos += 2
-            remaining -= bytes_per_group
+        # Extract IQ bytes as numpy array, strip mic samples
+        raw = np.frombuffer(iq_data[:n_groups * bytes_per_group], dtype=np.uint8)
+        raw = raw.reshape(n_groups, bytes_per_group)
+        # Drop last 2 bytes (mic) from each group
+        iq_only = raw[:, :n_receivers * 6].reshape(n_groups * n_receivers, 6)
+
+        # Reconstruct 24-bit signed I and Q from big-endian bytes
+        i_vals = (iq_only[:, 0].astype(np.int32) << 16 |
+                  iq_only[:, 1].astype(np.int32) << 8 |
+                  iq_only[:, 2].astype(np.int32))
+        i_vals = np.where(i_vals >= 0x800000, i_vals - 0x1000000, i_vals)
+
+        q_vals = (iq_only[:, 3].astype(np.int32) << 16 |
+                  iq_only[:, 4].astype(np.int32) << 8 |
+                  iq_only[:, 5].astype(np.int32))
+        q_vals = np.where(q_vals >= 0x800000, q_vals - 0x1000000, q_vals)
+
+        i_f = i_vals.astype(np.float32) / 8388608.0
+        q_f = -(q_vals.astype(np.float32) / 8388608.0)
+
+        # Split by receiver
+        i_f = i_f.reshape(n_groups, n_receivers)
+        q_f = q_f.reshape(n_groups, n_receivers)
+        for rx in range(n_receivers):
+            for g in range(n_groups):
+                all_iq[rx].append((float(i_f[g, rx]), float(q_f[g, rx])))
 
     return seq, all_iq
 
