@@ -672,15 +672,27 @@ class PFBChannelizer:
         block = self._buf[:usable]
         self._buf = self._buf[usable:]
 
-        out = np.zeros((N, n_steps), dtype=np.complex128)
-        for step in range(n_steps):
-            # Shift history right by M, prepend newest M samples (newest-first)
-            self._hist[M:] = self._hist[:-M].copy()
-            self._hist[:M] = block[step * M: step * M + M][::-1]
-            # mat[k, n] = hist[k*N + n] → branch n has K taps = mat[:, n]
-            mat = self._hist.reshape(K, N)        # (K, N)
-            y = np.einsum('nk,nk->n', self._H, mat.T)  # H (N,K) · mat.T (N,K) → (N,)
-            out[:, step] = np.fft.ifft(y) * N
+        # Build newest-first extended sequence: [block reversed, prior history]
+        # full_rev[i] = the i-th most recent sample overall
+        full_rev = np.concatenate([block[::-1], self._hist])  # (n_steps*M + N*K,)
+
+        # Strided view: sig[l, n, s'] = full_rev[s'*M + l*N + n]
+        # s'=0 → newest chunk (step n_steps-1); s'=n_steps-1 → oldest chunk (step 0)
+        itemsize = full_rev.itemsize
+        sig = np.lib.stride_tricks.as_strided(
+            full_rev,
+            shape=(K, N, n_steps),
+            strides=(N * itemsize, itemsize, M * itemsize),
+        )
+
+        # Polyphase filter — y_rev[n, s'] = Σ_l H[n,l] * sig[l,n,s']
+        y_rev = np.einsum('nl,lns->ns', self._H, sig)   # (N, n_steps)
+
+        # s'=0 is NEWEST step; reverse so out[:, 0] = oldest step
+        out = np.fft.ifft(y_rev[:, ::-1], axis=0) * N   # (N, n_steps)
+
+        # Update history: newest N*K samples
+        self._hist[:] = full_rev[:N * K]
 
         self.last_output = out
         return out
@@ -2553,7 +2565,7 @@ def run_file_mode(args, config):
             elif snr > clustered[-1][1]:
                 clustered[-1] = (freq, snr)
         # Reset PFB state after detection scan so streaming starts clean
-        manager._pfb._state[:] = 0
+        manager._pfb._hist[:] = 0
         manager._pfb._buf = np.zeros(0, dtype=np.complex128)
         manager._pfb.last_output = None
         log.info("  PFB: %d signals detected (250 Hz bins)", len(clustered))
