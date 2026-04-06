@@ -1590,7 +1590,7 @@ class SpotTracker:
         # Track processed length per (frequency, decoder_id) to avoid re-processing.
         # decoder_id is id(d) from SignalGroup.read() — stable for the decoder's
         # lifetime, unique across concurrent decoders on the same frequency.
-        freq_bin = int(round(freq_khz * 10))
+        freq_bin = int(round(freq_khz * 2))  # 500 Hz bins — 100 Hz caused bleedthrough from adjacent channels to saturate _cycle_calls
         cache_key = (freq_bin, decoder_id)
 
         # Track which frequencies have primary exact matches
@@ -2249,6 +2249,12 @@ def run_file_mode(args, config):
     for t_start in np.arange(start_sec, end_sec, chunk_sec):
         t_end = min(t_start + chunk_sec, end_sec)
         dur = t_end - t_start
+        # Reset hallucination filter each chunk — mirrors live-mode scan interval.
+        # Without this, _cycle_calls accumulates across the entire recording: a call
+        # appearing at 3+ nearby channels (due to signal bleed) gets permanently
+        # blocked even though it's a real station. In live mode reset_cycle() fires
+        # every scan_interval seconds; file mode must do the same.
+        tracker.reset_cycle()
         log.info("Feeding %.0f-%.0fs (%.1f-%.1f min)...",
                  t_start, t_end, t_start/60, t_end/60)
 
