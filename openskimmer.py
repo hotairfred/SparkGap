@@ -649,8 +649,9 @@ class PFBChannelizer:
         # Polyphase matrix: H[k, j] = h[k + j*N] → shape (N_CHAN, TAPS_PER_CHAN)
         self._H = h.reshape(self.TAPS_PER_CHAN, self.N_CHAN).T.copy()
 
-        # Per-branch delay lines: (N_CHAN, TAPS_PER_CHAN - 1)
-        self._state = np.zeros((self.N_CHAN, self.TAPS_PER_CHAN - 1), dtype=np.complex128)
+        # Rolling history buffer (newest-first), length N*K
+        # Branch n reads hist[n::N][:K] = hist.reshape(K,N)[:, n]
+        self._hist = np.zeros(self.N_CHAN * self.TAPS_PER_CHAN, dtype=np.complex128)
         self._buf = np.zeros(0, dtype=np.complex128)
 
         # Most recent processed output — read by PFBChannel.process()
@@ -673,11 +674,13 @@ class PFBChannelizer:
 
         out = np.zeros((N, n_steps), dtype=np.complex128)
         for step in range(n_steps):
-            x_n = np.zeros(N, dtype=np.complex128)
-            x_n[:M] = block[step * M: step * M + M]
-            full = np.concatenate([x_n[:, np.newaxis], self._state], axis=1)  # (N, K)
-            out[:, step] = np.fft.ifft(np.einsum('nk,nk->n', full, self._H))
-            self._state = full[:, :-1]
+            # Shift history right by M, prepend newest M samples (newest-first)
+            self._hist[M:] = self._hist[:-M].copy()
+            self._hist[:M] = block[step * M: step * M + M][::-1]
+            # mat[k, n] = hist[k*N + n] → branch n has K taps = mat[:, n]
+            mat = self._hist.reshape(K, N)        # (K, N)
+            y = np.einsum('nk,nk->n', self._H, mat.T)  # H (N,K) · mat.T (N,K) → (N,)
+            out[:, step] = np.fft.ifft(y) * N
 
         self.last_output = out
         return out
