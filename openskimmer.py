@@ -619,6 +619,226 @@ class Channelizer:
         return pcm
 
 
+class PFBChannelizer:
+    """Polyphase filter bank: full-band IQ → N narrowband channels at DECODER_RATE.
+
+    N_CHAN=768 channels, 250 Hz spacing, oversample=48 → 12 kHz output rate.
+    Two CW signals ≥250 Hz apart in RF frequency land in separate bins with
+    ≤-60 dB bleedthrough from the prototype Kaiser filter.
+
+    Shared across all SignalGroups in an InstanceManager.  Call process() once
+    per IQ block; the result (stored in last_output) is read by PFBChannel.
+    """
+
+    N_CHAN = 768
+    OVERSAMPLE = 48          # N/M — output rate = input_rate * os / N = 12000
+    TAPS_PER_CHAN = 9        # polyphase branch length; 9 → ~60 dB stopband
+
+    def __init__(self, input_rate=192000):
+        from scipy.signal import firwin
+        self.input_rate = input_rate
+        self.N = self.N_CHAN
+        self.M = self.N_CHAN // self.OVERSAMPLE   # = 16 input samples per output step
+        self.output_rate = input_rate * self.OVERSAMPLE // self.N_CHAN  # = 12000
+        self.bin_spacing = float(input_rate) / self.N_CHAN              # = 250.0 Hz
+
+        # Prototype lowpass filter: cutoff = half channel bandwidth
+        n_taps = self.N_CHAN * self.TAPS_PER_CHAN
+        h = firwin(n_taps, 1.0 / (2 * self.N_CHAN), window=('kaiser', 10.0))
+        h = (h * self.N_CHAN).astype(np.float64)
+        # Polyphase matrix: H[k, j] = h[k + j*N] → shape (N_CHAN, TAPS_PER_CHAN)
+        self._H = h.reshape(self.TAPS_PER_CHAN, self.N_CHAN).T.copy()
+
+        # Per-branch delay lines: (N_CHAN, TAPS_PER_CHAN - 1)
+        self._state = np.zeros((self.N_CHAN, self.TAPS_PER_CHAN - 1), dtype=np.complex128)
+        self._buf = np.zeros(0, dtype=np.complex128)
+
+        # Most recent processed output — read by PFBChannel.process()
+        self.last_output = None   # shape (N_CHAN, n_steps) or None
+
+    def process(self, i_samples, q_samples):
+        """Ingest one IQ block → update last_output.  Returns (N_CHAN, n_steps) or None."""
+        x = (i_samples + 1j * q_samples).astype(np.complex128)
+        self._buf = np.concatenate([self._buf, x])
+
+        M, N, K = self.M, self.N, self.TAPS_PER_CHAN
+        n_steps = len(self._buf) // M
+        if n_steps == 0:
+            self.last_output = None
+            return None
+
+        usable = n_steps * M
+        block = self._buf[:usable]
+        self._buf = self._buf[usable:]
+
+        out = np.zeros((N, n_steps), dtype=np.complex128)
+        for step in range(n_steps):
+            x_n = np.zeros(N, dtype=np.complex128)
+            x_n[:M] = block[step * M: step * M + M]
+            full = np.concatenate([x_n[:, np.newaxis], self._state], axis=1)  # (N, K)
+            out[:, step] = np.fft.ifft(np.einsum('nk,nk->n', full, self._H))
+            self._state = full[:, :-1]
+
+        self.last_output = out
+        return out
+
+    def channel_powers_db(self):
+        """Per-channel mean power in dB from last_output.  Used for signal detection."""
+        if self.last_output is None:
+            return None
+        power = np.mean(np.abs(self.last_output) ** 2, axis=1)
+        return 10.0 * np.log10(power + 1e-20)
+
+    def freq_to_bin(self, freq_offset_hz):
+        """Map signed Hz offset from receiver centre → bin index [0, N_CHAN)."""
+        return int(round(freq_offset_hz / self.bin_spacing)) % self.N
+
+    def bin_to_freq(self, k):
+        """Map bin index → signed Hz offset."""
+        f = k * self.bin_spacing
+        if f > self.input_rate / 2:
+            f -= self.input_rate
+        return f
+
+
+class PFBChannel:
+    """Extracts one channel from the shared PFBChannelizer output → int16 PCM.
+
+    Duck-type compatible with Channelizer: exposes the same process(),
+    detected_pitch, secondary_pitches, new_secondary_pitches, and
+    _pitch_detected attributes used by SignalGroup.
+    """
+
+    def __init__(self, freq_offset, pfb, output_rate=None, normalize='peak',
+                 cw_fir_bw=0):
+        self._pfb = pfb
+        self.freq_offset = freq_offset
+        self.output_rate = output_rate or pfb.output_rate
+        self.normalize = normalize
+
+        self.bin_idx = pfb.freq_to_bin(freq_offset)
+        self.bin_centre = pfb.bin_to_freq(self.bin_idx)
+        # Residual: signal lands at (CW_TONE - residual) Hz in this channel
+        self.residual_hz = freq_offset - self.bin_centre
+        self._shift_hz = CW_TONE - self.residual_hz
+        self._phase = 0.0  # running phase for continuous frequency shift
+
+        # Pitch detection — same state as Channelizer
+        self._pitch_detected = False
+        self._pitch = CW_TONE
+        self._secondary_pitches = []
+        self._new_secondary_pitches = []
+        self._known_sec_pitches = set()
+        self._pitch_buf = np.zeros(0, dtype=np.float64)
+
+        self._peak = 0.0
+
+        # Optional post-decimation FIR bandpass (for bmorse 4kHz path)
+        self._fir_taps = None
+        self._fir_zi = None
+        if cw_fir_bw > 0 and self.output_rate > 0:
+            from scipy.signal import firwin, lfilter_zi
+            lo = max(50, CW_TONE - cw_fir_bw / 2)
+            hi = min(self.output_rate / 2 - 50, CW_TONE + cw_fir_bw / 2)
+            self._fir_taps = firwin(256, [lo, hi], fs=self.output_rate,
+                                    pass_zero=False)
+            self._fir_zi = lfilter_zi(self._fir_taps, 1.0) * 0
+
+    @property
+    def detected_pitch(self):
+        return self._pitch
+
+    @property
+    def secondary_pitches(self):
+        return self._secondary_pitches
+
+    @property
+    def new_secondary_pitches(self):
+        pitches = self._new_secondary_pitches[:]
+        self._new_secondary_pitches = []
+        return pitches
+
+    def process(self, i_samples, q_samples):
+        """Same signature as Channelizer.process().  Reads from pfb.last_output."""
+        pfb_out = self._pfb.last_output
+        if pfb_out is None or pfb_out.shape[1] == 0:
+            return None
+
+        # Extract this channel
+        ch = pfb_out[self.bin_idx]  # (n_steps,) complex at pfb.output_rate
+
+        # Frequency-shift so CW tone lands at CW_TONE Hz
+        n = len(ch)
+        t = np.arange(n) / self.output_rate
+        phase_end = self._phase + 2 * np.pi * self._shift_hz * n / self.output_rate
+        phases = self._phase + 2 * np.pi * self._shift_hz * t
+        self._phase = phase_end % (2 * np.pi)
+        audio = (ch * np.exp(1j * phases)).real.astype(np.float64)
+
+        # Pitch detection
+        if not self._pitch_detected:
+            self._pitch_buf = np.concatenate([self._pitch_buf, audio])
+            needed = self.output_rate * 15
+            if len(self._pitch_buf) >= needed:
+                n_det = self.output_rate * 2
+                spectrum = np.abs(np.fft.rfft(
+                    self._pitch_buf[:n_det] * np.hanning(n_det)))
+                freqs = np.fft.rfftfreq(n_det, 1.0 / self.output_rate)
+                mask = (freqs >= 475) & (freqs <= 825)
+                if np.any(mask):
+                    spec_m = spectrum[mask]
+                    freqs_m = freqs[mask]
+                    peak_idx = np.argmax(spec_m)
+                    peak_freq = freqs_m[peak_idx]
+                    peak_amp = spec_m[peak_idx]
+                    self._pitch = max(450, min(850, int(round(peak_freq))))
+                    if abs(self._pitch - CW_TONE) > 5:
+                        log.info("PFB auto pitch: %d Hz (expected %d Hz)",
+                                 self._pitch, CW_TONE)
+                    threshold = peak_amp * 0.15
+                    candidates = []
+                    for i in range(len(freqs_m)):
+                        if abs(freqs_m[i] - peak_freq) <= 25:
+                            continue
+                        if spec_m[i] < threshold:
+                            continue
+                        lo, hi = max(0, i - 5), min(len(spec_m), i + 6)
+                        if spec_m[i] == np.max(spec_m[lo:hi]):
+                            candidates.append((spec_m[i], int(round(freqs_m[i]))))
+                    candidates.sort(reverse=True)
+                    merged = []
+                    for amp, freq in candidates:
+                        if not any(abs(freq - mf) < 25 for _, mf in merged):
+                            merged.append((amp, freq))
+                    self._secondary_pitches = [
+                        max(450, min(850, f)) for _, f in merged[:2]
+                    ]
+                    self._known_sec_pitches = set(self._secondary_pitches)
+                    if self._secondary_pitches:
+                        log.info("PFB secondary pitches: %s Hz alongside primary %d Hz",
+                                 self._secondary_pitches, self._pitch)
+                self._pitch_detected = True
+                self._pitch_buf = np.zeros(0, dtype=np.float64)
+
+        # Optional post-dec FIR bandpass
+        if self._fir_taps is not None:
+            from scipy.signal import lfilter
+            audio, self._fir_zi = lfilter(self._fir_taps, 1.0, audio, zi=self._fir_zi)
+
+        # Normalise → int16 PCM
+        if self.normalize == 'peak':
+            peak = np.max(np.abs(audio)) if len(audio) > 0 else 0.0
+            if peak > self._peak:
+                self._peak = peak
+            else:
+                self._peak = 0.9999 * self._peak + 0.0001 * peak
+            if self._peak > 0:
+                audio = audio / self._peak * 0.3
+            return np.clip(audio * 32767, -32767, 32767).astype(np.int16).tobytes()
+        else:
+            return np.clip(audio * 10.0, -32000, 32000).astype(np.int16).tobytes()
+
+
 class _SubprocessDecoder:
     """Thin wrapper around a decoder subprocess — no channelization.
 
@@ -1096,7 +1316,8 @@ class SignalGroup:
     def __init__(self, freq_offset, rf_khz, sample_rate, snr,
                  decoder_bin, speeds,
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
-                 wpm=30, ml_model_path=None, ml_min_confidence=0.7):
+                 wpm=30, ml_model_path=None, ml_min_confidence=0.7,
+                 pfb=None):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
@@ -1109,16 +1330,21 @@ class SignalGroup:
         if eng:
             self._cw_engine = _CWEngineChannel(freq_offset, rf_khz, snr, sample_rate)
 
-        # Python channelizers — always create (runs in parallel with cw_engine)
-        # cw_fir_bw=1200 adds a 256-tap post-decimation bandpass [100–1300 Hz] at
-        # DECODER_RATE (12 kHz). Passes CW tones (475–825 Hz), rejects a 700 Hz
-        # neighbour that appears at ~1400 Hz in the mixed audio. Applied post-dec
-        # so it runs at 12 kHz not 192 kHz — 16× cheaper than pre-decimation FIR.
-        self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
-                                     normalize='peak', cw_fir_bw=1200)
-        self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
-                                  normalize='peak',
-                                  cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
+        # Python channelizers — use PFBChannel when PFB is available, else Channelizer.
+        # PFBChannel extracts a 250 Hz-wide bin from the shared PFBChannelizer output,
+        # naturally isolating co-channel signals that are ≥250 Hz apart.
+        if pfb is not None:
+            self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
+                                        normalize='peak', cw_fir_bw=1200)
+            self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
+                                     normalize='peak',
+                                     cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
+        else:
+            self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
+                                         normalize='peak', cw_fir_bw=1200)
+            self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
+                                      normalize='peak',
+                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
 
         # Two-pass decoder spawn:
         #   Immediately: start uhsdr at default pitch (600 Hz) — no buffering
@@ -1439,6 +1665,8 @@ class InstanceManager:
         self.center_khz = 0
         # WPM cache: freq_key -> last known WPM (survives signal eviction)
         self._wpm_cache = {}
+        # Shared PFB channelizer — processes full-band IQ once for all signals
+        self._pfb = PFBChannelizer(input_rate=sample_rate) if sample_rate == 192000 else None
 
     def update_signals(self, signals, center_khz, wpm_hint=0):
         """Update instance list based on detected signals.
@@ -1496,6 +1724,7 @@ class InstanceManager:
                 wpm=signal_wpm,
                 ml_model_path=self.ml_model_path,
                 ml_min_confidence=self.ml_min_confidence,
+                pfb=self._pfb,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
@@ -1522,6 +1751,9 @@ class InstanceManager:
 
     def feed_all_iq(self, i_samples, q_samples):
         """Feed IQ to all SignalGroups — each runs its shared channelizer."""
+        # Run PFB once for all channels (if available)
+        if self._pfb is not None:
+            self._pfb.process(i_samples, q_samples)
         for group in list(self.instances.values()):
             group.feed_iq(i_samples, q_samples)
 
@@ -2287,33 +2519,61 @@ def run_file_mode(args, config):
         scan_i = samples[0::2] if file_channels == 2 else samples
         scan_q = samples[1::2] if file_channels == 2 else np.zeros_like(samples)
 
-    fft_size = 8192
-    n_ffts = min(len(scan_i) // fft_size, 200)
-    avg_spectrum = np.zeros(fft_size)
-    for fi in range(n_ffts):
-        chunk = scan_i[fi*fft_size:(fi+1)*fft_size] + \
-                1j * scan_q[fi*fft_size:(fi+1)*fft_size]
-        avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
-    avg_spectrum /= max(n_ffts, 1)
-    avg_db = 10 * np.log10(avg_spectrum + 1e-20)
-    freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
-    noise = np.median(avg_db)
     min_snr = config.get('signal_min_snr', 8)
 
-    signals = []
-    for i in range(1, fft_size - 1):
-        if avg_db[i] > noise + min_snr and \
-           avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
-            signals.append((freqs[i], avg_db[i] - noise))
+    if manager._pfb is not None:
+        # PFB-based detection: 250 Hz bins — separates closely-spaced signals
+        # Feed scan data through the shared PFB bank
+        block = 4096
+        for off in range(0, len(scan_i) - block + 1, block):
+            manager._pfb.process(scan_i[off:off+block], scan_q[off:off+block])
+        power_db = manager._pfb.channel_powers_db()
+        noise = np.median(power_db)
+        N = manager._pfb.N
+        signals = []
+        for k in range(1, N - 1):
+            if (power_db[k] > noise + min_snr and
+                    power_db[k] > power_db[k - 1] and
+                    power_db[k] > power_db[(k + 1) % N]):
+                freq = manager._pfb.bin_to_freq(k)
+                signals.append((freq, power_db[k] - noise))
+        clustered = []
+        for freq, snr in sorted(signals):
+            if not clustered or abs(freq - clustered[-1][0]) > 200:
+                clustered.append((freq, snr))
+            elif snr > clustered[-1][1]:
+                clustered[-1] = (freq, snr)
+        # Reset PFB state after detection scan so streaming starts clean
+        manager._pfb._state[:] = 0
+        manager._pfb._buf = np.zeros(0, dtype=np.complex128)
+        manager._pfb.last_output = None
+        log.info("  PFB: %d signals detected (250 Hz bins)", len(clustered))
+    else:
+        # Fallback: FFT-based detection
+        fft_size = 8192
+        n_ffts = min(len(scan_i) // fft_size, 200)
+        avg_spectrum = np.zeros(fft_size)
+        for fi in range(n_ffts):
+            chunk = scan_i[fi*fft_size:(fi+1)*fft_size] + \
+                    1j * scan_q[fi*fft_size:(fi+1)*fft_size]
+            avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
+        avg_spectrum /= max(n_ffts, 1)
+        avg_db = 10 * np.log10(avg_spectrum + 1e-20)
+        freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
+        noise = np.median(avg_db)
+        signals = []
+        for i in range(1, fft_size - 1):
+            if avg_db[i] > noise + min_snr and \
+               avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
+                signals.append((freqs[i], avg_db[i] - noise))
+        clustered = []
+        for freq, snr in sorted(signals):
+            if not clustered or abs(freq - clustered[-1][0]) > 200:
+                clustered.append((freq, snr))
+            elif snr > clustered[-1][1]:
+                clustered[-1] = (freq, snr)
+        log.info("  FFT: %d signals detected", len(clustered))
 
-    clustered = []
-    for freq, snr in sorted(signals):
-        if not clustered or abs(freq - clustered[-1][0]) > 200:
-            clustered.append((freq, snr))
-        elif snr > clustered[-1][1]:
-            clustered[-1] = (freq, snr)
-
-    log.info("  %d signals detected — spawning decoders once", len(clustered))
     manager.update_signals(clustered, center_khz)
     del scan_i, scan_q
 
