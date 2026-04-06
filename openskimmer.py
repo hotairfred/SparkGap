@@ -654,6 +654,13 @@ class PFBChannelizer:
         self._hist = np.zeros(self.N_CHAN * self.TAPS_PER_CHAN, dtype=np.complex128)
         self._buf = np.zeros(0, dtype=np.complex128)
 
+        # Per-bin baseband correction: out[k,s] *= exp(-j*2π*k*M*s/N)
+        # Without this, bin k output sits at f0 (mod output_rate), not at residual.
+        # phase_inc[k] = -2π * k * M / N  (radians per output step, per bin)
+        N, M = self.N_CHAN, self.N_CHAN // self.OVERSAMPLE
+        self._phase_inc = (-2 * np.pi * np.arange(N, dtype=np.float64) * M / N)
+        self._phase_vec = np.zeros(N, dtype=np.float64)  # running phase per bin
+
         # Most recent processed output — read by PFBChannel.process()
         self.last_output = None   # shape (N_CHAN, n_steps) or None
 
@@ -690,6 +697,13 @@ class PFBChannelizer:
 
         # s'=0 is NEWEST step; reverse so out[:, 0] = oldest step
         out = np.fft.ifft(y_rev[:, ::-1], axis=0) * N   # (N, n_steps)
+
+        # Per-bin baseband correction: out[k,s] *= exp(-j*2π*k*M*s/N)
+        # This mixes each bin to baseband (removes bin-centre carrier).
+        s_vec = np.arange(n_steps, dtype=np.float64)
+        phase_matrix = self._phase_vec[:, np.newaxis] + np.outer(self._phase_inc, s_vec)
+        out *= np.exp(1j * phase_matrix)
+        self._phase_vec = (self._phase_vec + self._phase_inc * n_steps) % (2 * np.pi)
 
         # Update history: newest N*K samples
         self._hist[:] = full_rev[:N * K]
