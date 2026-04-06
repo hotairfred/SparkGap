@@ -2523,11 +2523,17 @@ def run_file_mode(args, config):
 
     if manager._pfb is not None:
         # PFB-based detection: 250 Hz bins — separates closely-spaced signals
-        # Feed scan data through the shared PFB bank
+        # Accumulate per-channel power across all scan blocks
         block = 4096
+        total_power = np.zeros(manager._pfb.N, dtype=np.float64)
+        n_blocks = 0
         for off in range(0, len(scan_i) - block + 1, block):
-            manager._pfb.process(scan_i[off:off+block], scan_q[off:off+block])
-        power_db = manager._pfb.channel_powers_db()
+            out = manager._pfb.process(scan_i[off:off+block], scan_q[off:off+block])
+            if out is not None:
+                total_power += np.mean(np.abs(out) ** 2, axis=1)
+                n_blocks += 1
+        avg_power = total_power / max(n_blocks, 1)
+        power_db = 10.0 * np.log10(avg_power + 1e-20)
         noise = np.median(power_db)
         N = manager._pfb.N
         signals = []
