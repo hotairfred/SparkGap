@@ -498,6 +498,7 @@ class Channelizer:
 
         self._pitch_detected = False
         self._pitch = CW_TONE
+        self._secondary_pitches = []  # co-channel peaks detected alongside primary
         self._pitch_buf = np.zeros(0, dtype=np.float64)
 
         from scipy.signal import butter, sosfilt_zi
@@ -520,6 +521,10 @@ class Channelizer:
     @property
     def detected_pitch(self):
         return self._pitch
+
+    @property
+    def secondary_pitches(self):
+        return self._secondary_pitches
 
     def process(self, i_samples, q_samples):
         """Mix, filter, decimate IQ → int16 PCM bytes. Returns None if no output yet."""
@@ -558,11 +563,38 @@ class Channelizer:
                 freqs = np.fft.rfftfreq(n_det, 1.0 / self.output_rate)
                 mask = (freqs >= 475) & (freqs <= 825)
                 if np.any(mask):
-                    peak_freq = freqs[mask][np.argmax(spectrum[mask])]
+                    spec_m = spectrum[mask]
+                    freqs_m = freqs[mask]
+                    peak_idx = np.argmax(spec_m)
+                    peak_freq = freqs_m[peak_idx]
+                    peak_amp = spec_m[peak_idx]
                     self._pitch = max(450, min(850, int(round(peak_freq))))
                     if abs(self._pitch - CW_TONE) > 5:
                         log.info("Auto pitch: %d Hz (expected %d Hz)",
                                  self._pitch, CW_TONE)
+                    # Secondary pitch: local maxima > 15% of primary, > 50 Hz away
+                    threshold = peak_amp * 0.15
+                    candidates = []
+                    for i in range(len(freqs_m)):
+                        if abs(freqs_m[i] - peak_freq) <= 50:
+                            continue
+                        if spec_m[i] < threshold:
+                            continue
+                        lo, hi = max(0, i - 5), min(len(spec_m), i + 6)
+                        if spec_m[i] == np.max(spec_m[lo:hi]):
+                            candidates.append((spec_m[i], int(round(freqs_m[i]))))
+                    candidates.sort(reverse=True)  # strongest first
+                    # Deduplicate: merge candidates within 50 Hz of each other
+                    merged = []
+                    for amp, freq in candidates:
+                        if not any(abs(freq - mf) < 50 for _, mf in merged):
+                            merged.append((amp, freq))
+                    self._secondary_pitches = [
+                        max(450, min(850, f)) for _, f in merged[:2]
+                    ]
+                    if self._secondary_pitches:
+                        log.info("Secondary pitches: %s Hz alongside primary %d Hz",
+                                 self._secondary_pitches, self._pitch)
                 self._pitch_detected = True
                 self._pitch_buf = np.zeros(0)
 
@@ -1123,6 +1155,7 @@ class SignalGroup:
 
         self.bmorse = None
         self.hamfist = None
+        self._secondary_decoders = []  # uhsdr instances for co-channel secondary pitches
         self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path, min_confidence=ml_min_confidence) if ml_model_path else None
 
     @property
@@ -1150,6 +1183,28 @@ class SignalGroup:
                     dec = _SubprocessDecoder(self.rf_khz, self.snr, cmd, capture_wpm=True)
                 self.decoders.append(dec)
             log.info("Respawned uhsdr at pitch=%d Hz for %.1f kHz", pitch, self.rf_khz)
+
+        # Secondary pitch decoders — co-channel signals at different audio pitches
+        # Uses the uhsdr channelizer (always available) to detect secondary peaks.
+        # Only auto+detected-wpm (2 decoders per secondary pitch) to control CPU.
+        sec_pitches = self._ch_uhsdr.secondary_pitches
+        if sec_pitches:
+            lib = _get_uhsdr_lib()
+            sec_speeds = [0, wpm]  # auto + detected-wpm only (vs all 7 speeds)
+            for sec_pitch in sec_pitches:
+                for spd in sec_speeds:
+                    if lib:
+                        dec = _LibDecoder(self.rf_khz, self.snr, freq=sec_pitch,
+                                          sample_rate=DECODER_RATE, wpm=spd)
+                    else:
+                        cmd = [self._decoder_bin, '-r', str(DECODER_RATE),
+                               '-f', str(sec_pitch)]
+                        if spd > 0:
+                            cmd += ['-s', str(spd)]
+                        dec = _SubprocessDecoder(self.rf_khz, self.snr, cmd, capture_wpm=True)
+                    self._secondary_decoders.append(dec)
+            log.info("Spawned %d secondary-pitch uhsdr decoders at %s Hz for %.1f kHz",
+                     len(self._secondary_decoders), sec_pitches, self.rf_khz)
 
         if self._bmorse_bin:
             cmd = [self._bmorse_bin, '-stdin', '-txt',
@@ -1180,6 +1235,7 @@ class SignalGroup:
         engine_count = (self._cw_engine.decoder_count or 0) if self._cw_engine else 0
         pending_aux = ((1 if self._bmorse_bin else 0) + (1 if self._hamfist_bin else 0)) if not self._bmorse_started else 0
         return (engine_count + pending_aux + len(self.decoders)
+                + len(self._secondary_decoders)
                 + (1 if self.bmorse else 0)
                 + (1 if self.hamfist else 0))
 
@@ -1215,6 +1271,8 @@ class SignalGroup:
         # uhsdr runs immediately — feed it always
         if pcm_12k:
             for d in self.decoders:
+                d.feed_pcm(pcm_12k)
+            for d in self._secondary_decoders:
                 d.feed_pcm(pcm_12k)
 
         # Two-pass: bmorse waits for pitch detection (~15s) + uhsdr WPM (or timeout)
@@ -1309,6 +1367,13 @@ class SignalGroup:
                     continue  # pitch not confirmed yet, discard
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
                 self.last_output = time.time()
+        for d in self._secondary_decoders:
+            text = d.read()
+            if text:
+                if not self._bmorse_started:
+                    continue
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
+                self.last_output = time.time()
         for d in ([self.bmorse] if self.bmorse else []) + \
                  ([self.hamfist] if self.hamfist else []) + \
                  ([self._bmorse_fallback] if self._bmorse_fallback else []):
@@ -1324,6 +1389,9 @@ class SignalGroup:
             self._cw_engine = None
         for d in self.decoders:
             d.kill()
+        for d in self._secondary_decoders:
+            d.kill()
+        self._secondary_decoders = []
         if self.bmorse:
             self.bmorse.kill()
         if self.hamfist:
