@@ -1078,8 +1078,12 @@ class SignalGroup:
             self._cw_engine = _CWEngineChannel(freq_offset, rf_khz, snr, sample_rate)
 
         # Python channelizers — always create (runs in parallel with cw_engine)
+        # cw_fir_bw=1200 adds a 256-tap post-decimation bandpass [100–1300 Hz] at
+        # DECODER_RATE (12 kHz). Passes CW tones (475–825 Hz), rejects a 700 Hz
+        # neighbour that appears at ~1400 Hz in the mixed audio. Applied post-dec
+        # so it runs at 12 kHz not 192 kHz — 16× cheaper than pre-decimation FIR.
         self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
-                                     normalize='peak')
+                                     normalize='peak', cw_fir_bw=1200)
         self._ch_4k = Channelizer(freq_offset, sample_rate, BMORSE_RATE,
                                   normalize='peak',
                                   cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
