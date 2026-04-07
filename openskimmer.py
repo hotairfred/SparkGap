@@ -2550,64 +2550,38 @@ def run_file_mode(args, config):
 
     min_snr = config.get('signal_min_snr', 8)
 
+    # Always use high-resolution FFT for signal detection (23 Hz bins vs PFB 250 Hz).
+    # PFB has 10 dB less per-bin SNR than FFT, so it misses weak stations.
+    # PFB is used only for channelization, not detection.
+    fft_size = 8192
+    n_ffts = min(len(scan_i) // fft_size, 200)
+    avg_spectrum = np.zeros(fft_size)
+    for fi in range(n_ffts):
+        chunk = scan_i[fi*fft_size:(fi+1)*fft_size] + \
+                1j * scan_q[fi*fft_size:(fi+1)*fft_size]
+        avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
+    avg_spectrum /= max(n_ffts, 1)
+    avg_db = 10 * np.log10(avg_spectrum + 1e-20)
+    freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
+    noise = np.median(avg_db)
+    signals = []
+    for i in range(1, fft_size - 1):
+        if avg_db[i] > noise + min_snr and \
+           avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
+            signals.append((freqs[i], avg_db[i] - noise))
+    clustered = []
+    for freq, snr in sorted(signals):
+        if not clustered or abs(freq - clustered[-1][0]) > 200:
+            clustered.append((freq, snr))
+        elif snr > clustered[-1][1]:
+            clustered[-1] = (freq, snr)
+    log.info("  FFT: %d signals detected", len(clustered))
     if manager._pfb is not None:
-        # PFB-based detection: 250 Hz bins — separates closely-spaced signals
-        # Accumulate per-channel power across all scan blocks
-        block = 4096
-        total_power = np.zeros(manager._pfb.N, dtype=np.float64)
-        n_blocks = 0
-        for off in range(0, len(scan_i) - block + 1, block):
-            out = manager._pfb.process(scan_i[off:off+block], scan_q[off:off+block])
-            if out is not None:
-                total_power += np.mean(np.abs(out) ** 2, axis=1)
-                n_blocks += 1
-        avg_power = total_power / max(n_blocks, 1)
-        power_db = 10.0 * np.log10(avg_power + 1e-20)
-        noise = np.median(power_db)
-        N = manager._pfb.N
-        signals = []
-        for k in range(1, N - 1):
-            if (power_db[k] > noise + min_snr and
-                    power_db[k] > power_db[k - 1] and
-                    power_db[k] > power_db[(k + 1) % N]):
-                freq = manager._pfb.bin_to_freq(k)
-                signals.append((freq, power_db[k] - noise))
-        clustered = []
-        for freq, snr in sorted(signals):
-            if not clustered or abs(freq - clustered[-1][0]) > 200:
-                clustered.append((freq, snr))
-            elif snr > clustered[-1][1]:
-                clustered[-1] = (freq, snr)
-        # Reset PFB state after detection scan so streaming starts clean
+        # Reset PFB state — scan audio was used only for FFT detection above
         manager._pfb._hist[:] = 0
+        manager._pfb._phase_vec[:] = 0
         manager._pfb._buf = np.zeros(0, dtype=np.complex128)
         manager._pfb.last_output = None
-        log.info("  PFB: %d signals detected (250 Hz bins)", len(clustered))
-    else:
-        # Fallback: FFT-based detection
-        fft_size = 8192
-        n_ffts = min(len(scan_i) // fft_size, 200)
-        avg_spectrum = np.zeros(fft_size)
-        for fi in range(n_ffts):
-            chunk = scan_i[fi*fft_size:(fi+1)*fft_size] + \
-                    1j * scan_q[fi*fft_size:(fi+1)*fft_size]
-            avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
-        avg_spectrum /= max(n_ffts, 1)
-        avg_db = 10 * np.log10(avg_spectrum + 1e-20)
-        freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
-        noise = np.median(avg_db)
-        signals = []
-        for i in range(1, fft_size - 1):
-            if avg_db[i] > noise + min_snr and \
-               avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
-                signals.append((freqs[i], avg_db[i] - noise))
-        clustered = []
-        for freq, snr in sorted(signals):
-            if not clustered or abs(freq - clustered[-1][0]) > 200:
-                clustered.append((freq, snr))
-            elif snr > clustered[-1][1]:
-                clustered[-1] = (freq, snr)
-        log.info("  FFT: %d signals detected", len(clustered))
 
     manager.update_signals(clustered, center_khz)
     del scan_i, scan_q
