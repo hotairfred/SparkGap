@@ -645,7 +645,9 @@ class PFBChannelizer:
         # Prototype lowpass filter: cutoff = half channel bandwidth
         n_taps = self.N_CHAN * self.TAPS_PER_CHAN
         h = firwin(n_taps, 1.0 / (2 * self.N_CHAN), window=('kaiser', 10.0))
-        h = (h * self.N_CHAN).astype(np.float64)
+        # Unity-gain normalization: scale so PFB output amplitude matches input.
+        # sqrt(N)/K gives passband gain ≈ 1, matching Channelizer amplitude.
+        h = (h * np.sqrt(self.N_CHAN) / self.TAPS_PER_CHAN).astype(np.float64)
         # Polyphase matrix: H[k, j] = h[k + j*N] → shape (N_CHAN, TAPS_PER_CHAN)
         self._H = h.reshape(self.TAPS_PER_CHAN, self.N_CHAN).T.copy()
 
