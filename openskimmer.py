@@ -630,7 +630,7 @@ class PFBChannelizer:
     per IQ block; the result (stored in last_output) is read by PFBChannel.
     """
 
-    N_CHAN = 768
+    N_CHAN = 384
     OVERSAMPLE = 48          # N/M — output rate = input_rate * os / N = 12000
     TAPS_PER_CHAN = 9        # polyphase branch length; 9 → ~60 dB stopband
 
