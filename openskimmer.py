@@ -795,14 +795,20 @@ class PFBChannel:
 
         # Extract this channel
         ch = pfb_out[self.bin_idx]  # (n_steps,) complex at pfb.output_rate
+        pfb_rate = self._pfb.output_rate
 
-        # Frequency-shift so CW tone lands at CW_TONE Hz
+        # Frequency-shift so CW tone lands at CW_TONE Hz (time vector at pfb rate)
         n = len(ch)
-        t = np.arange(n) / self.output_rate
-        phase_end = self._phase + 2 * np.pi * self._shift_hz * n / self.output_rate
+        t = np.arange(n) / pfb_rate
+        phase_end = self._phase + 2 * np.pi * self._shift_hz * n / pfb_rate
         phases = self._phase + 2 * np.pi * self._shift_hz * t
         self._phase = phase_end % (2 * np.pi)
         audio = (ch * np.exp(1j * phases)).real.astype(np.float64)
+
+        # Decimate to self.output_rate if needed (e.g. 12 kHz → 4 kHz for bmorse)
+        dec = pfb_rate // self.output_rate
+        if dec > 1:
+            audio = audio[::dec]
 
         # Pitch detection
         if not self._pitch_detected:
@@ -1365,7 +1371,7 @@ class SignalGroup:
         if pfb is not None:
             self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
                                         normalize='peak', cw_fir_bw=1200)
-            self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
+            self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=BMORSE_RATE,
                                      normalize='peak',
                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
         else:
