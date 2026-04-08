@@ -70,12 +70,14 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
                 line = line.strip().upper()
                 if line and not line.startswith('#'):
                     calls.add(line)
+    add_calls = set()
     if add_path and os.path.exists(add_path):
         with open(add_path) as f:
             for line in f:
                 line = line.strip().upper()
                 if line:
-                    calls.add(line)
+                    add_calls.add(line)
+    calls |= add_calls
     blacklist = set()
     if blacklist_path and os.path.exists(blacklist_path):
         with open(blacklist_path) as f:
@@ -83,8 +85,9 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
                 line = line.strip().upper()
                 if line:
                     blacklist.add(line)
-    log.info("Database: %d calls + %d blacklisted", len(calls), len(blacklist))
-    return calls, blacklist
+    log.info("Database: %d calls (%d add_calls) + %d blacklisted",
+             len(calls), len(add_calls), len(blacklist))
+    return calls, blacklist, add_calls
 
 
 CW_TONE = 700       # Hz — matches natural tone placement from channelizer
@@ -1833,11 +1836,12 @@ class SpotTracker:
     """
 
     def __init__(self, valid_calls, blacklist, respot_interval=120,
-                 fuzzy_min_cycles=3):
+                 fuzzy_min_cycles=3, add_calls=None):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
         self.fuzzy_min_cycles = fuzzy_min_cycles
+        self.add_calls = add_calls or set()
 
         # Exact match tracking
         self._tracking = defaultdict(lambda: {
@@ -1860,8 +1864,10 @@ class SpotTracker:
             self._scp_by_len[len(call)].append(call)
 
     @staticmethod
-    def _min_sightings(call, snr=0):
+    def _min_sightings(self, call, snr=0):
         """Length-weighted sighting threshold, SNR-gated for short calls."""
+        if call in self.add_calls:
+            return 1  # pre-validated rare calls: one clean decode is enough
         n = len(call)
         if n <= 4:
             return 2 if snr >= 30 else 4  # strong 4-char: accept at 2
@@ -1938,9 +1944,7 @@ class SpotTracker:
         if not hasattr(self, '_primary_matched'):
             self._primary_matched = set()  # freq_bins with primary exact SCP match
 
-        # Skip secondary decoder output at frequencies where primary already matched
-        if dec_type == 'secondary' and freq_bin in self._primary_matched:
-            return []
+        # Secondary decoders run freely — sightings threshold is the quality gate
         if not hasattr(self, '_processed_len'):
             self._processed_len = {}
 
@@ -2161,13 +2165,14 @@ class OpenSkimmer:
     async def start(self):
         self.start_time = time.time()
 
-        calls, blacklist = load_callsign_db(
+        calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
             self.cfg.get('add_calls', 'add_calls.txt'),
             self.cfg.get('blacklist', 'blacklist.txt'),
         )
         self.tracker = SpotTracker(calls, blacklist,
-                                   self.cfg.get('respot_interval', 120))
+                                   self.cfg.get('respot_interval', 120),
+                                   add_calls=add_calls)
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
@@ -2483,12 +2488,12 @@ def run_file_mode(args, config):
     log.info("File mode: %s (%.1f-%.1f min)", args.file, args.start_min,
              args.end_min if args.end_min else 'end')
 
-    calls, blacklist = load_callsign_db(
+    calls, blacklist, add_calls = load_callsign_db(
         config.get('master_scp', 'MASTER.SCP'),
         config.get('add_calls', 'add_calls.txt'),
         config.get('blacklist', 'blacklist.txt'),
     )
-    tracker = SpotTracker(calls, blacklist, respot_interval=0)
+    tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls)
 
     # Determine file format and sample rate
     with open(args.file, 'rb') as f:
