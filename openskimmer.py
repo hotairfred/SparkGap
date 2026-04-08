@@ -1545,6 +1545,9 @@ class SignalGroup:
         if not self._bmorse_started:
             if pcm_4k:
                 self._pcm_buffer_4k += pcm_4k
+                # Feed ML decoder early — WPM estimate available in ~6s
+                if self._ml_decoder:
+                    self._ml_decoder.feed_pcm(pcm_4k)
 
             # Wait for pitch detection first
             pitch_ch = self._ch_4k if self._ch_4k else self._ch_uhsdr
@@ -1557,10 +1560,14 @@ class SignalGroup:
 
             pitch = pitch_ch.detected_pitch
             uhsdr_wpm = self.uhsdr_wpm
+            ml_wpm = self._ml_decoder.detected_wpm if self._ml_decoder else 0
             if uhsdr_wpm > 0:
                 self._start_bmorse(uhsdr_wpm, pitch)
             elif time.time() >= self._bmorse_spawn_time:
-                self._start_bmorse(self._wpm, pitch)  # fallback
+                best_wpm = ml_wpm if ml_wpm > 0 else self._wpm
+                if ml_wpm > 0:
+                    log.info("ML WPM pre-seed: %.1f kHz → %d WPM", self.rf_khz, ml_wpm)
+                self._start_bmorse(best_wpm, pitch)
             return
 
         # Steady state: feed bmorse/hamfist (subprocess, if configured)
@@ -1587,7 +1594,8 @@ class SignalGroup:
                     if bmlib:
                         pitch_ch = self._ch_4k if self._ch_4k else self._ch_uhsdr
                         pitch = pitch_ch.detected_pitch if pitch_ch._pitch_detected else CW_TONE
-                        wpm = self.uhsdr_wpm if self.uhsdr_wpm > 0 else 25
+                        ml_wpm = self._ml_decoder.detected_wpm if self._ml_decoder else 0
+                        wpm = self.uhsdr_wpm or ml_wpm or 25
                         self._bmorse_fallback = _LibBmorseDecoder(
                             self.rf_khz, self.snr, freq=pitch,
                             sample_rate=BMORSE_RATE, wpm=wpm)
