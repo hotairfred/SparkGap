@@ -1694,7 +1694,8 @@ class InstanceManager:
     def __init__(self, sample_rate, decoder_bin='./uhsdr_cw',
                  max_instances=150, max_channels=None, signal_timeout=90,
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
-                 hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7):
+                 hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7,
+                 ml_max_channels=20):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -1702,6 +1703,7 @@ class InstanceManager:
         self.hamfist_scp = hamfist_scp
         self.ml_model_path = ml_model_path  # None = no ML decoder
         self.ml_min_confidence = ml_min_confidence
+        self.ml_max_channels = ml_max_channels  # cap ML to top-N SNR channels
         self.max_instances = max_instances  # total decoder process cap (legacy)
         # max_channels: max simultaneous signals — decoupled from decoder count
         # defaults to max_instances for backwards compat
@@ -1762,6 +1764,9 @@ class InstanceManager:
             # Use cached WPM if available, otherwise default
             cached_wpm = self._wpm_cache.get(key, 0)
             signal_wpm = cached_wpm if cached_wpm > 0 else spd
+            # Gate ML to top-N channels by SNR (signals sorted strongest-first)
+            ml_count = sum(1 for g in self.instances.values() if g._ml_decoder is not None)
+            use_ml = self.ml_model_path if ml_count < self.ml_max_channels else None
             group = SignalGroup(
                 offset, rf_khz, self.sample_rate, snr,
                 decoder_bin=self.decoder_bin,
@@ -1770,7 +1775,7 @@ class InstanceManager:
                 hamfist_bin=self.hamfist_bin,
                 hamfist_scp=self.hamfist_scp,
                 wpm=signal_wpm,
-                ml_model_path=self.ml_model_path,
+                ml_model_path=use_ml,
                 ml_min_confidence=self.ml_min_confidence,
                 pfb=self._pfb,
             )
