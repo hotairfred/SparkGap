@@ -1473,9 +1473,15 @@ class SignalGroup:
                      len(self._secondary_decoders), sec_pitches, self.rf_khz)
 
         if self._bmorse_bin:
-            cmd = [self._bmorse_bin, '-stdin', '-txt',
-                   '-spd', str(wpm), '-frq', str(pitch), '-rate', str(BMORSE_RATE)]
-            self.bmorse = _SubprocessDecoder(self.rf_khz, self.snr, cmd)
+            # Prefer libbmorse.so (in-process) — the subprocess binary doesn't
+            # support -stdin or -rate flags (takes a WAV filename, not piped PCM).
+            bmlib = _get_bmorse_lib()
+            if bmlib:
+                self.bmorse = _LibBmorseDecoder(self.rf_khz, self.snr, freq=pitch,
+                                                sample_rate=BMORSE_RATE, wpm=wpm)
+            else:
+                log.warning("libbmorse.so not found — bmorse subprocess skipped"
+                            " (binary requires WAV file, not piped PCM)")
 
         if self._hamfist_bin:
             cmd = [self._hamfist_bin, '-stdin', '-frq', str(pitch),
