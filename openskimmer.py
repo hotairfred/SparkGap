@@ -1835,7 +1835,7 @@ class InstanceManager:
         procs = []
         for group in self.instances.values():
             for d in list(group.decoders) + list(group._secondary_decoders):
-                if d.process:
+                if getattr(d, 'process', None):
                     try: d.process.stdin.close()
                     except: pass
                     try: d.process.terminate()
