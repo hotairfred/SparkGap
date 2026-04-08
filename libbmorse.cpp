@@ -32,6 +32,7 @@ struct bmorse_state {
     float sample_rate;
     float tone_freq;
     float speed_wpm;
+    fftfilt *filter;   // per-instance filter — global FFT_filter must not be freed by destroy
 };
 
 extern "C" {
@@ -55,10 +56,11 @@ bmorse_handle_t bmorse_create(float freq, float sample_rate, int wpm)
     params.print_variables = FALSE;
     params.print_speed = FALSE;
 
-    // Initialize FFT filter (same as process_stdin)
+    // Initialize FFT filter (per-instance — owned by this handle)
     int FilterFFTLen = 4096;
     float bw = (wpm > 0 ? wpm : 25) / (1.2f * sample_rate);
-    FFT_filter = new fftfilt(bw, FilterFFTLen);
+    s->filter = new fftfilt(bw, FilterFFTLen);
+    FFT_filter = s->filter;   // point global at this instance's filter
 
     // Clear output buffer
     _bmorse_outlen = 0;
@@ -71,6 +73,16 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
                 char *out, int outlen)
 {
     if (!h || !samples || n <= 0) return 0;
+    bmorse_state *s = (bmorse_state *)h;
+
+    // Restore per-handle params and filter so this call uses the right state.
+    // Bayesian statics in process_data are still shared — single-instance quality
+    // for concurrent use, but no crash.
+    params.sample_rate = s->sample_rate;
+    params.frequency   = s->tone_freq;
+    params.speed       = (int)s->speed_wpm;
+    params.dec_ratio   = (int)(s->sample_rate / BAYES_RATE);
+    FFT_filter = s->filter;
 
     // Reset output buffer
     _bmorse_outlen = 0;
@@ -106,9 +118,13 @@ void bmorse_destroy(bmorse_handle_t h)
 {
     if (!h) return;
     bmorse_state *s = (bmorse_state *)h;
-    if (FFT_filter) {
-        delete FFT_filter;
-        FFT_filter = NULL;
+    // Free this instance's own filter — do NOT null the global FFT_filter since
+    // other instances may still be alive and bmorse_feed re-applies it anyway.
+    if (s->filter) {
+        if (FFT_filter == s->filter)
+            FFT_filter = NULL;  // only null global if it still points here
+        delete s->filter;
+        s->filter = NULL;
     }
     free(s);
 }

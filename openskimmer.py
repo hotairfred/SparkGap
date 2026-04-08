@@ -1391,6 +1391,7 @@ class SignalGroup:
         #   After pitch detection (~15s) + uhsdr WPM (or 10s timeout): start bmorse
         self._decoder_bin = decoder_bin
         self._speeds = speeds
+        self._pfb = pfb        # needed for lazy _ch_4k creation in bmorse fallback
         self._bmorse_bin = bmorse_bin
         self._hamfist_bin = hamfist_bin
         self._hamfist_scp = hamfist_scp
@@ -1595,7 +1596,7 @@ class SignalGroup:
                     # Strip [err], [?], <xx> tags — count only real letters/digits/spaces
                     clean = re.sub(r'\[.*?\]|<.*?>', '', text)
                     real_chars += sum(1 for c in clean if c.isalnum())
-                if real_chars < 20:  # uhsdr struggling on this signal
+                if real_chars < 20 and self._bmorse_bin:  # uhsdr struggling; only if bmorse configured
                     bmlib = _get_bmorse_lib()
                     if bmlib:
                         pitch_ch = self._ch_4k if self._ch_4k else self._ch_uhsdr
@@ -1607,9 +1608,15 @@ class SignalGroup:
                             sample_rate=BMORSE_RATE, wpm=wpm)
                         # Create lazy 4kHz channelizer for bmorse fallback
                         if self._ch_4k is None:
-                            self._ch_4k = Channelizer(
-                                self.freq_offset, self._ch_uhsdr.input_rate,
-                                BMORSE_RATE, normalize='peak', cw_fir_bw=400)
+                            if self._pfb is not None:
+                                self._ch_4k = PFBChannel(
+                                    self.freq_offset, self._pfb,
+                                    output_rate=BMORSE_RATE, normalize='peak',
+                                    cw_fir_bw=400)
+                            else:
+                                self._ch_4k = Channelizer(
+                                    self.freq_offset, self._ch_uhsdr.input_rate,
+                                    BMORSE_RATE, normalize='peak', cw_fir_bw=400)
                         log.info("bmorse fallback: pitch=%d wpm=%d for %.1f kHz (uhsdr had %d real chars)",
                                  pitch, wpm, self.rf_khz, real_chars)
                 self._bmorse_fallback_started = True
@@ -2238,15 +2245,21 @@ class OpenSkimmer:
         rx_sample_rate = self.cfg.get('sample_rate', 48000)
         sdr_port = self.cfg.get('sdr_port', 1024)
 
-        devices = discover(port=sdr_port)
-        if not devices:
-            log.error("No HPSDR devices found")
-            return False
+        sdr_ip = self.cfg.get('sdr_ip')
+        if sdr_ip:
+            log.info("Using direct SDR IP: %s", sdr_ip)
+            device_ip = sdr_ip
+        else:
+            devices = discover(port=sdr_port)
+            if not devices:
+                log.error("No HPSDR devices found")
+                return False
+            device_ip = devices[0]['ip']
         listen_port = self.cfg.get('hpsdr_listen_port', sdr_port)
         passive = self.cfg.get('passive', False)
         rx_filter = self.cfg.get('rx_filter', None)
         n_rx = self.cfg.get('max_receivers', 1)
-        self.receiver = HPSDRReceiver(devices[0]['ip'], port=sdr_port,
+        self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
                                       n_receivers=n_rx, sample_rate=rx_sample_rate,
                                       listen_port=listen_port,
                                       passive=passive, rx_filter=rx_filter)
