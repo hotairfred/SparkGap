@@ -1815,8 +1815,38 @@ class InstanceManager:
         return spots
 
     def kill_all(self):
+        # Terminate all subprocesses simultaneously, then wait in batch.
+        # Sequential kill() with wait(timeout=2) per process can take minutes
+        # with 800+ decoders. Batch terminate → short wait → SIGKILL stragglers.
+        import subprocess as _sp
+        procs = []
         for group in self.instances.values():
-            group.kill()
+            for d in list(group.decoders) + list(group._secondary_decoders):
+                if d.process:
+                    try: d.process.stdin.close()
+                    except: pass
+                    try: d.process.terminate()
+                    except: pass
+                    procs.append(d.process)
+                    d.process = None
+            for attr in ('bmorse', 'hamfist', '_bmorse_fallback', '_cw_engine'):
+                obj = getattr(group, attr, None)
+                if obj and getattr(obj, 'process', None):
+                    try: obj.process.stdin.close()
+                    except: pass
+                    try: obj.process.terminate()
+                    except: pass
+                    procs.append(obj.process)
+                    obj.process = None
+        # Wait up to 3s total for all to exit, then SIGKILL remainder
+        import time as _t
+        deadline = _t.time() + 3.0
+        for p in procs:
+            remaining = max(0.05, deadline - _t.time())
+            try: p.wait(timeout=remaining)
+            except:
+                try: p.kill()
+                except: pass
         self.instances.clear()
 
     @property
