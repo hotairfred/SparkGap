@@ -2221,6 +2221,21 @@ class OpenSkimmer:
         self.start_time = time.time()
 
         self._add_calls_path = self.cfg.get('add_calls', 'add_calls.txt')
+        spot_log_path = self.cfg.get('spot_log')
+        self._spot_log = open(spot_log_path, 'a', buffering=1) if spot_log_path else None
+
+        self._wav_record = None
+        record_wav = self.cfg.get('record_wav')
+        if record_wav:
+            import wave as _wave, datetime as _dt
+            ts = _dt.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
+            band_khz = self.cfg.get('bands', [0])[0] // 1000
+            rec_path = record_wav.format(ts=ts, band=band_khz)
+            self._wav_record = _wave.open(rec_path, 'wb')
+            self._wav_record.setnchannels(2)
+            self._wav_record.setsampwidth(2)
+            self._wav_record.setframerate(self.cfg.get('sample_rate', 192000))
+            log.info("Recording IQ to %s", rec_path)
         calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
             self._add_calls_path,
@@ -2300,6 +2315,9 @@ class OpenSkimmer:
             self.manager.kill_all()
         if self.telnet:
             await self.telnet.stop()
+        if self._wav_record:
+            self._wav_record.close()
+            self._wav_record = None
         elapsed = time.time() - self.start_time if self.start_time else 0
         log.info("Stopped: %d spots in %.0fs", self.spot_count, elapsed)
 
@@ -2316,6 +2334,14 @@ class OpenSkimmer:
                     self._iq_buffer.popleft()
                 self._feed_i.append(i_chunk)
                 self._feed_q.append(q_chunk)
+            if self._wav_record and rx_index == 0:
+                import struct as _struct
+                frames = bytearray()
+                for i_val, q_val in iq_samples:
+                    i16 = max(-32768, min(32767, int(i_val * 32767)))
+                    q16 = max(-32768, min(32767, int(q_val * 32767)))
+                    frames += _struct.pack('<hh', i16, q16)
+                self._wav_record.writeframes(bytes(frames))
         except Exception:
             pass  # Don't let errors kill the receiver thread
 
@@ -2458,6 +2484,12 @@ class OpenSkimmer:
                     method = spot.get('method', 'exact')
                     log.info("*** SPOT: %10.1f  %-12s  %d dB  [%s] ***",
                              spot['freq_khz'], spot['call'], spot['snr'], method)
+                    if self._spot_log:
+                        import datetime
+                        ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                        self._spot_log.write(
+                            f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.1f} | {spot['snr']:.0f}\n"
+                        )
 
             # Status
             if now - last_status >= status_interval:
