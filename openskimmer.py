@@ -1893,7 +1893,6 @@ class SpotTracker:
         for call in valid_calls:
             self._scp_by_len[len(call)].append(call)
 
-    @staticmethod
     def _min_sightings(self, call, snr=0):
         """Length-weighted sighting threshold, SNR-gated for short calls."""
         if call in self.add_calls:
