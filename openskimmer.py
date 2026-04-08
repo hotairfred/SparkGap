@@ -2220,11 +2220,14 @@ class OpenSkimmer:
     async def start(self):
         self.start_time = time.time()
 
+        self._add_calls_path = self.cfg.get('add_calls', 'add_calls.txt')
         calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
-            self.cfg.get('add_calls', 'add_calls.txt'),
+            self._add_calls_path,
             self.cfg.get('blacklist', 'blacklist.txt'),
         )
+        self._add_calls_mtime = (os.path.getmtime(self._add_calls_path)
+                                 if os.path.exists(self._add_calls_path) else 0)
         self.tracker = SpotTracker(calls, blacklist,
                                    self.cfg.get('respot_interval', 120),
                                    add_calls=add_calls)
@@ -2353,6 +2356,26 @@ class OpenSkimmer:
             if now - last_scan >= scan_interval:
                 last_scan = now
                 self.tracker.reset_cycle()
+
+                # Hot-reload add_calls.txt if file changed since last scan
+                if os.path.exists(self._add_calls_path):
+                    mtime = os.path.getmtime(self._add_calls_path)
+                    if mtime != self._add_calls_mtime:
+                        self._add_calls_mtime = mtime
+                        new_add = set()
+                        with open(self._add_calls_path) as f:
+                            for line in f:
+                                line = line.strip().upper()
+                                if line and not line.startswith('#'):
+                                    new_add.add(line)
+                        added = new_add - self.tracker.add_calls
+                        removed = self.tracker.add_calls - new_add
+                        self.tracker.add_calls = new_add
+                        self.tracker.valid_calls |= new_add
+                        for call in added:
+                            self.tracker._scp_by_len[len(call)].append(call)
+                        if added or removed:
+                            log.info("add_calls reloaded: +%d -%d calls", len(added), len(removed))
 
                 live_rate = self.cfg.get('sample_rate', 48000)
                 fft_size = 8192
