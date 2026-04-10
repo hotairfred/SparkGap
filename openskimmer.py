@@ -1747,7 +1747,7 @@ class InstanceManager:
 
         # Mark existing groups as seen if signal still present
         for offset, snr in signals:
-            key = int(round(offset / 50)) * 50  # 50Hz bins for co-channel separation
+            key = int(round(offset / 100)) * 100
             if key in self.instances:
                 self.instances[key].last_seen = now
                 self.instances[key].snr = max(self.instances[key].snr, snr)
@@ -1756,7 +1756,7 @@ class InstanceManager:
 
         # Spawn new SignalGroup for new signals
         for offset, snr in sorted(signals, key=lambda x: -x[1]):
-            key = int(round(offset / 50)) * 50  # 50Hz bins for co-channel separation
+            key = int(round(offset / 100)) * 100
             if key in self.instances:
                 continue
             if abs(offset) < 100:  # skip DC
@@ -2442,14 +2442,10 @@ class OpenSkimmer:
                             f = exact * live_rate / N
                             signals.append((f, psd_db[i] - noise))
 
-                    # Cluster — merge peaks within 70 Hz (single CW carrier
-                    # spans ~40-60 Hz with keying sidebands). 70 Hz is wide
-                    # enough to merge a single signal's spectral spread but
-                    # narrow enough to preserve co-channel signals (typically
-                    # 100+ Hz apart in real operation).
+                    # Cluster
                     clustered = []
                     for freq, snr in sorted(signals):
-                        if not clustered or abs(freq - clustered[-1][0]) > 70:
+                        if not clustered or abs(freq - clustered[-1][0]) > 100:
                             clustered.append((freq, snr))
                         elif snr > clustered[-1][1]:
                             clustered[-1] = (freq, snr)
