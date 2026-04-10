@@ -1920,12 +1920,14 @@ class SpotTracker:
             self._scp_by_len[len(call)].append(call)
 
     def _min_sightings(self, call, snr=0):
-        """Length-weighted sighting threshold, SNR-gated for short calls."""
+        """Length-weighted sighting threshold.
+        High SNR doesn't help short calls — strong channels produce
+        more 4-char fragment matches, not fewer."""
         if call in self.add_calls:
             return 1  # pre-validated rare calls: one clean decode is enough
         n = len(call)
         if n <= 4:
-            return 2 if snr >= 30 else 4  # strong 4-char: accept at 2
+            return 4  # 4-char calls always need 4 sightings (no SNR exception)
         elif n == 5:
             return 3
         return 2
