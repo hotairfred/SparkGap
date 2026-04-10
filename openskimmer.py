@@ -767,7 +767,8 @@ class PFBChannel:
 
         self._peak = 0.0
 
-        # Optional post-decimation FIR bandpass (for bmorse 4kHz path)
+        # Optional post-decimation FIR bandpass (for bmorse 4kHz path).
+        # Do NOT use on uhsdr path — adds group delay that breaks timing.
         self._fir_taps = None
         self._fir_zi = None
         if cw_fir_bw > 0 and self.output_rate > 0:
@@ -1374,8 +1375,12 @@ class SignalGroup:
         # PFBChannel extracts a 250 Hz-wide bin from the shared PFBChannelizer output,
         # naturally isolating co-channel signals that are ≥250 Hz apart.
         if pfb is not None:
+            # No pre-filter — uhsdr's Goertzel IS the filter (47 Hz @ 700 Hz).
+            # Each SignalGroup shifts its peak to CW_TONE; co-channel signals
+            # land at offsets and the Goertzel rejects them naturally.
+            # Adding a FIR here introduces group delay that breaks uhsdr timing.
             self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
-                                        normalize='peak', cw_fir_bw=1200)
+                                        normalize='peak', cw_fir_bw=0)
             self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=BMORSE_RATE,
                                      normalize='peak',
                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
@@ -2685,27 +2690,35 @@ def run_file_mode(args, config):
     # PFB has 10 dB less per-bin SNR than FFT, so it misses weak stations.
     # PFB is used only for channelization, not detection.
     fft_size = 8192
-    n_ffts = min(len(scan_i) // fft_size, 200)
-    avg_spectrum = np.zeros(fft_size)
-    for fi in range(n_ffts):
-        chunk = scan_i[fi*fft_size:(fi+1)*fft_size] + \
-                1j * scan_q[fi*fft_size:(fi+1)*fft_size]
-        avg_spectrum += np.abs(np.fft.fft(chunk * np.hanning(fft_size))) ** 2
-    avg_spectrum /= max(n_ffts, 1)
-    avg_db = 10 * np.log10(avg_spectrum + 1e-20)
-    freqs = np.fft.fftfreq(fft_size, 1.0 / file_rate)
-    noise = np.median(avg_db)
-    signals = []
-    for i in range(1, fft_size - 1):
-        if avg_db[i] > noise + min_snr and \
-           avg_db[i] > avg_db[i-1] and avg_db[i] > avg_db[i+1]:
-            signals.append((freqs[i], avg_db[i] - noise))
-    clustered = []
-    for freq, snr in sorted(signals):
-        if not clustered or abs(freq - clustered[-1][0]) > 200:
-            clustered.append((freq, snr))
-        elif snr > clustered[-1][1]:
-            clustered[-1] = (freq, snr)
+
+    def _scan_iq(i_arr, q_arr):
+        """Run FFT-average signal detection on an IQ slice. Returns clustered list."""
+        n_ffts_local = min(len(i_arr) // fft_size, 200)
+        if n_ffts_local == 0:
+            return []
+        avg = np.zeros(fft_size)
+        for fi in range(n_ffts_local):
+            ch = i_arr[fi*fft_size:(fi+1)*fft_size] + \
+                 1j * q_arr[fi*fft_size:(fi+1)*fft_size]
+            avg += np.abs(np.fft.fft(ch * np.hanning(fft_size))) ** 2
+        avg /= n_ffts_local
+        avg_db_l = 10 * np.log10(avg + 1e-20)
+        freqs_l = np.fft.fftfreq(fft_size, 1.0 / file_rate)
+        noise_l = np.median(avg_db_l)
+        sigs = []
+        for i in range(1, fft_size - 1):
+            if avg_db_l[i] > noise_l + min_snr and \
+               avg_db_l[i] > avg_db_l[i-1] and avg_db_l[i] > avg_db_l[i+1]:
+                sigs.append((freqs_l[i], avg_db_l[i] - noise_l))
+        cl = []
+        for freq, snr in sorted(sigs):
+            if not cl or abs(freq - cl[-1][0]) > 200:
+                cl.append((freq, snr))
+            elif snr > cl[-1][1]:
+                cl[-1] = (freq, snr)
+        return cl
+
+    clustered = _scan_iq(scan_i, scan_q)
     log.info("  FFT: %d signals detected", len(clustered))
     if manager._pfb is not None:
         # Reset PFB state — scan audio was used only for FFT detection above
@@ -2750,7 +2763,30 @@ def run_file_mode(args, config):
         block_size = file_rate // 10  # 100ms blocks
         total_chars = 0
         total_results = 0
+        # Periodic re-scan mirrors live-mode scan_interval. Without this the
+        # file-mode scanner runs exactly once at t=0 on ~8.5 s of data, and
+        # signals that key up later in the window (e.g. EB1EOE from t+405s)
+        # are never discovered → never get a channel spawned for the entire
+        # eval. update_signals() only adds channels, never removes them
+        # (signal_timeout=9999 in file mode), so re-scanning is safe.
+        rescan_interval_sec = int(config.get('rescan_interval_sec', 30))
+        rescan_samples = int(rescan_interval_sec * file_rate)
+        next_rescan_pos = rescan_samples
+        scan_slice_samples = fft_size * 200  # ~8.5s matches initial scan
         for pos in range(0, len(i_data), block_size):
+            if pos >= next_rescan_pos:
+                s_start = max(0, pos - scan_slice_samples)
+                s_end = min(len(i_data), pos)
+                new_clustered = _scan_iq(i_data[s_start:s_end],
+                                         q_data[s_start:s_end])
+                prev_count = len(manager.instances)
+                manager.update_signals(new_clustered, center_khz)
+                added = len(manager.instances) - prev_count
+                if added > 0:
+                    log.info("  Re-scan t=%.0fs: +%d signals (%d total, %d peaks)",
+                             t_start + pos/file_rate, added,
+                             len(manager.instances), len(new_clustered))
+                next_rescan_pos += rescan_samples
             i_block = i_data[pos:pos+block_size]
             q_block = q_data[pos:pos+block_size]
             manager.feed_all_iq(i_block, q_block)
