@@ -767,7 +767,8 @@ class PFBChannel:
 
         self._peak = 0.0
 
-        # Optional post-decimation FIR bandpass (for bmorse 4kHz path)
+        # Optional post-decimation FIR bandpass (for bmorse 4kHz path).
+        # Do NOT use on uhsdr path — adds group delay that breaks timing.
         self._fir_taps = None
         self._fir_zi = None
         if cw_fir_bw > 0 and self.output_rate > 0:
@@ -1374,8 +1375,12 @@ class SignalGroup:
         # PFBChannel extracts a 250 Hz-wide bin from the shared PFBChannelizer output,
         # naturally isolating co-channel signals that are ≥250 Hz apart.
         if pfb is not None:
+            # No pre-filter — uhsdr's Goertzel IS the filter (47 Hz @ 700 Hz).
+            # Each SignalGroup shifts its peak to CW_TONE; co-channel signals
+            # land at offsets and the Goertzel rejects them naturally.
+            # Adding a FIR here introduces group delay that breaks uhsdr timing.
             self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
-                                        normalize='peak', cw_fir_bw=1200)
+                                        normalize='peak', cw_fir_bw=0)
             self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=BMORSE_RATE,
                                      normalize='peak',
                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
@@ -1742,7 +1747,7 @@ class InstanceManager:
 
         # Mark existing groups as seen if signal still present
         for offset, snr in signals:
-            key = int(round(offset / 100)) * 100
+            key = int(round(offset / 50)) * 50  # 50Hz bins for co-channel separation
             if key in self.instances:
                 self.instances[key].last_seen = now
                 self.instances[key].snr = max(self.instances[key].snr, snr)
@@ -1751,7 +1756,7 @@ class InstanceManager:
 
         # Spawn new SignalGroup for new signals
         for offset, snr in sorted(signals, key=lambda x: -x[1]):
-            key = int(round(offset / 100)) * 100
+            key = int(round(offset / 50)) * 50  # 50Hz bins for co-channel separation
             if key in self.instances:
                 continue
             if abs(offset) < 100:  # skip DC
@@ -2437,10 +2442,14 @@ class OpenSkimmer:
                             f = exact * live_rate / N
                             signals.append((f, psd_db[i] - noise))
 
-                    # Cluster
+                    # Cluster — merge peaks within 70 Hz (single CW carrier
+                    # spans ~40-60 Hz with keying sidebands). 70 Hz is wide
+                    # enough to merge a single signal's spectral spread but
+                    # narrow enough to preserve co-channel signals (typically
+                    # 100+ Hz apart in real operation).
                     clustered = []
                     for freq, snr in sorted(signals):
-                        if not clustered or abs(freq - clustered[-1][0]) > 100:
+                        if not clustered or abs(freq - clustered[-1][0]) > 70:
                             clustered.append((freq, snr))
                         elif snr > clustered[-1][1]:
                             clustered[-1] = (freq, snr)
