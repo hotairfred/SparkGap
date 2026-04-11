@@ -200,6 +200,49 @@ int cw_disp_get_channel_audio(cw_dispatcher_handle_t d,
                               int16_t *out,
                               int max_samples);
 
+/* ------------------------------------------------------------------------
+ * bmorse support (v3)
+ *
+ * bmorse channels share the same PFB and the same channel pool, but their
+ * bin output is additionally FIR-bandpassed before being handed to
+ * bmorse_feed. libbmorse.so is not thread-safe, so bmorse channels are
+ * processed serially inside cw_disp_feed_iq — only the uhsdr channels run
+ * under the OpenMP parallel-for.
+ *
+ * Drained records from bmorse channels use the same cw_decoded_record_t
+ * struct as uhsdr. The caller can tell them apart by channel_id.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Install the FIR bandpass taps used for all subsequently-added bmorse
+ * channels. Caller supplies the taps (typically via scipy.signal.firwin).
+ * The dispatcher copies them — the `taps` array need not outlive the call.
+ *
+ * Returns 0 on success, -1 on failure (NULL dispatcher, bad n_taps).
+ */
+int cw_disp_set_bmorse_fir(cw_dispatcher_handle_t d,
+                           const float *taps,
+                           int n_taps);
+
+/**
+ * Add a PFB-aware bmorse channel. Returns a non-negative channel_id on
+ * success or -1 on failure (no PFB initialised, pool full, libbmorse
+ * unavailable, decimation factor not integer, FIR taps not installed).
+ *
+ * @param freq_offset_hz  Signed Hz from receiver center
+ * @param sample_rate     Output PCM rate for bmorse (4000 typical)
+ * @param tone_freq       CW tone in the decimated audio (700 typical)
+ * @param wpm             Initial speed hint, 0 = auto
+ * @param rf_khz, snr_db  Tags carried through to drain
+ */
+int cw_disp_add_pfb_bmorse_channel(cw_dispatcher_handle_t d,
+                                   float freq_offset_hz,
+                                   float sample_rate,
+                                   float tone_freq,
+                                   int   wpm,
+                                   float rf_khz,
+                                   float snr_db);
+
 #ifdef __cplusplus
 }
 #endif
