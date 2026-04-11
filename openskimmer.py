@@ -1110,6 +1110,28 @@ def _get_cw_dispatcher_lib():
     _cw_disp_lib.cw_disp_drain.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int]
     _cw_disp_lib.cw_disp_get_wpm.restype  = _ct.c_int
     _cw_disp_lib.cw_disp_get_wpm.argtypes = [_ct.c_void_p, _ct.c_int]
+
+    # v2 PFB-fed entry points (added in cw_dispatcher v2). Optional — if the
+    # library was built without them, these signature setups simply fail
+    # silently and the v2 code path falls back.
+    try:
+        _cw_disp_lib.cw_disp_init_pfb.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_init_pfb.argtypes = [
+            _ct.c_void_p, _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int]
+        _cw_disp_lib.cw_disp_add_pfb_channel.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_add_pfb_channel.argtypes = [
+            _ct.c_void_p, _ct.c_float, _ct.c_float, _ct.c_float,
+            _ct.c_int, _ct.c_float, _ct.c_float]
+        _cw_disp_lib.cw_disp_feed_iq.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_feed_iq.argtypes = [
+            _ct.c_void_p,
+            _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float), _ct.c_int]
+        _cw_disp_lib.cw_disp_get_channel_audio.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_get_channel_audio.argtypes = [
+            _ct.c_void_p, _ct.c_int, _ct.POINTER(_ct.c_int16), _ct.c_int]
+    except AttributeError:
+        log.warning("libcw_dispatcher.so missing v2 PFB symbols — v2 path disabled")
+
     log.info("Loaded libcw_dispatcher.so (parallel uhsdr fan-out)")
     return _cw_disp_lib
 
@@ -1303,6 +1325,261 @@ def _make_uhsdr_decoder(rf_khz, snr, freq, sample_rate, wpm, use_dispatcher):
         # Pool full or add failed — fall through to _LibDecoder
     return _LibDecoder(rf_khz, snr, freq=freq,
                        sample_rate=sample_rate, wpm=wpm)
+
+
+# ---------------------------------------------------------------------------
+# libcw_dispatcher v2 — PFB lives in the dispatcher (IQ-fed path)
+# ---------------------------------------------------------------------------
+# When InstanceManager.use_pfb_dispatcher is set, the same shared dispatcher
+# pool is reused but PFB lives inside the .so. The flow per IQ block is:
+#
+#   InstanceManager.feed_all_iq:
+#     1. (legacy bmorse leg only) self._pfb.process(i, q)   # Python PFBChannelizer
+#     2. cw_disp_feed_iq(d, i, q, n)                         # one C call → fanout
+#     3. for each group: group.feed_iq(...)                  # only ch_4k pcm + bmorse
+#     4. _pfb_disp_drain()                                   # walk drain output back
+#
+# Each _PFBDispDecoder is one uhsdr instance registered with the dispatcher
+# via cw_disp_add_pfb_channel. SignalGroup may spawn many of them per signal
+# (one per fixed speed, plus secondary-pitch ones once pitch is detected).
+# A SignalGroup also gets a _PFBDispChannel that ducks the existing
+# PFBChannel interface enough for SignalGroup.feed_iq to keep working — it
+# does pitch detection by polling cw_disp_get_channel_audio on whichever of
+# its decoders' channel_ids was registered first.
+
+_pfb_disp_initialised = False
+_pfb_disp_instances   = {}  # channel_id -> _PFBDispDecoder
+
+def _pfb_dispatcher_init(input_rate, n_chan, oversample, taps_per_chan):
+    """Initialise the dispatcher's PFB. Idempotent — second calls with
+    matching parameters are no-ops, mismatched calls re-init."""
+    global _pfb_disp_initialised
+    lib = _get_cw_dispatcher_lib()
+    if not lib or not hasattr(lib, 'cw_disp_init_pfb'):
+        return False
+    h = _get_cw_dispatcher_handle()
+    if not h:
+        return False
+    rc = lib.cw_disp_init_pfb(h, int(input_rate), int(n_chan),
+                              int(oversample), int(taps_per_chan))
+    if rc != 0:
+        log.error("cw_disp_init_pfb failed (rc=%d)", rc)
+        return False
+    _pfb_disp_initialised = True
+    log.info("Initialised dispatcher PFB: input=%d n_chan=%d os=%d K=%d",
+             input_rate, n_chan, oversample, taps_per_chan)
+    return True
+
+
+class _PFBDispDecoder:
+    """uhsdr decoder backed by a PFB-aware dispatcher channel.
+
+    Registers via cw_disp_add_pfb_channel — the dispatcher computes bin
+    index, residual, decimation, and runs the per-block fanout in C++.
+    feed_pcm() is a no-op (the dispatcher feeds via cw_disp_feed_iq at the
+    InstanceManager level). Decoded text is routed here from the central
+    drain inside _pfb_dispatcher_drain().
+    """
+
+    def __init__(self, rf_khz, snr, freq_offset_hz, tone_freq,
+                 sample_rate=12000, wpm=0):
+        self.rf_khz       = rf_khz
+        self.snr          = snr
+        self.decoded_text = ''
+        self.total_chars  = 0
+        self.last_output  = time.time()
+        self.detected_wpm = 0
+        self._pending     = ''
+
+        lib = _get_cw_dispatcher_lib()
+        h = _get_cw_dispatcher_handle() if lib else None
+        if not lib or not h or not _pfb_disp_initialised:
+            self._cid = -1
+            return
+        self._lib = lib
+        self._cid = lib.cw_disp_add_pfb_channel(
+            h, float(freq_offset_hz), float(sample_rate), float(tone_freq),
+            int(wpm), float(rf_khz), float(snr))
+        if self._cid < 0:
+            log.warning("cw_disp_add_pfb_channel failed for %.1f kHz "
+                        "(pool full?) — will fall back per-instance", rf_khz)
+            return
+        _pfb_disp_instances[self._cid] = self
+
+    # _LibDecoder-shaped interface ------------------------------------------
+    def feed_pcm(self, pcm_bytes):
+        # No-op — dispatcher already fed via cw_disp_feed_iq.
+        return
+
+    def read(self):
+        t = self._pending
+        self._pending = ''
+        return t
+
+    def kill(self):
+        if self._cid < 0:
+            return
+        _pfb_disp_instances.pop(self._cid, None)
+        try:
+            self._lib.cw_disp_remove_channel(_get_cw_dispatcher_handle(), self._cid)
+        except Exception:
+            pass
+        self._cid = -1
+
+
+class _PFBDispChannel:
+    """Duck-type stand-in for PFBChannel on the v2 path.
+
+    The dispatcher does the actual PFB + per-channel work in C++, so this
+    class doesn't process IQ at all. It only:
+      - exposes the freq_offset / output_rate / detected_pitch attributes
+        SignalGroup expects
+      - polls cw_disp_get_channel_audio on its assigned decoder during the
+        first ~15 seconds of life to run the same FFT-based pitch detector
+        the Python PFBChannel uses.
+
+    SignalGroup must call set_pitch_source(channel_id) once the first
+    decoder is registered, otherwise pitch detection is skipped (defaults
+    to CW_TONE).
+    """
+
+    def __init__(self, freq_offset, output_rate=DECODER_RATE):
+        self.freq_offset       = freq_offset
+        self.output_rate       = output_rate
+        self._pitch_detected   = False
+        self._pitch            = CW_TONE
+        self._secondary_pitches      = []
+        self._new_secondary_pitches  = []
+        self._known_sec_pitches      = set()
+        self._pitch_buf        = np.zeros(0, dtype=np.int16)
+        self._pitch_source_cid = -1
+        self._lib              = _get_cw_dispatcher_lib()
+        self._handle           = _get_cw_dispatcher_handle() if self._lib else None
+        self._audio_chunk      = None  # ctypes int16 array, lazy-allocated
+
+    @property
+    def detected_pitch(self):
+        return self._pitch
+
+    @property
+    def secondary_pitches(self):
+        return self._secondary_pitches
+
+    @property
+    def new_secondary_pitches(self):
+        p = self._new_secondary_pitches[:]
+        self._new_secondary_pitches = []
+        return p
+
+    def set_pitch_source(self, channel_id):
+        self._pitch_source_cid = int(channel_id)
+
+    def process(self, i_samples, q_samples):
+        """No-op for audio (the dispatcher already handled it). Pitch
+        detection happens here by pulling audio from cw_disp_get_channel_audio.
+        Returns None — SignalGroup tolerates None for the uhsdr leg."""
+        if self._pitch_detected or self._pitch_source_cid < 0:
+            return None
+        if not self._lib or not self._handle:
+            return None
+
+        import ctypes as _ct
+        if self._audio_chunk is None:
+            self._audio_chunk = (_ct.c_int16 * 8192)()
+
+        # Drain whatever the dispatcher has accumulated for our pitch source
+        # since the last call. (cw_disp_get_channel_audio consumes what it
+        # returns; that's fine — only pitch detection wants this audio.)
+        for _ in range(8):  # cap loop to avoid pulling forever
+            got = self._lib.cw_disp_get_channel_audio(
+                self._handle, self._pitch_source_cid,
+                self._audio_chunk, 8192)
+            if got <= 0:
+                break
+            new = np.frombuffer(self._audio_chunk, dtype=np.int16)[:got]
+            self._pitch_buf = np.concatenate([self._pitch_buf, new])
+            if got < 8192:
+                break
+
+        needed = self.output_rate * 15
+        if len(self._pitch_buf) < needed:
+            return None
+
+        # Same pitch detection as PFBChannel.process()
+        n_det = self.output_rate * 2
+        spectrum = np.abs(np.fft.rfft(
+            self._pitch_buf[:n_det].astype(np.float64) * np.hanning(n_det)))
+        freqs = np.fft.rfftfreq(n_det, 1.0 / self.output_rate)
+        mask = (freqs >= 475) & (freqs <= 825)
+        if np.any(mask):
+            spec_m = spectrum[mask]
+            freqs_m = freqs[mask]
+            peak_idx = np.argmax(spec_m)
+            peak_freq = freqs_m[peak_idx]
+            peak_amp = spec_m[peak_idx]
+            self._pitch = max(450, min(850, int(round(peak_freq))))
+            if abs(self._pitch - CW_TONE) > 5:
+                log.info("PFB[v2] auto pitch: %d Hz (expected %d Hz)",
+                         self._pitch, CW_TONE)
+            threshold = peak_amp * 0.15
+            candidates = []
+            for i in range(len(freqs_m)):
+                if abs(freqs_m[i] - peak_freq) <= 25:
+                    continue
+                if spec_m[i] < threshold:
+                    continue
+                lo, hi = max(0, i - 5), min(len(spec_m), i + 6)
+                if spec_m[i] == np.max(spec_m[lo:hi]):
+                    candidates.append((spec_m[i], int(round(freqs_m[i]))))
+            candidates.sort(reverse=True)
+            merged = []
+            for amp, freq in candidates:
+                if not any(abs(freq - mf) < 25 for _, mf in merged):
+                    merged.append((amp, freq))
+            self._secondary_pitches = [
+                max(450, min(850, f)) for _, f in merged[:2]
+            ]
+            self._known_sec_pitches = set(self._secondary_pitches)
+            if self._secondary_pitches:
+                self._new_secondary_pitches = list(self._secondary_pitches)
+                log.info("PFB[v2] secondary pitches: %s Hz alongside primary %d Hz",
+                         self._secondary_pitches, self._pitch)
+        self._pitch_detected = True
+        self._pitch_buf = np.zeros(0, dtype=np.int16)
+        return None
+
+
+def _pfb_dispatcher_drain():
+    """Walk cw_disp_drain output and route decoded text into each
+    _PFBDispDecoder's pending buffer. Called once per InstanceManager
+    iteration when the v2 path is active."""
+    if not _pfb_disp_instances:
+        return
+    lib = _cw_disp_lib
+    if not lib:
+        return
+    h = _cw_disp_handle
+    if not h:
+        return
+
+    import ctypes as _ct
+    Record = _CWDecodedRecord.struct()
+    MAX_DRAIN = 4096
+    records = (Record * MAX_DRAIN)()
+    n = lib.cw_disp_drain(h, _ct.cast(records, _ct.c_void_p), MAX_DRAIN)
+    now = time.time()
+    for i in range(n):
+        r = records[i]
+        d = _pfb_disp_instances.get(r.channel_id)
+        if d is None:
+            continue
+        text = bytes(r.text[:r.text_len]).decode('latin-1', errors='replace')
+        d._pending      += text
+        d.decoded_text  += text
+        d.total_chars   += r.text_len
+        d.last_output    = now
+        if r.wpm > 0:
+            d.detected_wpm = r.wpm
 
 
 _ml_model = None
@@ -1603,13 +1880,14 @@ class SignalGroup:
                  decoder_bin, speeds,
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
                  wpm=30, ml_model_path=None, ml_min_confidence=0.7,
-                 pfb=None, use_dispatcher=False):
+                 pfb=None, use_dispatcher=False, use_pfb_dispatcher=False):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
         self.last_seen = time.time()
         self.last_output = time.time()
         self._use_dispatcher = use_dispatcher
+        self._use_pfb_dispatcher = use_pfb_dispatcher
 
         # Try C++ cw_engine first (owns channelization + both decoders)
         self._cw_engine = None
@@ -1621,12 +1899,18 @@ class SignalGroup:
         # PFBChannel extracts a 250 Hz-wide bin from the shared PFBChannelizer output,
         # naturally isolating co-channel signals that are ≥250 Hz apart.
         if pfb is not None:
-            # No pre-filter — uhsdr's Goertzel IS the filter (47 Hz @ 700 Hz).
-            # Each SignalGroup shifts its peak to CW_TONE; co-channel signals
-            # land at offsets and the Goertzel rejects them naturally.
-            # Adding a FIR here introduces group delay that breaks uhsdr timing.
-            self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
-                                        normalize='peak', cw_fir_bw=0)
+            # On the v2 path the C++ dispatcher owns PFB + uhsdr fanout, so the
+            # uhsdr leg is replaced with a no-op _PFBDispChannel that just runs
+            # pitch detection. The bmorse leg (4 kHz) still uses the Python PFB.
+            if use_pfb_dispatcher:
+                self._ch_uhsdr = _PFBDispChannel(freq_offset, output_rate=DECODER_RATE)
+            else:
+                # No pre-filter — uhsdr's Goertzel IS the filter (47 Hz @ 700 Hz).
+                # Each SignalGroup shifts its peak to CW_TONE; co-channel signals
+                # land at offsets and the Goertzel rejects them naturally.
+                # Adding a FIR here introduces group delay that breaks uhsdr timing.
+                self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
+                                            normalize='peak', cw_fir_bw=0)
             self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=BMORSE_RATE,
                                      normalize='peak',
                                      cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
@@ -1661,7 +1945,18 @@ class SignalGroup:
         if True:
             lib = _get_uhsdr_lib()
             for spd in speeds:
-                if lib:
+                if self._use_pfb_dispatcher:
+                    dec = _PFBDispDecoder(rf_khz, snr,
+                                          freq_offset_hz=freq_offset,
+                                          tone_freq=CW_TONE,
+                                          sample_rate=DECODER_RATE,
+                                          wpm=spd)
+                    if dec._cid < 0:
+                        # Fallback if pool full / not initialised
+                        dec = _make_uhsdr_decoder(rf_khz, snr, freq=CW_TONE,
+                                                  sample_rate=DECODER_RATE, wpm=spd,
+                                                  use_dispatcher=self._use_dispatcher)
+                elif lib:
                     dec = _make_uhsdr_decoder(rf_khz, snr, freq=CW_TONE,
                                               sample_rate=DECODER_RATE, wpm=spd,
                                               use_dispatcher=self._use_dispatcher)
@@ -1671,6 +1966,14 @@ class SignalGroup:
                         cmd += ['-s', str(spd)]
                     dec = _SubprocessDecoder(rf_khz, snr, cmd, capture_wpm=True)
                 self.decoders.append(dec)
+            # Tell the v2 _PFBDispChannel which channel to pull audio from
+            # for pitch detection (the first successfully-registered decoder).
+            if self._use_pfb_dispatcher and isinstance(self._ch_uhsdr, _PFBDispChannel):
+                for dec in self.decoders:
+                    cid = getattr(dec, '_cid', -1)
+                    if cid >= 0:
+                        self._ch_uhsdr.set_pitch_source(cid)
+                        break
 
         self.bmorse = None
         self.hamfist = None
@@ -1692,7 +1995,17 @@ class SignalGroup:
             self.decoders = []
             lib = _get_uhsdr_lib()
             for spd in self._speeds:
-                if lib:
+                if self._use_pfb_dispatcher:
+                    dec = _PFBDispDecoder(self.rf_khz, self.snr,
+                                          freq_offset_hz=self.freq_offset,
+                                          tone_freq=pitch,
+                                          sample_rate=DECODER_RATE,
+                                          wpm=spd)
+                    if dec._cid < 0:
+                        dec = _make_uhsdr_decoder(self.rf_khz, self.snr, freq=pitch,
+                                                  sample_rate=DECODER_RATE, wpm=spd,
+                                                  use_dispatcher=self._use_dispatcher)
+                elif lib:
                     dec = _make_uhsdr_decoder(self.rf_khz, self.snr, freq=pitch,
                                               sample_rate=DECODER_RATE, wpm=spd,
                                               use_dispatcher=self._use_dispatcher)
@@ -1713,7 +2026,17 @@ class SignalGroup:
             sec_speeds = [0, wpm]  # auto + detected-wpm only (vs all 7 speeds)
             for sec_pitch in sec_pitches:
                 for spd in sec_speeds:
-                    if lib:
+                    if self._use_pfb_dispatcher:
+                        dec = _PFBDispDecoder(self.rf_khz, self.snr,
+                                              freq_offset_hz=self.freq_offset,
+                                              tone_freq=sec_pitch,
+                                              sample_rate=DECODER_RATE,
+                                              wpm=spd)
+                        if dec._cid < 0:
+                            dec = _make_uhsdr_decoder(self.rf_khz, self.snr, freq=sec_pitch,
+                                                      sample_rate=DECODER_RATE, wpm=spd,
+                                                      use_dispatcher=self._use_dispatcher)
+                    elif lib:
                         dec = _make_uhsdr_decoder(self.rf_khz, self.snr, freq=sec_pitch,
                                                   sample_rate=DECODER_RATE, wpm=spd,
                                                   use_dispatcher=self._use_dispatcher)
@@ -1962,7 +2285,8 @@ class InstanceManager:
                  max_instances=150, max_channels=None, signal_timeout=90,
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
                  hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7,
-                 ml_max_channels=20, use_dispatcher=False):
+                 ml_max_channels=20, use_dispatcher=False,
+                 use_pfb_dispatcher=False):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -1987,16 +2311,30 @@ class InstanceManager:
         # libcw_dispatcher.so fan-out (experimental). When enabled, uhsdr
         # decoders are routed via the C++ dispatcher so the per-IQ-block
         # fanout runs in OpenMP instead of a GIL-serialized Python loop.
-        self.use_dispatcher = bool(use_dispatcher)
-        if self.use_dispatcher:
+        # use_pfb_dispatcher (v2) takes precedence over use_dispatcher (v1).
+        self.use_pfb_dispatcher = bool(use_pfb_dispatcher)
+        self.use_dispatcher = bool(use_dispatcher) and not self.use_pfb_dispatcher
+        if self.use_dispatcher or self.use_pfb_dispatcher:
             # Pre-provision the pool so all add_channel calls can succeed.
             # At max_channels logical signals × up to ~9 uhsdr instances
             # per signal (5 fixed speeds + 2 secondary pitches × 2 speeds),
             # we want ~9× headroom. Round up.
             _set_dispatcher_max_channels(self.max_channels * 16)
             if _get_cw_dispatcher_lib() is None:
-                log.warning("use_cpp_dispatcher=True but libcw_dispatcher.so not loaded — falling back")
+                log.warning("dispatcher enabled but libcw_dispatcher.so not loaded — falling back")
                 self.use_dispatcher = False
+                self.use_pfb_dispatcher = False
+        if self.use_pfb_dispatcher and self._pfb is not None:
+            # Init the C++ PFB to match the Python PFBChannelizer geometry
+            # (so a SignalGroup at offset X computes the same bin in both).
+            ok = _pfb_dispatcher_init(
+                input_rate=self._pfb.input_rate,
+                n_chan=self._pfb.N_CHAN,
+                oversample=self._pfb.OVERSAMPLE,
+                taps_per_chan=self._pfb.TAPS_PER_CHAN)
+            if not ok:
+                log.warning("cw_disp_init_pfb failed — disabling v2 path")
+                self.use_pfb_dispatcher = False
 
     def update_signals(self, signals, center_khz, wpm_hint=0):
         """Update instance list based on detected signals.
@@ -2059,6 +2397,7 @@ class InstanceManager:
                 ml_min_confidence=self.ml_min_confidence,
                 pfb=self._pfb,
                 use_dispatcher=self.use_dispatcher,
+                use_pfb_dispatcher=self.use_pfb_dispatcher,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
@@ -2085,16 +2424,37 @@ class InstanceManager:
 
     def feed_all_iq(self, i_samples, q_samples):
         """Feed IQ to all SignalGroups — each runs its shared channelizer."""
-        # Run PFB once for all channels (if available)
+        # v2 PFB-fed dispatcher: one C call runs PFB + per-channel fanout +
+        # uhsdr_feed for every PFB-aware channel. We still need the Python
+        # PFBChannelizer for the bmorse 4 kHz leg if any group uses it.
+        if self.use_pfb_dispatcher:
+            import ctypes as _ct
+            i_arr = np.ascontiguousarray(np.asarray(i_samples, dtype=np.float32))
+            q_arr = np.ascontiguousarray(np.asarray(q_samples, dtype=np.float32))
+            n = int(i_arr.size)
+            lib = _cw_disp_lib
+            h = _cw_disp_handle
+            if lib and h and n > 0:
+                lib.cw_disp_feed_iq(
+                    h,
+                    i_arr.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+                    q_arr.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+                    n)
+
+        # Run Python PFB once for all channels (if available). v2 still
+        # needs this for the bmorse 4 kHz leg; v1 needs it for everything.
         if self._pfb is not None:
             self._pfb.process(i_samples, q_samples)
         for group in list(self.instances.values()):
             group.feed_iq(i_samples, q_samples)
+
         # If the C++ dispatcher is enabled, every _DispDecoder.feed_pcm call
         # above just stashed bytes. Now drive one batched feed + drain for
         # the whole IQ block (single C call, runs fanout in OpenMP).
         if self.use_dispatcher:
             _dispatcher_flush()
+        if self.use_pfb_dispatcher:
+            _pfb_dispatcher_drain()
 
     def collect_all(self):
         """Read decoded text from all groups.
@@ -2573,6 +2933,7 @@ class OpenSkimmer:
             ml_model_path=self.cfg.get('ml_model', None),
             ml_min_confidence=float(self.cfg.get('ml_min_confidence', 0.7)),
             use_dispatcher=bool(self.cfg.get('use_cpp_dispatcher', False)),
+            use_pfb_dispatcher=bool(self.cfg.get('use_cpp_pfb', False)),
         )
 
         self.receiver.start()
@@ -2915,6 +3276,7 @@ def run_file_mode(args, config):
         ml_model_path=config.get('ml_model'),
         ml_min_confidence=float(config.get('ml_min_confidence', 0.7)),
         use_dispatcher=bool(config.get('use_cpp_dispatcher', False)),
+        use_pfb_dispatcher=bool(config.get('use_cpp_pfb', False)),
     )
 
     center_khz = args.center_khz
