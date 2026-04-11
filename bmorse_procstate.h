@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstddef>
 #include "bmorse.h"
+class fftfilt;  // forward declaration — bmorse_procstate.h only needs the pointer
 
 struct ProcessState {
     // --- filter() state ---
@@ -48,6 +49,10 @@ struct ProcessState {
     int        pd_pinit;    // 1 = header not yet printed
     double     pd_agc_peak;
     morse     *pd_mp;       // Bayesian Viterbi decoder — owned by this state
+
+    // --- FFT filter (set by bmorse_create; read by rx_FFTprocess in library mode
+    //     via st->filter->run() instead of the global FFT_filter pointer) ---
+    fftfilt   *filter;    // alias to bmorse_state::filter; not owned here
 
     // --- libbmorse output (written by process_data, read by bmorse_feed) ---
     char       outbuf[4096];

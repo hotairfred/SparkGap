@@ -504,8 +504,12 @@ int rx_FFTprocess(const double *buf, int len)
 
 		buf++;
 		
-		// run low pass filter 
+		// run low pass filter
+#ifdef LIBBMORSE_BUILD
+		n = st->filter->run(z, &zp); // per-handle filter — no global race
+#else
 		n = FFT_filter->run(z, &zp); // n = 0 or filterlen/2
+#endif
 		
 		if (!n) continue;
 
