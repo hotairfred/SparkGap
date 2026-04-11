@@ -134,6 +134,72 @@ int cw_disp_drain(cw_dispatcher_handle_t d,
  */
 int cw_disp_get_wpm(cw_dispatcher_handle_t d, int channel_id);
 
+/* ------------------------------------------------------------------------
+ * v2 IQ-fed API (PFB inside the dispatcher)
+ *
+ * The legacy cw_disp_add_channel / cw_disp_feed_batch path takes already-
+ * decimated PCM and is kept around for tests + simple consumers. The v2
+ * path lets the dispatcher own the PFB channelizer too: callers feed raw
+ * IQ, the dispatcher runs PFB once, then OpenMP-fans across registered
+ * channels (each of which extracts its bin, baseband-shifts, decimates,
+ * and feeds uhsdr — all in C++, GIL-free).
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Initialise PFB inside the dispatcher. Must be called once after
+ * cw_disp_create and before any cw_disp_add_pfb_channel call. Calling it
+ * a second time tears the existing PFB down and replaces it (any
+ * already-registered PFB channels are removed).
+ */
+int cw_disp_init_pfb(cw_dispatcher_handle_t d,
+                     int input_rate,
+                     int n_chan,
+                     int oversample,
+                     int taps_per_chan);
+
+/**
+ * Add a PFB-aware uhsdr channel.
+ *
+ * @param freq_offset_hz   Signed Hz from receiver center; the dispatcher
+ *                         picks the PFB bin and computes the residual.
+ * @param output_rate      Decimated PCM rate the uhsdr decoder runs at
+ *                         (e.g. 12000). Must evenly divide pfb output_rate.
+ * @param tone_freq        CW tone target frequency (Hz), e.g. 700.
+ * @param wpm              Fixed speed, 0 = auto.
+ * @param rf_khz, snr_db   Tags carried through to drain.
+ *
+ * Returns the new channel_id (>= 0), or -1 on failure (no PFB initialised,
+ * pool full, allocation error, decimation factor not integer, etc.).
+ */
+int cw_disp_add_pfb_channel(cw_dispatcher_handle_t d,
+                            float freq_offset_hz,
+                            float output_rate,
+                            float tone_freq,
+                            int   wpm,
+                            float rf_khz,
+                            float snr_db);
+
+/**
+ * Feed one block of raw IQ. Runs PFB once, then runs the OpenMP fan-out
+ * across registered channels: bin extract → frequency shift → decimate →
+ * uhsdr_feed. Returns 0 on success, -1 if PFB has not been initialised.
+ */
+int cw_disp_feed_iq(cw_dispatcher_handle_t d,
+                    const float *i_samples,
+                    const float *q_samples,
+                    int n_samples);
+
+/**
+ * Drain recent decimated PCM audio for one channel. Used by Python during
+ * the first ~15 seconds of a channel's life for pitch detection. Returns
+ * the number of int16 samples written into `out` (0..max_samples). Audio
+ * is *consumed*: subsequent calls only return new samples.
+ */
+int cw_disp_get_channel_audio(cw_dispatcher_handle_t d,
+                              int channel_id,
+                              int16_t *out,
+                              int max_samples);
+
 #ifdef __cplusplus
 }
 #endif
