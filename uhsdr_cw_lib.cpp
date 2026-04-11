@@ -1299,6 +1299,17 @@ static void CW_Decode(cw_decoder_t *cw)
 		cw_DataRecognition(cw, &received);      // True if new character received
 		if (received && (cw->data_len > 0))     // also make sure it is not a spike
 		{
+			// Trailing char suppression: on timeout, a slow AGC decay can leave a
+			// spurious element whose preceding gap >> normal inter-char space.
+			// Strip it before CodeGenFunc so it never reaches the output buffer.
+			if ((cw->cur_time >= ONE_SECOND * CW_TIMEOUT) &&
+			    (cw->data_len > 0) &&
+			    (cw->data_gap[cw->data_len - 1] > (uint32_t)(cw->times.cwspace_avg * 2)))
+			{
+				cw->data_len--;
+			}
+			if (cw->data_len > 0)
+			{
 			CodeGenFunc(cw);                    // Generate a dot/dash pattern string
 
 			uint8_t decoded = CwGen_CharacterIdFunc(cw->code);
@@ -1333,6 +1344,7 @@ static void CW_Decode(cw_decoder_t *cw)
                 cw->err_timeout = 0;
                 ext_send_msg(cw->rx_chan, false, "EXT cw_train=0");
 			}
+			} // if (cw->data_len > 0) — trailing char suppression guard
 		}
 	}
 }

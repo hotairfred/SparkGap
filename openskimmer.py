@@ -2503,7 +2503,7 @@ class InstanceManager:
                 if not self.instances:
                     break
                 weakest_key = min(self.instances, key=lambda k: self.instances[k].snr)
-                if snr <= self.instances[weakest_key].snr + 5:
+                if snr <= self.instances[weakest_key].snr + 3:
                     break  # new signal not significantly stronger, stop
                 evicted = self.instances.pop(weakest_key)
                 # Cache WPM from evicted signal for future respawns
