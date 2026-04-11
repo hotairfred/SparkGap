@@ -17,8 +17,7 @@
 #include <stdio.h>
 
 // Globals defined in bmorse_lib.cxx
-extern PARAMS params;
-extern fftfilt *FFT_filter;
+extern PARAMS params;  // still global; same-params invariant holds for all channels
 
 // Forward declarations of bmorse functions (ProcessState* versions)
 extern int rx_FFTprocess(ProcessState* st, const double *buf, int len);
@@ -57,11 +56,11 @@ bmorse_handle_t bmorse_create(float freq, float sample_rate, int wpm)
     int FilterFFTLen = 4096;
     float bw = (wpm > 0 ? wpm : 25) / (1.2f * sample_rate);
     s->filter = new fftfilt(bw, FilterFFTLen);
-    FFT_filter = s->filter;   // point global at this instance's filter (for non-lib paths)
 
     // Initialize per-instance decoder state
     s->proc = process_state_create();
     if (!s->proc) { delete s->filter; free(s); return NULL; }
+    s->proc->filter = s->filter;  // rx_FFTprocess uses st->filter, not global FFT_filter
 
     return (bmorse_handle_t)s;
 }
@@ -72,13 +71,12 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
     if (!h || !samples || n <= 0) return 0;
     bmorse_state *s = (bmorse_state *)h;
 
-    // Restore per-handle params and FFT filter (params are still global;
-    // process_data/filter/rx_FFTprocess state is now fully per-instance via proc).
+    // params is still global — benign under same-params invariant (all channels
+    // use identical rate/freq/speed); see comms 2026-04-11 for rationale.
     params.sample_rate = s->sample_rate;
     params.frequency   = s->tone_freq;
     params.speed       = (int)s->speed_wpm;
     params.dec_ratio   = (int)(s->sample_rate / BAYES_RATE);
-    FFT_filter = s->filter;
 
     // Sync init_speed into the morse object if it's already been created
     if (s->proc->pd_mp)
@@ -124,10 +122,8 @@ void bmorse_destroy(bmorse_handle_t h)
         process_state_destroy(s->proc);
         s->proc = NULL;
     }
-    // Free this instance's FFT filter
+    // Free this instance's FFT filter (proc->filter is a non-owning alias)
     if (s->filter) {
-        if (FFT_filter == s->filter)
-            FFT_filter = NULL;
         delete s->filter;
         s->filter = NULL;
     }
