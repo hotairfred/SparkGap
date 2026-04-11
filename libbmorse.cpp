@@ -96,6 +96,17 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
         pos += chunk;
     }
 
+    // Speed-adaptive filter width: update fftfilt BW when detected WPM changes.
+    // AG1LE formula: BW_Hz = WPM / 0.6  →  normalized f = WPM / (1.2 * sample_rate).
+    // Hysteresis: only update when WPM shifts ≥3 from last configured value.
+    // Transition causes one overlap block (~42 ms) of mild ringing — acceptable.
+    float det_wpm = s->proc->spdhat;
+    if (det_wpm > 5.0f && fabsf(det_wpm - s->proc->cur_bw_wpm) >= 3.0f) {
+        float new_bw = det_wpm / (1.2f * s->sample_rate);
+        s->proc->filter->create_lpf((double)new_bw);
+        s->proc->cur_bw_wpm = det_wpm;
+    }
+
     // Copy accumulated output to caller
     int ncopy = s->proc->outlen;
     if (ncopy > outlen - 1) ncopy = outlen - 1;

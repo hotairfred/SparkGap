@@ -52,7 +52,8 @@ struct ProcessState {
 
     // --- FFT filter (set by bmorse_create; read by rx_FFTprocess in library mode
     //     via st->filter->run() instead of the global FFT_filter pointer) ---
-    fftfilt   *filter;    // alias to bmorse_state::filter; not owned here
+    fftfilt   *filter;      // alias to bmorse_state::filter; not owned here
+    float      cur_bw_wpm;  // WPM at which filter was last set (0 = initial/unknown)
 
     // --- libbmorse output (written by process_data, read by bmorse_feed) ---
     char       outbuf[4096];
