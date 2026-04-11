@@ -2023,9 +2023,19 @@ class SignalGroup:
                 # Adding a FIR here introduces group delay that breaks uhsdr timing.
                 self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
                                             normalize='peak', cw_fir_bw=0)
+            # 4 kHz leg: only needed for Python-side consumers (legacy bmorse,
+            # hamfist, ML). In v3 (use_pfb_dispatcher=True), bmorse lives in
+            # the dispatcher so it no longer needs ch_4k — we only spin it up
+            # when ML is active for this group (top-N by SNR) or when hamfist
+            # is wired. For the ~230 non-ML channels in a 250-cap eval this
+            # skips a per-block numpy polyphase extract + FIR + normalise.
+            if use_pfb_dispatcher:
+                need_ch_4k = bool(ml_model_path) or bool(hamfist_bin)
+            else:
+                need_ch_4k = bool(bmorse_bin) or bool(hamfist_bin)
             self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=BMORSE_RATE,
                                      normalize='peak',
-                                     cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
+                                     cw_fir_bw=400) if need_ch_4k else None
         else:
             self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
                                          normalize='peak', cw_fir_bw=1200)
@@ -2285,8 +2295,11 @@ class SignalGroup:
             if self.hamfist:
                 self.hamfist.feed_pcm(pcm_4k)
 
-        # Second-pass bmorse fallback: spawn libbmorse when uhsdr hasn't decoded
-        if not self._bmorse_fallback_started:
+        # Second-pass bmorse fallback: spawn libbmorse when uhsdr hasn't decoded.
+        # Skipped entirely on the v3 dispatcher path — dispatcher bmorse is
+        # already running for this channel and a Python _LibBmorseDecoder
+        # fallback would double-feed.
+        if not self._bmorse_fallback_started and not self._use_pfb_dispatcher:
             if self._bmorse_fallback_time == 0 and self._bmorse_started:
                 self._bmorse_fallback_time = time.time() + 20  # check after 20s
             if self._bmorse_fallback_time > 0 and time.time() >= self._bmorse_fallback_time:
