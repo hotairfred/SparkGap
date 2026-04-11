@@ -36,6 +36,9 @@
 #include "window.h"
 #include "bmorse.h"
 #include "fftfilt.h"
+#ifdef LIBBMORSE_BUILD
+#include "bmorse_procstate.h"
+#endif
 
 #define ARRAY_LEN(x)    ((int) (sizeof (x) / sizeof (x [0])))
 #define MAX(x,y)                ((x) > (y) ? (x) : (y))
@@ -74,19 +77,27 @@ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 8192, 32, 0, 600, 5, 4000, 10.0, 0.0, 
 fftfilt			*FFT_filter; 
 
 
+#ifdef LIBBMORSE_BUILD
+double filter(ProcessState* st, double a, int len)
+{
+	double* in    = st->flt_in;
+	double& out   = st->flt_out;
+	int&    pint  = st->flt_pint;
+	int&    empty = st->flt_empty;
+#else
 double filter(double a, int len)
 {
 	static double  in[2000];
 	static double  out;
-	static int	i, pint;
-	static int empty = 1;
-
+	static int     pint;
+	static int     empty = 1;
+#endif
         if ((len == 0) || (len ==1)) {
                 return a;
         }
         if (empty) {
                 empty = 0;
-                for (i = 0; i < len; i++) {
+                for (int i = 0; i < len; i++) {
                         in[i] = a;
                 }
                 out = a * len;
@@ -303,6 +314,26 @@ void interp_spec (float * mag, int maglen, const double *spec, int speclen)
 	return ;
 } /* interp_spec */
 
+#ifdef LIBBMORSE_BUILD
+void process_data(ProcessState* st, double x)
+{
+	int&       sample_counter = st->pd_sample_counter;
+	float&     rn             = st->pd_rn;
+	int&       retstat        = st->pd_retstat;
+	int&       n1             = st->pd_n1;
+	int&       n2             = st->pd_n2;
+	long int&  imax           = st->pd_imax;
+	long int&  xhat           = st->pd_xhat;
+	long int&  elmhat         = st->pd_elmhat;
+	float&     pmax           = st->pd_pmax;
+	float&     zout           = st->pd_zout;
+	float&     spdhat         = st->pd_spdhat;
+	float&     px             = st->pd_px;
+	int&       init           = st->pd_init;
+	int&       pinit          = st->pd_pinit;
+	double&    agc_peak       = st->pd_agc_peak;
+	morse*&    mp             = st->pd_mp;
+#else
 void process_data(double x)
 {
 	static int sample_counter = 0;
@@ -310,12 +341,13 @@ void process_data(double x)
 	static int retstat, n1, n2;
 	static long int imax, xhat, elmhat;
 	static float pmax, zout, spdhat, px;
-	static int init = 1,pinit = 1; 
+	static int init = 1,pinit = 1;
 	static double agc_peak = 0.0;
-	static morse* mp; 
+	static morse* mp;
+#endif
 	char buf [12];
-	
-	
+
+
 	if (init) {
 		mp = new morse();
 		if (params.speed > 0) {
@@ -358,16 +390,13 @@ void process_data(double x)
 
 	retstat = mp->proces_(zout, rn, &xhat, &px, &elmhat, &spdhat, &imax, &pmax, buf);
 #ifdef LIBBMORSE_BUILD
-	// Library mode: accumulate output in global buffer
-	extern char _bmorse_outbuf[4096];
-	extern int _bmorse_outlen;
-	extern float _bmorse_spdhat;
+	// Library mode: accumulate output into per-handle ProcessState buffer
 	if (buf[0] != '\0') {
 		int blen = strlen(buf);
-		for (int bi = 0; bi < blen && _bmorse_outlen < 4095; bi++)
-			_bmorse_outbuf[_bmorse_outlen++] = buf[bi];
+		for (int bi = 0; bi < blen && st->outlen < 4095; bi++)
+			st->outbuf[st->outlen++] = buf[bi];
 	}
-	if (spdhat > 0) _bmorse_spdhat = spdhat;
+	if (spdhat > 0) st->spdhat = spdhat;
 #else
 	if (params.print_variables)
 		printf("\n%d\t%d\t%d\t%d\t%f\t%f\t%f\t%f\t%f\t%f",(int)retstat,(int)imax,(int)elmhat,(int)xhat,x,px,pmax,spdhat,rn,zout);
@@ -380,12 +409,22 @@ void process_data(double x)
 
 }
 
+#ifdef LIBBMORSE_BUILD
+int rx_FFTprocess(ProcessState* st, const double *buf, int len)
+{
+	complex  z, *zp;
+	int n,i,speclen,Hz;
+	int&    smpl_ctr = st->smpl_ctr;
+	double& FFTvalue = st->FFTvalue;
+	double& FFTphase = st->FFTphase;
+#else
 int rx_FFTprocess(const double *buf, int len)
 {
 	complex  z, *zp;
 	int n,i,speclen,Hz;
 	static int smpl_ctr = 0;
-	static double FFTvalue,FFTphase =0.0; 
+	static double FFTvalue,FFTphase =0.0;
+#endif
 
 /*	fftw_plan plan; 
 	double single_max,noise_sum,sig_sum,Nrms,Srms,fbin;
@@ -465,8 +504,12 @@ int rx_FFTprocess(const double *buf, int len)
 
 		buf++;
 		
-		// run low pass filter 
+		// run low pass filter
+#ifdef LIBBMORSE_BUILD
+		n = st->filter->run(z, &zp); // per-handle filter — no global race
+#else
 		n = FFT_filter->run(z, &zp); // n = 0 or filterlen/2
+#endif
 		
 		if (!n) continue;
 
@@ -480,15 +523,20 @@ int rx_FFTprocess(const double *buf, int len)
 
 	// demodulate
 				FFTvalue = zp[i].mag();
-	// run envelope filter 
-				FFTvalue = filter(FFTvalue,params.bfv);
-
+	// run envelope filter
+#ifdef LIBBMORSE_BUILD
+				FFTvalue = filter(st, FFTvalue, params.bfv);
+				process_data(st, FFTvalue);
+#else
+				FFTvalue = filter(FFTvalue, params.bfv);
 				process_data(FFTvalue);
+#endif
 
 		} // for (i =0; i < n ...
 
 	} //while (len-- > 0)
 
+	return 0;
 }
 
 
@@ -706,31 +754,33 @@ void process_stdin()
 #endif // LIBBMORSE_BUILD
 
 
+#ifndef LIBBMORSE_BUILD
 void process_textfile(char *filename)
 {
-	FILE *fp; 
-	float x; 
-	int res; 
-	static int samplecounter =0; 
-	
+	FILE *fp;
+	float x;
+	int res;
+	static int samplecounter =0;
+
 	fp = fopen(filename, "r");
 	if (fp == NULL) {
-		printf("\nError : failed to open text file '%s' : \n", filename); 
-		return; 
+		printf("\nError : failed to open text file '%s' : \n", filename);
+		return;
 	}
-	while (1) { 
- 		res = fscanf(fp,"%f",&x); 
-		if ( res != 1) { 
-			fclose(fp); 
+	while (1) {
+ 		res = fscanf(fp,"%f",&x);
+		if ( res != 1) {
+			fclose(fp);
 			printf("\n");
 			exit(0);
 		}
 		samplecounter++;
-		if ((samplecounter % 20) == 0) {  // assuming that text envelope files have 4000 Hz sampling rate, decimate by 20 to get to 200 Hz (5ms sample time)st
-			process_data((double)x); 
+		if ((samplecounter % 20) == 0) {
+			process_data((double)x);
 		}
-	}	
+	}
 }
+#endif // LIBBMORSE_BUILD
 
 
 void usage_exit (const char * argv0)
