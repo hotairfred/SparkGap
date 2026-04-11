@@ -39,5 +39,6 @@
     "status_interval": 30,
     "max_instances": 300,
     "ml_model": "/mnt/atlas/skimmer/cw_decoder_ctc_183k_ep31.pth",
-    "ml_min_confidence": 0.7
+    "ml_min_confidence": 0.7,
+    "use_cpp_pfb": true
 }
