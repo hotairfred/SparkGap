@@ -1132,6 +1132,18 @@ def _get_cw_dispatcher_lib():
     except AttributeError:
         log.warning("libcw_dispatcher.so missing v2 PFB symbols — v2 path disabled")
 
+    # v3 bmorse entry points. Same fallback pattern.
+    try:
+        _cw_disp_lib.cw_disp_set_bmorse_fir.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_set_bmorse_fir.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_float), _ct.c_int]
+        _cw_disp_lib.cw_disp_add_pfb_bmorse_channel.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_add_pfb_bmorse_channel.argtypes = [
+            _ct.c_void_p, _ct.c_float, _ct.c_float, _ct.c_float,
+            _ct.c_int, _ct.c_float, _ct.c_float]
+    except AttributeError:
+        log.warning("libcw_dispatcher.so missing v3 bmorse symbols — bmorse-in-dispatcher disabled")
+
     log.info("Loaded libcw_dispatcher.so (parallel uhsdr fan-out)")
     return _cw_disp_lib
 
@@ -1551,8 +1563,8 @@ class _PFBDispChannel:
 
 def _pfb_dispatcher_drain():
     """Walk cw_disp_drain output and route decoded text into each
-    _PFBDispDecoder's pending buffer. Called once per InstanceManager
-    iteration when the v2 path is active."""
+    _PFBDispDecoder / _PFBDispBmorseDecoder's pending buffer. Called once
+    per InstanceManager iteration when the v2/v3 path is active."""
     if not _pfb_disp_instances:
         return
     lib = _cw_disp_lib
@@ -1580,6 +1592,106 @@ def _pfb_dispatcher_drain():
         d.last_output    = now
         if r.wpm > 0:
             d.detected_wpm = r.wpm
+
+
+# v3 bmorse-in-dispatcher state ------------------------------------------
+_bmorse_fir_installed = False
+
+def _pfb_dispatcher_install_bmorse_fir(sample_rate=BMORSE_RATE,
+                                       fir_bw_hz=400,
+                                       n_taps=256,
+                                       tone=None):
+    """Install the bandpass FIR taps used by all bmorse channels in the
+    dispatcher. Called once before the first bmorse channel is added."""
+    global _bmorse_fir_installed
+    if _bmorse_fir_installed:
+        return True
+    lib = _get_cw_dispatcher_lib()
+    if not lib or not hasattr(lib, 'cw_disp_set_bmorse_fir'):
+        return False
+    h = _get_cw_dispatcher_handle()
+    if not h:
+        return False
+
+    from scipy.signal import firwin
+    centre = tone if tone is not None else CW_TONE
+    lo = max(50.0, centre - fir_bw_hz / 2.0)
+    hi = min(sample_rate / 2.0 - 50.0, centre + fir_bw_hz / 2.0)
+    taps = firwin(n_taps, [lo, hi], fs=sample_rate,
+                  pass_zero=False).astype(np.float32)
+
+    import ctypes as _ct
+    rc = lib.cw_disp_set_bmorse_fir(
+        h,
+        taps.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+        int(len(taps)))
+    if rc != 0:
+        log.error("cw_disp_set_bmorse_fir failed rc=%d", rc)
+        return False
+    _bmorse_fir_installed = True
+    log.info("Installed dispatcher bmorse FIR: %d taps, %.0f–%.0f Hz @ %.0f Hz",
+             int(len(taps)), lo, hi, sample_rate)
+    return True
+
+
+class _PFBDispBmorseDecoder:
+    """bmorse decoder backed by a PFB-aware dispatcher channel.
+
+    Mirrors the _PFBDispDecoder shape so _LibBmorseDecoder can be swapped
+    out behind the v3 flag. feed_pcm() is a no-op (the dispatcher feeds
+    via cw_disp_feed_iq at the InstanceManager level). Decoded text
+    arrives via the shared _pfb_dispatcher_drain().
+    """
+
+    def __init__(self, rf_khz, snr, freq_offset_hz, tone_freq,
+                 sample_rate=BMORSE_RATE, wpm=25):
+        self.rf_khz       = rf_khz
+        self.snr          = snr
+        self.decoded_text = ''
+        self.total_chars  = 0
+        self.last_output  = time.time()
+        self.detected_wpm = 0
+        self._pending     = ''
+
+        lib = _get_cw_dispatcher_lib()
+        h = _get_cw_dispatcher_handle() if lib else None
+        if (not lib or not h or not _pfb_disp_initialised
+                or not hasattr(lib, 'cw_disp_add_pfb_bmorse_channel')):
+            self._cid = -1
+            return
+        # Install the FIR lazily on first bmorse channel.
+        if not _bmorse_fir_installed:
+            if not _pfb_dispatcher_install_bmorse_fir(
+                    sample_rate=sample_rate, tone=tone_freq):
+                self._cid = -1
+                return
+        self._lib = lib
+        self._cid = lib.cw_disp_add_pfb_bmorse_channel(
+            h, float(freq_offset_hz), float(sample_rate), float(tone_freq),
+            int(wpm), float(rf_khz), float(snr))
+        if self._cid < 0:
+            log.warning("cw_disp_add_pfb_bmorse_channel failed for %.1f kHz",
+                        rf_khz)
+            return
+        _pfb_disp_instances[self._cid] = self
+
+    def feed_pcm(self, pcm_bytes):
+        return
+
+    def read(self):
+        t = self._pending
+        self._pending = ''
+        return t
+
+    def kill(self):
+        if self._cid < 0:
+            return
+        _pfb_disp_instances.pop(self._cid, None)
+        try:
+            self._lib.cw_disp_remove_channel(_get_cw_dispatcher_handle(), self._cid)
+        except Exception:
+            pass
+        self._cid = -1
 
 
 _ml_model = None
@@ -1911,9 +2023,19 @@ class SignalGroup:
                 # Adding a FIR here introduces group delay that breaks uhsdr timing.
                 self._ch_uhsdr = PFBChannel(freq_offset, pfb, output_rate=DECODER_RATE,
                                             normalize='peak', cw_fir_bw=0)
+            # 4 kHz leg: only needed for Python-side consumers (legacy bmorse,
+            # hamfist, ML). In v3 (use_pfb_dispatcher=True), bmorse lives in
+            # the dispatcher so it no longer needs ch_4k — we only spin it up
+            # when ML is active for this group (top-N by SNR) or when hamfist
+            # is wired. For the ~230 non-ML channels in a 250-cap eval this
+            # skips a per-block numpy polyphase extract + FIR + normalise.
+            if use_pfb_dispatcher:
+                need_ch_4k = bool(ml_model_path) or bool(hamfist_bin)
+            else:
+                need_ch_4k = bool(bmorse_bin) or bool(hamfist_bin)
             self._ch_4k = PFBChannel(freq_offset, pfb, output_rate=BMORSE_RATE,
                                      normalize='peak',
-                                     cw_fir_bw=400) if (bmorse_bin or hamfist_bin) else None
+                                     cw_fir_bw=400) if need_ch_4k else None
         else:
             self._ch_uhsdr = Channelizer(freq_offset, sample_rate, DECODER_RATE,
                                          normalize='peak', cw_fir_bw=1200)
@@ -2051,15 +2173,27 @@ class SignalGroup:
                      len(self._secondary_decoders), sec_pitches, self.rf_khz)
 
         if self._bmorse_bin:
-            # Prefer libbmorse.so (in-process) — the subprocess binary doesn't
-            # support -stdin or -rate flags (takes a WAV filename, not piped PCM).
-            bmlib = _get_bmorse_lib()
-            if bmlib:
-                self.bmorse = _LibBmorseDecoder(self.rf_khz, self.snr, freq=pitch,
-                                                sample_rate=BMORSE_RATE, wpm=wpm)
-            else:
-                log.warning("libbmorse.so not found — bmorse subprocess skipped"
-                            " (binary requires WAV file, not piped PCM)")
+            # v3 dispatcher path — bmorse runs inside libcw_dispatcher.so,
+            # fed by the shared PFB in C++. Falls back to _LibBmorseDecoder
+            # if the dispatcher lib is missing the v3 symbols or the add
+            # fails (pool full).
+            self.bmorse = None
+            if self._use_pfb_dispatcher:
+                dec = _PFBDispBmorseDecoder(self.rf_khz, self.snr,
+                                            freq_offset_hz=self.freq_offset,
+                                            tone_freq=pitch,
+                                            sample_rate=BMORSE_RATE,
+                                            wpm=wpm)
+                if dec._cid >= 0:
+                    self.bmorse = dec
+            if self.bmorse is None:
+                bmlib = _get_bmorse_lib()
+                if bmlib:
+                    self.bmorse = _LibBmorseDecoder(self.rf_khz, self.snr, freq=pitch,
+                                                    sample_rate=BMORSE_RATE, wpm=wpm)
+                else:
+                    log.warning("libbmorse.so not found — bmorse subprocess skipped"
+                                " (binary requires WAV file, not piped PCM)")
 
         if self._hamfist_bin:
             cmd = [self._hamfist_bin, '-stdin', '-frq', str(pitch),
@@ -2161,8 +2295,11 @@ class SignalGroup:
             if self.hamfist:
                 self.hamfist.feed_pcm(pcm_4k)
 
-        # Second-pass bmorse fallback: spawn libbmorse when uhsdr hasn't decoded
-        if not self._bmorse_fallback_started:
+        # Second-pass bmorse fallback: spawn libbmorse when uhsdr hasn't decoded.
+        # Skipped entirely on the v3 dispatcher path — dispatcher bmorse is
+        # already running for this channel and a Python _LibBmorseDecoder
+        # fallback would double-feed.
+        if not self._bmorse_fallback_started and not self._use_pfb_dispatcher:
             if self._bmorse_fallback_time == 0 and self._bmorse_started:
                 self._bmorse_fallback_time = time.time() + 20  # check after 20s
             if self._bmorse_fallback_time > 0 and time.time() >= self._bmorse_fallback_time:
