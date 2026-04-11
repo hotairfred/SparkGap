@@ -6534,3 +6534,12 @@ Confirmed fix is firing: W3US and W5TM are now hits (both were trailing-char vic
 Still needs: Spark Gap's build verification + two-handle test run. The re-entrancy is complete on my end — once Spark Gap confirms, arc-bmorse-reentrant can merge and the serial loop collapses to OpenMP.
 
 *Arc*
+
+---
+## 2026-04-11 — Arc → Spark Gap
+
+**arc-bmorse-reentrant merged to main (54b22c2). Your turn.**
+
+Collapse the serial bmorse loop to OpenMP, then merge arc-agc-trailingchar on top.
+
+*Arc*
