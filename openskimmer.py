@@ -1060,6 +1060,251 @@ def _get_bmorse_lib():
     return _bmorse_lib
 
 
+# ---------------------------------------------------------------------------
+# libcw_dispatcher.so — batched parallel uhsdr fan-out
+# ---------------------------------------------------------------------------
+# One shared pool is created lazily the first time a _DispDecoder is spawned.
+# Each _DispDecoder registers a channel in the pool and stashes its feed PCM
+# into a per-instance buffer. Once per IQ block, InstanceManager.feed_all_iq
+# calls _dispatcher_flush() which builds a contiguous (N, n_samples) int16
+# batch and issues a single cw_disp_feed_batch call — the feed runs across
+# all N channels in C++ with OpenMP, releasing the Python GIL for the whole
+# fanout. Drained text is routed back into each _DispDecoder's pending buffer.
+
+_cw_disp_lib = None
+_cw_disp_handle = None        # opaque pool handle
+_cw_disp_max_channels = 4096  # overridable via config
+_dispatcher_instances = {}    # channel_id -> _DispDecoder (drain routing)
+
+
+def _get_cw_dispatcher_lib():
+    global _cw_disp_lib
+    if _cw_disp_lib is not None:
+        return _cw_disp_lib
+    import ctypes as _ct
+    try:
+        _cw_disp_lib = _ct.CDLL('./libcw_dispatcher.so')
+    except OSError:
+        log.warning("libcw_dispatcher.so not found — dispatcher path disabled")
+        _cw_disp_lib = False  # sentinel: tried and failed
+        return None
+
+    _cw_disp_lib.cw_disp_create.restype  = _ct.c_void_p
+    _cw_disp_lib.cw_disp_create.argtypes = [_ct.c_int]
+    _cw_disp_lib.cw_disp_destroy.restype  = None
+    _cw_disp_lib.cw_disp_destroy.argtypes = [_ct.c_void_p]
+    _cw_disp_lib.cw_disp_add_channel.restype  = _ct.c_int
+    _cw_disp_lib.cw_disp_add_channel.argtypes = [
+        _ct.c_void_p, _ct.c_float, _ct.c_float, _ct.c_int,
+        _ct.c_float, _ct.c_float]
+    _cw_disp_lib.cw_disp_remove_channel.restype  = None
+    _cw_disp_lib.cw_disp_remove_channel.argtypes = [_ct.c_void_p, _ct.c_int]
+    _cw_disp_lib.cw_disp_channel_count.restype  = _ct.c_int
+    _cw_disp_lib.cw_disp_channel_count.argtypes = [_ct.c_void_p]
+    _cw_disp_lib.cw_disp_feed_batch.restype  = _ct.c_int
+    _cw_disp_lib.cw_disp_feed_batch.argtypes = [
+        _ct.c_void_p,
+        _ct.POINTER(_ct.c_int), _ct.c_int,
+        _ct.POINTER(_ct.c_int16), _ct.c_int]
+    _cw_disp_lib.cw_disp_drain.restype  = _ct.c_int
+    _cw_disp_lib.cw_disp_drain.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int]
+    _cw_disp_lib.cw_disp_get_wpm.restype  = _ct.c_int
+    _cw_disp_lib.cw_disp_get_wpm.argtypes = [_ct.c_void_p, _ct.c_int]
+    log.info("Loaded libcw_dispatcher.so (parallel uhsdr fan-out)")
+    return _cw_disp_lib
+
+
+class _CWDecodedRecord:
+    """Mirror of struct cw_decoded_record_t in cw_dispatcher.h."""
+    # Declared lazily so ctypes isn't needed at module load.
+    _ct_struct = None
+
+    @classmethod
+    def struct(cls):
+        if cls._ct_struct is None:
+            import ctypes as _ct
+            class S(_ct.Structure):
+                _fields_ = [
+                    ('channel_id', _ct.c_int),
+                    ('rf_khz',     _ct.c_float),
+                    ('snr_db',     _ct.c_float),
+                    ('wpm',        _ct.c_int),
+                    ('text_len',   _ct.c_int),
+                    ('text',       _ct.c_char * 256),
+                ]
+            cls._ct_struct = S
+        return cls._ct_struct
+
+
+def _get_cw_dispatcher_handle():
+    """Return the process-wide dispatcher handle, creating it on first use."""
+    global _cw_disp_handle
+    if _cw_disp_handle is not None:
+        return _cw_disp_handle
+    lib = _get_cw_dispatcher_lib()
+    if not lib:
+        return None
+    _cw_disp_handle = lib.cw_disp_create(_cw_disp_max_channels)
+    if not _cw_disp_handle:
+        log.error("cw_disp_create failed for max_channels=%d", _cw_disp_max_channels)
+        return None
+    log.info("Created cw_dispatcher pool (max_channels=%d)", _cw_disp_max_channels)
+    return _cw_disp_handle
+
+
+def _set_dispatcher_max_channels(n):
+    """Called by InstanceManager before first decoder is spawned."""
+    global _cw_disp_max_channels
+    _cw_disp_max_channels = max(16, int(n))
+
+
+class _DispDecoder:
+    """Thin _LibDecoder-shaped shim that routes through libcw_dispatcher.so.
+
+    feed_pcm() only stashes bytes into a per-instance buffer; the actual
+    uhsdr_feed call happens in batch from _dispatcher_flush() once per IQ
+    block. read() returns any text that drain has already routed here.
+    """
+
+    def __init__(self, rf_khz, snr, freq, sample_rate=12000, wpm=0):
+        self.rf_khz = rf_khz
+        self.snr = snr
+        self.decoded_text = ''
+        self.total_chars = 0
+        self.last_output = time.time()
+        self.detected_wpm = 0
+        self._pending = ''
+        self._stash = bytearray()
+
+        lib = _get_cw_dispatcher_lib()
+        h = _get_cw_dispatcher_handle() if lib else None
+        if not h:
+            self._cid = -1
+            return
+        self._lib = lib
+        self._cid = lib.cw_disp_add_channel(
+            h, float(freq), float(sample_rate), int(wpm),
+            float(rf_khz), float(snr))
+        if self._cid < 0:
+            log.warning("cw_disp_add_channel failed — pool full? falling back for this instance")
+            return
+        _dispatcher_instances[self._cid] = self
+
+    def feed_pcm(self, pcm_bytes):
+        # Stash only; real feed happens in _dispatcher_flush().
+        if self._cid < 0 or not pcm_bytes:
+            return
+        self._stash += pcm_bytes
+
+    def read(self):
+        t = self._pending
+        self._pending = ''
+        return t
+
+    def kill(self):
+        if self._cid < 0:
+            return
+        _dispatcher_instances.pop(self._cid, None)
+        try:
+            self._lib.cw_disp_remove_channel(_get_cw_dispatcher_handle(), self._cid)
+        except Exception:
+            pass
+        self._cid = -1
+
+
+def _dispatcher_flush():
+    """Drain all _DispDecoder stash buffers into one batched feed + drain.
+
+    Called from InstanceManager.feed_all_iq() once per IQ block when the
+    dispatcher is enabled. Keeps the C-side call cost O(1) per block
+    regardless of how many channels are active.
+    """
+    if not _dispatcher_instances:
+        return
+    lib = _cw_disp_lib
+    if not lib:
+        return
+    h = _cw_disp_handle
+    if not h:
+        return
+
+    import ctypes as _ct
+
+    # Gather non-empty stashes. Channels with no pcm this round are skipped.
+    live = [d for d in _dispatcher_instances.values()
+            if d._cid >= 0 and len(d._stash) > 0]
+    if not live:
+        return
+
+    # All channels fed by the same SignalGroup loop receive exactly the
+    # same pcm_12k length per IQ block. But different groups may be at
+    # different pipeline stages (e.g. waiting for pitch detection), so
+    # stash lengths can differ. Bucket by length and fire one batch per
+    # bucket — still a huge reduction vs one C call per decoder.
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for d in live:
+        buckets[len(d._stash)].append(d)
+
+    int16_p = _ct.POINTER(_ct.c_int16)
+    Record = _CWDecodedRecord.struct()
+    MAX_DRAIN = 4096
+    records = (Record * MAX_DRAIN)()
+
+    for stash_len, group_decs in buckets.items():
+        n_ch = len(group_decs)
+        n_samples = stash_len // 2  # bytes → int16
+        if n_samples == 0:
+            for d in group_decs: d._stash.clear()
+            continue
+
+        # Build contiguous (n_ch, n_samples) int16 buffer. frombuffer is
+        # zero-copy on bytes; we stack rows into a fresh array.
+        rows = np.empty((n_ch, n_samples), dtype=np.int16)
+        ids  = (_ct.c_int * n_ch)()
+        for i, d in enumerate(group_decs):
+            rows[i] = np.frombuffer(bytes(d._stash), dtype=np.int16)
+            ids[i]  = d._cid
+            d._stash.clear()
+
+        rc = lib.cw_disp_feed_batch(
+            h, ids, n_ch,
+            rows.ctypes.data_as(int16_p), n_samples)
+        if rc != 0:
+            log.warning("cw_disp_feed_batch rc=%d n_ch=%d n_samples=%d",
+                        rc, n_ch, n_samples)
+
+    # One drain per flush catches all text from every bucket.
+    n = lib.cw_disp_drain(h, _ct.cast(records, _ct.c_void_p), MAX_DRAIN)
+    now = time.time()
+    for i in range(n):
+        r = records[i]
+        d = _dispatcher_instances.get(r.channel_id)
+        if d is None:
+            continue
+        text = bytes(r.text[:r.text_len]).decode('latin-1', errors='replace')
+        d._pending      += text
+        d.decoded_text  += text
+        d.total_chars   += r.text_len
+        d.last_output    = now
+        if r.wpm > 0:
+            d.detected_wpm = r.wpm
+
+
+def _make_uhsdr_decoder(rf_khz, snr, freq, sample_rate, wpm, use_dispatcher):
+    """Factory used by SignalGroup. Returns _DispDecoder when the flag is
+    set AND the dispatcher lib is available; falls back to _LibDecoder
+    otherwise so the baseline path is always reachable."""
+    if use_dispatcher and _get_cw_dispatcher_lib():
+        dec = _DispDecoder(rf_khz, snr, freq=freq,
+                           sample_rate=sample_rate, wpm=wpm)
+        if dec._cid >= 0:
+            return dec
+        # Pool full or add failed — fall through to _LibDecoder
+    return _LibDecoder(rf_khz, snr, freq=freq,
+                       sample_rate=sample_rate, wpm=wpm)
+
+
 _ml_model = None
 _ml_device = None
 
@@ -1358,12 +1603,13 @@ class SignalGroup:
                  decoder_bin, speeds,
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
                  wpm=30, ml_model_path=None, ml_min_confidence=0.7,
-                 pfb=None):
+                 pfb=None, use_dispatcher=False):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
         self.last_seen = time.time()
         self.last_output = time.time()
+        self._use_dispatcher = use_dispatcher
 
         # Try C++ cw_engine first (owns channelization + both decoders)
         self._cw_engine = None
@@ -1416,8 +1662,9 @@ class SignalGroup:
             lib = _get_uhsdr_lib()
             for spd in speeds:
                 if lib:
-                    dec = _LibDecoder(rf_khz, snr, freq=CW_TONE,
-                                      sample_rate=DECODER_RATE, wpm=spd)
+                    dec = _make_uhsdr_decoder(rf_khz, snr, freq=CW_TONE,
+                                              sample_rate=DECODER_RATE, wpm=spd,
+                                              use_dispatcher=self._use_dispatcher)
                 else:
                     cmd = [decoder_bin, '-r', str(DECODER_RATE), '-f', str(CW_TONE)]
                     if spd > 0:
@@ -1446,8 +1693,9 @@ class SignalGroup:
             lib = _get_uhsdr_lib()
             for spd in self._speeds:
                 if lib:
-                    dec = _LibDecoder(self.rf_khz, self.snr, freq=pitch,
-                                      sample_rate=DECODER_RATE, wpm=spd)
+                    dec = _make_uhsdr_decoder(self.rf_khz, self.snr, freq=pitch,
+                                              sample_rate=DECODER_RATE, wpm=spd,
+                                              use_dispatcher=self._use_dispatcher)
                 else:
                     cmd = [self._decoder_bin, '-r', str(DECODER_RATE), '-f', str(pitch)]
                     if spd > 0:
@@ -1466,8 +1714,9 @@ class SignalGroup:
             for sec_pitch in sec_pitches:
                 for spd in sec_speeds:
                     if lib:
-                        dec = _LibDecoder(self.rf_khz, self.snr, freq=sec_pitch,
-                                          sample_rate=DECODER_RATE, wpm=spd)
+                        dec = _make_uhsdr_decoder(self.rf_khz, self.snr, freq=sec_pitch,
+                                                  sample_rate=DECODER_RATE, wpm=spd,
+                                                  use_dispatcher=self._use_dispatcher)
                     else:
                         cmd = [self._decoder_bin, '-r', str(DECODER_RATE),
                                '-f', str(sec_pitch)]
@@ -1713,7 +1962,7 @@ class InstanceManager:
                  max_instances=150, max_channels=None, signal_timeout=90,
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
                  hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7,
-                 ml_max_channels=20):
+                 ml_max_channels=20, use_dispatcher=False):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -1735,6 +1984,19 @@ class InstanceManager:
         self._wpm_cache = {}
         # Shared PFB channelizer — processes full-band IQ once for all signals
         self._pfb = PFBChannelizer(input_rate=sample_rate) if sample_rate == 192000 else None
+        # libcw_dispatcher.so fan-out (experimental). When enabled, uhsdr
+        # decoders are routed via the C++ dispatcher so the per-IQ-block
+        # fanout runs in OpenMP instead of a GIL-serialized Python loop.
+        self.use_dispatcher = bool(use_dispatcher)
+        if self.use_dispatcher:
+            # Pre-provision the pool so all add_channel calls can succeed.
+            # At max_channels logical signals × up to ~9 uhsdr instances
+            # per signal (5 fixed speeds + 2 secondary pitches × 2 speeds),
+            # we want ~9× headroom. Round up.
+            _set_dispatcher_max_channels(self.max_channels * 16)
+            if _get_cw_dispatcher_lib() is None:
+                log.warning("use_cpp_dispatcher=True but libcw_dispatcher.so not loaded — falling back")
+                self.use_dispatcher = False
 
     def update_signals(self, signals, center_khz, wpm_hint=0):
         """Update instance list based on detected signals.
@@ -1796,6 +2058,7 @@ class InstanceManager:
                 ml_model_path=use_ml,
                 ml_min_confidence=self.ml_min_confidence,
                 pfb=self._pfb,
+                use_dispatcher=self.use_dispatcher,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
@@ -1827,6 +2090,11 @@ class InstanceManager:
             self._pfb.process(i_samples, q_samples)
         for group in list(self.instances.values()):
             group.feed_iq(i_samples, q_samples)
+        # If the C++ dispatcher is enabled, every _DispDecoder.feed_pcm call
+        # above just stashed bytes. Now drive one batched feed + drain for
+        # the whole IQ block (single C call, runs fanout in OpenMP).
+        if self.use_dispatcher:
+            _dispatcher_flush()
 
     def collect_all(self):
         """Read decoded text from all groups.
@@ -2304,6 +2572,7 @@ class OpenSkimmer:
             hamfist_scp=self.cfg.get('hamfist_scp', None),
             ml_model_path=self.cfg.get('ml_model', None),
             ml_min_confidence=float(self.cfg.get('ml_min_confidence', 0.7)),
+            use_dispatcher=bool(self.cfg.get('use_cpp_dispatcher', False)),
         )
 
         self.receiver.start()
@@ -2645,6 +2914,7 @@ def run_file_mode(args, config):
         bmorse_bin=config.get('bmorse_bin'),
         ml_model_path=config.get('ml_model'),
         ml_min_confidence=float(config.get('ml_min_confidence', 0.7)),
+        use_dispatcher=bool(config.get('use_cpp_dispatcher', False)),
     )
 
     center_khz = args.center_khz
