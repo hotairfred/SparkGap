@@ -16,11 +16,6 @@
 #include <math.h>
 #include <stdio.h>
 
-// Global output buffer (written by process_data in library mode)
-char _bmorse_outbuf[4096];
-int _bmorse_outlen = 0;
-float _bmorse_spdhat = 0;
-
 // Globals defined in bmorse_lib.cxx
 extern PARAMS params;
 extern fftfilt *FFT_filter;
@@ -68,10 +63,6 @@ bmorse_handle_t bmorse_create(float freq, float sample_rate, int wpm)
     s->proc = process_state_create();
     if (!s->proc) { delete s->filter; free(s); return NULL; }
 
-    // Clear output buffer
-    _bmorse_outlen = 0;
-    _bmorse_spdhat = 0;
-
     return (bmorse_handle_t)s;
 }
 
@@ -93,8 +84,8 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
     if (s->proc->pd_mp)
         s->proc->pd_mp->init_speed = (int)s->speed_wpm;
 
-    // Reset output buffer
-    _bmorse_outlen = 0;
+    // Reset per-handle output buffer
+    s->proc->outlen = 0;
 
     // Convert to double and call rx_FFTprocess with per-instance state
     double dbl_buf[512];
@@ -108,10 +99,10 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
     }
 
     // Copy accumulated output to caller
-    int ncopy = _bmorse_outlen;
+    int ncopy = s->proc->outlen;
     if (ncopy > outlen - 1) ncopy = outlen - 1;
     if (ncopy > 0) {
-        memcpy(out, _bmorse_outbuf, ncopy);
+        memcpy(out, s->proc->outbuf, ncopy);
         out[ncopy] = '\0';
     }
     return ncopy;
@@ -119,7 +110,9 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
 
 int bmorse_get_wpm(bmorse_handle_t h)
 {
-    return (int)(_bmorse_spdhat + 0.5f);
+    if (!h) return 0;
+    bmorse_state *s = (bmorse_state *)h;
+    return (int)(s->proc->spdhat + 0.5f);
 }
 
 void bmorse_destroy(bmorse_handle_t h)
@@ -142,3 +135,44 @@ void bmorse_destroy(bmorse_handle_t h)
 }
 
 } // extern "C"
+
+#ifdef TEST_REENTRANT
+// Two-handle re-entrancy test — compile with -DTEST_REENTRANT and link as executable
+// g++ -DTEST_REENTRANT -DLIBBMORSE_BUILD -o test_reentrant libbmorse.cpp bmorse_lib.cxx ... -lfftw3
+#include <stdio.h>
+int main()
+{
+    const float SR = 4000.0f;
+    const int   N  = 512;
+    int16_t zeros[N] = {};
+
+    bmorse_handle_t h1 = bmorse_create(700.0f, SR, 25);
+    bmorse_handle_t h2 = bmorse_create(700.0f, SR, 25);
+    if (!h1 || !h2) { fprintf(stderr, "FAIL: bmorse_create returned NULL\n"); return 1; }
+    printf("h1=%p  h2=%p\n", h1, h2);
+
+    char out1[256], out2[256];
+
+    // Feed h1 — verify no crash and independent state
+    printf("feeding h1... ");
+    int r1 = bmorse_feed(h1, zeros, N, out1, sizeof(out1));
+    printf("h1 feed: %d\n", r1);
+
+    // Feed h2 — verify no crash and h1 proc untouched
+    printf("feeding h2... ");
+    int r2 = bmorse_feed(h2, zeros, N, out2, sizeof(out2));
+    printf("h2 feed: %d\n", r2);
+
+    // Verify output buffers are independent
+    if (((bmorse_state*)h1)->proc->outlen != 0 &&
+        ((bmorse_state*)h1)->proc->outbuf == ((bmorse_state*)h2)->proc->outbuf) {
+        fprintf(stderr, "FAIL: h1 and h2 share outbuf — not re-entrant\n");
+        bmorse_destroy(h1); bmorse_destroy(h2); return 1;
+    }
+
+    bmorse_destroy(h1);
+    bmorse_destroy(h2);
+    printf("PASS\n");
+    return 0;
+}
+#endif // TEST_REENTRANT
