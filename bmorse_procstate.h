@@ -48,6 +48,11 @@ struct ProcessState {
     int        pd_pinit;    // 1 = header not yet printed
     double     pd_agc_peak;
     morse     *pd_mp;       // Bayesian Viterbi decoder — owned by this state
+
+    // --- libbmorse output (written by process_data, read by bmorse_feed) ---
+    char       outbuf[4096];
+    int        outlen;
+    float      spdhat;
 };
 
 /**

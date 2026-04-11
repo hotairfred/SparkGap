@@ -390,16 +390,13 @@ void process_data(double x)
 
 	retstat = mp->proces_(zout, rn, &xhat, &px, &elmhat, &spdhat, &imax, &pmax, buf);
 #ifdef LIBBMORSE_BUILD
-	// Library mode: accumulate output in global buffer
-	extern char _bmorse_outbuf[4096];
-	extern int _bmorse_outlen;
-	extern float _bmorse_spdhat;
+	// Library mode: accumulate output into per-handle ProcessState buffer
 	if (buf[0] != '\0') {
 		int blen = strlen(buf);
-		for (int bi = 0; bi < blen && _bmorse_outlen < 4095; bi++)
-			_bmorse_outbuf[_bmorse_outlen++] = buf[bi];
+		for (int bi = 0; bi < blen && st->outlen < 4095; bi++)
+			st->outbuf[st->outlen++] = buf[bi];
 	}
-	if (spdhat > 0) _bmorse_spdhat = spdhat;
+	if (spdhat > 0) st->spdhat = spdhat;
 #else
 	if (params.print_variables)
 		printf("\n%d\t%d\t%d\t%d\t%f\t%f\t%f\t%f\t%f\t%f",(int)retstat,(int)imax,(int)elmhat,(int)xhat,x,px,pmax,spdhat,rn,zout);
