@@ -1303,6 +1303,7 @@ static void CW_Decode(cw_decoder_t *cw)
 			// spurious element whose preceding gap >> normal inter-char space.
 			// Strip it before CodeGenFunc so it never reaches the output buffer.
 			if ((cw->cur_time >= ONE_SECOND * CW_TIMEOUT) &&
+			    (cw->times.cwspace_avg > 0) &&
 			    (cw->data_len > 0) &&
 			    (cw->data_gap[cw->data_len - 1] > (uint32_t)(cw->times.cwspace_avg * 2)))
 			{
