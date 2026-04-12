@@ -353,6 +353,13 @@ void process_data(double x)
 		if (params.speed > 0) {
 			mp->init_speed = params.speed;
 		}
+#ifdef LIBBMORSE_BUILD
+		// Option 4: seed noise estimator from shared snapshot so new channels
+		// start with a converged noise floor instead of fresh 1.f init values.
+		// bmorse_seed_noise() is a no-op if no prior instance has run yet.
+		extern void bmorse_seed_noise(morse *);
+		bmorse_seed_noise(mp);
+#endif
 		init = 0;
 	}
 

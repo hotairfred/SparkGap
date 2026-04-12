@@ -22,6 +22,41 @@ extern PARAMS params;  // still global; same-params invariant holds for all chan
 // Forward declarations of bmorse functions (ProcessState* versions)
 extern int rx_FFTprocess(ProcessState* st, const double *buf, int len);
 
+// ---------------------------------------------------------------------------
+// Option 4: shared noise-estimator seed
+//
+// The Bayesian noise_() estimator (ylong/yshort/ymavg) needs ~200 samples to
+// converge from its fresh-init state. In the old single-global-morse world,
+// every new channel inherited an already-converged noise estimate "for free"
+// because there was only one morse object. That accidental warm-start was
+// worth ~4 calls on B1 (AA3B, K5DXR, N5AW, VE7ZO, W6IWI).
+//
+// We recover it intentionally: after each bmorse_feed call, snapshot the
+// noise state from the active handle into g_noise_seed. When a new morse
+// object is created (pd_init==1 path in process_data), bmorse_lib.cxx calls
+// bmorse_seed_noise() to seed it from the snapshot.
+//
+// Thread safety: libbmorse is still called serially from the Python skimmer
+// (one bmorse_feed at a time). No mutex needed. If OpenMP parallelism is
+// added later, wrap g_noise_seed accesses with a spinlock.
+// ---------------------------------------------------------------------------
+
+static morse::NoiseSeed g_noise_seed;  // zero-initialized (valid=false)
+
+// Called from bmorse_lib.cxx right after mp = new morse() when pd_init fires.
+// Seeds the new instance's noise state from the shared snapshot.
+void bmorse_seed_noise(morse *mp)
+{
+    mp->seed_noise(g_noise_seed);
+}
+
+// Called from bmorse_feed after each processing batch. Captures the noise
+// state from the active handle into the shared snapshot.
+static void capture_noise_seed(morse *mp)
+{
+    mp->capture_noise(g_noise_seed);
+}
+
 // Internal state
 struct bmorse_state {
     float sample_rate;
@@ -95,6 +130,11 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
         rx_FFTprocess(s->proc, dbl_buf, chunk);
         pos += chunk;
     }
+
+    // Capture noise state into shared seed after each batch — new channels spawned
+    // after this point will inherit a converged noise estimate (Option 4).
+    if (s->proc->pd_mp)
+        capture_noise_seed(s->proc->pd_mp);
 
     // Speed-adaptive filter width: update fftfilt BW when detected WPM changes.
     // AG1LE formula: BW_Hz = WPM / 0.6  →  normalized f = WPM / (1.2 * sample_rate).
