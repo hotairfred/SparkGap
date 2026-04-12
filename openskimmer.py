@@ -2474,6 +2474,9 @@ class InstanceManager:
         self.center_khz = 0
         # WPM cache: freq_key -> last known WPM (survives signal eviction)
         self._wpm_cache = {}
+        # Pileup persistence tracker: centroid_bin -> {'centroid': kHz, 'passes': int, 'last': time}
+        # centroid_bin = round(freq_khz * 5) / 5  (200 Hz grid)
+        self._pileup_history = {}
         # Shared PFB channelizer — processes full-band IQ once for all signals
         self._pfb = PFBChannelizer(input_rate=sample_rate) if sample_rate == 192000 else None
         # libcw_dispatcher.so fan-out (experimental). When enabled, uhsdr
@@ -2676,67 +2679,145 @@ class InstanceManager:
                 except: pass
         self.instances.clear()
 
-    def detect_pileups(self):
-        """Detect pileup clusters — groups of 3+ active non-CQ decoders within ±500 Hz.
+    def detect_pileups(self, spotted_freqs=None):
+        """Detect confirmed pileup clusters — corrected geometry.
 
-        A pileup cluster indicates a DX station is operating below the caller
-        pile.  The centroid of the cluster is logged as the inferred DX listen
-        frequency.
+        Pileup geometry (from operating experience):
+          - DX station transmits BELOW the cluster, listens in the pileup zone
+          - Callers pile up ABOVE the DX listen frequency, spreading further upward
+            as the pileup grows
+          - The cluster FLOOR (lowest active caller) is the most stable anchor;
+            the top grows upward over time
+          - Inferred DX TX frequency = cluster floor − DX_OFFSET (typically 1-3 kHz below)
 
-        Returns list of dicts:
-            freq_khz   — centroid of pileup callers (kHz)
-            size       — number of active channels in cluster
-            snr_max    — peak SNR in cluster
-            dx_freq_khz — same as freq_khz (placeholder; DX decoding not yet implemented)
+        Filters applied in order:
+          1. Size ≥ 3 active non-CQ channels within 1 kHz span
+          2. Floor persistence: cluster floor stays within ±500 Hz between passes
+             (≤ 90 s gap).  Floor may drift upward — that's normal pileup growth.
+          3. No existing spot within ±1.5 kHz of cluster floor
+          4. Uniform cluster SNR: no member ≥ 20 dB below cluster max
+             (rejects contest QSOs where one dominant station skews the spread)
+
+        spotted_freqs: set of kHz values recently spotted by SpotTracker.
+                       Pass None to skip filter 3.
+
+        Returns list of confirmed pileup dicts:
+            floor_khz   — lowest caller frequency (kHz); closest to DX listen freq
+            top_khz     — highest caller frequency (kHz)
+            size        — number of active channels in cluster
+            snr_max     — peak SNR in cluster
+            dx_tx_khz   — inferred DX TX frequency (floor − DX_OFFSET); spawn decoder here
+            members     — list of member channel frequencies (kHz)
+            passes      — number of detection passes this cluster has persisted
         """
         now = time.time()
-        CQ_GRACE = 120.0   # seconds after last CQ before a channel is "non-CQ"
-        ACTIVE_WINDOW = 45.0  # seconds since last_seen to be considered active
-        CLUSTER_HZ = 1000.0  # total span: channels within 1000 Hz = ±500 Hz
+        CQ_GRACE        = 120.0  # s after last CQ before channel counts as non-CQ
+        ACTIVE_WIN      = 45.0   # s since last_seen to be considered active
+        CLUSTER_HZ      = 1000.0 # total span: callers within 1 kHz = typical pileup width
+        MIN_SIZE        = 3      # filter 1
+        FLOOR_DRIFT     = 0.5    # kHz — filter 2: floor may shift ≤500 Hz between passes
+        PERSIST_MAX_GAP = 90.0   # s — filter 2: max gap between passes
+        MIN_PASSES      = 2      # filter 2: passes before confirmed
+        SPOT_RADIUS     = 1.5    # kHz — filter 3: no spot within this radius of floor
+        SNR_SPREAD      = 20.0   # dB — filter 4: max spread across cluster members
+        DX_OFFSET       = 1.5    # kHz below cluster floor where DX is likely transmitting
 
-        # Gather active, non-CQ groups
+        # --- Build candidate list: active, has output, not recently CQ ---
         candidates = []
         for group in self.instances.values():
-            if now - group.last_seen > ACTIVE_WINDOW:
+            if now - group.last_seen > ACTIVE_WIN:
                 continue
             if group.total_chars == 0:
                 continue
             if group._last_cq_time > 0 and now - group._last_cq_time < CQ_GRACE:
-                continue  # recently sent CQ — skip
+                continue
             candidates.append(group)
 
-        if len(candidates) < 3:
+        # Expire stale history entries regardless
+        stale = [k for k, v in self._pileup_history.items()
+                 if now - v['last'] > PERSIST_MAX_GAP * 2]
+        for k in stale:
+            del self._pileup_history[k]
+
+        if len(candidates) < MIN_SIZE:
             return []
 
-        # Sort by RF frequency
         candidates.sort(key=lambda g: g.rf_khz)
 
-        # Sliding-window cluster detection
-        pileups = []
+        # --- Sliding-window raw cluster detection ---
+        raw_clusters = []
         i = 0
         while i < len(candidates):
-            # Extend window as long as next channel is within CLUSTER_HZ of window start
             j = i
             while j < len(candidates) and \
                   (candidates[j].rf_khz - candidates[i].rf_khz) * 1000 <= CLUSTER_HZ:
                 j += 1
             window = candidates[i:j]
-            if len(window) >= 3:
+            if len(window) >= MIN_SIZE:
                 freqs = [g.rf_khz for g in window]
-                snrs  = [g.snr   for g in window]
-                centroid = sum(freqs) / len(freqs)
-                pileups.append({
-                    'freq_khz':    centroid,
-                    'size':        len(window),
-                    'snr_max':     max(snrs),
-                    'dx_freq_khz': centroid,  # DX decoder not yet spawned
-                    'members':     freqs,
+                snrs  = [g.snr    for g in window]
+                raw_clusters.append({
+                    'floor':   min(freqs),
+                    'top':     max(freqs),
+                    'size':    len(window),
+                    'snr_max': max(snrs),
+                    'snr_min': min(snrs),
+                    'members': freqs,
                 })
-                i = j  # advance past this cluster
+                i = j
             else:
                 i += 1
 
-        return pileups
+        confirmed = []
+        for cl in raw_clusters:
+            floor = cl['floor']
+
+            # Filter 2: floor persistence — find matching history entry by floor proximity
+            matched_key = None
+            for k, entry in self._pileup_history.items():
+                if abs(entry['floor'] - floor) <= FLOOR_DRIFT:
+                    matched_key = k
+                    break
+            if matched_key is not None:
+                entry = self._pileup_history[matched_key]
+                if now - entry['last'] <= PERSIST_MAX_GAP:
+                    entry['passes'] += 1
+                    entry['last']    = now
+                    entry['floor']   = floor  # update to latest observed floor
+                else:
+                    entry['passes']  = 1
+                    entry['last']    = now
+                    entry['floor']   = floor
+            else:
+                matched_key = id(cl)
+                self._pileup_history[matched_key] = {
+                    'floor': floor, 'passes': 1, 'last': now
+                }
+
+            if self._pileup_history[matched_key]['passes'] < MIN_PASSES:
+                continue
+
+            # Filter 3: no existing spot near the cluster floor
+            if spotted_freqs:
+                if any(abs(sf - floor) <= SPOT_RADIUS for sf in spotted_freqs):
+                    continue
+
+            # Filter 4: uniform cluster SNR
+            if cl['snr_max'] - cl['snr_min'] > SNR_SPREAD:
+                continue
+
+            dx_tx = floor - DX_OFFSET
+            confirmed.append({
+                'floor_khz':  floor,
+                'top_khz':    cl['top'],
+                'size':       cl['size'],
+                'snr_max':    cl['snr_max'],
+                'dx_tx_khz':  dx_tx,
+                'members':    cl['members'],
+                'passes':     self._pileup_history[matched_key]['passes'],
+            })
+
+        return confirmed
 
     @property
     def count(self):
@@ -3650,6 +3731,7 @@ def run_file_mode(args, config):
         pileup_interval_sec = 30
         pileup_samples = int(pileup_interval_sec * file_rate)
         next_pileup_pos = pileup_samples
+        spotted_freqs = set()  # kHz values of confirmed spots — passed to detect_pileups filter 3
         for pos in range(0, len(i_data), block_size):
             if pos >= next_rescan_pos:
                 s_start = max(0, pos - scan_slice_samples)
@@ -3666,14 +3748,17 @@ def run_file_mode(args, config):
                 next_rescan_pos += rescan_samples
             if pos >= next_pileup_pos:
                 t_now = t_start + pos / file_rate
-                pileups = manager.detect_pileups()
+                pileups = manager.detect_pileups(spotted_freqs=spotted_freqs)
                 for pu in pileups:
                     members_str = ', '.join('%.1f' % f for f in pu['members'])
-                    log.info("PILEUP t=%.0fs: centroid=%.1f kHz  size=%d  snr_max=%.0f dB"
-                             "  members=[%s]",
-                             t_now, pu['freq_khz'], pu['size'], pu['snr_max'], members_str)
+                    log.info("PILEUP t=%.0fs: floor=%.1f kHz  top=%.1f kHz  size=%d"
+                             "  snr_max=%.0f dB  dx_tx=%.1f kHz  passes=%d"
+                             "  callers=[%s]",
+                             t_now, pu['floor_khz'], pu['top_khz'], pu['size'],
+                             pu['snr_max'], pu['dx_tx_khz'], pu['passes'],
+                             members_str)
                 if not pileups:
-                    log.debug("PILEUP t=%.0fs: no clusters detected", t_now)
+                    log.debug("PILEUP t=%.0fs: no confirmed clusters", t_now)
                 next_pileup_pos += pileup_samples
             i_block = i_data[pos:pos+block_size]
             q_block = q_data[pos:pos+block_size]
@@ -3688,6 +3773,7 @@ def run_file_mode(args, config):
                                         dec_type=dec_type)
                 for spot in spots:
                     all_spots.append(spot)
+                    spotted_freqs.add(spot['freq_khz'])
                     log.info("SPOT: %.1f kHz %s %d dB [%s]",
                              spot['freq_khz'], spot['call'],
                              spot['snr'], spot['method'])
