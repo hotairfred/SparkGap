@@ -2025,6 +2025,7 @@ class SignalGroup:
         self.last_output = time.time()
         self._use_dispatcher = use_dispatcher
         self._use_pfb_dispatcher = use_pfb_dispatcher
+        self._last_cq_time = 0  # timestamp of last CQ/QRZ decoded (0 = never)
 
         # Try C++ cw_engine first (owns channelization + both decoders)
         self._cw_engine = None
@@ -2407,6 +2408,11 @@ class SignalGroup:
             if text:
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
                 self.last_output = time.time()
+        # Track CQ state: if any new text contains a CQ/QRZ pattern, mark time
+        if results:
+            all_new = ' '.join(r[2] for r in results)
+            if CQ_PATTERNS.search(all_new):
+                self._last_cq_time = time.time()
         return results
 
     def kill(self):
@@ -2669,6 +2675,68 @@ class InstanceManager:
                 try: p.kill()
                 except: pass
         self.instances.clear()
+
+    def detect_pileups(self):
+        """Detect pileup clusters — groups of 3+ active non-CQ decoders within ±500 Hz.
+
+        A pileup cluster indicates a DX station is operating below the caller
+        pile.  The centroid of the cluster is logged as the inferred DX listen
+        frequency.
+
+        Returns list of dicts:
+            freq_khz   — centroid of pileup callers (kHz)
+            size       — number of active channels in cluster
+            snr_max    — peak SNR in cluster
+            dx_freq_khz — same as freq_khz (placeholder; DX decoding not yet implemented)
+        """
+        now = time.time()
+        CQ_GRACE = 120.0   # seconds after last CQ before a channel is "non-CQ"
+        ACTIVE_WINDOW = 45.0  # seconds since last_seen to be considered active
+        CLUSTER_HZ = 1000.0  # total span: channels within 1000 Hz = ±500 Hz
+
+        # Gather active, non-CQ groups
+        candidates = []
+        for group in self.instances.values():
+            if now - group.last_seen > ACTIVE_WINDOW:
+                continue
+            if group.total_chars == 0:
+                continue
+            if group._last_cq_time > 0 and now - group._last_cq_time < CQ_GRACE:
+                continue  # recently sent CQ — skip
+            candidates.append(group)
+
+        if len(candidates) < 3:
+            return []
+
+        # Sort by RF frequency
+        candidates.sort(key=lambda g: g.rf_khz)
+
+        # Sliding-window cluster detection
+        pileups = []
+        i = 0
+        while i < len(candidates):
+            # Extend window as long as next channel is within CLUSTER_HZ of window start
+            j = i
+            while j < len(candidates) and \
+                  (candidates[j].rf_khz - candidates[i].rf_khz) * 1000 <= CLUSTER_HZ:
+                j += 1
+            window = candidates[i:j]
+            if len(window) >= 3:
+                freqs = [g.rf_khz for g in window]
+                snrs  = [g.snr   for g in window]
+                centroid = sum(freqs) / len(freqs)
+                pileups.append({
+                    'freq_khz':    centroid,
+                    'size':        len(window),
+                    'snr_max':     max(snrs),
+                    'dx_freq_khz': centroid,  # DX decoder not yet spawned
+                    'members':     freqs,
+                })
+                i = j  # advance past this cluster
+            else:
+                i += 1
+
+        return pileups
 
     @property
     def count(self):
@@ -3579,6 +3647,9 @@ def run_file_mode(args, config):
         rescan_samples = int(rescan_interval_sec * file_rate)
         next_rescan_pos = rescan_samples
         scan_slice_samples = fft_size * 200  # ~8.5s matches initial scan
+        pileup_interval_sec = 30
+        pileup_samples = int(pileup_interval_sec * file_rate)
+        next_pileup_pos = pileup_samples
         for pos in range(0, len(i_data), block_size):
             if pos >= next_rescan_pos:
                 s_start = max(0, pos - scan_slice_samples)
@@ -3593,6 +3664,17 @@ def run_file_mode(args, config):
                              t_start + pos/file_rate, added,
                              len(manager.instances), len(new_clustered))
                 next_rescan_pos += rescan_samples
+            if pos >= next_pileup_pos:
+                t_now = t_start + pos / file_rate
+                pileups = manager.detect_pileups()
+                for pu in pileups:
+                    members_str = ', '.join('%.1f' % f for f in pu['members'])
+                    log.info("PILEUP t=%.0fs: centroid=%.1f kHz  size=%d  snr_max=%.0f dB"
+                             "  members=[%s]",
+                             t_now, pu['freq_khz'], pu['size'], pu['snr_max'], members_str)
+                if not pileups:
+                    log.debug("PILEUP t=%.0fs: no clusters detected", t_now)
+                next_pileup_pos += pileup_samples
             i_block = i_data[pos:pos+block_size]
             q_block = q_data[pos:pos+block_size]
             manager.feed_all_iq(i_block, q_block)
