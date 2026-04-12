@@ -2794,16 +2794,25 @@ class InstanceManager:
                     'floor': floor, 'passes': 1, 'last': now
                 }
 
-            if self._pileup_history[matched_key]['passes'] < MIN_PASSES:
+            passes = self._pileup_history[matched_key]['passes']
+            if passes < MIN_PASSES:
+                log.debug("PILEUP_DBG: floor=%.1f passes=%d < %d (need more)",
+                          floor, passes, MIN_PASSES)
                 continue
 
             # Filter 3: no existing spot near the cluster floor
             if spotted_freqs:
-                if any(abs(sf - floor) <= SPOT_RADIUS for sf in spotted_freqs):
+                blocking = [sf for sf in spotted_freqs if abs(sf - floor) <= SPOT_RADIUS]
+                if blocking:
+                    log.debug("PILEUP_DBG: floor=%.1f blocked by spot at %.1f",
+                              floor, blocking[0])
                     continue
 
             # Filter 4: uniform cluster SNR
-            if cl['snr_max'] - cl['snr_min'] > SNR_SPREAD:
+            spread = cl['snr_max'] - cl['snr_min']
+            if spread > SNR_SPREAD:
+                log.debug("PILEUP_DBG: floor=%.1f SNR spread=%.0f > %.0f (max=%d min=%d)",
+                          floor, spread, SNR_SPREAD, cl['snr_max'], cl['snr_min'])
                 continue
 
             dx_tx = floor - DX_OFFSET
