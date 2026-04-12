@@ -2679,8 +2679,14 @@ class InstanceManager:
                 except: pass
         self.instances.clear()
 
-    def detect_pileups(self, spotted_freqs=None):
+    def detect_pileups(self, spotted_freqs=None, now=None):
         """Detect confirmed pileup clusters — corrected geometry.
+
+        now: override timestamp for persistence checks. Pass the audio-file
+             simulation time (t_now) in file mode so persistence isn't
+             measured in wall-clock seconds (which run 3-4× faster than
+             audio time when processing is slow). Pass None in live mode
+             to use time.time().
 
         Pileup geometry (from operating experience):
           - DX station transmits BELOW the cluster, listens in the pileup zone
@@ -2710,12 +2716,14 @@ class InstanceManager:
             members     — list of member channel frequencies (kHz)
             passes      — number of detection passes this cluster has persisted
         """
-        now = time.time()
+        wall_now = time.time()
+        if now is None:
+            now = wall_now
         CQ_GRACE        = 120.0  # s after last CQ before channel counts as non-CQ
         ACTIVE_WIN      = 45.0   # s since last_seen to be considered active
         CLUSTER_HZ      = 1000.0 # total span: callers within 1 kHz = typical pileup width
         MIN_SIZE        = 3      # filter 1
-        FLOOR_DRIFT     = 0.5    # kHz — filter 2: floor may shift ≤500 Hz between passes
+        FLOOR_DRIFT     = 1.0    # kHz — filter 2: floor may shift ≤1 kHz between passes
         PERSIST_MAX_GAP = 90.0   # s — filter 2: max gap between passes
         MIN_PASSES      = 2      # filter 2: passes before confirmed
         SPOT_RADIUS     = 1.5    # kHz — filter 3: no spot within this radius of floor
@@ -2723,13 +2731,14 @@ class InstanceManager:
         DX_OFFSET       = 1.5    # kHz below cluster floor where DX is likely transmitting
 
         # --- Build candidate list: active, has output, not recently CQ ---
+        # Use wall_now for last_seen / _last_cq_time — those are wall-clock timestamps
         candidates = []
         for group in self.instances.values():
-            if now - group.last_seen > ACTIVE_WIN:
+            if wall_now - group.last_seen > ACTIVE_WIN:
                 continue
             if group.total_chars == 0:
                 continue
-            if group._last_cq_time > 0 and now - group._last_cq_time < CQ_GRACE:
+            if group._last_cq_time > 0 and wall_now - group._last_cq_time < CQ_GRACE:
                 continue
             candidates.append(group)
 
@@ -2767,6 +2776,15 @@ class InstanceManager:
                 i = j
             else:
                 i += 1
+
+        # Diagnostic: log every raw cluster before filtering
+        log.debug("PILEUP_RAW: %d candidates, %d raw clusters",
+                  len(candidates), len(raw_clusters))
+        for cl in raw_clusters:
+            log.debug("PILEUP_RAW: floor=%.1f top=%.1f size=%d snr=[%d..%d] members=%s",
+                      cl['floor'], cl['top'], cl['size'],
+                      cl['snr_min'], cl['snr_max'],
+                      ','.join('%.1f' % f for f in cl['members']))
 
         confirmed = []
         for cl in raw_clusters:
@@ -3757,7 +3775,7 @@ def run_file_mode(args, config):
                 next_rescan_pos += rescan_samples
             if pos >= next_pileup_pos:
                 t_now = t_start + pos / file_rate
-                pileups = manager.detect_pileups(spotted_freqs=spotted_freqs)
+                pileups = manager.detect_pileups(spotted_freqs=spotted_freqs, now=t_now)
                 for pu in pileups:
                     members_str = ', '.join('%.1f' % f for f in pu['members'])
                     log.info("PILEUP t=%.0fs: floor=%.1f kHz  top=%.1f kHz  size=%d"
