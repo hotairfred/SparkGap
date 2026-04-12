@@ -200,6 +200,25 @@ int cw_disp_get_channel_audio(cw_dispatcher_handle_t d,
                               int16_t *out,
                               int max_samples);
 
+/* ------------------------------------------------------------------------
+ * bmorse support
+ *
+ * bmorse channels share the same PFB and channel pool. libbmorse is fully
+ * re-entrant (arc-option4), so bmorse channels run under the same OpenMP
+ * parallel-for as uhsdr channels — no serial loop needed.
+ * ------------------------------------------------------------------------ */
+
+int cw_disp_set_bmorse_fir(cw_dispatcher_handle_t d,
+                           const float *taps, int n_taps);
+
+int cw_disp_add_pfb_bmorse_channel(cw_dispatcher_handle_t d,
+                                   float freq_offset_hz,
+                                   float sample_rate,
+                                   float tone_freq,
+                                   int   wpm,
+                                   float rf_khz,
+                                   float snr_db);
+
 #ifdef __cplusplus
 }
 #endif
