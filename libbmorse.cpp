@@ -99,9 +99,17 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
     // Speed-adaptive filter width: update fftfilt BW when detected WPM changes.
     // AG1LE formula: BW_Hz = WPM / 0.6  →  normalized f = WPM / (1.2 * sample_rate).
     // Hysteresis: only update when WPM shifts ≥3 from last configured value.
-    // Transition causes one overlap block (~42 ms) of mild ringing — acceptable.
+    // Warmup gate: suppress all BW updates until:
+    //   (a) pd_init==0 (morse object created — Bayesian lattice is live), AND
+    //   (b) warmup_blocks > 20 (~2.5 s at 4 kHz / 512 samples per block)
+    // This prevents spdhat thrashing during the Viterbi training period from
+    // repeatedly resetting fftfilt's overlap accumulator (pass counter).
+    s->proc->warmup_blocks++;
     float det_wpm = s->proc->spdhat;
-    if (det_wpm > 5.0f && fabsf(det_wpm - s->proc->cur_bw_wpm) >= 3.0f) {
+    if (s->proc->pd_init == 0 &&
+        s->proc->warmup_blocks > 20 &&
+        det_wpm > 5.0f &&
+        fabsf(det_wpm - s->proc->cur_bw_wpm) >= 3.0f) {
         float new_bw = det_wpm / (1.2f * s->sample_rate);
         s->proc->filter->create_lpf((double)new_bw);
         s->proc->cur_bw_wpm = det_wpm;
