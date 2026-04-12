@@ -1,0 +1,35 @@
+{
+    "callsign": "WF8Z-2",
+    "grid": "EM79sm",
+    "node_call": "SPARK-2",
+    "sdr_type": "flex",
+    "sdr_ip": "192.168.1.238",
+    "sdr_port": 4992,
+    "flex_udp_port": 7791,
+    "sample_rate": 192000,
+    "bands": [
+        7040000
+    ],
+    "cw_min_khz": 6944,
+    "cw_max_khz": 7136,
+    "signal_min_snr": 8,
+    "signal_timeout": 90,
+    "max_channels": 50,
+    "master_scp": "MASTER.SCP",
+    "add_calls": "add_calls.txt",
+    "blacklist": "blacklist.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "bmorse_bin": "/home/fred/morse-wip/src/bmorse",
+    "decoder_speeds": [
+        0,
+        15,
+        20,
+        25,
+        30
+    ],
+    "min_sightings": 1,
+    "respot_interval": 600,
+    "telnet_port": 7399,
+    "status_interval": 15,
+    "max_instances": 150
+}

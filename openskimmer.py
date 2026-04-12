@@ -40,6 +40,7 @@ import numpy as np
 from scipy.signal import decimate as scipy_decimate
 
 from hpsdr_receiver import HPSDRReceiver, discover
+from flex_iq import FlexIQReceiver
 from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('openskimmer')
@@ -2908,16 +2909,28 @@ class OpenSkimmer:
                 log.error("No HPSDR devices found")
                 return False
             device_ip = devices[0]['ip']
-        listen_port = self.cfg.get('hpsdr_listen_port', sdr_port)
-        passive = self.cfg.get('passive', False)
-        rx_filter = self.cfg.get('rx_filter', None)
-        n_rx = self.cfg.get('max_receivers', 1)
-        self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
-                                      n_receivers=n_rx, sample_rate=rx_sample_rate,
-                                      listen_port=listen_port,
-                                      passive=passive, rx_filter=rx_filter)
-        self.receiver.set_frequency(0, center)
-        self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
+        sdr_type = self.cfg.get('sdr_type', 'hpsdr')
+
+        if sdr_type == 'flex':
+            # FlexRadio DAX-IQ path — wideband I/Q over VITA-49 UDP
+            flex_port = self.cfg.get('flex_udp_port', 7791)
+            self.receiver = FlexIQReceiver(device_ip, freq_hz=int(center),
+                                           sample_rate=rx_sample_rate,
+                                           udp_port=flex_port,
+                                           control_port=sdr_port)
+            log.info("Using FlexRadio DAX-IQ receiver at %s", device_ip)
+        else:
+            # HPSDR Protocol 1 path (Red Pitaya)
+            listen_port = self.cfg.get('hpsdr_listen_port', sdr_port)
+            passive = self.cfg.get('passive', False)
+            rx_filter = self.cfg.get('rx_filter', None)
+            n_rx = self.cfg.get('max_receivers', 1)
+            self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
+                                          n_receivers=n_rx, sample_rate=rx_sample_rate,
+                                          listen_port=listen_port,
+                                          passive=passive, rx_filter=rx_filter)
+            self.receiver.set_frequency(0, center)
+            self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
 
         speeds_cfg = self.cfg.get('decoder_speeds', [0, 25, 30, 35])
         self.manager = InstanceManager(
