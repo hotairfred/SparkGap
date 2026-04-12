@@ -211,6 +211,13 @@ int cw_disp_get_channel_audio(cw_dispatcher_handle_t d,
 int cw_disp_set_bmorse_fir(cw_dispatcher_handle_t d,
                            const float *taps, int n_taps);
 
+/** Dual filter width: install narrow taps + WPM threshold.
+ *  Channels with spdhat ≤ threshold use narrow; above use wide (set by
+ *  cw_disp_set_bmorse_fir). Set threshold=0 to disable. */
+int cw_disp_set_bmorse_fir_narrow(cw_dispatcher_handle_t d,
+                                  const float *taps, int n_taps,
+                                  int threshold_wpm);
+
 int cw_disp_add_pfb_bmorse_channel(cw_dispatcher_handle_t d,
                                    float freq_offset_hz,
                                    float sample_rate,

@@ -117,7 +117,10 @@ struct cw_dispatcher_t {
 
     // Shared FIR taps used by all bmorse channels. Installed via
     // cw_disp_set_bmorse_fir. Empty == no FIR (pass-through).
-    std::vector<float>           bmorse_fir_taps;
+    // Dual filter: wide taps for fast CW (>threshold_wpm), narrow for slow/DX.
+    std::vector<float>           bmorse_fir_taps;          // wide (default)
+    std::vector<float>           bmorse_fir_taps_narrow;   // narrow (for ≤threshold_wpm)
+    int                          bmorse_fir_threshold_wpm; // 0 = single-width mode
 };
 
 extern "C" {
@@ -564,7 +567,9 @@ static void process_pfb_bmorse_channel(channel_slot_t *s,
                                        const std::complex<float> *bin_row,
                                        int n_steps,
                                        int pfb_rate,
-                                       const std::vector<float> &fir_taps)
+                                       const std::vector<float> &fir_taps_wide,
+                                       const std::vector<float> &fir_taps_narrow,
+                                       int threshold_wpm)
 {
     const float shift_hz = s->tone_freq - s->residual_hz;
     const float dphi = 2.0f * (float)M_PI * shift_hz / (float)pfb_rate;
@@ -573,7 +578,19 @@ static void process_pfb_bmorse_channel(channel_slot_t *s,
     int n_out = n_steps / dec;
     if (n_out <= 0) return;
 
+    // Dual filter width: select narrow taps for slow CW (≤threshold_wpm),
+    // wide taps for fast CW. Use wide as default until spdhat is known.
+    // SDC uses this to get better SNR on weak DX (narrow) while keeping
+    // full keying sidebands on fast contest exchanges (wide).
+    int spdhat = bmorse_get_wpm(s->bmorse);
+    const std::vector<float> &fir_taps =
+        (threshold_wpm > 0 && spdhat > 0 && spdhat <= threshold_wpm
+         && !fir_taps_narrow.empty())
+        ? fir_taps_narrow : fir_taps_wide;
+
     // Ensure FIR delay line is sized (n_taps state entries).
+    // Both narrow and wide should use the same n_taps (256) so the delay
+    // line stays valid across width switches. If they differ, resize.
     int n_taps = (int)fir_taps.size();
     if (n_taps > 0 && (int)s->fir_delay.size() != n_taps) {
         s->fir_delay.assign(n_taps, 0.0f);
@@ -695,7 +712,9 @@ int cw_disp_feed_iq(cw_dispatcher_handle_t d,
     // channels run serially (libbmorse is not thread-safe).
     std::vector<channel_slot_t*> live_uhsdr;
     std::vector<channel_slot_t*> live_bmorse;
-    std::vector<float>           fir_taps_snapshot;
+    std::vector<float>           fir_wide_snap;
+    std::vector<float>           fir_narrow_snap;
+    int                          fir_threshold_wpm;
     {
         std::lock_guard<std::mutex> lk(d->mu);
         live_uhsdr.reserve(d->max_channels);
@@ -705,9 +724,9 @@ int cw_disp_feed_iq(cw_dispatcher_handle_t d,
             if (s.kind == DEC_UHSDR)  live_uhsdr.push_back(&s);
             else if (s.kind == DEC_BMORSE) live_bmorse.push_back(&s);
         }
-        // Copy the taps out under the lock so the loop below doesn't race
-        // with a concurrent cw_disp_set_bmorse_fir call.
-        fir_taps_snapshot = d->bmorse_fir_taps;
+        fir_wide_snap     = d->bmorse_fir_taps;
+        fir_narrow_snap   = d->bmorse_fir_taps_narrow;
+        fir_threshold_wpm = d->bmorse_fir_threshold_wpm;
     }
 
     // Parallel fan-out for uhsdr channels.
@@ -734,7 +753,8 @@ int cw_disp_feed_iq(cw_dispatcher_handle_t d,
         const std::complex<float> *bin_row =
             out_c + (size_t)s->bin_idx * (size_t)out_n_steps;
         process_pfb_bmorse_channel(s, bin_row, out_n_steps, pfb_rate,
-                                   fir_taps_snapshot);
+                                   fir_wide_snap, fir_narrow_snap,
+                                   fir_threshold_wpm);
     }
 
     (void)n_chan;  // not used directly; referenced via PFB helpers
@@ -795,6 +815,27 @@ int cw_disp_set_bmorse_fir(cw_dispatcher_handle_t d,
 
     std::lock_guard<std::mutex> lk(d->mu);
     d->bmorse_fir_taps.assign(taps, taps + n_taps);
+    return 0;
+}
+
+// Dual filter width: install narrow taps and a WPM threshold.
+// Channels with spdhat ≤ threshold_wpm use narrow; above use wide.
+// Set threshold_wpm=0 to disable (single-width mode).
+int cw_disp_set_bmorse_fir_narrow(cw_dispatcher_handle_t d,
+                                  const float *taps, int n_taps,
+                                  int threshold_wpm)
+{
+    if (!d) return -1;
+    if (n_taps < 0 || n_taps > 1024) return -1;
+    if (n_taps > 0 && !taps) return -1;
+
+    std::lock_guard<std::mutex> lk(d->mu);
+    if (n_taps > 0) {
+        d->bmorse_fir_taps_narrow.assign(taps, taps + n_taps);
+    } else {
+        d->bmorse_fir_taps_narrow.clear();
+    }
+    d->bmorse_fir_threshold_wpm = threshold_wpm;
     return 0;
 }
 

@@ -1142,6 +1142,9 @@ def _get_cw_dispatcher_lib():
         _cw_disp_lib.cw_disp_add_pfb_bmorse_channel.argtypes = [
             _ct.c_void_p, _ct.c_float, _ct.c_float, _ct.c_float,
             _ct.c_int, _ct.c_float, _ct.c_float]
+        _cw_disp_lib.cw_disp_set_bmorse_fir_narrow.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_set_bmorse_fir_narrow.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_float), _ct.c_int, _ct.c_int]
     except AttributeError:
         log.warning("libcw_dispatcher.so missing v3 bmorse symbols — bmorse-in-dispatcher disabled")
 
@@ -1600,10 +1603,13 @@ _bmorse_fir_installed = False
 
 def _pfb_dispatcher_install_bmorse_fir(sample_rate=BMORSE_RATE,
                                        fir_bw_hz=400,
+                                       fir_bw_narrow_hz=200,
+                                       dual_threshold_wpm=20,
                                        n_taps=256,
                                        tone=None):
-    """Install the bandpass FIR taps used by all bmorse channels in the
-    dispatcher. Called once before the first bmorse channel is added."""
+    """Install bandpass FIR taps for bmorse channels. Dual filter width:
+    wide (fir_bw_hz, default 400) for fast CW, narrow (fir_bw_narrow_hz,
+    default 200) for slow CW/DX (≤dual_threshold_wpm). SDC-inspired."""
     global _bmorse_fir_installed
     if _bmorse_fir_installed:
         return True
@@ -1615,23 +1621,41 @@ def _pfb_dispatcher_install_bmorse_fir(sample_rate=BMORSE_RATE,
         return False
 
     from scipy.signal import firwin
-    centre = tone if tone is not None else CW_TONE
-    lo = max(50.0, centre - fir_bw_hz / 2.0)
-    hi = min(sample_rate / 2.0 - 50.0, centre + fir_bw_hz / 2.0)
-    taps = firwin(n_taps, [lo, hi], fs=sample_rate,
-                  pass_zero=False).astype(np.float32)
-
     import ctypes as _ct
+    centre = tone if tone is not None else CW_TONE
+
+    # Wide taps (fast CW, >threshold WPM)
+    lo_w = max(50.0, centre - fir_bw_hz / 2.0)
+    hi_w = min(sample_rate / 2.0 - 50.0, centre + fir_bw_hz / 2.0)
+    taps_wide = firwin(n_taps, [lo_w, hi_w], fs=sample_rate,
+                       pass_zero=False).astype(np.float32)
     rc = lib.cw_disp_set_bmorse_fir(
-        h,
-        taps.ctypes.data_as(_ct.POINTER(_ct.c_float)),
-        int(len(taps)))
+        h, taps_wide.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+        int(len(taps_wide)))
     if rc != 0:
-        log.error("cw_disp_set_bmorse_fir failed rc=%d", rc)
+        log.error("cw_disp_set_bmorse_fir (wide) failed rc=%d", rc)
         return False
+
+    # Narrow taps (slow CW/DX, ≤threshold WPM) — better SNR on weak signals
+    lo_n = max(50.0, centre - fir_bw_narrow_hz / 2.0)
+    hi_n = min(sample_rate / 2.0 - 50.0, centre + fir_bw_narrow_hz / 2.0)
+    taps_narrow = firwin(n_taps, [lo_n, hi_n], fs=sample_rate,
+                         pass_zero=False).astype(np.float32)
+    if hasattr(lib, 'cw_disp_set_bmorse_fir_narrow'):
+        rc = lib.cw_disp_set_bmorse_fir_narrow(
+            h, taps_narrow.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+            int(len(taps_narrow)), int(dual_threshold_wpm))
+        if rc != 0:
+            log.warning("cw_disp_set_bmorse_fir_narrow failed rc=%d — single-width mode", rc)
+        else:
+            log.info("Installed dual bmorse FIR: wide %.0f–%.0f Hz, narrow %.0f–%.0f Hz, "
+                     "threshold %d WPM @ %.0f Hz",
+                     lo_w, hi_w, lo_n, hi_n, dual_threshold_wpm, sample_rate)
+    else:
+        log.info("Installed bmorse FIR (single width): %d taps, %.0f–%.0f Hz @ %.0f Hz",
+                 n_taps, lo_w, hi_w, sample_rate)
+
     _bmorse_fir_installed = True
-    log.info("Installed dispatcher bmorse FIR: %d taps, %.0f–%.0f Hz @ %.0f Hz",
-             int(len(taps)), lo, hi, sample_rate)
     return True
 
 
