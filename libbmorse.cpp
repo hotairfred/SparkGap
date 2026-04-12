@@ -131,9 +131,11 @@ int bmorse_feed(bmorse_handle_t h, const int16_t *samples, int n,
         pos += chunk;
     }
 
-    // Capture noise state into shared seed after each batch — new channels spawned
-    // after this point will inherit a converged noise estimate (Option 4).
-    if (s->proc->pd_mp)
+    // Capture noise state into shared seed, but only from channels with a confirmed
+    // active signal (spdhat > 0). Idle/scanning channels with no signal would seed
+    // new instances with a noise estimate from a quiet channel, which can suppress
+    // weak calls like CY0S that decode against a slightly different noise floor.
+    if (s->proc->pd_mp && s->proc->spdhat > 0.0f)
         capture_noise_seed(s->proc->pd_mp);
 
     // Speed-adaptive filter width: update fftfilt BW when detected WPM changes.
