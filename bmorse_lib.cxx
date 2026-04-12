@@ -424,6 +424,12 @@ int rx_FFTprocess(ProcessState* st, const double *buf, int len)
 	int&    smpl_ctr = st->smpl_ctr;
 	double& FFTvalue = st->FFTvalue;
 	double& FFTphase = st->FFTphase;
+	// Per-handle frequency/dec_ratio — no longer read from global params in this path.
+	// params.frequency is still set by bmorse_feed (same-params invariant for all other
+	// fields), but for the mixing accumulator we use the per-handle copy so concurrent
+	// channels don't clobber each other's phase calculation.
+	const double h_frequency = st->frequency;
+	const int    h_dec_ratio = st->dec_ratio;
 #else
 int rx_FFTprocess(const double *buf, int len)
 {
@@ -503,7 +509,11 @@ int rx_FFTprocess(const double *buf, int len)
 	while (len-- > 0) {
 		// convert CW signal to baseband 	
 		z = complex ( *buf * cos(FFTphase), *buf * sin(FFTphase) );
+#ifdef LIBBMORSE_BUILD
+		FFTphase += TWOPI * h_frequency / params.sample_rate;
+#else
 		FFTphase += TWOPI * params.frequency / params.sample_rate;
+#endif
 		if (FFTphase > M_PI)
 			FFTphase -= TWOPI;
 		else if (FFTphase < M_PI)
@@ -526,7 +536,11 @@ int rx_FFTprocess(const double *buf, int len)
 
 	// update the basic sample counter used for morse timing
 				++smpl_ctr;
-				if (smpl_ctr % params.dec_ratio) continue; // decimate by DEC_RATIO		
+	#ifdef LIBBMORSE_BUILD
+			if (smpl_ctr % h_dec_ratio) continue; // per-handle dec_ratio
+#else
+			if (smpl_ctr % params.dec_ratio) continue; // decimate by DEC_RATIO
+#endif
 
 	// demodulate
 				FFTvalue = zp[i].mag();

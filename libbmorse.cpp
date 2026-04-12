@@ -95,7 +95,9 @@ bmorse_handle_t bmorse_create(float freq, float sample_rate, int wpm)
     // Initialize per-instance decoder state
     s->proc = process_state_create();
     if (!s->proc) { delete s->filter; free(s); return NULL; }
-    s->proc->filter = s->filter;  // rx_FFTprocess uses st->filter, not global FFT_filter
+    s->proc->filter    = s->filter;  // rx_FFTprocess uses st->filter, not global FFT_filter
+    s->proc->frequency = freq;
+    s->proc->dec_ratio = (int)(sample_rate / BAYES_RATE);
 
     return (bmorse_handle_t)s;
 }

@@ -37,6 +37,8 @@ struct ProcessState {
     int    smpl_ctr;        // sample counter for decimation
     double FFTvalue;        // envelope magnitude after filter
     double FFTphase;        // phase accumulator for baseband mixing
+    double frequency;       // per-handle tone freq (Hz) — replaces params.frequency
+    int    dec_ratio;       // per-handle decimation ratio — replaces params.dec_ratio
 
     // --- process_data() state ---
     int        pd_sample_counter;
