@@ -2528,20 +2528,36 @@ class InstanceManager:
             if abs(offset) < 100:  # skip DC
                 continue
             if len(self.instances) >= self.max_channels:
-                # Evict the lowest-SNR group if new signal is stronger
+                # Evict the lowest-SNR group if new signal is stronger.
+                # WPM-aware: protect slow/weak DX (≤20 WPM) from being
+                # bumped by fast contest stations (>20 WPM). SDC does
+                # this with pile-up spatial classification; we use WPM
+                # as a proxy since DX stations are typically slower.
                 if not self.instances:
                     break
                 weakest_key = min(self.instances, key=lambda k: self.instances[k].snr)
-                if snr <= self.instances[weakest_key].snr + 3:
-                    break  # new signal not significantly stronger, stop
+                weakest = self.instances[weakest_key]
+                incumbent_wpm = weakest.uhsdr_wpm
+
+                # Determine eviction threshold based on WPM
+                if (incumbent_wpm > 0 and incumbent_wpm <= 20):
+                    # Incumbent is slow (likely DX/CQ) — protect it.
+                    # Require 10 dB margin to evict, not the default 3.
+                    eviction_margin = 10
+                else:
+                    eviction_margin = 3  # default: challenger must be ≥3 dB stronger
+
+                if snr <= weakest.snr + eviction_margin:
+                    break  # new signal not strong enough to justify eviction
                 evicted = self.instances.pop(weakest_key)
                 # Cache WPM from evicted signal for future respawns
                 evicted_wpm = evicted.uhsdr_wpm
                 if evicted_wpm > 0:
                     self._wpm_cache[weakest_key] = evicted_wpm
-                log.info("Evicted %.1f kHz (%+.0f dB) for %.1f kHz (%+.0f dB)",
+                log.info("Evicted %.1f kHz (%+.0f dB, %d WPM) for %.1f kHz (%+.0f dB) [margin=%d]",
                          center_khz + weakest_key/1000, evicted.snr,
-                         center_khz + offset/1000, snr)
+                         evicted_wpm if evicted_wpm else 0,
+                         center_khz + offset/1000, snr, eviction_margin)
                 evicted.kill()
 
             rf_khz = center_khz + offset / 1000
