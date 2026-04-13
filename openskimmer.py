@@ -2281,16 +2281,16 @@ class SignalGroup:
         """Drop all but the best-matching uhsdr speed decoder after WPM locks in.
 
         Called from InstanceManager every ~30 s (re-scan interval).  After
-        uhsdr_wpm is stable (> 0) for two consecutive calls (≥ 60 s of audio),
-        keep only the decoder whose _spawn_wpm is closest to the locked speed
-        and kill the rest.  This reduces per-channel uhsdr instances from
-        len(speeds) (typically 7) to 1, freeing dispatcher channel slots and
-        CPU for more bands and channels.
+        uhsdr_wpm is stable (≥ 10 WPM) for two consecutive calls (≥ 60 s of
+        audio), keep only the best-matching fixed-speed decoder + the auto
+        (spawn_wpm=0) decoder, and kill the rest.  Retaining auto provides a
+        safety net if the WPM lock-in was inaccurate.
 
         No-op if:
           - already locked (self._wpm_locked)
           - decoders already pruned to ≤ 1
           - uhsdr has not yet detected a WPM (returns 0)
+          - detected WPM < 10 (noise read — reset stability counter)
         """
         if self._wpm_locked or len(self.decoders) <= 1:
             return
@@ -2298,20 +2298,24 @@ class SignalGroup:
         if wpm <= 0:
             self._wpm_stable_scans = 0
             return
+        # Reject noise-induced low WPM readings — real CW is ≥ 10 WPM.
+        if wpm < 10:
+            self._wpm_stable_scans = 0
+            return
         self._wpm_stable_scans += 1
         if self._wpm_stable_scans < 2:
             return  # wait for another scan to confirm stability
 
         # Find the decoder whose spawn WPM is closest to the locked speed.
-        # Prefer exact match; among fixed-speed decoders pick closest diff;
-        # fall back to auto (spawn_wpm=0) only if no fixed-speed decoder exists.
+        # Always keep the auto (spawn_wpm=0) decoder as a safety net alongside
+        # the best fixed-speed match — protects against bad WPM lock-in.
         best      = None
         best_diff = 9999
         auto_dec  = None
         for d in self.decoders:
             spawn = getattr(d, '_spawn_wpm', -1)
             if spawn == 0:
-                auto_dec = d   # remember auto as fallback
+                auto_dec = d   # always keep auto
                 continue
             diff = abs(spawn - wpm)
             if diff < best_diff:
@@ -2319,18 +2323,21 @@ class SignalGroup:
                 best_diff = diff
 
         if best is None:
-            best = auto_dec  # all decoders were auto — keep one
-        if best is None:
+            # All decoders were auto — nothing to prune
             return
 
-        victims = [d for d in self.decoders if d is not best]
+        # Keep best fixed-speed + auto; kill everything else.
+        keep = {best}
+        if auto_dec is not None:
+            keep.add(auto_dec)
+        victims = [d for d in self.decoders if d not in keep]
         for d in victims:
             d.kill()
-        self.decoders      = [best]
+        self.decoders      = [d for d in self.decoders if d in keep]
         self._wpm_locked   = True
-        log.info("WPM lock %.1f kHz: %d WPM detected, pruned %d decoders → 1 "
-                 "(spawn_wpm=%d)", self.rf_khz, wpm, len(victims),
-                 getattr(best, '_spawn_wpm', -1))
+        log.info("WPM lock %.1f kHz: %d WPM detected, pruned %d decoders → %d "
+                 "(spawn_wpm=%d + auto)", self.rf_khz, wpm, len(victims),
+                 len(self.decoders), getattr(best, '_spawn_wpm', -1))
 
     def feed_iq(self, i_samples, q_samples):
         # C++ cw_engine path: feed raw IQ (runs in parallel with Python)
