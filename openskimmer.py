@@ -1142,6 +1142,9 @@ def _get_cw_dispatcher_lib():
         _cw_disp_lib.cw_disp_add_pfb_bmorse_channel.argtypes = [
             _ct.c_void_p, _ct.c_float, _ct.c_float, _ct.c_float,
             _ct.c_int, _ct.c_float, _ct.c_float]
+        _cw_disp_lib.cw_disp_set_bmorse_fir_narrow.restype  = _ct.c_int
+        _cw_disp_lib.cw_disp_set_bmorse_fir_narrow.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_float), _ct.c_int, _ct.c_int]
     except AttributeError:
         log.warning("libcw_dispatcher.so missing v3 bmorse symbols — bmorse-in-dispatcher disabled")
 
@@ -1600,10 +1603,13 @@ _bmorse_fir_installed = False
 
 def _pfb_dispatcher_install_bmorse_fir(sample_rate=BMORSE_RATE,
                                        fir_bw_hz=400,
+                                       fir_bw_narrow_hz=200,
+                                       dual_threshold_wpm=20,
                                        n_taps=256,
                                        tone=None):
-    """Install the bandpass FIR taps used by all bmorse channels in the
-    dispatcher. Called once before the first bmorse channel is added."""
+    """Install bandpass FIR taps for bmorse channels. Dual filter width:
+    wide (fir_bw_hz, default 400) for fast CW, narrow (fir_bw_narrow_hz,
+    default 200) for slow CW/DX (≤dual_threshold_wpm). SDC-inspired."""
     global _bmorse_fir_installed
     if _bmorse_fir_installed:
         return True
@@ -1615,23 +1621,41 @@ def _pfb_dispatcher_install_bmorse_fir(sample_rate=BMORSE_RATE,
         return False
 
     from scipy.signal import firwin
-    centre = tone if tone is not None else CW_TONE
-    lo = max(50.0, centre - fir_bw_hz / 2.0)
-    hi = min(sample_rate / 2.0 - 50.0, centre + fir_bw_hz / 2.0)
-    taps = firwin(n_taps, [lo, hi], fs=sample_rate,
-                  pass_zero=False).astype(np.float32)
-
     import ctypes as _ct
+    centre = tone if tone is not None else CW_TONE
+
+    # Wide taps (fast CW, >threshold WPM)
+    lo_w = max(50.0, centre - fir_bw_hz / 2.0)
+    hi_w = min(sample_rate / 2.0 - 50.0, centre + fir_bw_hz / 2.0)
+    taps_wide = firwin(n_taps, [lo_w, hi_w], fs=sample_rate,
+                       pass_zero=False).astype(np.float32)
     rc = lib.cw_disp_set_bmorse_fir(
-        h,
-        taps.ctypes.data_as(_ct.POINTER(_ct.c_float)),
-        int(len(taps)))
+        h, taps_wide.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+        int(len(taps_wide)))
     if rc != 0:
-        log.error("cw_disp_set_bmorse_fir failed rc=%d", rc)
+        log.error("cw_disp_set_bmorse_fir (wide) failed rc=%d", rc)
         return False
+
+    # Narrow taps (slow CW/DX, ≤threshold WPM) — better SNR on weak signals
+    lo_n = max(50.0, centre - fir_bw_narrow_hz / 2.0)
+    hi_n = min(sample_rate / 2.0 - 50.0, centre + fir_bw_narrow_hz / 2.0)
+    taps_narrow = firwin(n_taps, [lo_n, hi_n], fs=sample_rate,
+                         pass_zero=False).astype(np.float32)
+    if hasattr(lib, 'cw_disp_set_bmorse_fir_narrow'):
+        rc = lib.cw_disp_set_bmorse_fir_narrow(
+            h, taps_narrow.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+            int(len(taps_narrow)), int(dual_threshold_wpm))
+        if rc != 0:
+            log.warning("cw_disp_set_bmorse_fir_narrow failed rc=%d — single-width mode", rc)
+        else:
+            log.info("Installed dual bmorse FIR: wide %.0f–%.0f Hz, narrow %.0f–%.0f Hz, "
+                     "threshold %d WPM @ %.0f Hz",
+                     lo_w, hi_w, lo_n, hi_n, dual_threshold_wpm, sample_rate)
+    else:
+        log.info("Installed bmorse FIR (single width): %d taps, %.0f–%.0f Hz @ %.0f Hz",
+                 n_taps, lo_w, hi_w, sample_rate)
+
     _bmorse_fir_installed = True
-    log.info("Installed dispatcher bmorse FIR: %d taps, %.0f–%.0f Hz @ %.0f Hz",
-             int(len(taps)), lo, hi, sample_rate)
     return True
 
 
@@ -2001,6 +2025,7 @@ class SignalGroup:
         self.last_output = time.time()
         self._use_dispatcher = use_dispatcher
         self._use_pfb_dispatcher = use_pfb_dispatcher
+        self._last_cq_time = 0  # timestamp of last CQ/QRZ decoded (0 = never)
 
         # Try C++ cw_engine first (owns channelization + both decoders)
         self._cw_engine = None
@@ -2383,6 +2408,11 @@ class SignalGroup:
             if text:
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
                 self.last_output = time.time()
+        # Track CQ state: if any new text contains a CQ/QRZ pattern, mark time
+        if results:
+            all_new = ' '.join(r[2] for r in results)
+            if CQ_PATTERNS.search(all_new):
+                self._last_cq_time = time.time()
         return results
 
     def kill(self):
@@ -2444,6 +2474,9 @@ class InstanceManager:
         self.center_khz = 0
         # WPM cache: freq_key -> last known WPM (survives signal eviction)
         self._wpm_cache = {}
+        # Pileup persistence tracker: centroid_bin -> {'centroid': kHz, 'passes': int, 'last': time}
+        # centroid_bin = round(freq_khz * 5) / 5  (200 Hz grid)
+        self._pileup_history = {}
         # Shared PFB channelizer — processes full-band IQ once for all signals
         self._pfb = PFBChannelizer(input_rate=sample_rate) if sample_rate == 192000 else None
         # libcw_dispatcher.so fan-out (experimental). When enabled, uhsdr
@@ -2645,6 +2678,203 @@ class InstanceManager:
                 try: p.kill()
                 except: pass
         self.instances.clear()
+
+    def detect_pileups(self, spotted_freqs=None, now=None):
+        """Detect confirmed pileup clusters — corrected geometry.
+
+        now: override timestamp for persistence checks. Pass the audio-file
+             simulation time (t_now) in file mode so persistence isn't
+             measured in wall-clock seconds (which run 3-4× faster than
+             audio time when processing is slow). Pass None in live mode
+             to use time.time().
+
+        Pileup geometry (from operating experience):
+          - DX station transmits BELOW the cluster, listens in the pileup zone
+          - Callers pile up ABOVE the DX listen frequency, spreading further upward
+            as the pileup grows
+          - The cluster FLOOR (lowest active caller) is the most stable anchor;
+            the top grows upward over time
+          - Inferred DX TX frequency = cluster floor − DX_OFFSET (typically 1-3 kHz below)
+
+        Filters applied in order:
+          1. Size ≥ 3 active non-CQ channels within 1 kHz span
+          1b. Digital mode exclusion: cluster floor not within ±2 kHz of a known
+              FT8/FT4 frequency (160m–6m). These produce tight non-CQ clusters
+              that pass all other filters.
+          2. Floor persistence: cluster floor stays within ±500 Hz between passes
+             (≤ 90 s gap).  Floor may drift upward — that's normal pileup growth.
+          3. No existing spot within ±1.5 kHz of cluster floor
+          4. Uniform cluster SNR: no member ≥ 20 dB below cluster max
+             (rejects contest QSOs where one dominant station skews the spread)
+
+        spotted_freqs: set of kHz values recently spotted by SpotTracker.
+                       Pass None to skip filter 3.
+
+        Returns list of confirmed pileup dicts:
+            floor_khz   — lowest caller frequency (kHz); closest to DX listen freq
+            top_khz     — highest caller frequency (kHz)
+            size        — number of active channels in cluster
+            snr_max     — peak SNR in cluster
+            dx_tx_khz   — inferred DX TX frequency (floor − DX_OFFSET); spawn decoder here
+            members     — list of member channel frequencies (kHz)
+            passes      — number of detection passes this cluster has persisted
+        """
+        wall_now = time.time()
+        if now is None:
+            now = wall_now
+        CQ_GRACE        = 120.0  # s after last CQ before channel counts as non-CQ
+        ACTIVE_WIN      = 45.0   # s since last_seen to be considered active
+        CLUSTER_HZ      = 1000.0 # total span: callers within 1 kHz = typical pileup width
+        MIN_SIZE        = 3      # filter 1
+        FLOOR_DRIFT     = 1.0    # kHz — filter 2: floor may shift ≤1 kHz between passes
+        PERSIST_MAX_GAP = 90.0   # s — filter 2: max gap between passes
+        MIN_PASSES      = 2      # filter 2: passes before confirmed
+        SPOT_RADIUS     = 1.5    # kHz — filter 3: no spot within this radius of floor
+        SNR_SPREAD      = 20.0   # dB — filter 4: max spread across cluster members
+        DX_OFFSET       = 1.5    # kHz below cluster floor where DX is likely transmitting
+
+        # --- Build candidate list: active, has output, not recently CQ ---
+        # Use wall_now for last_seen / _last_cq_time — those are wall-clock timestamps
+        candidates = []
+        for group in self.instances.values():
+            if wall_now - group.last_seen > ACTIVE_WIN:
+                continue
+            if group.total_chars == 0:
+                continue
+            if group._last_cq_time > 0 and wall_now - group._last_cq_time < CQ_GRACE:
+                continue
+            candidates.append(group)
+
+        # Expire stale history entries regardless
+        stale = [k for k, v in self._pileup_history.items()
+                 if now - v['last'] > PERSIST_MAX_GAP * 2]
+        for k in stale:
+            del self._pileup_history[k]
+
+        if len(candidates) < MIN_SIZE:
+            return []
+
+        candidates.sort(key=lambda g: g.rf_khz)
+
+        # --- Sliding-window raw cluster detection ---
+        raw_clusters = []
+        i = 0
+        while i < len(candidates):
+            j = i
+            while j < len(candidates) and \
+                  (candidates[j].rf_khz - candidates[i].rf_khz) * 1000 <= CLUSTER_HZ:
+                j += 1
+            window = candidates[i:j]
+            if len(window) >= MIN_SIZE:
+                freqs = [g.rf_khz for g in window]
+                snrs  = [g.snr    for g in window]
+                raw_clusters.append({
+                    'floor':   min(freqs),
+                    'top':     max(freqs),
+                    'size':    len(window),
+                    'snr_max': max(snrs),
+                    'snr_min': min(snrs),
+                    'members': freqs,
+                })
+                i = j
+            else:
+                i += 1
+
+        # Diagnostic: log every raw cluster before filtering
+        log.debug("PILEUP_RAW: %d candidates, %d raw clusters",
+                  len(candidates), len(raw_clusters))
+        for cl in raw_clusters:
+            log.debug("PILEUP_RAW: floor=%.1f top=%.1f size=%d snr=[%d..%d] members=%s",
+                      cl['floor'], cl['top'], cl['size'],
+                      cl['snr_min'], cl['snr_max'],
+                      ','.join('%.1f' % f for f in cl['members']))
+
+        # Digital mode exclusion zones — ±2 kHz around known FT8/FT4 frequencies.
+        # These produce tight clusters of non-CQ signals that pass all other filters.
+        DIGITAL_EXCL_KHZ = [
+            1840.0,   # 160m FT8
+            3573.0,   # 80m FT8
+            7047.0,   # 40m FT4
+            7074.0,   # 40m FT8
+            10136.0,  # 30m FT8
+            14074.0,  # 20m FT8
+            14080.0,  # 20m FT4
+            18100.0,  # 17m FT8
+            21074.0,  # 15m FT8
+            24915.0,  # 12m FT8
+            28074.0,  # 10m FT8
+            28180.0,  # 10m FT4
+            50313.0,  # 6m FT8
+        ]
+        DIGITAL_EXCL_RADIUS = 2.0  # kHz
+
+        confirmed = []
+        for cl in raw_clusters:
+            floor = cl['floor']
+
+            # Filter 1b: reject clusters near known digital mode frequencies
+            excl_hit = next((f for f in DIGITAL_EXCL_KHZ
+                             if abs(floor - f) <= DIGITAL_EXCL_RADIUS), None)
+            if excl_hit is not None:
+                log.debug("PILEUP_DBG: floor=%.1f excluded — within %.1f kHz of digital freq %.1f",
+                          floor, abs(floor - excl_hit), excl_hit)
+                continue
+
+            # Filter 2: floor persistence — find matching history entry by floor proximity
+            matched_key = None
+            for k, entry in self._pileup_history.items():
+                if abs(entry['floor'] - floor) <= FLOOR_DRIFT:
+                    matched_key = k
+                    break
+            if matched_key is not None:
+                entry = self._pileup_history[matched_key]
+                if now - entry['last'] <= PERSIST_MAX_GAP:
+                    entry['passes'] += 1
+                    entry['last']    = now
+                    entry['floor']   = floor  # update to latest observed floor
+                else:
+                    entry['passes']  = 1
+                    entry['last']    = now
+                    entry['floor']   = floor
+            else:
+                matched_key = id(cl)
+                self._pileup_history[matched_key] = {
+                    'floor': floor, 'passes': 1, 'last': now
+                }
+
+            passes = self._pileup_history[matched_key]['passes']
+            if passes < MIN_PASSES:
+                log.debug("PILEUP_DBG: floor=%.1f passes=%d < %d (need more)",
+                          floor, passes, MIN_PASSES)
+                continue
+
+            # Filter 3: no existing spot near the cluster floor
+            if spotted_freqs:
+                blocking = [sf for sf in spotted_freqs if abs(sf - floor) <= SPOT_RADIUS]
+                if blocking:
+                    log.debug("PILEUP_DBG: floor=%.1f blocked by spot at %.1f",
+                              floor, blocking[0])
+                    continue
+
+            # Filter 4: uniform cluster SNR
+            spread = cl['snr_max'] - cl['snr_min']
+            if spread > SNR_SPREAD:
+                log.debug("PILEUP_DBG: floor=%.1f SNR spread=%.0f > %.0f (max=%d min=%d)",
+                          floor, spread, SNR_SPREAD, cl['snr_max'], cl['snr_min'])
+                continue
+
+            dx_tx = floor - DX_OFFSET
+            confirmed.append({
+                'floor_khz':  floor,
+                'top_khz':    cl['top'],
+                'size':       cl['size'],
+                'snr_max':    cl['snr_max'],
+                'dx_tx_khz':  dx_tx,
+                'members':    cl['members'],
+                'passes':     self._pileup_history[matched_key]['passes'],
+            })
+
+        return confirmed
 
     @property
     def count(self):
@@ -3555,6 +3785,10 @@ def run_file_mode(args, config):
         rescan_samples = int(rescan_interval_sec * file_rate)
         next_rescan_pos = rescan_samples
         scan_slice_samples = fft_size * 200  # ~8.5s matches initial scan
+        pileup_interval_sec = 30
+        pileup_samples = int(pileup_interval_sec * file_rate)
+        next_pileup_pos = pileup_samples
+        spotted_freqs = set()  # kHz values of confirmed spots — passed to detect_pileups filter 3
         for pos in range(0, len(i_data), block_size):
             if pos >= next_rescan_pos:
                 s_start = max(0, pos - scan_slice_samples)
@@ -3569,6 +3803,20 @@ def run_file_mode(args, config):
                              t_start + pos/file_rate, added,
                              len(manager.instances), len(new_clustered))
                 next_rescan_pos += rescan_samples
+            if pos >= next_pileup_pos:
+                t_now = t_start + pos / file_rate
+                pileups = manager.detect_pileups(spotted_freqs=spotted_freqs, now=t_now)
+                for pu in pileups:
+                    members_str = ', '.join('%.1f' % f for f in pu['members'])
+                    log.info("PILEUP t=%.0fs: floor=%.1f kHz  top=%.1f kHz  size=%d"
+                             "  snr_max=%.0f dB  dx_tx=%.1f kHz  passes=%d"
+                             "  callers=[%s]",
+                             t_now, pu['floor_khz'], pu['top_khz'], pu['size'],
+                             pu['snr_max'], pu['dx_tx_khz'], pu['passes'],
+                             members_str)
+                if not pileups:
+                    log.debug("PILEUP t=%.0fs: no confirmed clusters", t_now)
+                next_pileup_pos += pileup_samples
             i_block = i_data[pos:pos+block_size]
             q_block = q_data[pos:pos+block_size]
             manager.feed_all_iq(i_block, q_block)
@@ -3582,6 +3830,7 @@ def run_file_mode(args, config):
                                         dec_type=dec_type)
                 for spot in spots:
                     all_spots.append(spot)
+                    spotted_freqs.add(spot['freq_khz'])
                     log.info("SPOT: %.1f kHz %s %d dB [%s]",
                              spot['freq_khz'], spot['call'],
                              spot['snr'], spot['method'])
