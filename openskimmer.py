@@ -2698,6 +2698,9 @@ class InstanceManager:
 
         Filters applied in order:
           1. Size ≥ 3 active non-CQ channels within 1 kHz span
+          1b. Digital mode exclusion: cluster floor not within ±2 kHz of a known
+              FT8/FT4 frequency (160m–6m). These produce tight non-CQ clusters
+              that pass all other filters.
           2. Floor persistence: cluster floor stays within ±500 Hz between passes
              (≤ 90 s gap).  Floor may drift upward — that's normal pileup growth.
           3. No existing spot within ±1.5 kHz of cluster floor
@@ -2786,9 +2789,36 @@ class InstanceManager:
                       cl['snr_min'], cl['snr_max'],
                       ','.join('%.1f' % f for f in cl['members']))
 
+        # Digital mode exclusion zones — ±2 kHz around known FT8/FT4 frequencies.
+        # These produce tight clusters of non-CQ signals that pass all other filters.
+        DIGITAL_EXCL_KHZ = [
+            1840.0,   # 160m FT8
+            3573.0,   # 80m FT8
+            7047.0,   # 40m FT4
+            7074.0,   # 40m FT8
+            10136.0,  # 30m FT8
+            14074.0,  # 20m FT8
+            14080.0,  # 20m FT4
+            18100.0,  # 17m FT8
+            21074.0,  # 15m FT8
+            24915.0,  # 12m FT8
+            28074.0,  # 10m FT8
+            28180.0,  # 10m FT4
+            50313.0,  # 6m FT8
+        ]
+        DIGITAL_EXCL_RADIUS = 2.0  # kHz
+
         confirmed = []
         for cl in raw_clusters:
             floor = cl['floor']
+
+            # Filter 1b: reject clusters near known digital mode frequencies
+            excl_hit = next((f for f in DIGITAL_EXCL_KHZ
+                             if abs(floor - f) <= DIGITAL_EXCL_RADIUS), None)
+            if excl_hit is not None:
+                log.debug("PILEUP_DBG: floor=%.1f excluded — within %.1f kHz of digital freq %.1f",
+                          floor, abs(floor - excl_hit), excl_hit)
+                continue
 
             # Filter 2: floor persistence — find matching history entry by floor proximity
             matched_key = None
