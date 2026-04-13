@@ -993,6 +993,7 @@ class _LibDecoder:
         self.total_chars = 0
         self.last_output = time.time()
         self.detected_wpm = 0
+        self._spawn_wpm   = wpm   # WPM this instance was created with (0=auto)
         self._outbuf = _ct.create_string_buffer(4096)
         self._pending = ''
 
@@ -1406,6 +1407,7 @@ class _PFBDispDecoder:
         self.last_output  = time.time()
         self.detected_wpm = 0
         self._pending     = ''
+        self._spawn_wpm   = wpm   # WPM this instance was created with (0=auto)
 
         lib = _get_cw_dispatcher_lib()
         h = _get_cw_dispatcher_handle() if lib else None
@@ -2113,6 +2115,7 @@ class SignalGroup:
                     if spd > 0:
                         cmd += ['-s', str(spd)]
                     dec = _SubprocessDecoder(rf_khz, snr, cmd, capture_wpm=True)
+                dec._spawn_wpm = spd  # tag all paths uniformly (overrides _LibDecoder default)
                 self.decoders.append(dec)
             # Tell the v2 _PFBDispChannel which channel to pull audio from
             # for pitch detection (the first successfully-registered decoder).
@@ -2126,6 +2129,11 @@ class SignalGroup:
         self.bmorse = None
         self.hamfist = None
         self._secondary_decoders = []  # uhsdr instances for co-channel secondary pitches
+
+        # WPM speed lock-in: after two consecutive scans with uhsdr_wpm > 0,
+        # prune all but the best-matching speed instance to free channel slots.
+        self._wpm_locked       = False
+        self._wpm_stable_scans = 0
         self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path, min_confidence=ml_min_confidence) if ml_model_path else None
 
     @property
@@ -2141,6 +2149,9 @@ class SignalGroup:
             for d in self.decoders:
                 d.kill()
             self.decoders = []
+            # Reset WPM lock — respawn restores all speed instances
+            self._wpm_locked       = False
+            self._wpm_stable_scans = 0
             lib = _get_uhsdr_lib()
             for spd in self._speeds:
                 if self._use_pfb_dispatcher:
@@ -2162,6 +2173,7 @@ class SignalGroup:
                     if spd > 0:
                         cmd += ['-s', str(spd)]
                     dec = _SubprocessDecoder(self.rf_khz, self.snr, cmd, capture_wpm=True)
+                dec._spawn_wpm = spd
                 self.decoders.append(dec)
             log.info("Respawned uhsdr at pitch=%d Hz for %.1f kHz", pitch, self.rf_khz)
 
@@ -2264,6 +2276,68 @@ class SignalGroup:
             if d.detected_wpm > 0:
                 return d.detected_wpm
         return 0
+
+    def prune_to_locked_speed(self):
+        """Drop all but the best-matching uhsdr speed decoder after WPM locks in.
+
+        Called from InstanceManager every ~30 s (re-scan interval).  After
+        uhsdr_wpm is stable (≥ 10 WPM) for two consecutive calls (≥ 60 s of
+        audio), keep only the best-matching fixed-speed decoder + the auto
+        (spawn_wpm=0) decoder, and kill the rest.  Retaining auto provides a
+        safety net if the WPM lock-in was inaccurate.
+
+        No-op if:
+          - already locked (self._wpm_locked)
+          - decoders already pruned to ≤ 1
+          - uhsdr has not yet detected a WPM (returns 0)
+          - detected WPM < 10 (noise read — reset stability counter)
+        """
+        if self._wpm_locked or len(self.decoders) <= 1:
+            return
+        wpm = self.uhsdr_wpm
+        if wpm <= 0:
+            self._wpm_stable_scans = 0
+            return
+        # Reject noise-induced low WPM readings — real CW is ≥ 10 WPM.
+        if wpm < 10:
+            self._wpm_stable_scans = 0
+            return
+        self._wpm_stable_scans += 1
+        if self._wpm_stable_scans < 2:
+            return  # wait for another scan to confirm stability
+
+        # Find the decoder whose spawn WPM is closest to the locked speed.
+        # Always keep the auto (spawn_wpm=0) decoder as a safety net alongside
+        # the best fixed-speed match — protects against bad WPM lock-in.
+        best      = None
+        best_diff = 9999
+        auto_dec  = None
+        for d in self.decoders:
+            spawn = getattr(d, '_spawn_wpm', -1)
+            if spawn == 0:
+                auto_dec = d   # always keep auto
+                continue
+            diff = abs(spawn - wpm)
+            if diff < best_diff:
+                best      = d
+                best_diff = diff
+
+        if best is None:
+            # All decoders were auto — nothing to prune
+            return
+
+        # Keep best fixed-speed + auto; kill everything else.
+        keep = {best}
+        if auto_dec is not None:
+            keep.add(auto_dec)
+        victims = [d for d in self.decoders if d not in keep]
+        for d in victims:
+            d.kill()
+        self.decoders      = [d for d in self.decoders if d in keep]
+        self._wpm_locked   = True
+        log.info("WPM lock %.1f kHz: %d WPM detected, pruned %d decoders → %d "
+                 "(spawn_wpm=%d + auto)", self.rf_khz, wpm, len(victims),
+                 len(self.decoders), getattr(best, '_spawn_wpm', -1))
 
     def feed_iq(self, i_samples, q_samples):
         # C++ cw_engine path: feed raw IQ (runs in parallel with Python)
@@ -2603,6 +2677,12 @@ class InstanceManager:
             log.info("Killed %d decoders: %.1f kHz (%d chars total)",
                      group.count, group.rf_khz, group.total_chars)
             group.kill()
+
+        # WPM speed lock-in: prune redundant uhsdr speed instances once WPM is stable.
+        # Each surviving group that has locked WPM goes from len(speeds) decoders → 1,
+        # freeing dispatcher channel slots for new signals.
+        for group in self.instances.values():
+            group.prune_to_locked_speed()
 
     def feed_all_iq(self, i_samples, q_samples):
         """Feed IQ to all SignalGroups — each runs its shared channelizer."""
