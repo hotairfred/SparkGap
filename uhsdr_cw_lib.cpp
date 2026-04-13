@@ -175,6 +175,13 @@ struct cw_decoder_t {
     bool processed;
     int training_interval;
 
+    // CW-specific AGC hang + decay (SDC-inspired AGC_CW_Hang / AGC_CW_Decay).
+    // After CW_mag drops below CW_env, hold CW_env for agc_hang_blocks before
+    // decaying. Prevents AGC pumping between CW elements (dot/dash/gap).
+    uint32_t agc_hang_count;       // blocks since signal dropped below envelope
+    uint32_t agc_hang_blocks;      // configured hang duration (0 = disabled, use legacy)
+    float32_t agc_decay_weight;    // decay weight after hang expires (0 = use legacy)
+
     // Library API additions
     float sample_rate_hz;          // Per-instance sample rate (replaces global snd_rate)
     char outbuf[1024];             // Accumulated decoded text
@@ -454,14 +461,24 @@ static void CW_Decode_exe(cw_decoder_t *cw)
 	{
         cw->CW_mag = siglevel;
 
-        cw->CW_env = decayavg(
-                        cw->CW_env,     // average
-                        cw->CW_mag,     // input
-                        (cw->CW_mag > cw->CW_env)?      // weight
-                            (cw->weight_linear /1000 / 4)   // (CW_ONE_BIT_SAMPLE_COUNT / 4)
-                        :
-                            (cw->weight_linear /1000 * 16)  // (CW_ONE_BIT_SAMPLE_COUNT * 16)
-                    );
+        if (cw->CW_mag > cw->CW_env) {
+            // Signal appearing — fast attack (unchanged)
+            cw->CW_env = decayavg(cw->CW_env, cw->CW_mag,
+                                  cw->weight_linear / 1000 / 4);
+            cw->agc_hang_count = 0;  // reset hang timer
+        } else if (cw->agc_hang_blocks > 0 && cw->agc_hang_count < cw->agc_hang_blocks) {
+            // Signal gone but within hang window — hold envelope steady.
+            // This prevents AGC pumping between CW elements (SDC AGC_CW_Hang).
+            cw->agc_hang_count++;
+            // CW_env unchanged — frozen at its current level
+        } else {
+            // Signal gone, hang expired — decay with configured weight.
+            // SDC AGC_CW_Decay controls how fast the envelope drops after hang.
+            float32_t decay_w = (cw->agc_decay_weight > 0)
+                ? cw->agc_decay_weight
+                : (float32_t)(cw->weight_linear / 1000 * 16);  // legacy default
+            cw->CW_env = decayavg(cw->CW_env, cw->CW_mag, (int)decay_w);
+        }
 
         cw->CW_noise = decayavg(
                             cw->CW_noise,   // average
@@ -1372,6 +1389,14 @@ uhsdr_handle_t uhsdr_init(float freq, float sample_rate, int wpm)
     src->isAutoThreshold = true;
     src->weight_linear = AUTO_WEIGHT_LINEAR;
     src->threshold_linear = 500;
+
+    // CW-specific AGC hang + decay defaults (SDC-inspired).
+    // hang = ~60 ms (one dot at 20 WPM) → holds envelope steady between elements.
+    // At 12 kHz / blocksize 32 = 375 blocks/sec → 60 ms ≈ 22 blocks.
+    // decay_weight = 0 → use legacy weight_linear/1000*16 = 256.
+    src->agc_hang_count = 0;
+    src->agc_hang_blocks = (uint32_t)(sample_rate / 32.0f * 0.060f);  // ~22 at 12 kHz
+    src->agc_decay_weight = 0;  // 0 = use legacy
 
     // Copy to heap-allocated instance
     cw_decoder_t *cw = (cw_decoder_t *)malloc(sizeof(cw_decoder_t));
