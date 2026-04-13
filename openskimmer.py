@@ -2370,43 +2370,38 @@ class SignalGroup:
         return []
 
     def read(self):
-        """Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type)."""
+        """Returns list of (rf_khz, snr, new_text, accumulated_text, dec_id, dec_type, wpm)."""
         results = []
         if self._cw_engine:
-            # Read text from each C++ decoder → feed into SpotTracker
             for di in range(self._cw_engine.decoder_count):
                 text, wpm, speed = self._cw_engine.read_decoder_text(di)
                 if text:
-                    # Accumulate per-decoder text for SpotTracker context
                     acc = self._cw_engine._accumulated
                     acc[di] = acc.get(di, '') + text
-                    dec_type = 'primary'  # all uhsdr speeds are primary
+                    dec_type = 'primary'
                     dec_id = id(self._cw_engine) + di
-                    results.append((self.rf_khz, self.snr, text, acc[di], dec_id, dec_type))
+                    results.append((self.rf_khz, self.snr, text, acc[di], dec_id, dec_type, wpm))
                     self.last_output = time.time()
-            # Fall through to also collect Python decoder output
         for d in self.decoders:
             text = d.read()
             if text:
-                # Suppress uhsdr output before pitch respawn — pre-respawn
-                # output is noise from wrong pitch that generates false positives
                 if not self._bmorse_started:
-                    continue  # pitch not confirmed yet, discard
-                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
+                    continue
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary', d.detected_wpm))
                 self.last_output = time.time()
         for d in self._secondary_decoders:
             text = d.read()
             if text:
                 if not self._bmorse_started:
                     continue
-                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary'))
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'primary', d.detected_wpm))
                 self.last_output = time.time()
         for d in ([self.bmorse] if self.bmorse else []) + \
                  ([self.hamfist] if self.hamfist else []) + \
                  ([self._bmorse_fallback] if self._bmorse_fallback else []):
             text = d.read()
             if text:
-                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary'))
+                results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary', d.detected_wpm))
                 self.last_output = time.time()
         # Track CQ state: if any new text contains a CQ/QRZ pattern, mark time
         if results:
@@ -2983,7 +2978,7 @@ class SpotTracker:
         return prev[-1]
 
     def process(self, freq_khz, snr, text, context_text=None, decoder_id=0,
-                dec_type='primary'):
+                dec_type='primary', wpm=0):
         """Process decoded text. Returns list of spot dicts.
 
         text: new text fragment (1-2 chars in streaming mode)
@@ -2991,6 +2986,7 @@ class SpotTracker:
         dec_type: 'primary' (uhsdr) or 'secondary' (bmorse/hamfist).
             Secondary decoders only contribute at frequencies where no primary
             decoder has produced an exact SCP match.
+        wpm: decoder-estimated WPM (0 = unknown). Carried through to spot dict.
         """
         # Track processed length per (frequency, decoder_id) to avoid re-processing.
         # decoder_id is id(d) from SignalGroup.read() — stable for the decoder's
@@ -3054,6 +3050,7 @@ class SpotTracker:
                             'call': call,
                             'freq_khz': freq_khz,
                             'snr': snr,
+                            'wpm': wpm,
                             'method': 'exact',
                         })
 
@@ -3084,6 +3081,7 @@ class SpotTracker:
                             'call': frag,
                             'freq_khz': freq_khz,
                             'snr': snr,
+                            'wpm': wpm,
                             'method': 'exact_window',
                         })
 
@@ -3160,6 +3158,7 @@ class SpotTracker:
                                 'call': consensus_str,
                                 'freq_khz': freq_khz,
                                 'snr': snr,
+                                'wpm': wpm,
                                 'method': f'consensus(n={len(frag_list)},conf={avg_confidence:.0%})',
                             })
                             log.info("Consensus: %s (n=%d, %.0f%% conf) @ %.1f kHz",
@@ -3182,6 +3181,7 @@ class SpotTracker:
                                     'call': best_call,
                                     'freq_khz': freq_khz,
                                     'snr': snr,
+                                    'wpm': wpm,
                                     'method': f'fuzzy_consensus(d={best_dist},n={len(frag_list)},conf={avg_confidence:.0%})',
                                 })
                                 log.info("Fuzzy consensus: '%s' → %s (d=%d, n=%d, %.0f%%)",
@@ -3480,7 +3480,7 @@ class OpenSkimmer:
 
             # Collect all decoder output (C++ engine + Python fallback)
             results = self.manager.collect_all()
-            for rf_khz, snr, text, ctx, dec_id, dec_type in results:
+            for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
                 log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
                 # Skip pure noise until enough alphanumeric chars have accumulated
                 # for a callsign to be present. Streaming decoders (fldigi_cw)
@@ -3490,7 +3490,7 @@ class OpenSkimmer:
                 if len(alnum) < 4:
                     continue
                 spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                             dec_type=dec_type)
+                                             dec_type=dec_type, wpm=wpm)
                 for spot in spots:
                     self.spot_count += 1
                     self.telnet.broadcast_spot(
@@ -3499,13 +3499,16 @@ class OpenSkimmer:
                         snr=spot['snr'],
                     )
                     method = spot.get('method', 'exact')
-                    log.info("*** SPOT: %10.1f  %-12s  %d dB  [%s] ***",
-                             spot['freq_khz'], spot['call'], spot['snr'], method)
+                    spot_wpm = spot.get('wpm', 0)
+                    log.info("*** SPOT: %10.1f  %-12s  %d dB  %d WPM  [%s] ***",
+                             spot['freq_khz'], spot['call'], spot['snr'],
+                             spot_wpm, method)
                     if self._spot_log:
                         import datetime
                         ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
                         self._spot_log.write(
-                            f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.1f} | {spot['snr']:.0f}\n"
+                            f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.1f} | "
+                            f"{spot['snr']:.0f} | {spot_wpm} WPM\n"
                         )
 
             # Status
@@ -3823,27 +3826,27 @@ def run_file_mode(args, config):
 
             # Collect output periodically
             results = manager.collect_all()
-            for rf_khz, snr, text, ctx, dec_id, dec_type in results:
+            for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
                 total_chars += len(text)
                 total_results += 1
                 spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                        dec_type=dec_type)
+                                        dec_type=dec_type, wpm=wpm)
                 for spot in spots:
                     all_spots.append(spot)
                     spotted_freqs.add(spot['freq_khz'])
-                    log.info("SPOT: %.1f kHz %s %d dB [%s]",
+                    log.info("SPOT: %.1f kHz %s %d dB %d WPM [%s]",
                              spot['freq_khz'], spot['call'],
-                             spot['snr'], spot['method'])
+                             spot['snr'], spot.get('wpm', 0), spot['method'])
 
         # Final collect after all data fed — give decoders a moment to flush
         import time as _time
         _time.sleep(0.5)
         results = manager.collect_all()
-        for rf_khz, snr, text, ctx, dec_id, dec_type in results:
+        for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
             total_chars += len(text)
             total_results += 1
             spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                    dec_type=dec_type)
+                                    dec_type=dec_type, wpm=wpm)
             for spot in spots:
                 all_spots.append(spot)
 
