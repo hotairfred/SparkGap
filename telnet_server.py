@@ -175,7 +175,7 @@ class SpotTelnetServer:
         if not comment:
             parts = []
             if snr:
-                parts.append(f'{snr} dB')
+                parts.append(f'{int(snr)} dB')
             if wpm:
                 parts.append(f'{wpm} WPM')
             if mode and mode != 'CW':
