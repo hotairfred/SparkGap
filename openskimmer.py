@@ -3017,6 +3017,11 @@ class SpotTracker:
     # pass the threshold over minutes/hours.
     SIGHTING_WINDOW = 60.0
 
+    # WPM cap — spots with decoder WPM above this are suppressed as noise.
+    # Contest CW tops out ~40-45 WPM; anything above 50 is almost certainly
+    # a decoder artifact from noise or digital mode interference.
+    MAX_WPM = 50
+
     def _min_sightings(self, call, snr=0):
         """Length-weighted sighting threshold.
         High SNR doesn't help short calls — strong channels produce
@@ -3120,6 +3125,11 @@ class SpotTracker:
         # Secondary decoders run freely — sightings threshold is the quality gate
         if not hasattr(self, '_processed_len'):
             self._processed_len = {}
+
+        # WPM cap: suppress spots from decoders reporting unrealistic speed.
+        # Noise and digital-mode interference produce high WPM artifacts.
+        if wpm > self.MAX_WPM:
+            return []
 
         full_text = context_text or text
         prev_len = self._processed_len.get(cache_key, 0)
