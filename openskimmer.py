@@ -3025,12 +3025,22 @@ class SpotTracker:
     def _min_sightings(self, call, snr=0):
         """Length-weighted sighting threshold.
         High SNR doesn't help short calls — strong channels produce
-        more 4-char fragment matches, not fewer."""
+        more 4-char fragment matches, not fewer.
+        Calls composed entirely of short Morse elements (E,I,S,T,R,5,H)
+        get a higher threshold — they're the most common noise artifacts."""
         if call in self.add_calls:
             return 1  # pre-validated rare calls: one clean decode is enough
         n = len(call)
+
+        # Short-Morse penalty: R3ER, SE5E, SE5I, N5EE, S5SH etc.
+        # These are produced by random dots/dashes far more often than
+        # calls with longer elements (W, M, O, etc.)
+        all_short = all(c in self.SHORT_MORSE_CHARS or c.isdigit() for c in call)
+        if all_short:
+            return 6  # require 6 sightings regardless of length
+
         if n <= 4:
-            return 4  # 4-char calls always need 4 sightings (no SNR exception)
+            return 4
         elif n == 5:
             return 3
         return 2
@@ -3041,16 +3051,32 @@ class SpotTracker:
             self._sighting_times = defaultdict(list)
         self._sighting_times[call].append((now, freq_bin))
 
+    # Max distinct frequency bins within the sighting window before
+    # suppressing a call as a noise hallucination. Real stations sit on
+    # one frequency; noise fragments scatter across the band.
+    MAX_FREQ_SPREAD = 3
+
+    # Characters that are short Morse elements — callsigns composed
+    # entirely of these are highly susceptible to noise decode.
+    SHORT_MORSE_CHARS = set('EISTR5H')
+
     def _count_recent_sightings(self, call, freq_bin, now):
-        """Count sightings within SIGHTING_WINDOW seconds at the same freq bin."""
+        """Count sightings within SIGHTING_WINDOW seconds at the same freq bin.
+        Suppresses calls seen at too many distinct frequencies (noise scatter)."""
         if not hasattr(self, '_sighting_times'):
             return 0
         entries = self._sighting_times.get(call, [])
-        # Prune old entries while counting
         cutoff = now - self.SIGHTING_WINDOW
-        fresh = [(t, fb) for t, fb in entries if t >= cutoff and fb == freq_bin]
+        fresh = [(t, fb) for t, fb in entries if t >= cutoff]
         self._sighting_times[call] = fresh
-        return len(fresh)
+
+        # Multi-frequency suppression: if this call appears at 3+ distinct
+        # freq bins in the window, it's noise — real ops don't QSY 3x/min.
+        distinct_bins = set(fb for _, fb in fresh)
+        if len(distinct_bins) > self.MAX_FREQ_SPREAD:
+            return 0
+
+        return sum(1 for _, fb in fresh if fb == freq_bin)
 
     def _can_respot(self, call, freq_khz, now):
         """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
