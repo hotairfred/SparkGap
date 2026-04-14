@@ -3011,6 +3011,12 @@ class SpotTracker:
         for call in valid_calls:
             self._scp_by_len[len(call)].append(call)
 
+    # Window for time-gated sighting counts (seconds). A call must be
+    # seen N times within this window to pass the sightings threshold.
+    # Without this, cumulative counts in live mode let noise fragments
+    # pass the threshold over minutes/hours.
+    SIGHTING_WINDOW = 60.0
+
     def _min_sightings(self, call, snr=0):
         """Length-weighted sighting threshold.
         High SNR doesn't help short calls — strong channels produce
@@ -3023,6 +3029,23 @@ class SpotTracker:
         elif n == 5:
             return 3
         return 2
+
+    def _record_sighting(self, call, freq_bin, now):
+        """Record a timestamped sighting for time-windowed counting."""
+        if not hasattr(self, '_sighting_times'):
+            self._sighting_times = defaultdict(list)
+        self._sighting_times[call].append((now, freq_bin))
+
+    def _count_recent_sightings(self, call, freq_bin, now):
+        """Count sightings within SIGHTING_WINDOW seconds at the same freq bin."""
+        if not hasattr(self, '_sighting_times'):
+            return 0
+        entries = self._sighting_times.get(call, [])
+        # Prune old entries while counting
+        cutoff = now - self.SIGHTING_WINDOW
+        fresh = [(t, fb) for t, fb in entries if t >= cutoff and fb == freq_bin]
+        self._sighting_times[call] = fresh
+        return len(fresh)
 
     def _can_respot(self, call, freq_khz, now):
         """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
@@ -3135,10 +3158,15 @@ class SpotTracker:
                 info['count'] += 1
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
+                self._record_sighting(call, freq_bin, now)
 
-                has_context = bool(CQ_PATTERNS.search(context_clean))
+                # Context check: only look at RECENT text (last ~500 chars)
+                # to avoid "CQ" appearing by chance in hours of noise output.
+                recent_ctx = context_clean[-500:] if len(context_clean) > 500 else context_clean
+                has_context = bool(CQ_PATTERNS.search(recent_ctx))
                 min_s = self._min_sightings(call, snr)
-                if (has_context or info['count'] >= min_s) and \
+                recent_count = self._count_recent_sightings(call, freq_bin, now)
+                if (has_context or recent_count >= min_s) and \
                    self._can_respot(call, freq_khz, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
                         self._mark_spotted(call, freq_khz, now)
@@ -3167,9 +3195,11 @@ class SpotTracker:
                 info['count'] += 1
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
+                self._record_sighting(frag, freq_bin, now)
 
                 min_s = self._min_sightings(frag, snr)
-                if info['count'] >= min_s and \
+                recent_count = self._count_recent_sightings(frag, freq_bin, now)
+                if recent_count >= min_s and \
                    self._can_respot(frag, freq_khz, now):
                     if len(self._cycle_calls[frag]) < 3:
                         self._mark_spotted(frag, freq_khz, now)
