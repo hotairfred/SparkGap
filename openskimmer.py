@@ -3305,16 +3305,44 @@ class OpenSkimmer:
     def __init__(self, config):
         self.cfg = config
         self.receiver = None
-        self.manager = None
+        self.manager  = None   # single-band legacy ref (= self.managers[0])
+        self.managers  = []    # one InstanceManager per band
+        self._band_meta = []   # [(name, center_hz, rx_index), ...]
         self.tracker = None
         self.telnet = None
         self.running = False
         self.spot_count = 0
         self.start_time = None
         self._iq_lock = threading.Lock()
-        self._iq_buffer = deque()  # (i,q) tuples for FFT scan, O(1) append/trim
-        self._feed_i = []          # numpy chunks for decoder feeding
-        self._feed_q = []
+        # Per-band IQ buffers keyed by rx_index.  For single-band configs
+        # rx_index=0 is the only key (same as before).
+        self._band_bufs = {}   # rx_index → {'iq': deque, 'i': [], 'q': []}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_band(band_entry):
+        """Return (name, center_hz) from a bands[] config entry.
+
+        Accepts:
+          '40m'             → ('40m', 7100000)
+          7090000           → ('7090', 7090000)
+          {'center_khz': 7090, 'rx_index': 0}  → ('7090', 7090000)
+          {'center_hz': 7090000}                → ('7090000', 7090000)
+        """
+        if isinstance(band_entry, dict):
+            if 'center_khz' in band_entry:
+                hz = int(band_entry['center_khz'] * 1000)
+            elif 'center_hz' in band_entry:
+                hz = int(band_entry['center_hz'])
+            else:
+                raise ValueError(f"Band dict must have center_khz or center_hz: {band_entry}")
+            name = band_entry.get('name', str(int(hz // 1000)))
+            return name, hz
+        if isinstance(band_entry, str) and band_entry in BANDS:
+            return band_entry, BANDS[band_entry]
+        return str(band_entry), int(band_entry)
 
     async def start(self):
         self.start_time = time.time()
@@ -3353,11 +3381,21 @@ class OpenSkimmer:
         )
         await self.telnet.start()
 
-        band = self.cfg.get('bands', ['20m'])[0]
-        if isinstance(band, str) and band in BANDS:
-            center = BANDS[band]
-        else:
-            center = int(band)
+        # ----------------------------------------------------------------
+        # Band configuration — supports single band (legacy) and multi-band
+        # ----------------------------------------------------------------
+        bands_cfg = self.cfg.get('bands', ['20m'])
+        self._band_meta = []
+        for idx, entry in enumerate(bands_cfg):
+            name, center_hz = self._resolve_band(entry)
+            # rx_index: explicit in dict, else sequential (0, 1, 2, …)
+            rx_idx = entry.get('rx_index', idx) if isinstance(entry, dict) else idx
+            self._band_meta.append((name, center_hz, rx_idx))
+            self._band_bufs[rx_idx] = {
+                'iq': deque(),
+                'i': [],
+                'q': [],
+            }
 
         rx_sample_rate = self.cfg.get('sample_rate', 48000)
         sdr_port = self.cfg.get('sdr_port', 1024)
@@ -3374,58 +3412,72 @@ class OpenSkimmer:
             device_ip = devices[0]['ip']
         sdr_type = self.cfg.get('sdr_type', 'hpsdr')
 
+        n_bands = len(self._band_meta)
+
         if sdr_type == 'flex':
-            # FlexRadio DAX-IQ path — wideband I/Q over VITA-49 UDP
+            # FlexRadio DAX-IQ path — single-band only for now
+            _, center_hz, _ = self._band_meta[0]
             flex_port = self.cfg.get('flex_udp_port', 7791)
-            self.receiver = FlexIQReceiver(device_ip, freq_hz=int(center),
+            self.receiver = FlexIQReceiver(device_ip, freq_hz=int(center_hz),
                                            sample_rate=rx_sample_rate,
                                            udp_port=flex_port,
                                            control_port=sdr_port)
             log.info("Using FlexRadio DAX-IQ receiver at %s", device_ip)
         else:
-            # HPSDR Protocol 1 path (Red Pitaya)
+            # HPSDR Protocol 1 path (Red Pitaya) — supports n_receivers for multi-band
             listen_port = self.cfg.get('hpsdr_listen_port', sdr_port)
             passive = self.cfg.get('passive', False)
             rx_filter = self.cfg.get('rx_filter', None)
-            n_rx = self.cfg.get('max_receivers', 1)
+            n_rx = max(self.cfg.get('max_receivers', 1), n_bands)
             self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
                                           n_receivers=n_rx, sample_rate=rx_sample_rate,
                                           listen_port=listen_port,
                                           passive=passive, rx_filter=rx_filter)
-            self.receiver.set_frequency(0, center)
+            for _name, center_hz, rx_idx in self._band_meta:
+                self.receiver.set_frequency(rx_idx, center_hz)
             self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
 
+        # ----------------------------------------------------------------
+        # One InstanceManager per band
+        # ----------------------------------------------------------------
         speeds_cfg = self.cfg.get('decoder_speeds', [0, 25, 30, 35])
-        self.manager = InstanceManager(
-            sample_rate=rx_sample_rate,
-            decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
-            max_instances=self.cfg.get('max_instances', 150),
-            max_channels=self.cfg.get('max_channels', None),
-            signal_timeout=self.cfg.get('signal_timeout', 90),
-            speeds=speeds_cfg,
-            bmorse_bin=self.cfg.get('bmorse_bin', None),
-            hamfist_bin=self.cfg.get('hamfist_bin', None),
-            hamfist_scp=self.cfg.get('hamfist_scp', None),
-            ml_model_path=self.cfg.get('ml_model', None),
-            ml_min_confidence=float(self.cfg.get('ml_min_confidence', 0.7)),
-            use_dispatcher=bool(self.cfg.get('use_cpp_dispatcher', False)),
-            use_pfb_dispatcher=bool(self.cfg.get('use_cpp_pfb', False)),
-        )
+        self.managers = []
+        for _name, _center_hz, _rx_idx in self._band_meta:
+            mgr = InstanceManager(
+                sample_rate=rx_sample_rate,
+                decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
+                max_instances=self.cfg.get('max_instances', 150),
+                max_channels=self.cfg.get('max_channels', None),
+                signal_timeout=self.cfg.get('signal_timeout', 90),
+                speeds=speeds_cfg,
+                bmorse_bin=self.cfg.get('bmorse_bin', None),
+                hamfist_bin=self.cfg.get('hamfist_bin', None),
+                hamfist_scp=self.cfg.get('hamfist_scp', None),
+                ml_model_path=self.cfg.get('ml_model', None),
+                ml_min_confidence=float(self.cfg.get('ml_min_confidence', 0.7)),
+                use_dispatcher=bool(self.cfg.get('use_cpp_dispatcher', False)),
+                use_pfb_dispatcher=bool(self.cfg.get('use_cpp_pfb', False)),
+            )
+            self.managers.append(mgr)
+        # Legacy single-manager ref
+        self.manager = self.managers[0]
 
         self.receiver.start()
         self.running = True
 
-        cal_center = center * 0.9999961
-        log.info("OpenSkimmer LIVE: %s (%.3f kHz), telnet :%d",
-                 band, cal_center / 1000, self.cfg.get('telnet_port', 7300))
+        for name, center_hz, rx_idx in self._band_meta:
+            cal_center = center_hz * 0.9999961
+            log.info("OpenSkimmer LIVE: %s (%.3f kHz) rx%d, telnet :%d",
+                     name, cal_center / 1000, rx_idx,
+                     self.cfg.get('telnet_port', 7300))
         return True
 
     async def stop(self):
         self.running = False
         if self.receiver:
             self.receiver.close()
-        if self.manager:
-            self.manager.kill_all()
+        for mgr in self.managers:
+            mgr.kill_all()
         if self.telnet:
             await self.telnet.stop()
         if self._wav_record:
@@ -3435,18 +3487,25 @@ class OpenSkimmer:
         log.info("Stopped: %d spots in %.0fs", self.spot_count, elapsed)
 
     def _iq_callback(self, rx_index, iq_samples):
-        """Called from HPSDR receiver thread — buffer only, no processing."""
+        """Called from HPSDR receiver thread — buffer only, no processing.
+
+        Routes IQ data to the per-band buffer for rx_index.  Unknown rx_index
+        values are silently dropped (e.g. extra receivers not in config).
+        """
         try:
+            buf = self._band_bufs.get(rx_index)
+            if buf is None:
+                return
             iq_arr = np.asarray(iq_samples, dtype=np.float64)
             i_chunk = iq_arr[:, 0] * 8388608.0
             q_chunk = iq_arr[:, 1] * 8388608.0
             with self._iq_lock:
-                self._iq_buffer.extend(iq_samples)
+                buf['iq'].extend(iq_samples)
                 max_buf = self.cfg.get('sample_rate', 48000) * 10
-                while len(self._iq_buffer) > max_buf:
-                    self._iq_buffer.popleft()
-                self._feed_i.append(i_chunk)
-                self._feed_q.append(q_chunk)
+                while len(buf['iq']) > max_buf:
+                    buf['iq'].popleft()
+                buf['i'].append(i_chunk)
+                buf['q'].append(q_chunk)
             if self._wav_record and rx_index == 0:
                 import struct as _struct
                 frames = bytearray()
@@ -3474,24 +3533,30 @@ class OpenSkimmer:
 
         while self.running:
             now = time.time()
+            live_rate = self.cfg.get('sample_rate', 48000)
 
-            # Drain feed buffer and push to decoders (200ms cap to stay real-time)
-            # Cap CHUNKS before concatenate — avoids building huge arrays from backlogs
-            with self._iq_lock:
-                feed_i, feed_q = self._feed_i, self._feed_q
-                self._feed_i, self._feed_q = [], []
-            if feed_i:
-                live_rate = self.cfg.get('sample_rate', 48000)
-                chunk_size = len(feed_i[0]) if feed_i else 126
-                max_chunks = max(1, live_rate // 5 // chunk_size)  # ~200ms of chunks
-                if len(feed_i) > max_chunks:
-                    feed_i = feed_i[-max_chunks:]
-                    feed_q = feed_q[-max_chunks:]
-                i_cat = np.concatenate(feed_i)
-                q_cat = np.concatenate(feed_q)
-                self.manager.feed_all_iq(i_cat, q_cat)
+            # ----------------------------------------------------------------
+            # Per-band: drain feed buffers and push IQ to decoders
+            # 200ms cap per band to stay real-time even under backlog.
+            # ----------------------------------------------------------------
+            for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
+                with self._iq_lock:
+                    buf = self._band_bufs[rx_idx]
+                    feed_i, feed_q = buf['i'], buf['q']
+                    buf['i'], buf['q'] = [], []
+                if feed_i:
+                    chunk_size = len(feed_i[0]) if feed_i else 126
+                    max_chunks = max(1, live_rate // 5 // chunk_size)  # ~200ms
+                    if len(feed_i) > max_chunks:
+                        feed_i = feed_i[-max_chunks:]
+                        feed_q = feed_q[-max_chunks:]
+                    i_cat = np.concatenate(feed_i)
+                    q_cat = np.concatenate(feed_q)
+                    mgr.feed_all_iq(i_cat, q_cat)
 
-            # Periodic signal scan
+            # ----------------------------------------------------------------
+            # Periodic signal scan — one FFT per band
+            # ----------------------------------------------------------------
             if now - last_scan >= scan_interval:
                 last_scan = now
                 self.tracker.reset_cycle()
@@ -3516,24 +3581,30 @@ class OpenSkimmer:
                         if added or removed:
                             log.info("add_calls reloaded: +%d -%d calls", len(added), len(removed))
 
-                live_rate = self.cfg.get('sample_rate', 48000)
                 fft_size = 8192
-                needed = fft_size
-                with self._iq_lock:
-                    if len(self._iq_buffer) >= needed:
-                        buf = list(itertools.islice(self._iq_buffer, len(self._iq_buffer) - needed, None))
-                    else:
-                        buf = None
+                min_snr = self.cfg.get('signal_min_snr', 12)
+                cw_min  = self.cfg.get('cw_min_khz', 0)
+                cw_max  = self.cfg.get('cw_max_khz', 99999)
 
-                if buf is not None:
-                    iq_arr = np.array([complex(i, q) for i, q in buf])
-                    # Blackman window — critical for CW burst signals
-                    # n_avg averaging without window destroys SNR for transient bursts
-                    window = np.blackman(fft_size)
-                    psd = np.abs(np.fft.fft(iq_arr * window)) ** 2
-                    psd_db = 10 * np.log10(psd + 1e-20)
-                    noise = np.median(psd_db)
-                    min_snr = self.cfg.get('signal_min_snr', 12)
+                for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
+                    center_khz = center_hz / 1000
+                    with self._iq_lock:
+                        iq_deque = self._band_bufs[rx_idx]['iq']
+                        if len(iq_deque) >= fft_size:
+                            raw = list(itertools.islice(iq_deque,
+                                                        len(iq_deque) - fft_size,
+                                                        None))
+                        else:
+                            raw = None
+
+                    if raw is None:
+                        continue
+
+                    iq_arr = np.array([complex(i, q) for i, q in raw])
+                    window  = np.blackman(fft_size)
+                    psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
+                    psd_db  = 10 * np.log10(psd + 1e-20)
+                    noise   = np.median(psd_db)
 
                     signals = []
                     N = fft_size
@@ -3548,7 +3619,7 @@ class OpenSkimmer:
                             f = exact * live_rate / N
                             signals.append((f, psd_db[i] - noise))
 
-                    # Cluster
+                    # Cluster peaks within 100 Hz
                     clustered = []
                     for freq, snr in sorted(signals):
                         if not clustered or abs(freq - clustered[-1][0]) > 100:
@@ -3556,66 +3627,67 @@ class OpenSkimmer:
                         elif snr > clustered[-1][1]:
                             clustered[-1] = (freq, snr)
 
-                    center_khz = self.receiver.frequencies[0] / 1000
+                    log.info("[%s] noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
+                             band_name, noise, noise + min_snr, len(iq_deque))
+                    top = sorted(signals, key=lambda x: -x[1])[:10]
+                    for f, s in top:
+                        log.info("  [%s] PEAK %.3f kHz %.1f dB",
+                                 band_name, center_khz + f/1000, s)
+                    if not top:
+                        log.info("  [%s] (no peaks above threshold)", band_name)
 
-                    if True:  # log every scan for debugging
-                        log.info("noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
-                                 noise, noise + min_snr, len(self._iq_buffer))
-                        top = sorted(signals, key=lambda x: -x[1])[:10]
-                        for f, s in top:
-                            log.info("  PEAK %.3f kHz %.1f dB", center_khz + f/1000, s)
-                        if not top:
-                            log.info("  (no peaks above threshold)")
-
-                    cw_min = self.cfg.get('cw_min_khz', 0)
-                    cw_max = self.cfg.get('cw_max_khz', 99999)
                     if cw_min or cw_max < 99999:
                         clustered = [(f, s) for f, s in clustered
                                      if cw_min <= center_khz + f/1000 <= cw_max]
-                    self.manager.update_signals(clustered, center_khz)
+                    mgr.update_signals(clustered, center_khz)
 
-            # Collect all decoder output (C++ engine + Python fallback)
-            results = self.manager.collect_all()
-            for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
-                log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
-                # Skip pure noise until enough alphanumeric chars have accumulated
-                # for a callsign to be present. Streaming decoders (fldigi_cw)
-                # output one char at a time with spaces between — splitting never
-                # yields multi-char tokens, so check collapsed alnum length instead.
-                alnum = re.sub(r'[^A-Z0-9]', '', (ctx or text).upper())
-                if len(alnum) < 4:
-                    continue
-                spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                             dec_type=dec_type, wpm=wpm)
-                for spot in spots:
-                    self.spot_count += 1
-                    self.telnet.broadcast_spot(
-                        freq_khz=spot['freq_khz'],
-                        dx_call=spot['call'],
-                        snr=spot['snr'],
-                    )
-                    method = spot.get('method', 'exact')
-                    spot_wpm = spot.get('wpm', 0)
-                    log.info("*** SPOT: %10.1f  %-12s  %d dB  %d WPM  [%s] ***",
-                             spot['freq_khz'], spot['call'], spot['snr'],
-                             spot_wpm, method)
-                    if self._spot_log:
-                        import datetime
-                        ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                        self._spot_log.write(
-                            f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.1f} | "
-                            f"{spot['snr']:.0f} | {spot_wpm} WPM\n"
+            # ----------------------------------------------------------------
+            # Collect decoder output from every band — spots to shared telnet
+            # ----------------------------------------------------------------
+            for (_band_name, _center_hz, _rx_idx), mgr in zip(self._band_meta, self.managers):
+                results = mgr.collect_all()
+                for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
+                    log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
+                    alnum = re.sub(r'[^A-Z0-9]', '', (ctx or text).upper())
+                    if len(alnum) < 4:
+                        continue
+                    spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                                 dec_type=dec_type, wpm=wpm)
+                    for spot in spots:
+                        self.spot_count += 1
+                        self.telnet.broadcast_spot(
+                            freq_khz=spot['freq_khz'],
+                            dx_call=spot['call'],
+                            snr=spot['snr'],
                         )
+                        method   = spot.get('method', 'exact')
+                        spot_wpm = spot.get('wpm', 0)
+                        log.info("*** SPOT: %10.1f  %-12s  %d dB  %d WPM  [%s] ***",
+                                 spot['freq_khz'], spot['call'], spot['snr'],
+                                 spot_wpm, method)
+                        if self._spot_log:
+                            import datetime
+                            ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                            self._spot_log.write(
+                                f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.1f} | "
+                                f"{spot['snr']:.0f} | {spot_wpm} WPM\n"
+                            )
 
-            # Status
+            # ----------------------------------------------------------------
+            # Status — aggregate across all bands
+            # ----------------------------------------------------------------
             if now - last_status >= status_interval:
                 last_status = now
                 elapsed = now - self.start_time
-                total_chars = sum(
-                    g.total_chars for g in self.manager.instances.values()
+                total_decoders = sum(mgr.count for mgr in self.managers)
+                total_chars    = sum(
+                    g.total_chars
+                    for mgr in self.managers
+                    for g in mgr.instances.values()
                 )
-                log.info("Status: %d spots, %d decoders, %d clients, %d chars, %.0fs",
-                         self.spot_count, self.manager.count,
+                log.info("Status: %d spots, %d decoders (%d bands), %d clients, "
+                         "%d chars, %.0fs",
+                         self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
 
             await asyncio.sleep(0.025)
