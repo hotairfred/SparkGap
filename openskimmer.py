@@ -3593,6 +3593,7 @@ class OpenSkimmer:
                         freq_khz=spot['freq_khz'],
                         dx_call=spot['call'],
                         snr=spot['snr'],
+                        wpm=spot.get('wpm', 0),
                     )
                     method = spot.get('method', 'exact')
                     spot_wpm = spot.get('wpm', 0)
