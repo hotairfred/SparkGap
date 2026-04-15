@@ -460,16 +460,31 @@ def em_estimate(env, wpm_init=25.0, n_iter=10, A_init=None, noise_mean_init=None
     Phase 2 (n_iter//2 iterations): re-estimate WPM from gamma, then refine.
 
     Returns (A, noise_mean, sigma2_obs, gamma, wpm_est).
+
+    Normalization: env is scaled to [0,1] range before EM to avoid numerical
+    collapse when absolute envelope values are tiny (e.g. 1e-5).  A,
+    noise_mean, sigma_obs are denormalized before return.
     """
-    # Initialize from data percentiles
+    # Normalize envelope for numerical stability — EM runs on values in [0,1].
+    # Without this, sigma2_obs_init = (noise_mean * 0.2)^2 ≈ 0 when the
+    # envelope is small, causing log-likelihood blow-up and WPM runaway.
+    env_scale = float(np.percentile(env, 99))
+    if env_scale < 1e-30:
+        # Essentially no signal — return degenerate estimate
+        gamma = np.full((len(env), 2), 0.5)
+        return 0.0, 0.0, 1.0, gamma, wpm_init
+    env = env / env_scale  # normalized copy, original unchanged by caller
+
+    # Initialize from data percentiles (on normalized envelope)
     if noise_mean_init is None:
         noise_mean_init = float(np.percentile(env, 30))
     if sigma2_obs_init is None:
-        # Variance of lower-envelope (noise) samples
         lo = env[env < np.percentile(env, 40)]
-        sigma2_obs_init = max(float(np.var(lo)) if len(lo) > 2 else (noise_mean_init * 0.2)**2, 1e-20)
+        var_lo = float(np.var(lo)) if len(lo) > 2 else 0.0
+        # Fallback: use spread between P5 and P95 to set sigma floor
+        env_spread = float(np.percentile(env, 95) - np.percentile(env, 5))
+        sigma2_obs_init = max(var_lo, (env_spread * 0.15)**2, 1e-6)
     if A_init is None:
-        # Use samples well above noise level as signal estimate
         thresh = noise_mean_init + 3 * np.sqrt(sigma2_obs_init)
         hi = env[env > thresh]
         A_init = float(np.mean(hi)) if len(hi) > 10 else float(np.percentile(env, 95))
@@ -503,6 +518,11 @@ def em_estimate(env, wpm_init=25.0, n_iter=10, A_init=None, noise_mean_init=None
     if wpm_new is not None:
         wpm = wpm_new
     A, noise_mean, sigma2_obs, gamma = _em_step(wpm, A, noise_mean, sigma2_obs, n_iter - half)
+
+    # Denormalize — scale A, noise_mean, sigma back to original envelope units
+    A          *= env_scale
+    noise_mean *= env_scale
+    sigma2_obs *= env_scale ** 2
 
     return A, noise_mean, sigma2_obs, gamma, wpm
 
