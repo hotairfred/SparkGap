@@ -175,7 +175,7 @@ def load_iq_wav(path, start_sec=0, end_sec=None, negate_q=True):
 
 def read_iq_wav(path, center_khz, target_khz, start_sec=0, end_sec=None,
                 negate_q=True, tone_lo_hz=200, tone_hi_hz=3000,
-                iq_cache=None):
+                iq_cache=None, lpf_hz=100):
     """Read B1-style IQ WAV (2ch, 192kHz) and extract CW envelope at target_khz.
 
     Pipeline:
@@ -224,9 +224,10 @@ def read_iq_wav(path, center_khz, target_khz, start_sec=0, end_sec=None,
     bb_mid = bb[:n_mid * dec1].reshape(n_mid, dec1).mean(axis=1)
     del bb
 
-    # Channelizing LPF at 200 Hz — select this station, reject adjacent ones.
-    # Order 6 Butterworth at fc/fs_nyq=0.2 → group delay at DC ≈ 5ms.
-    sos = butter(6, 200.0 / (fs_mid / 2.0), btype='low', output='sos')
+    # Channelizing LPF — select this station, reject adjacent ones.
+    # lpf_hz=100 → halves noise bandwidth vs 200 Hz, improves SNR on weak signals.
+    # Group delay at DC ≈ 5ms (order 6 Butterworth), negligible vs 54ms dits at 22 WPM.
+    sos = butter(6, lpf_hz / (fs_mid / 2.0), btype='low', output='sos')
     bb_i = sosfilt(sos, np.real(bb_mid).astype(np.float64))
     bb_q = sosfilt(sos, np.imag(bb_mid).astype(np.float64))
 
@@ -688,7 +689,7 @@ def extract_callsigns(text, valid_calls=None):
 # ---------------------------------------------------------------------------
 
 def decode_channel(env, center_khz, freq_khz, start_sec=0, em_iter=8,
-                   evidence_threshold=10.0, verbose=False):
+                   evidence_threshold=10.0, verbose=False, lpf_hz=100):
     """Full pipeline for a single channel: EM → speed marginal → decode.
 
     Returns dict with keys: wpm, A, sigma2, text, callsigns, log_bayes, gamma
@@ -751,7 +752,7 @@ def decode_channel(env, center_khz, freq_khz, start_sec=0, em_iter=8,
 
 def run_eval(wav_path, center_khz, key_path, start_min=15, end_min=30,
              freq_step_khz=0.1, band_khz_min=None, band_khz_max=None,
-             evidence_threshold=10.0, verbose=False):
+             evidence_threshold=10.0, verbose=False, lpf_hz=100):
     """Scan a frequency range in the B1 recording and score against gold key."""
 
     # Load gold key
@@ -795,7 +796,7 @@ def run_eval(wav_path, center_khz, key_path, start_min=15, end_min=30,
         for i, freq in enumerate(freqs):
             try:
                 env, _ = read_iq_wav(wav_path, center_khz, freq,
-                                      iq_cache=iq_cache)
+                                      iq_cache=iq_cache, lpf_hz=lpf_hz)
             except Exception as e:
                 if verbose:
                     print(f"  {freq:.2f}: env error: {e}", flush=True)
@@ -803,7 +804,7 @@ def run_eval(wav_path, center_khz, key_path, start_min=15, end_min=30,
 
             result = decode_channel(env, center_khz, freq,
                                      evidence_threshold=evidence_threshold,
-                                     verbose=verbose)
+                                     verbose=verbose, lpf_hz=lpf_hz)
             if result and result['callsigns']:
                 for call in result['callsigns']:
                     if call in gold and call not in found:
@@ -829,7 +830,7 @@ def run_eval(wav_path, center_khz, key_path, start_min=15, end_min=30,
 
 def run_diag(wav_path, center_khz, key_path, start_min=15, end_min=30,
              freq_step_khz=0.3, band_khz_min=None, band_khz_max=None,
-             diag_threshold=200.0, out_path=None):
+             diag_threshold=200.0, out_path=None, lpf_hz=100):
     """Diagnostic scan: run at low threshold, track per-callsign best result.
 
     Categorizes each gold-key callsign:
@@ -889,13 +890,13 @@ def run_diag(wav_path, center_khz, key_path, start_min=15, end_min=30,
             for freq in freqs:
                 try:
                     env, _ = read_iq_wav(wav_path, center_khz, freq,
-                                          iq_cache=iq_cache)
+                                          iq_cache=iq_cache, lpf_hz=lpf_hz)
                 except Exception:
                     continue
 
                 result = decode_channel(env, center_khz, freq,
                                          evidence_threshold=diag_threshold,
-                                         verbose=False)
+                                         verbose=False, lpf_hz=lpf_hz)
                 if result is None:
                     continue
 
@@ -985,19 +986,19 @@ def run_diag(wav_path, center_khz, key_path, start_min=15, end_min=30,
 # ---------------------------------------------------------------------------
 
 def run_single(wav_path, center_khz, target_khz, start_min=0, end_min=None,
-               evidence_threshold=5.0, verbose=True):
+               evidence_threshold=5.0, verbose=True, lpf_hz=100):
     """Decode a single frequency and print results."""
     start_sec = start_min * 60.0
     end_sec   = end_min * 60.0 if end_min else None
 
     print(f"Decoding {target_khz:.3f} kHz from {wav_path}", flush=True)
     env, _ = read_iq_wav(wav_path, center_khz, target_khz,
-                          start_sec=start_sec, end_sec=end_sec)
+                          start_sec=start_sec, end_sec=end_sec, lpf_hz=lpf_hz)
     print(f"  Envelope: {len(env)} samples ({len(env)/BAYES_RATE:.1f}s)", flush=True)
 
     result = decode_channel(env, center_khz, target_khz,
                              evidence_threshold=evidence_threshold,
-                             verbose=verbose)
+                             verbose=verbose, lpf_hz=lpf_hz)
     if result:
         print(f"\nResult: {result['wpm']:.0f} WPM  logBF={result['log_bayes']:.1f}")
         print(f"Text: {result['text'][:200]}")
@@ -1030,6 +1031,8 @@ def main():
                     help='log BF threshold for diagnostic scan (default 200, vs 2000 for eval)')
     ap.add_argument('--diag-out',    default='/tmp/itila_diag.txt',
                     help='Output file for diagnostic results (default /tmp/itila_diag.txt)')
+    ap.add_argument('--lpf',         type=float, default=100.0,
+                    help='Channelizing LPF cutoff Hz (default 100; M3 used 200)')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
 
@@ -1044,7 +1047,8 @@ def main():
                  band_khz_min=args.band_min,
                  band_khz_max=args.band_max,
                  diag_threshold=args.diag_thresh,
-                 out_path=args.diag_out)
+                 out_path=args.diag_out,
+                 lpf_hz=args.lpf)
     elif args.eval:
         if not args.key:
             print("--key required for eval mode", file=sys.stderr)
@@ -1056,13 +1060,15 @@ def main():
                  band_khz_min=args.band_min,
                  band_khz_max=args.band_max,
                  evidence_threshold=args.thresh,
-                 verbose=args.verbose)
+                 verbose=args.verbose,
+                 lpf_hz=args.lpf)
     elif args.freq:
         run_single(args.wav, args.center, args.freq,
                    start_min=args.start,
                    end_min=args.end,
                    evidence_threshold=args.thresh,
-                   verbose=args.verbose)
+                   verbose=args.verbose,
+                   lpf_hz=args.lpf)
     else:
         ap.print_help()
 
