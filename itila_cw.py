@@ -622,6 +622,100 @@ def decode_runs(marks, wpm):
     return text
 
 
+def decode_runs_beam(marks, wpm, boundary_tol=0.25, max_texts=20):
+    """Soft dit/dah classification via beam search over boundary-zone elements.
+
+    M7: targets only elements near the 2*unit hard-threshold boundary.
+    Elements within ±boundary_tol of 2*unit are propagated as BOTH dit and dah.
+    Elements clearly outside that zone keep the standard hard classification.
+
+    At WPM=40 (unit=6): boundary=12, zone=[9,15] — only these expand both paths.
+    Normal dits (1-8) and dahs (16+) are hard-classified and don't grow the beam.
+    Space classification (element / letter / word) remains hard throughout.
+
+    Returns list of unique decoded hypothesis strings (up to max_texts).
+    """
+    if marks is None or len(marks) == 0:
+        return ['']
+
+    unit = unit_samples(wpm)
+    if unit < 1:
+        unit = 1
+
+    boundary = 2.0 * unit
+    zone_lo = boundary * (1.0 - boundary_tol)  # 1.5*unit at tol=0.25
+    zone_hi = boundary * (1.0 + boundary_tol)  # 2.5*unit at tol=0.25
+
+    # Build run list
+    runs = []
+    val = marks[0]
+    count = 1
+    for i in range(1, len(marks)):
+        if marks[i] == val:
+            count += 1
+        else:
+            runs.append((int(val), count))
+            val = marks[i]
+            count = 1
+    runs.append((int(val), count))
+
+    # Each state in the beam: (current_symbol_str, text_so_far)
+    beam = [('', '')]
+
+    for (is_mark, dur) in runs:
+        if is_mark:
+            if zone_lo <= dur <= zone_hi:
+                # Boundary zone: expand both paths
+                new_beam = []
+                for (sym, txt) in beam:
+                    new_beam.append((sym + '.', txt))  # dit hypothesis
+                    new_beam.append((sym + '-', txt))  # dah hypothesis
+                # Deduplicate and cap
+                seen_states = set()
+                beam = []
+                for state in new_beam:
+                    if state not in seen_states:
+                        seen_states.add(state)
+                        beam.append(state)
+                        if len(beam) >= max_texts * 4:
+                            break
+            else:
+                # Clear dit or clear dah — hard classify
+                elem = '.' if dur < boundary else '-'
+                beam = [(sym + elem, txt) for (sym, txt) in beam]
+        else:
+            if dur < 2 * unit:
+                pass  # element separator — no state change
+            elif dur < 5 * unit:
+                # letter-space: emit current symbol in each hypothesis
+                new_beam = []
+                for (sym, txt) in beam:
+                    ch = MORSE_TABLE.get(sym, '?') if sym else ''
+                    new_beam.append(('', txt + ch))
+                beam = new_beam
+            else:
+                # word-space: emit current symbol + space
+                new_beam = []
+                for (sym, txt) in beam:
+                    ch = MORSE_TABLE.get(sym, '?') if sym else ''
+                    new_beam.append(('', txt + ch + ' '))
+                beam = new_beam
+
+    # Flush remaining symbol in each hypothesis
+    result_texts = []
+    seen_texts = set()
+    for (sym, txt) in beam:
+        if sym:
+            txt = txt + MORSE_TABLE.get(sym, '?')
+        if txt not in seen_texts:
+            seen_texts.add(txt)
+            result_texts.append(txt)
+        if len(result_texts) >= max_texts:
+            break
+
+    return result_texts if result_texts else ['']
+
+
 # ---------------------------------------------------------------------------
 # Channel scanner — find signals in a frequency band
 # ---------------------------------------------------------------------------
@@ -741,15 +835,26 @@ def decode_channel(env, center_khz, freq_khz, start_sec=0, em_iter=8,
         env, A, noise_mean, sigma2_obs)
     best_wpm = wpm_est  # EM WPM is more reliable than evidence argmax
 
-    # Decode to text using EM-estimated WPM
+    # M7: Decode using beam search over soft dit/dah classification.
+    # decode_runs_beam returns a list of hypothesis strings; union callsigns
+    # across all of them so borderline elements don't kill a callsign.
     marks = posterior_to_marks(gamma_marg)
-    text  = decode_runs(marks, best_wpm)
+    texts = decode_runs_beam(marks, best_wpm)
+    text  = texts[0]  # primary text for display
 
-    callsigns = extract_callsigns(text)
+    seen_calls = set()
+    callsigns = []
+    for hyp in texts:
+        for c in extract_callsigns(hyp):
+            if c not in seen_calls:
+                seen_calls.add(c)
+                callsigns.append(c)
 
     if verbose:
         ev_best_wpm = SPEED_BINS[np.argmax(log_evs)]
         print(f"  wpm={best_wpm:.0f} (em), ev_wpm={ev_best_wpm:.0f}  text={repr(text[:80])}", flush=True)
+        if len(texts) > 1:
+            print(f"  beam hypotheses: {len(texts)}", flush=True)
         if callsigns:
             print(f"  CALLSIGNS: {callsigns}", flush=True)
 
