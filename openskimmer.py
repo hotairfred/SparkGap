@@ -3514,13 +3514,8 @@ class OpenSkimmer:
                 self._feed_i.append(i_chunk)
                 self._feed_q.append(q_chunk)
             if self._wav_record and rx_index == 0:
-                import struct as _struct
-                frames = bytearray()
-                for i_val, q_val in iq_samples:
-                    i16 = max(-32768, min(32767, int(i_val * 32767)))
-                    q16 = max(-32768, min(32767, int(q_val * 32767)))
-                    frames += _struct.pack('<hh', i16, q16)
-                self._wav_record.writeframes(bytes(frames))
+                scaled = np.clip(iq_arr * 32767.0, -32768, 32767).astype('<i2')
+                self._wav_record.writeframes(scaled.tobytes())
         except Exception:
             pass  # Don't let errors kill the receiver thread
 

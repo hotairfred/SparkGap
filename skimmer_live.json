@@ -9,6 +9,7 @@
     "bands": [
         7090000
     ],
+    "record_wav": "/mnt/atlas/skimmer/recordings/cwt_{ts}_{band}kHz.wav",
     "buffer_seconds": 120,
     "bmorse_speeds": [
         25
