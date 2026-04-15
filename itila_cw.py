@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ITILA-based Bayesian CW decoder prototype — M1/M2/M3
+ITILA-based Bayesian CW decoder prototype — M1/M2/M3/M4
 Arc, 2026-04-14
 
 Architecture (MacKay ITILA Ch. 16, 25, 28, 34):
@@ -780,6 +780,163 @@ def run_eval(wav_path, center_khz, key_path, start_min=15, end_min=30,
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic mode — why did we miss what we missed?
+# ---------------------------------------------------------------------------
+
+def run_diag(wav_path, center_khz, key_path, start_min=15, end_min=30,
+             freq_step_khz=0.3, band_khz_min=None, band_khz_max=None,
+             diag_threshold=200.0, out_path=None):
+    """Diagnostic scan: run at low threshold, track per-callsign best result.
+
+    Categorizes each gold-key callsign:
+      FOUND_AT_DIAG   — decoded when threshold=diag_threshold (threshold was too high)
+      DECODED_GARBLED — callsign appeared in raw text but not extracted as callsign
+      NOT_DECODED     — never appeared in any channel's text (signal too weak / decode fail)
+
+    Output goes to out_path (default /tmp/itila_diag.txt).
+    """
+    out_path = out_path or '/tmp/itila_diag.txt'
+
+    with open(key_path) as f:
+        gold = set(f.read().strip().upper().replace('\n', ',').split(','))
+    gold = {c.strip() for c in gold if c.strip()}
+
+    start_sec = start_min * 60.0
+    end_sec   = end_min   * 60.0
+
+    if band_khz_min is None:
+        band_khz_min = center_khz - 90
+    if band_khz_max is None:
+        band_khz_max = center_khz + 90
+
+    freqs = np.arange(band_khz_min, band_khz_max, freq_step_khz)
+
+    # Per-callsign tracking: best sighting across all chunks/freqs
+    # call -> {'log_bf', 'freq', 'chunk', 'text', 'wpm', 'as_callsign': bool}
+    call_best = {}
+
+    chunk_sec = 120.0
+    t = start_sec
+    chunk_num = 0
+
+    print(f"[diag] scanning {len(freqs)} channels, threshold={diag_threshold}, out={out_path}", flush=True)
+
+    with open(out_path, 'w') as out:
+        out.write(f"ITILA DIAGNOSTIC — {wav_path}\n")
+        out.write(f"Gold key: {len(gold)} calls | threshold={diag_threshold}\n")
+        out.write(f"Scan: {band_khz_min}-{band_khz_max} kHz step={freq_step_khz} kHz"
+                  f"  {start_min}-{end_min} min\n")
+        out.write("=" * 70 + "\n\n")
+
+        while t < end_sec:
+            t1 = min(t + chunk_sec, end_sec)
+            chunk_num += 1
+            out.write(f"\n=== Chunk {chunk_num}: {t/60:.0f}-{t1/60:.0f} min ===\n")
+            out.flush()
+            print(f"[diag] chunk {chunk_num}: {t/60:.0f}-{t1/60:.0f} min", flush=True)
+
+            try:
+                iq_cache = load_iq_wav(wav_path, start_sec=t, end_sec=t1)
+            except Exception as e:
+                out.write(f"  WAV load error: {e}\n")
+                t = t1
+                continue
+
+            for freq in freqs:
+                try:
+                    env, _ = read_iq_wav(wav_path, center_khz, freq,
+                                          iq_cache=iq_cache)
+                except Exception:
+                    continue
+
+                result = decode_channel(env, center_khz, freq,
+                                         evidence_threshold=diag_threshold,
+                                         verbose=False)
+                if result is None:
+                    continue
+
+                log_bf   = result.get('log_bayes', -1e9)
+                text     = result.get('text', '')
+                calls    = result.get('callsigns', [])
+                wpm      = result.get('wpm', 0)
+                text_up  = text.upper()
+
+                # Check which gold calls appear in raw text (even if not extracted)
+                gold_in_text = [c for c in gold if c in text_up]
+                gold_calls   = [c for c in calls if c in gold]
+
+                # Update per-callsign tracker
+                for call in set(gold_in_text + gold_calls):
+                    as_call = call in gold_calls
+                    prev = call_best.get(call)
+                    if prev is None or log_bf > prev['log_bf']:
+                        call_best[call] = {
+                            'log_bf':     log_bf,
+                            'freq':       freq,
+                            'chunk':      chunk_num,
+                            'text':       text[:120],
+                            'wpm':        wpm,
+                            'as_callsign': as_call,
+                        }
+
+                # Log any channel that decoded something interesting
+                if gold_in_text or gold_calls or (text and log_bf > diag_threshold):
+                    flag = ''
+                    if gold_calls:
+                        flag = f"  *** CALLSIGN: {gold_calls}"
+                    elif gold_in_text:
+                        flag = f"  *** IN_TEXT: {gold_in_text}"
+                    out.write(f"  {freq:8.2f} kHz  logBF={log_bf:8.1f}  wpm={wpm:4.0f}{flag}\n")
+                    if gold_in_text or gold_calls:
+                        out.write(f"    text: {repr(text[:100])}\n")
+
+            t = t1
+
+        # ---------------------------------------------------------------
+        # Per-callsign summary
+        # ---------------------------------------------------------------
+        out.write("\n" + "=" * 70 + "\n")
+        out.write("PER-CALLSIGN DIAGNOSTIC SUMMARY\n")
+        out.write("=" * 70 + "\n\n")
+
+        found_at_diag  = []
+        garbled        = []
+        not_decoded    = []
+
+        for call in sorted(gold):
+            b = call_best.get(call)
+            if b is None:
+                not_decoded.append(call)
+            elif b['as_callsign']:
+                found_at_diag.append(call)
+                out.write(f"  FOUND_AT_DIAG  {call:10s}: logBF={b['log_bf']:8.1f}  "
+                          f"freq={b['freq']:.2f}  chunk={b['chunk']}  wpm={b['wpm']:.0f}\n")
+                out.write(f"    text: {repr(b['text'][:100])}\n")
+            else:
+                garbled.append(call)
+                out.write(f"  GARBLED        {call:10s}: logBF={b['log_bf']:8.1f}  "
+                          f"freq={b['freq']:.2f}  chunk={b['chunk']}  wpm={b['wpm']:.0f}\n")
+                out.write(f"    text: {repr(b['text'][:100])}\n")
+
+        out.write(f"\n--- NOT DECODED (never appeared in any channel text) ---\n")
+        for call in not_decoded:
+            out.write(f"  {call}\n")
+
+        out.write(f"\nSUMMARY:\n")
+        out.write(f"  Found at diag threshold ({diag_threshold}): {len(found_at_diag)}\n")
+        out.write(f"  Decoded but garbled/not extracted:         {len(garbled)}\n")
+        out.write(f"  Never decoded:                             {len(not_decoded)}\n")
+        out.write(f"  Total gold: {len(gold)}\n")
+
+    print(f"[diag] done. Results: {out_path}", flush=True)
+    print(f"  Found at diag threshold: {len(found_at_diag)} — {found_at_diag}", flush=True)
+    print(f"  Garbled/not extracted:   {len(garbled)} — {garbled}", flush=True)
+    print(f"  Never decoded:           {len(not_decoded)} — {not_decoded}", flush=True)
+
+    return found_at_diag, garbled, not_decoded
+
+
+# ---------------------------------------------------------------------------
 # Single-frequency decode mode
 # ---------------------------------------------------------------------------
 
@@ -823,10 +980,28 @@ def main():
     ap.add_argument('--step',     type=float, default=0.1, help='Frequency step kHz (eval)')
     ap.add_argument('--thresh',   type=float, default=10.0,
                     help='log Bayes factor threshold for signal detection')
+    ap.add_argument('--diag',    action='store_true',
+                    help='Diagnostic scan: run at low threshold, show per-callsign breakdown')
+    ap.add_argument('--diag-thresh', type=float, default=200.0,
+                    help='log BF threshold for diagnostic scan (default 200, vs 2000 for eval)')
+    ap.add_argument('--diag-out',    default='/tmp/itila_diag.txt',
+                    help='Output file for diagnostic results (default /tmp/itila_diag.txt)')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
 
-    if args.eval:
+    if args.diag:
+        if not args.key:
+            print("--key required for diag mode", file=sys.stderr)
+            sys.exit(1)
+        run_diag(args.wav, args.center, args.key,
+                 start_min=args.start,
+                 end_min=args.end if args.end else 30,
+                 freq_step_khz=args.step,
+                 band_khz_min=args.band_min,
+                 band_khz_max=args.band_max,
+                 diag_threshold=args.diag_thresh,
+                 out_path=args.diag_out)
+    elif args.eval:
         if not args.key:
             print("--key required for eval mode", file=sys.stderr)
             sys.exit(1)
