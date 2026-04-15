@@ -814,24 +814,31 @@ def run_eval(wav_path, center_khz, key_path, start_min=15, end_min=30,
             continue
 
         for i, freq in enumerate(freqs):
-            try:
-                env, _ = read_iq_wav(wav_path, center_khz, freq,
-                                      iq_cache=iq_cache, lpf_hz=lpf_hz)
-            except Exception as e:
-                if verbose:
-                    print(f"  {freq:.2f}: env error: {e}", flush=True)
-                continue
+            # Dual-LPF pass: run at lpf_hz and 200 Hz, union callsigns.
+            # 100 Hz isolates weak/DX stations swamped at wider bandwidth.
+            # 200 Hz preserves fast (high WPM) stations whose dits smear at 100 Hz.
+            all_calls_this_freq = set()
+            for this_lpf in sorted(set([lpf_hz, 200])):
+                try:
+                    env, _ = read_iq_wav(wav_path, center_khz, freq,
+                                          iq_cache=iq_cache, lpf_hz=this_lpf)
+                except Exception as e:
+                    if verbose:
+                        print(f"  {freq:.2f}: env error (lpf={this_lpf}): {e}", flush=True)
+                    continue
 
-            result = decode_channel(env, center_khz, freq,
-                                     evidence_threshold=evidence_threshold,
-                                     verbose=verbose, lpf_hz=lpf_hz)
-            if result and result['callsigns']:
-                for call in result['callsigns']:
-                    if call in gold and call not in found:
-                        found.add(call)
-                        total_channels += 1
-                        print(f"  HIT: {call} on {freq:.2f} kHz "
-                              f"[chunk {chunk_num}]", flush=True)
+                result = decode_channel(env, center_khz, freq,
+                                         evidence_threshold=evidence_threshold,
+                                         verbose=verbose, lpf_hz=this_lpf)
+                if result and result['callsigns']:
+                    all_calls_this_freq.update(result['callsigns'])
+
+            for call in all_calls_this_freq:
+                if call in gold and call not in found:
+                    found.add(call)
+                    total_channels += 1
+                    print(f"  HIT: {call} on {freq:.2f} kHz "
+                          f"[chunk {chunk_num}]", flush=True)
 
         t = t1
 
