@@ -626,16 +626,60 @@ def scan_channel(env, wpm, A, sigma2, snr_threshold=8.0):
 def extract_callsigns(text, valid_calls=None):
     """Find plausible callsigns in decoded text.
 
-    Uses simple heuristic: tokens matching callsign pattern (letter/digit mix,
-    3–7 chars, starts with letter or digit).
+    Two passes:
+      Pass 1: standard token regex — runs of 3-7 consecutive alphanum chars.
+      Pass 2: adjacent-pair merge — concatenate pairs of adjacent tokens and
+              re-check the callsign pattern. Catches cases where the run-length
+              decoder inserts a spurious letter-space inside a callsign
+              (e.g. "W6IW I" → missed on pass 1, caught on pass 2 as "W6IWI").
     """
     import re
-    tokens = re.findall(r'[A-Z0-9]{3,7}', text.upper())
+    CALL_RE = re.compile(r'^[A-Z0-9]{1,2}[0-9][A-Z0-9]{1,4}$')
+    text_up  = text.upper()
+
+    # All runs of 1+ alphanum chars (pass 2 needs short fragments too)
+    all_tokens = re.findall(r'[A-Z0-9]+', text_up)
+    # Standard 3-7 char tokens for pass 1
+    tokens = [t for t in all_tokens if 3 <= len(t) <= 7]
+
+    seen = set()
     callsigns = []
-    for tok in tokens:
-        if re.match(r'^[A-Z0-9]{1,2}[0-9][A-Z0-9]{1,4}$', tok):
+
+    def _accept(tok):
+        if tok in seen:
+            return
+        if CALL_RE.match(tok):
             if valid_calls is None or tok in valid_calls:
+                seen.add(tok)
                 callsigns.append(tok)
+
+    # Pass 1: individual tokens
+    for tok in tokens:
+        _accept(tok)
+
+    # Pass 2: merge pairs of adjacent tokens from the full token list
+    # (handles spurious letter-space mid-callsign at slow speeds)
+    for i in range(len(all_tokens) - 1):
+        merged = all_tokens[i] + all_tokens[i + 1]
+        if 3 <= len(merged) <= 7:
+            _accept(merged)
+
+    # Pass 3: scan substrings of long tokens (>7 chars) for embedded callsigns.
+    # Handles WPM underestimation collapsing word-spaces into letter-spaces,
+    # e.g. "DEW6IWIK" → extract "W6IWI".  Only applied to tokens with a digit
+    # (heuristic to limit false positives).
+    for tok in all_tokens:
+        if len(tok) <= 7:
+            continue
+        if not any(c.isdigit() for c in tok):
+            continue
+        for start in range(len(tok) - 2):
+            for length in range(3, 8):
+                sub = tok[start:start + length]
+                if len(sub) < 3:
+                    continue
+                _accept(sub)
+
     return callsigns
 
 
