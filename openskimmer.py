@@ -3365,6 +3365,47 @@ class SpotTracker:
         self._cycle_calls.clear()
 
 
+class _IQWavWriter:
+    """24-bit stereo WAV writer that handles files > 4 GB."""
+
+    def __init__(self, path, sample_rate):
+        self._path = path
+        self._rate = sample_rate
+        self._f = open(path, 'wb')
+        self._data_written = 0
+        ch, bps, align = 2, 24, 6
+        byterate = sample_rate * align
+        self._f.write(struct.pack('<4sI4s', b'RIFF', 0, b'WAVE'))
+        self._f.write(struct.pack('<4sIHHIIHH', b'fmt ', 16,
+                                  1, ch, sample_rate, byterate, align, bps))
+        self._f.write(struct.pack('<4sI', b'data', 0))
+
+    def writeframes(self, data):
+        self._f.write(data)
+        self._data_written += len(data)
+
+    def close(self):
+        if self._f is None:
+            return
+        try:
+            self._f.flush()
+            file_size = self._f.tell()
+            riff_size = min(file_size - 8, 0xFFFFFFFF)
+            data_size = min(self._data_written, 0xFFFFFFFF)
+            self._f.seek(4)
+            self._f.write(struct.pack('<I', riff_size))
+            self._f.seek(40)
+            self._f.write(struct.pack('<I', data_size))
+            self._f.close()
+            dur = self._data_written / (self._rate * 6)
+            log.info("Recording closed: %s (%.1fs, %.0f MB)",
+                     self._path, dur, file_size / 1e6)
+        except Exception as e:
+            log.error("Error closing WAV %s: %s", self._path, e)
+        finally:
+            self._f = None
+
+
 class OpenSkimmer:
     """Main daemon — streaming architecture with dynamic decoder instances."""
 
@@ -3392,14 +3433,11 @@ class OpenSkimmer:
         self._wav_record = None
         record_wav = self.cfg.get('record_wav')
         if record_wav:
-            import wave as _wave, datetime as _dt
+            import datetime as _dt
             ts = _dt.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
             band_khz = self.cfg.get('bands', [0])[0] // 1000
             rec_path = record_wav.format(ts=ts, band=band_khz)
-            self._wav_record = _wave.open(rec_path, 'wb')
-            self._wav_record.setnchannels(2)
-            self._wav_record.setsampwidth(3)
-            self._wav_record.setframerate(self.cfg.get('sample_rate', 192000))
+            self._wav_record = _IQWavWriter(rec_path, self.cfg.get('sample_rate', 192000))
             log.info("Recording IQ to %s", rec_path)
         calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
