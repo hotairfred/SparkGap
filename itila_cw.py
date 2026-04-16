@@ -807,6 +807,99 @@ def extract_callsigns(text, valid_calls=None):
 
 
 # ---------------------------------------------------------------------------
+# M8: Multi-station WPM detection via mark-run-length GMM
+# ---------------------------------------------------------------------------
+
+def fit_mark_wpm_components(marks, wpm_em, min_marks=20, bic_delta=6.0):
+    """Fit K=1 and K=2 Gaussians to mark-run durations in log-space.
+
+    M8: detects multi-station channels by finding a bimodal run-length
+    distribution.  If K=2 GMM is significantly better by BIC, returns two
+    WPM estimates.  Otherwise returns [wpm_em].
+
+    WPM conversion: for a mixed dit+dah distribution, the geometric mean
+    duration ≈ 2*unit, so wpm ≈ 480 / mean_dur (in samples at BAYES_RATE).
+    This gives the correct WPM for both well-separated stations.
+
+    Returns list of wpm floats (1 or 2 elements), always within [WPM_MIN, WPM_MAX].
+    """
+    # Extract mark-run durations
+    durations = []
+    val = int(marks[0]); count = 1
+    for i in range(1, len(marks)):
+        v = int(marks[i])
+        if v == val:
+            count += 1
+        else:
+            if val == 1:
+                durations.append(count)
+            val = v; count = 1
+    if val == 1:
+        durations.append(count)
+
+    if len(durations) < min_marks:
+        return [wpm_em]
+
+    x = np.log(np.array(durations, dtype=float) + 0.5)
+    N = len(x)
+
+    # K=1 fit (closed-form)
+    mu1  = np.mean(x)
+    var1 = np.var(x) + 1e-6
+    ll1  = -0.5 * N * (np.log(2 * np.pi * var1) + 1.0)
+    bic1 = -2.0 * ll1 + 3.0 * np.log(N)  # 3 free params: mu, var, (pi=1)
+
+    # K=2 fit via EM, initialize at quartiles
+    lo, hi = np.percentile(x, 25), np.percentile(x, 75)
+    if hi - lo < 0.3:          # essentially unimodal already
+        return [wpm_em]
+
+    mu  = np.array([lo, hi])
+    var = np.array([var1 * 0.5, var1 * 0.5])
+    pi  = np.array([0.5, 0.5])
+
+    for _ in range(40):
+        # E-step
+        log_r0 = np.log(pi[0] + 1e-300) - 0.5*(x-mu[0])**2/var[0] - 0.5*np.log(2*np.pi*var[0])
+        log_r1 = np.log(pi[1] + 1e-300) - 0.5*(x-mu[1])**2/var[1] - 0.5*np.log(2*np.pi*var[1])
+        log_Z  = np.logaddexp(log_r0, log_r1)
+        gamma0 = np.exp(log_r0 - log_Z)
+        gamma1 = 1.0 - gamma0
+
+        # M-step
+        N0 = gamma0.sum() + 1e-10;  N1 = gamma1.sum() + 1e-10
+        pi[0] = N0 / N;             pi[1] = N1 / N
+        mu[0] = (gamma0 @ x) / N0; mu[1] = (gamma1 @ x) / N1
+        var[0] = (gamma0 @ (x-mu[0])**2) / N0 + 1e-6
+        var[1] = (gamma1 @ (x-mu[1])**2) / N1 + 1e-6
+
+    # K=2 log-likelihood and BIC
+    ll2  = np.sum(np.logaddexp(
+        np.log(pi[0]+1e-300) - 0.5*(x-mu[0])**2/var[0] - 0.5*np.log(2*np.pi*var[0]),
+        np.log(pi[1]+1e-300) - 0.5*(x-mu[1])**2/var[1] - 0.5*np.log(2*np.pi*var[1])))
+    bic2 = -2.0 * ll2 + 5.0 * np.log(N)  # 5 free params
+
+    if bic2 >= bic1 - bic_delta:
+        return [wpm_em]  # not significantly bimodal
+
+    # Sanity check 1: components must be separated by at least 30% in WPM
+    wpm0 = float(np.clip(480.0 / np.exp(mu[0]), WPM_MIN, WPM_MAX))
+    wpm1 = float(np.clip(480.0 / np.exp(mu[1]), WPM_MIN, WPM_MAX))
+    if min(wpm0, wpm1) / max(wpm0, wpm1) > 0.7:  # < 30% apart → same station
+        return [wpm_em]
+
+    # Sanity check 2: reject the common false-bimodal case where the GMM fits
+    # a single station's dit cluster and dah cluster as two "stations".
+    # A single station has dah_mean / dit_mean ≈ 3.0.  Real multi-station shows
+    # a ratio well away from 3 (e.g. WPM=60 vs WPM=25 → mean ratio ≈ 2.4).
+    mean_ratio = np.exp(max(mu)) / np.exp(min(mu))
+    if 2.5 <= mean_ratio <= 3.5:  # consistent with one station's dit/dah split
+        return [wpm_em]
+
+    return sorted([wpm0, wpm1])
+
+
+# ---------------------------------------------------------------------------
 # Full single-channel decode pipeline
 # ---------------------------------------------------------------------------
 
@@ -844,25 +937,32 @@ def decode_channel(env, center_khz, freq_khz, start_sec=0, em_iter=8,
     best_wpm = wpm_est  # EM WPM is more reliable than evidence argmax
 
     # M7: Decode using beam search over soft dit/dah classification.
-    # decode_runs_beam returns a list of hypothesis strings; union callsigns
-    # across all of them so borderline elements don't kill a callsign.
     marks = posterior_to_marks(gamma_marg)
-    texts = decode_runs_beam(marks, best_wpm)
-    text  = texts[0]  # primary text for display
+
+    # M8: Multi-station detection — if mark-run histogram is bimodal, decode
+    # against each detected WPM and union callsigns.  Handles channels with
+    # two overlapping CW stations at different speeds (e.g. K1GU @ WPM=25
+    # under a dominant WPM=60 station on the same frequency).
+    wpm_candidates = fit_mark_wpm_components(marks, best_wpm)
 
     seen_calls = set()
-    callsigns = []
-    for hyp in texts:
-        for c in extract_callsigns(hyp):
-            if c not in seen_calls:
-                seen_calls.add(c)
-                callsigns.append(c)
+    callsigns  = []
+    text       = ''
+
+    for wpm_cand in wpm_candidates:
+        texts = decode_runs_beam(marks, wpm_cand)
+        if not text:
+            text = texts[0]  # primary text from dominant WPM for display
+        for hyp in texts:
+            for c in extract_callsigns(hyp):
+                if c not in seen_calls:
+                    seen_calls.add(c)
+                    callsigns.append(c)
 
     if verbose:
         ev_best_wpm = SPEED_BINS[np.argmax(log_evs)]
-        print(f"  wpm={best_wpm:.0f} (em), ev_wpm={ev_best_wpm:.0f}  text={repr(text[:80])}", flush=True)
-        if len(texts) > 1:
-            print(f"  beam hypotheses: {len(texts)}", flush=True)
+        multi = f" +multi@{[round(w) for w in wpm_candidates]}" if len(wpm_candidates) > 1 else ""
+        print(f"  wpm={best_wpm:.0f} (em), ev_wpm={ev_best_wpm:.0f}{multi}  text={repr(text[:80])}", flush=True)
         if callsigns:
             print(f"  CALLSIGNS: {callsigns}", flush=True)
 
