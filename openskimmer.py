@@ -3618,20 +3618,27 @@ class OpenSkimmer:
 
                 live_rate = self.cfg.get('sample_rate', 48000)
                 fft_size = 8192
-                needed = fft_size
+                n_avg = 200
+                needed = fft_size * n_avg
                 with self._iq_lock:
-                    if len(self._iq_buffer) >= needed:
-                        buf = list(itertools.islice(self._iq_buffer, len(self._iq_buffer) - needed, None))
+                    buf_len = len(self._iq_buffer)
+                    actual = min(buf_len, needed)
+                    if actual >= fft_size:
+                        buf = list(itertools.islice(self._iq_buffer, buf_len - actual, None))
                     else:
                         buf = None
 
                 if buf is not None:
-                    iq_arr = np.array([complex(i, q) for i, q in buf])
-                    # Blackman window — critical for CW burst signals
-                    # n_avg averaging without window destroys SNR for transient bursts
-                    window = np.blackman(fft_size)
-                    psd = np.abs(np.fft.fft(iq_arr * window)) ** 2
-                    psd_db = 10 * np.log10(psd + 1e-20)
+                    iq_arr = np.array(buf, dtype=np.float64)
+                    iq_c = iq_arr[:, 0] + 1j * iq_arr[:, 1]
+                    n_ffts = len(iq_c) // fft_size
+                    window = np.hanning(fft_size)
+                    avg = np.zeros(fft_size)
+                    for fi in range(n_ffts):
+                        seg = iq_c[fi * fft_size:(fi + 1) * fft_size]
+                        avg += np.abs(np.fft.fft(seg * window)) ** 2
+                    avg /= max(n_ffts, 1)
+                    psd_db = 10 * np.log10(avg + 1e-20)
                     noise = np.median(psd_db)
                     min_snr = self.cfg.get('signal_min_snr', 12)
 
