@@ -3398,7 +3398,7 @@ class OpenSkimmer:
             rec_path = record_wav.format(ts=ts, band=band_khz)
             self._wav_record = _wave.open(rec_path, 'wb')
             self._wav_record.setnchannels(2)
-            self._wav_record.setsampwidth(2)
+            self._wav_record.setsampwidth(3)
             self._wav_record.setframerate(self.cfg.get('sample_rate', 192000))
             log.info("Recording IQ to %s", rec_path)
         calls, blacklist, add_calls = load_callsign_db(
@@ -3514,8 +3514,9 @@ class OpenSkimmer:
                 self._feed_i.append(i_chunk)
                 self._feed_q.append(q_chunk)
             if self._wav_record and rx_index == 0:
-                scaled = np.clip(iq_arr * 32767.0, -32768, 32767).astype('<i2')
-                self._wav_record.writeframes(scaled.tobytes())
+                scaled32 = np.clip(iq_arr * 8388607.0, -8388608, 8388607).astype('<i4')
+                frames = scaled32.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+                self._wav_record.writeframes(frames)
         except Exception:
             pass  # Don't let errors kill the receiver thread
 
