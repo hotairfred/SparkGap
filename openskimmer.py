@@ -2856,18 +2856,32 @@ class InstanceManager:
         self.center_khz = center_khz
         now = time.time()
 
-        # Mark existing groups as seen if signal still present
+        # Mark existing groups as seen if signal still present.
+        # Use 150 Hz hysteresis: FFT peaks can wander ±50 Hz between rescans
+        # (different noise floor, slightly different signal level). Without this,
+        # a 51 Hz drift resets the SignalGroup, killing ITILA's 120s accumulation.
+        matched_keys = set()
         for offset, snr in signals:
-            key = int(round(offset / 100)) * 100
-            if key in self.instances:
-                self.instances[key].last_seen = now
-                self.instances[key].snr = max(self.instances[key].snr, snr)
+            best_key = None
+            best_dist = 150  # Hz — hysteresis window
+            for k in self.instances:
+                d = abs(offset - k)
+                if d < best_dist:
+                    best_dist = d
+                    best_key = k
+            if best_key is not None:
+                self.instances[best_key].last_seen = now
+                self.instances[best_key].snr = max(self.instances[best_key].snr, snr)
+                matched_keys.add(best_key)
 
         spd = wpm_hint if wpm_hint > 0 else 25  # default 25 (contest CW center)
 
         # Spawn new SignalGroup for new signals
         for offset, snr in sorted(signals, key=lambda x: -x[1]):
             key = int(round(offset / 100)) * 100
+            # Skip if already matched to an existing group within 150 Hz
+            if any(abs(offset - k) < 150 for k in matched_keys):
+                continue
             if key in self.instances:
                 continue
             if abs(offset) < 100:  # skip DC
