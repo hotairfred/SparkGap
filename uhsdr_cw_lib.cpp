@@ -1008,6 +1008,16 @@ static void CodeGenFunc(cw_decoder_t *cw)
 
 static void cw_print(cw_decoder_t *cw, const char *s)
 {
+    // Goertzel tone gate: suppress all text output when there's no real
+    // CW signal on this channel. CW_env tracks the signal envelope,
+    // CW_noise tracks the noise floor. If the ratio is near 1, we're
+    // decoding noise — producing random SCP-matching callsign fragments
+    // that flood the spotter with false positives.
+    // Gate threshold: CW_env must be at least 2x CW_noise (6 dB SNR).
+    if (cw->CW_noise > 0 && cw->CW_env < cw->CW_noise * 2.0f) {
+        return;  // no tone detected — suppress output
+    }
+
     // Write to instance output buffer (library mode)
     for (const char *p = s; *p; p++) {
         if (cw->outbuf_len < (int)sizeof(cw->outbuf) - 1) {

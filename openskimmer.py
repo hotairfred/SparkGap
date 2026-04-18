@@ -3291,18 +3291,72 @@ class SpotTracker:
         for call in valid_calls:
             self._scp_by_len[len(call)].append(call)
 
+    # Window for time-gated sighting counts (seconds). A call must be
+    # seen N times within this window to pass the sightings threshold.
+    # Without this, cumulative counts in live mode let noise fragments
+    # pass the threshold over minutes/hours.
+    SIGHTING_WINDOW = 60.0
+
+    # WPM cap — spots with decoder WPM above this are suppressed as noise.
+    # Contest CW tops out ~40-45 WPM; anything above 50 is almost certainly
+    # a decoder artifact from noise or digital mode interference.
+    MAX_WPM = 50
+
     def _min_sightings(self, call, snr=0):
         """Length-weighted sighting threshold.
         High SNR doesn't help short calls — strong channels produce
-        more 4-char fragment matches, not fewer."""
+        more 4-char fragment matches, not fewer.
+        Calls composed entirely of short Morse elements (E,I,S,T,R,5,H)
+        get a higher threshold — they're the most common noise artifacts."""
         if call in self.add_calls:
             return 1  # pre-validated rare calls: one clean decode is enough
         n = len(call)
+
+        # Short-Morse penalty: R3ER, SE5E, SE5I, N5EE, S5SH etc.
+        # These are produced by random dots/dashes far more often than
+        # calls with longer elements (W, M, O, etc.)
+        all_short = all(c in self.SHORT_MORSE_CHARS or c.isdigit() for c in call)
+        if all_short:
+            return 6  # require 6 sightings regardless of length
+
         if n <= 4:
-            return 4  # 4-char calls always need 4 sightings (no SNR exception)
+            return 4
         elif n == 5:
             return 3
         return 2
+
+    def _record_sighting(self, call, freq_bin, now):
+        """Record a timestamped sighting for time-windowed counting."""
+        if not hasattr(self, '_sighting_times'):
+            self._sighting_times = defaultdict(list)
+        self._sighting_times[call].append((now, freq_bin))
+
+    # Max distinct frequency bins within the sighting window before
+    # suppressing a call as a noise hallucination. Real stations sit on
+    # one frequency; noise fragments scatter across the band.
+    MAX_FREQ_SPREAD = 3
+
+    # Characters that are short Morse elements — callsigns composed
+    # entirely of these are highly susceptible to noise decode.
+    SHORT_MORSE_CHARS = set('EISTR5H')
+
+    def _count_recent_sightings(self, call, freq_bin, now):
+        """Count sightings within SIGHTING_WINDOW seconds at the same freq bin.
+        Suppresses calls seen at too many distinct frequencies (noise scatter)."""
+        if not hasattr(self, '_sighting_times'):
+            return 0
+        entries = self._sighting_times.get(call, [])
+        cutoff = now - self.SIGHTING_WINDOW
+        fresh = [(t, fb) for t, fb in entries if t >= cutoff]
+        self._sighting_times[call] = fresh
+
+        # Multi-frequency suppression: if this call appears at 3+ distinct
+        # freq bins in the window, it's noise — real ops don't QSY 3x/min.
+        distinct_bins = set(fb for _, fb in fresh)
+        if len(distinct_bins) > self.MAX_FREQ_SPREAD:
+            return 0
+
+        return sum(1 for _, fb in fresh if fb == freq_bin)
 
     def _can_respot(self, call, freq_khz, now):
         """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
@@ -3378,6 +3432,11 @@ class SpotTracker:
         if not hasattr(self, '_processed_len'):
             self._processed_len = {}
 
+        # WPM cap: suppress spots from decoders reporting unrealistic speed.
+        # Noise and digital-mode interference produce high WPM artifacts.
+        if wpm > self.MAX_WPM:
+            return []
+
         full_text = context_text or text
 
         # ITILA emits fresh short strings each window ("CQ CALL "), not an
@@ -3419,10 +3478,15 @@ class SpotTracker:
                 info['count'] += 1
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
+                self._record_sighting(call, freq_bin, now)
 
-                has_context = bool(CQ_PATTERNS.search(context_clean))
+                # Context check: only look at RECENT text (last ~500 chars)
+                # to avoid "CQ" appearing by chance in hours of noise output.
+                recent_ctx = context_clean[-500:] if len(context_clean) > 500 else context_clean
+                has_context = bool(CQ_PATTERNS.search(recent_ctx))
                 min_s = self._min_sightings(call, snr)
-                if (has_context or info['count'] >= min_s) and \
+                recent_count = self._count_recent_sightings(call, freq_bin, now)
+                if (has_context or recent_count >= min_s) and \
                    self._can_respot(call, freq_khz, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
                         self._mark_spotted(call, freq_khz, now)
@@ -3472,9 +3536,11 @@ class SpotTracker:
                 info['count'] += 1
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
+                self._record_sighting(frag, freq_bin, now)
 
                 min_s = self._min_sightings(frag, snr)
-                if info['count'] >= min_s and \
+                recent_count = self._count_recent_sightings(frag, freq_bin, now)
+                if recent_count >= min_s and \
                    self._can_respot(frag, freq_khz, now):
                     if len(self._cycle_calls[frag]) < 3:
                         self._mark_spotted(frag, freq_khz, now)
@@ -3970,6 +4036,7 @@ class OpenSkimmer:
                             freq_khz=spot['freq_khz'],
                             dx_call=spot['call'],
                             snr=spot['snr'],
+                            wpm=spot.get('wpm', 0),
                         )
                         method   = spot.get('method', 'exact')
                         spot_wpm = spot.get('wpm', 0)
