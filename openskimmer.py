@@ -46,7 +46,13 @@ from telnet_server import SpotTelnetServer
 log = logging.getLogger('openskimmer')
 
 CALL_RE = re.compile(
-    r'(?<![A-Z0-9])([A-Z0-9]{1,2}\d{1,2}[A-Z]{1,3}(?:/[A-Z0-9]+)?)(?![A-Z0-9])'
+    r'(?<![A-Z0-9])'
+    r'('
+    r'[A-Z0-9]{1,3}/[A-Z0-9]{1,2}\d{1,2}[A-Z]{1,4}'   # PREFIX/CALL: PJ2/AG3I, VE3/WF8Z
+    r'|'
+    r'[A-Z0-9]{1,2}\d{1,2}[A-Z]{1,4}(?:/[A-Z0-9]{1,4})?'  # CALL or CALL/SUFFIX: W1AW/0, K9MA/P
+    r')'
+    r'(?![A-Z0-9])'
 )
 FALSE_POSITIVES = {
     'CQ', 'TEST', 'QRZ', 'DE', 'TU', '5NN', '599', 'RST',
@@ -1063,6 +1069,246 @@ def _get_bmorse_lib():
 
 
 # ---------------------------------------------------------------------------
+# libitila.so — Bayesian CW decoder (envelope in, callsigns out)
+# ---------------------------------------------------------------------------
+
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'CWT', 'SST'}
+# Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
+_BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]{1,4}$')
+# Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
+_SLASH_SUFFIX_PAT = re.compile(r'^([0-9]|P|M|MM|QRP|A|B)$')
+
+def _is_base_call(tok):
+    return bool(_BASE_CALL_PAT.match(tok)) and len(tok) >= 4
+
+def _itila_extract_cq_call(text):
+    """Extract callsign adjacent to CQ/TEST in decoded Morse text.
+
+    Handles full slash callsigns in all forms:
+      CALL/SUFFIX  — W1AW/0, K9MA/P, K9MA/MM, K9MA/QRP
+      PREFIX/CALL  — PJ2/AG3I, VE3/WF8Z
+      Split tokens — slash decoded as space: ['PJ2', 'AG3I'] → PJ2/AG3I
+    Returns callsign string (with slash) or None.
+    """
+    # Tokenize preserving slashes; collapse whitespace
+    tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
+
+    for i, tok in enumerate(tokens):
+        if tok not in _ITILA_CQ_WORDS:
+            continue
+        # Look at next few tokens for a callsign
+        for j in range(i + 1, min(i + 5, len(tokens))):
+            t = tokens[j]
+
+            # Case 1: already a slash call in one token (CALL_RE already handles CALL/SUFFIX;
+            # also handle PREFIX/CALL: short-prefix/base-call)
+            if '/' in t:
+                parts = t.split('/', 1)
+                left, right = parts[0], parts[1]
+                if _is_base_call(left) and right:
+                    # CALL/SUFFIX — W1AW/0, K9MA/MM
+                    return t if len(right) <= 4 else left
+                if _is_base_call(right) and re.match(r'^[A-Z]{1,2}[0-9]', left):
+                    # PREFIX/CALL — PJ2/AG3I, VE3/WF8Z (prefix must have letter+digit)
+                    return t
+                # Not a valid slash call — try to salvage the base call part
+                for part in (right, left):
+                    if _is_base_call(part):
+                        return part
+                continue
+
+            # Case 2: plain base call
+            if _is_base_call(t):
+                # Check if next token looks like a slash suffix (slash decoded as space)
+                if j + 1 < min(i + 6, len(tokens)):
+                    nxt = tokens[j + 1]
+                    if _SLASH_SUFFIX_PAT.match(nxt):
+                        # CALL/SUFFIX: K9MA P → K9MA/P
+                        return f'{t}/{nxt}'
+                return t
+
+            # Case 3: short DX prefix (e.g. PJ2, VE3) — slash decoded as space
+            # Pattern: 1-2 letters + 1 digit, like PJ2, VE3, W1, DL0
+            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 6, len(tokens)):
+                nxt = tokens[j + 1]
+                if _is_base_call(nxt):
+                    # PREFIX CALL → PREFIX/CALL
+                    return f'{t}/{nxt}'
+
+    return None
+
+
+_itila_lib = None
+
+def _get_itila_lib():
+    global _itila_lib
+    if _itila_lib is None:
+        import ctypes as _ct
+        try:
+            _itila_lib = _ct.CDLL('./libitila.so')
+            _itila_lib.itila_create.restype = _ct.c_void_p
+            _itila_lib.itila_create.argtypes = [_ct.c_int, _ct.c_double]
+            _itila_lib.itila_feed.restype  = _ct.c_char_p
+            _itila_lib.itila_feed.argtypes = [_ct.c_void_p,
+                                               _ct.POINTER(_ct.c_double),
+                                               _ct.c_int,
+                                               _ct.c_double, _ct.c_double]
+            _itila_lib.itila_free.restype  = None
+            _itila_lib.itila_free.argtypes = [_ct.c_void_p]
+            log.info("Loaded libitila.so")
+        except OSError:
+            log.warning("libitila.so not found — ITILA decoder unavailable")
+            _itila_lib = False  # sentinel: tried and failed
+    return _itila_lib if _itila_lib else None
+
+
+class _ItilaChannel:
+    """Streaming Bayesian CW decoder via libitila.so.
+
+    Pipeline per 12kHz PCM block:
+      12 kHz real PCM  →  mix at -pitch_hz  →  complex baseband
+                       →  IIR Butterworth LPF (100 Hz + 200 Hz paths)
+                       →  |z|  →  envelope at 12 kHz
+                       →  60:1 block-avg  →  200 Hz envelope
+
+    Accumulates window_sec of envelope, then calls itila_feed (dual-LPF,
+    union callsigns).  Emits space-separated callsigns via read().
+    """
+
+    def __init__(self, rf_khz, ev_thresh=2.0, window_sec=120.0):
+        import ctypes as _ct
+        from scipy.signal import butter, sosfilt_zi
+
+        self.rf_khz      = rf_khz
+        self.decoded_text  = ''
+        self.detected_wpm  = 0
+
+        self._ev_thresh      = ev_thresh
+        self._window_samples = int(window_sec * 200)  # samples at 200 Hz
+        self._pending        = []
+
+        # Phase-continuous mixing state
+        self._phase = 0.0
+
+        # IIR LPF at 12 kHz (applied independently to I and Q after mixing)
+        fs_pcm = DECODER_RATE  # 12000 Hz
+        self._sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
+        self._sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
+        zi_100 = sosfilt_zi(self._sos_100)
+        zi_200 = sosfilt_zi(self._sos_200)
+        self._zi_100_i = zi_100.copy()
+        self._zi_100_q = zi_100.copy()
+        self._zi_200_i = zi_200.copy()
+        self._zi_200_q = zi_200.copy()
+
+        # Decimation residuals (carry-over between PCM blocks)
+        self._res_100 = np.zeros(0, dtype=np.float64)
+        self._res_200 = np.zeros(0, dtype=np.float64)
+
+        # Envelope accumulators at 200 Hz
+        self._env_100 = []
+        self._env_200 = []
+
+        # libitila handles (one per LPF path)
+        lib = _get_itila_lib()
+        if lib:
+            self._h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
+            self._h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
+        else:
+            self._h100 = self._h200 = None
+        self._lib = lib
+
+    def feed_pcm(self, pcm_bytes, pitch_hz):
+        """Feed 12kHz int16 PCM; mix CW tone at pitch_hz to DC, extract envelope."""
+        from scipy.signal import sosfilt
+
+        if not pcm_bytes:
+            return
+
+        pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64)
+        n = len(pcm)
+        if n == 0:
+            return
+
+        # Mix at -pitch_hz to shift CW tone to DC
+        phase_inc = -2.0 * np.pi * pitch_hz / DECODER_RATE
+        phases = self._phase + np.arange(n, dtype=np.float64) * phase_inc
+        self._phase = (phases[-1] + phase_inc) % (2.0 * np.pi)
+        mixed_i = pcm * np.cos(phases)
+        mixed_q = pcm * np.sin(phases)
+
+        # IIR LPF (100 Hz and 200 Hz paths) — streaming with zi state
+        i_100, self._zi_100_i = sosfilt(self._sos_100, mixed_i, zi=self._zi_100_i)
+        q_100, self._zi_100_q = sosfilt(self._sos_100, mixed_q, zi=self._zi_100_q)
+        i_200, self._zi_200_i = sosfilt(self._sos_200, mixed_i, zi=self._zi_200_i)
+        q_200, self._zi_200_q = sosfilt(self._sos_200, mixed_q, zi=self._zi_200_q)
+
+        env_100_12k = np.sqrt(i_100**2 + q_100**2)
+        env_200_12k = np.sqrt(i_200**2 + q_200**2)
+
+        # 60:1 block-average decimate 12 kHz → 200 Hz
+        for env_12k, res_attr, env_list in (
+            (env_100_12k, '_res_100', self._env_100),
+            (env_200_12k, '_res_200', self._env_200),
+        ):
+            env_all = np.concatenate([getattr(self, res_attr), env_12k])
+            n_dec = (len(env_all) // 60) * 60
+            setattr(self, res_attr, env_all[n_dec:])
+            if n_dec > 0:
+                env_list.extend(env_all[:n_dec].reshape(-1, 60).mean(axis=1).tolist())
+
+        # Decode any complete windows
+        while len(self._env_100) >= self._window_samples:
+            self._decode_window()
+
+    def _decode_window(self):
+        import ctypes as _ct
+        lib = self._lib
+        if not lib:
+            return
+
+        env100 = np.array(self._env_100[:self._window_samples], dtype=np.float64)
+        env200 = np.array(self._env_200[:self._window_samples], dtype=np.float64)
+        self._env_100 = self._env_100[self._window_samples:]
+        self._env_200 = self._env_200[self._window_samples:]
+
+        seen = set()
+        for h, env in ((self._h100, env100), (self._h200, env200)):
+            if h is None or h.value is None:
+                continue
+            n = len(env)
+            env_c = np.ascontiguousarray(env, dtype=np.float64)
+            ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
+            result = lib.itila_feed(h, ptr, _ct.c_int(n),
+                                    _ct.c_double(self.rf_khz),
+                                    _ct.c_double(self._ev_thresh))
+            if result:
+                text = result.decode('ascii', errors='replace').strip()
+                call = _itila_extract_cq_call(text)
+                if call and call not in seen:
+                    seen.add(call)
+                    self._pending.append(f'CQ {call} ')
+                    log.info("ITILA %.1f kHz: %s (from: %s)", self.rf_khz, call, text[:60])
+
+    def read(self):
+        if not self._pending:
+            return ''
+        text = ''.join(self._pending)
+        self._pending = []
+        return text
+
+    def kill(self):
+        lib = self._lib
+        if lib:
+            if self._h100 and self._h100.value:
+                lib.itila_free(self._h100)
+                self._h100 = None
+            if self._h200 and self._h200.value:
+                lib.itila_free(self._h200)
+                self._h200 = None
+
+
+# ---------------------------------------------------------------------------
 # libcw_dispatcher.so — batched parallel uhsdr fan-out
 # ---------------------------------------------------------------------------
 # One shared pool is created lazily the first time a _DispDecoder is spawned.
@@ -2019,7 +2265,8 @@ class SignalGroup:
                  decoder_bin, speeds,
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
                  wpm=30, ml_model_path=None, ml_min_confidence=0.7,
-                 pfb=None, use_dispatcher=False, use_pfb_dispatcher=False):
+                 pfb=None, use_dispatcher=False, use_pfb_dispatcher=False,
+                 use_itila=False, center_khz=0, itila_ev_thresh=2.0):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
@@ -2135,6 +2382,10 @@ class SignalGroup:
         self._wpm_locked       = False
         self._wpm_stable_scans = 0
         self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path, min_confidence=ml_min_confidence) if ml_model_path else None
+
+        # ITILA Bayesian decoder (optional — accumulates envelope, batch decode)
+        self._itila = (_ItilaChannel(rf_khz, ev_thresh=itila_ev_thresh)
+                       if use_itila else None)
 
     @property
     def _decoders_started(self):
@@ -2347,6 +2598,10 @@ class SignalGroup:
         # Python channelizer path (always runs)
         pcm_12k = self._ch_uhsdr.process(i_samples, q_samples)
 
+        # ITILA path: tap Channelizer's 12kHz PCM; mix CW tone at detected_pitch to DC
+        if self._itila and pcm_12k:
+            self._itila.feed_pcm(pcm_12k, self._ch_uhsdr.detected_pitch)
+
         if self._ch_4k:
             pcm_4k = self._ch_4k.process(i_samples, q_samples)
         else:
@@ -2477,6 +2732,15 @@ class SignalGroup:
             if text:
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary', d.detected_wpm))
                 self.last_output = time.time()
+        # ITILA decoder: emits space-separated callsigns as 'primary' text
+        if self._itila:
+            text = self._itila.read()
+            if text:
+                results.append((self.rf_khz, self.snr, text,
+                                 text, id(self._itila),
+                                 'itila', self._itila.detected_wpm))
+                self.last_output = time.time()
+
         # Track CQ state: if any new text contains a CQ/QRZ pattern, mark time
         if results:
             all_new = ' '.join(r[2] for r in results)
@@ -2488,6 +2752,9 @@ class SignalGroup:
         if self._cw_engine:
             self._cw_engine.kill()
             self._cw_engine = None
+        if self._itila:
+            self._itila.kill()
+            self._itila = None
         for d in self.decoders:
             d.kill()
         for d in self._secondary_decoders:
@@ -2523,7 +2790,8 @@ class InstanceManager:
                  speeds=None, bmorse_bin=None, hamfist_bin=None,
                  hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7,
                  ml_max_channels=20, use_dispatcher=False,
-                 use_pfb_dispatcher=False):
+                 use_pfb_dispatcher=False, use_itila=False,
+                 itila_ev_thresh=2.0):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -2532,12 +2800,14 @@ class InstanceManager:
         self.ml_model_path = ml_model_path  # None = no ML decoder
         self.ml_min_confidence = ml_min_confidence
         self.ml_max_channels = ml_max_channels  # cap ML to top-N SNR channels
+        self.use_itila = bool(use_itila)
+        self.itila_ev_thresh = float(itila_ev_thresh)
         self.max_instances = max_instances  # total decoder process cap (legacy)
         # max_channels: max simultaneous signals — decoupled from decoder count
         # defaults to max_instances for backwards compat
         self.max_channels = max_channels if max_channels is not None else max_instances
         self.signal_timeout = signal_timeout
-        self.speeds = speeds or [0, 30]  # auto + 30 WPM
+        self.speeds = speeds if speeds is not None else [0, 30]  # auto + 30 WPM
         # freq_key -> SignalGroup
         self.instances = {}
         self.center_khz = 0
@@ -2654,10 +2924,14 @@ class InstanceManager:
                 pfb=self._pfb,
                 use_dispatcher=self.use_dispatcher,
                 use_pfb_dispatcher=self.use_pfb_dispatcher,
+                use_itila=self.use_itila,
+                center_khz=self.center_khz,
+                itila_ev_thresh=self.itila_ev_thresh,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
-                     ('+hamfist' if self.hamfist_bin else '')
+                     ('+hamfist' if self.hamfist_bin else '') + \
+                     ('+itila' if self.use_itila else '')
             log.info("Spawned %d decoders: %.1f kHz (offset %+.0f Hz, +%.0f dB, speeds %s%s)",
                      group.count, rf_khz, offset, snr,
                      [s if s > 0 else 'auto' for s in self.speeds], extras)
@@ -2984,17 +3258,23 @@ class SpotTracker:
     """
 
     def __init__(self, valid_calls, blacklist, respot_interval=120,
-                 fuzzy_min_cycles=3, add_calls=None):
+                 fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
         self.fuzzy_min_cycles = fuzzy_min_cycles
         self.add_calls = add_calls or set()
+        # 0 = naked (no SCP), None = SCP-only (no bypass), N>0 = promote after N decodes
+        self.scp_bypass_threshold = scp_bypass_threshold
 
         # Exact match tracking
         self._tracking = defaultdict(lambda: {
             'freq': 0, 'count': 0, 'last_spotted': 0, 'snr': 0
         })
+        # Non-SCP callsign bypass: (call, freq_bin) → decode count
+        self._bypass_counts = defaultdict(int)
+        # Bypass calls already emitted — emit once per (call, freq_bin)
+        self._bypass_spotted = set()
         # Per-frequency sighting counts: (call, freq_bin) → count
         self._freq_sightings = defaultdict(int)
 
@@ -3099,16 +3379,20 @@ class SpotTracker:
             self._processed_len = {}
 
         full_text = context_text or text
-        prev_len = self._processed_len.get(cache_key, 0)
 
-        # Only re-scan when we have 10+ new chars (avoid per-character overhead)
-        if len(full_text) - prev_len < 10:
-            return []
-
-        self._processed_len[cache_key] = len(full_text)
-
-        # Only process the NEW portion for fragment accumulation
-        new_text = full_text[max(0, prev_len - 10):]  # overlap 10 chars for boundary
+        # ITILA emits fresh short strings each window ("CQ CALL "), not an
+        # accumulating context.  Skip the incremental-length guard for itila —
+        # its own _decode_window seen-set prevents duplicate entries per window.
+        if dec_type == 'itila':
+            new_text = full_text
+        else:
+            prev_len = self._processed_len.get(cache_key, 0)
+            # Only re-scan when we have 10+ new chars (avoid per-character overhead)
+            if len(full_text) - prev_len < 10:
+                return []
+            self._processed_len[cache_key] = len(full_text)
+            # Only process the NEW portion for fragment accumulation
+            new_text = full_text[max(0, prev_len - 10):]  # overlap 10 chars for boundary
         clean = re.sub(r'\b[EIT]\b', '', new_text.upper())
         # Full text for context matching (CQ/TEST detection)
         context_clean = re.sub(r'\b[EIT]\b', '', full_text.upper())
@@ -3128,7 +3412,7 @@ class SpotTracker:
             if call in self.valid_calls:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
-                if dec_type == 'primary':
+                if dec_type in ('primary', 'itila'):
                     self._primary_matched.add(freq_bin)
                     self._cycle_calls[call].add(freq_bin)
                 info = self._tracking[call]
@@ -3149,6 +3433,27 @@ class SpotTracker:
                             'wpm': wpm,
                             'method': 'exact',
                         })
+            elif self.scp_bypass_threshold and CALL_RE.match(call) \
+                    and call not in seen_p1:
+                # Non-SCP call that looks structurally valid — track per (call, freq).
+                # seen_p1 prevents counting the same call twice in one process() call.
+                # Promotes to spot after scp_bypass_threshold consistent decode events.
+                # Noise won't produce the same non-SCP call N times at one frequency.
+                seen_p1.add(call)  # dedupe within this process() call
+                bkey = (call, freq_bin)
+                self._bypass_counts[bkey] += 1
+                if self._bypass_counts[bkey] >= self.scp_bypass_threshold and \
+                   bkey not in self._bypass_spotted:
+                    self._bypass_spotted.add(bkey)  # emit once per (call, freq)
+                    log.info("SCP bypass: %s at %.1f kHz (count=%d)",
+                             call, freq_khz, self._bypass_counts[bkey])
+                    spots.append({
+                        'call': call,
+                        'freq_khz': freq_khz,
+                        'snr': snr,
+                        'wpm': wpm,
+                        'method': 'unverified',
+                    })
 
         # 1b: sliding window on collapsed text — catches calls embedded in
         # noise like "TUCY0S" where the regex word-boundary check misses them
@@ -3372,7 +3677,8 @@ class OpenSkimmer:
                                  if os.path.exists(self._add_calls_path) else 0)
         self.tracker = SpotTracker(calls, blacklist,
                                    self.cfg.get('respot_interval', 120),
-                                   add_calls=add_calls)
+                                   add_calls=add_calls,
+                                   scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)))
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
@@ -3644,12 +3950,17 @@ class OpenSkimmer:
             # ----------------------------------------------------------------
             # Collect decoder output from every band — spots to shared telnet
             # ----------------------------------------------------------------
+            max_spot_wpm = self.cfg.get('max_spot_wpm', 0)  # 0 = unlimited
             for (_band_name, _center_hz, _rx_idx), mgr in zip(self._band_meta, self.managers):
                 results = mgr.collect_all()
                 for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
                     log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
                     alnum = re.sub(r'[^A-Z0-9]', '', (ctx or text).upper())
                     if len(alnum) < 4:
+                        continue
+                    if max_spot_wpm and wpm > max_spot_wpm:
+                        log.debug("WPM cap: %.1f kHz %d WPM > %d, skipped",
+                                  rf_khz, wpm, max_spot_wpm)
                         continue
                     spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
                                                  dec_type=dec_type, wpm=wpm)
@@ -3797,7 +4108,8 @@ def run_file_mode(args, config):
         config.get('add_calls', 'add_calls.txt'),
         config.get('blacklist', 'blacklist.txt'),
     )
-    tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls)
+    tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls,
+                          scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)))
 
     # Determine file format and sample rate
     with open(args.file, 'rb') as f:
@@ -3828,6 +4140,8 @@ def run_file_mode(args, config):
         ml_min_confidence=float(config.get('ml_min_confidence', 0.7)),
         use_dispatcher=bool(config.get('use_cpp_dispatcher', False)),
         use_pfb_dispatcher=bool(config.get('use_cpp_pfb', False)),
+        use_itila=bool(config.get('use_itila', False)),
+        itila_ev_thresh=float(config.get('itila_ev_thresh', 2.0)),
     )
 
     center_khz = args.center_khz
@@ -4018,8 +4332,11 @@ def run_file_mode(args, config):
             for spot in spots:
                 all_spots.append(spot)
 
-        log.info("  Chunk decoded: %d text outputs, %d total chars, %d spots",
-                 total_results, total_chars, len(all_spots))
+        unique_so_far = len({s['call'] for s in all_spots})
+        log.info("  Chunk decoded: %d text outputs, %d total chars, %d spots (%d unique so far)",
+                 total_results, total_chars, len(all_spots), unique_so_far)
+        # Flush stdout so file-mode progress is visible without waiting for exit
+        print(f"  [progress] t={t_end/60:.1f}min: {unique_so_far} unique spots so far", flush=True)
 
         del i_data, q_data
 
