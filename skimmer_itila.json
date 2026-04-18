@@ -1,0 +1,14 @@
+{
+  "callsign": "WF8Z",
+  "grid": "EN82",
+  "master_scp": "MASTER.SCP",
+  "add_calls": "add_calls.txt",
+  "decoder_bin": "./uhsdr_cw",
+  "decoder_speeds": [],
+  "max_channels": 300,
+  "signal_min_snr": 6,
+  "rescan_interval_sec": 30,
+  "use_itila": true,
+  "use_cpp_dispatcher": false,
+  "use_cpp_pfb": false
+}
