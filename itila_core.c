@@ -34,7 +34,7 @@
 #define MAX_TEXT        2048     /* max decoded text per chunk */
 #define MAX_CALLS       64       /* max callsigns per chunk */
 #define MAX_CALL        8        /* max callsign length + null */
-#define RESULT_BUF      1024     /* output buffer */
+#define RESULT_BUF      2048     /* output buffer — must hold MAX_TEXT */
 
 /* Forward declaration of fb_core (fb_core.c) */
 void fb_core(const double* log_B, const double* log_T, int T,
@@ -648,15 +648,17 @@ static int is_callsign(const char *s) {
     return 0;
 }
 
-typedef struct { char call[MAX_CALL]; } callsign_t;
+typedef struct { char call[MAX_CALL]; int count; } callsign_t;
 
 static int add_callsign(const char *tok, callsign_t *calls, int *n_calls) {
-    if (*n_calls >= MAX_CALLS) return 0;
     if (!is_callsign(tok)) return 0;
-    for (int i = 0; i < *n_calls; i++)
-        if (strcmp(calls[i].call, tok)==0) return 0;
+    for (int i = 0; i < *n_calls; i++) {
+        if (strcmp(calls[i].call, tok)==0) { calls[i].count++; return 1; }
+    }
+    if (*n_calls >= MAX_CALLS) return 0;
     strncpy(calls[*n_calls].call, tok, MAX_CALL-1);
     calls[*n_calls].call[MAX_CALL-1] = '\0';
+    calls[*n_calls].count = 1;
     (*n_calls)++;
     return 1;
 }
@@ -797,27 +799,41 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     double wpm_cands[2]; int n_cands;
     n_cands = fit_mark_wpm_components(st->marks, n, wpm_em, wpm_cands, 2);
 
-    /* Collect callsigns across all WPM candidates */
+    /* Collect callsigns across all WPM candidates; save primary path text */
     static callsign_t calls[MAX_CALLS];
     int n_calls = 0;
 
     static char out_texts[MAX_TEXTS][MAX_TEXT];
+    static char primary_text[MAX_TEXT];
+    primary_text[0] = '\0';
+
     for (int ci = 0; ci < n_cands; ci++) {
         int n_texts = decode_runs_beam(st->marks, n, wpm_cands[ci],
                                        out_texts, MAX_TEXTS);
+        /* Save top beam text from primary WPM candidate — has CQ/TEST context */
+        if (ci == 0 && n_texts > 0)
+            strncpy(primary_text, out_texts[0], MAX_TEXT-1);
         for (int ti = 0; ti < n_texts; ti++)
             extract_callsigns(out_texts[ti], calls, &n_calls);
     }
 
-    /* Build result string */
-    int pos = 0;
-    for (int i = 0; i < n_calls && pos < RESULT_BUF-MAX_CALL-2; i++) {
-        int l = (int)strlen(calls[i].call);
-        memcpy(st->result_buf + pos, calls[i].call, l);
-        pos += l;
-        st->result_buf[pos++] = '\n';
+    if (n_calls == 0) return st->result_buf;
+
+    /* Return full primary text — preserves CQ/TEST context for caller */
+    if (primary_text[0]) {
+        strncpy(st->result_buf, primary_text, RESULT_BUF-1);
+        st->result_buf[RESULT_BUF-1] = '\0';
+        return st->result_buf;
     }
-    st->result_buf[pos] = '\0';
+
+    /* Fallback: no primary text, return top-1 callsign */
+    int best = 0;
+    for (int i = 1; i < n_calls; i++)
+        if (calls[i].count > calls[best].count) best = i;
+    int l = (int)strlen(calls[best].call);
+    memcpy(st->result_buf, calls[best].call, l);
+    st->result_buf[l]   = '\n';
+    st->result_buf[l+1] = '\0';
     return st->result_buf;
 }
 
