@@ -2431,8 +2431,9 @@ class SignalGroup:
         # Secondary pitch decoders — co-channel signals at different audio pitches
         # Uses the uhsdr channelizer (always available) to detect secondary peaks.
         # Only auto+detected-wpm (2 decoders per secondary pitch) to control CPU.
+        # Skip if no uhsdr speeds configured (ITILA-only mode).
         sec_pitches = self._ch_uhsdr.secondary_pitches
-        if sec_pitches:
+        if sec_pitches and self._speeds:
             lib = _get_uhsdr_lib()
             sec_speeds = [0, wpm]  # auto + detected-wpm only (vs all 7 speeds)
             for sec_pitch in sec_pitches:
