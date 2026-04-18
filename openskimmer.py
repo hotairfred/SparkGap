@@ -3867,6 +3867,8 @@ class OpenSkimmer:
                 ml_min_confidence=float(self.cfg.get('ml_min_confidence', 0.7)),
                 use_dispatcher=bool(self.cfg.get('use_cpp_dispatcher', False)),
                 use_pfb_dispatcher=bool(self.cfg.get('use_cpp_pfb', False)),
+                use_itila=bool(self.cfg.get('use_itila', False)),
+                itila_ev_thresh=float(self.cfg.get('itila_ev_thresh', 2.0)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
