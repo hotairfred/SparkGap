@@ -3507,13 +3507,17 @@ class SpotTracker:
                 recent_count = self._count_recent_sightings(call, freq_bin, now)
                 if dec_type == 'itila':
                     # ITILA already applies a Bayesian quality gate per window.
-                    # Don't bypass sightings via has_context — one wrong-WPM
-                    # decode would immediately spot. Use info['count'] (lifetime
-                    # per tracker reset) not recent_count (60s window) since
-                    # ITILA windows are 120s apart and would fall outside SIGHTING_WINDOW.
-                    # Require 2 window decodes: noise rarely produces the same SCP
-                    # call twice at the same frequency across separate 120s windows.
-                    gate = info['count'] >= 2
+                    # Require 2 decodes at the same (call, freq_bin) — noise rarely
+                    # produces the same SCP call twice at the same frequency across
+                    # separate 120s windows. Use per-(call,freq_bin) count, not
+                    # global info['count'], to avoid cross-channel false promotions.
+                    if not hasattr(self, '_itila_counts'):
+                        self._itila_counts = defaultdict(int)
+                    itila_key = (call, freq_bin)
+                    self._itila_counts[itila_key] += 1
+                    itila_n = self._itila_counts[itila_key]
+                    log.debug("ITILA gate: %s at %.1f kHz count=%d", call, freq_khz, itila_n)
+                    gate = itila_n >= 2
                 else:
                     # Context check: only look at RECENT text (last ~500 chars)
                     # to avoid "CQ" appearing by chance in hours of noise output.
