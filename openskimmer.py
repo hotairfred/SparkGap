@@ -2278,7 +2278,7 @@ class SignalGroup:
 
         # Try C++ cw_engine first (owns channelization + both decoders)
         self._cw_engine = None
-        eng = _get_cw_engine()
+        eng = _get_cw_engine() if speeds else None
         if eng:
             self._cw_engine = _CWEngineChannel(freq_offset, rf_khz, snr, sample_rate)
 
