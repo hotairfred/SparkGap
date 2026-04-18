@@ -2266,7 +2266,8 @@ class SignalGroup:
                  bmorse_bin=None, hamfist_bin=None, hamfist_scp=None,
                  wpm=30, ml_model_path=None, ml_min_confidence=0.7,
                  pfb=None, use_dispatcher=False, use_pfb_dispatcher=False,
-                 use_itila=False, center_khz=0, itila_ev_thresh=2.0):
+                 use_itila=False, center_khz=0, itila_ev_thresh=2.0,
+                 itila_window_sec=120.0):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
@@ -2384,7 +2385,8 @@ class SignalGroup:
         self._ml_decoder = _MLDecoder(rf_khz, snr, ml_model_path, min_confidence=ml_min_confidence) if ml_model_path else None
 
         # ITILA Bayesian decoder (optional — accumulates envelope, batch decode)
-        self._itila = (_ItilaChannel(rf_khz, ev_thresh=itila_ev_thresh)
+        self._itila = (_ItilaChannel(rf_khz, ev_thresh=itila_ev_thresh,
+                                     window_sec=itila_window_sec)
                        if use_itila else None)
 
     @property
@@ -2395,6 +2397,9 @@ class SignalGroup:
     def _start_bmorse(self, wpm, pitch):
         """Start bmorse/hamfist with detected WPM and pitch.
         Also respawn uhsdr at the detected pitch if it differs from CW_TONE."""
+        if not self._speeds:
+            self._bmorse_started = True
+            return
         # Respawn uhsdr at detected pitch (was started at CW_TONE initially)
         if pitch != CW_TONE:
             for d in self.decoders:
@@ -2791,7 +2796,7 @@ class InstanceManager:
                  hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7,
                  ml_max_channels=20, use_dispatcher=False,
                  use_pfb_dispatcher=False, use_itila=False,
-                 itila_ev_thresh=2.0):
+                 itila_ev_thresh=2.0, itila_window_sec=120.0):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -2802,6 +2807,7 @@ class InstanceManager:
         self.ml_max_channels = ml_max_channels  # cap ML to top-N SNR channels
         self.use_itila = bool(use_itila)
         self.itila_ev_thresh = float(itila_ev_thresh)
+        self.itila_window_sec = float(itila_window_sec)
         self.max_instances = max_instances  # total decoder process cap (legacy)
         # max_channels: max simultaneous signals — decoupled from decoder count
         # defaults to max_instances for backwards compat
@@ -2941,6 +2947,7 @@ class InstanceManager:
                 use_itila=self.use_itila,
                 center_khz=self.center_khz,
                 itila_ev_thresh=self.itila_ev_thresh,
+                itila_window_sec=self.itila_window_sec,
             )
             self.instances[key] = group
             extras = ('+bmorse' if self.bmorse_bin else '') + \
@@ -3869,6 +3876,7 @@ class OpenSkimmer:
                 use_pfb_dispatcher=bool(self.cfg.get('use_cpp_pfb', False)),
                 use_itila=bool(self.cfg.get('use_itila', False)),
                 itila_ev_thresh=float(self.cfg.get('itila_ev_thresh', 2.0)),
+                itila_window_sec=float(self.cfg.get('itila_window_sec', 120.0)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
@@ -4249,6 +4257,7 @@ def run_file_mode(args, config):
         use_pfb_dispatcher=bool(config.get('use_cpp_pfb', False)),
         use_itila=bool(config.get('use_itila', False)),
         itila_ev_thresh=float(config.get('itila_ev_thresh', 2.0)),
+        itila_window_sec=float(config.get('itila_window_sec', 120.0)),
     )
 
     center_khz = args.center_khz

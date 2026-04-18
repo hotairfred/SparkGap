@@ -9,6 +9,12 @@
   "signal_min_snr": 6,
   "rescan_interval_sec": 30,
   "use_itila": true,
+  "itila_window_sec": 60,
   "use_cpp_dispatcher": false,
-  "use_cpp_pfb": false
+  "use_cpp_pfb": false,
+  "sdr_ip": "192.168.1.54",
+  "sdr_port": 1024,
+  "sample_rate": 192000,
+  "bands": ["20m"],
+  "telnet_port": 7305
 }
