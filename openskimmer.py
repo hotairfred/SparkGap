@@ -1375,6 +1375,16 @@ class _ItilaScanner:
         # f_khz -> bin state dict
         self._bins = {}
 
+        # Rolling buffer for energy scan — accumulate ENERGY_WIN samples before
+        # running FFT so proxy's small 126-sample chunks don't cause coarse-bin jitter
+        self._scan_buf_i = np.zeros(0, dtype=np.float64)
+        self._scan_buf_q = np.zeros(0, dtype=np.float64)
+
+        # Residual IQ carry-over — ensures every sample is decimated even when
+        # chunk size is not a multiple of dec_factor (126 mod 16 = 14 drops 11% otherwise)
+        self._iq_res_i = np.zeros(0, dtype=np.float64)
+        self._iq_res_q = np.zeros(0, dtype=np.float64)
+
     def _make_bin(self):
         import ctypes as _ct
         lib = _get_itila_lib()
@@ -1403,49 +1413,73 @@ class _ItilaScanner:
         now = time.time()
 
         # --- Energy scan: find active 0.1 kHz bins ---
-        n_fft = min(self.ENERGY_WIN, len(i_arr))
-        z_seg = (i_arr[-n_fft:] + 1j * q_arr[-n_fft:]) * np.blackman(n_fft)
-        psd_db = 10 * np.log10(np.abs(np.fft.fft(z_seg)) ** 2 + 1e-20)
-        noise  = np.median(psd_db)
-        freqs_hz = np.fft.fftfreq(n_fft, 1.0 / self.sample_rate)
+        # Accumulate into rolling buffer so we always run a full ENERGY_WIN FFT.
+        # With proxy delivering ~126-sample chunks the FFT would otherwise be only
+        # 126 points → 1524 Hz resolution → ±762 Hz bin jitter → premature eviction.
+        self._scan_buf_i = np.concatenate([self._scan_buf_i, i_arr])
+        self._scan_buf_q = np.concatenate([self._scan_buf_q, q_arr])
 
-        # Collect (power, freq_khz) pairs above threshold, then cluster within
-        # 300 Hz so one CW signal (which spreads across 3-5 adjacent 0.1 kHz
-        # bins) produces a single channel at its peak-power bin.
-        raw_peaks = []
-        for f_hz, p in zip(freqs_hz, psd_db):
-            if p > noise + self.min_snr:
-                f_khz = self.center_khz + f_hz / 1000.0
-                if self.band_min_khz <= f_khz <= self.band_max_khz:
-                    raw_peaks.append((p, round(round(f_khz / self.GRID_KHZ) * self.GRID_KHZ, 1)))
+        if len(self._scan_buf_i) >= self.ENERGY_WIN:
+            seg_i = self._scan_buf_i[-self.ENERGY_WIN:]
+            seg_q = self._scan_buf_q[-self.ENERGY_WIN:]
+            self._scan_buf_i = np.zeros(0, dtype=np.float64)
+            self._scan_buf_q = np.zeros(0, dtype=np.float64)
 
-        # Cluster: 300 Hz window, keep strongest bin per cluster
-        active = {}  # f_khz -> power
-        for p, f_khz in sorted(raw_peaks, reverse=True):
-            if not any(abs(f_khz - k) < 0.3 for k in active):
-                active[f_khz] = p
+            win = np.blackman(self.ENERGY_WIN)
+            z_seg = (seg_i + 1j * seg_q) * win
+            psd_db = 10 * np.log10(np.abs(np.fft.fft(z_seg)) ** 2 + 1e-20)
+            noise  = np.median(psd_db)
+            freqs_hz = np.fft.fftfreq(self.ENERGY_WIN, 1.0 / self.sample_rate)
 
-        for f_khz in sorted(active, key=lambda k: -active[k]):  # strongest first
-            if f_khz not in self._bins:
-                # Don't spawn if within 300 Hz of an already-running channel
-                nearby = next((k for k in self._bins if abs(f_khz - k) < 0.3), None)
-                if nearby is not None:
-                    self._bins[nearby]['last_active'] = now
-                    continue
-                if len(self._bins) >= self.max_bins:
-                    continue  # hard cap — don't OOM
-                self._bins[f_khz] = self._make_bin()
-                log.info("ITILA scanner: spawned %.1f kHz", f_khz)
-            self._bins[f_khz]['last_active'] = now
+            # Collect (power, freq_khz) pairs above threshold, then cluster within
+            # 300 Hz so one CW signal (which spreads across 3-5 adjacent 0.1 kHz
+            # bins) produces a single channel at its peak-power bin.
+            raw_peaks = []
+            for f_hz, p in zip(freqs_hz, psd_db):
+                if p > noise + self.min_snr:
+                    f_khz = self.center_khz + f_hz / 1000.0
+                    if self.band_min_khz <= f_khz <= self.band_max_khz:
+                        raw_peaks.append((p, round(round(f_khz / self.GRID_KHZ) * self.GRID_KHZ, 1)))
+
+            # Cluster: 300 Hz window, keep strongest bin per cluster
+            active_scan = {}  # f_khz -> power
+            for p, f_khz in sorted(raw_peaks, reverse=True):
+                if not any(abs(f_khz - k) < 0.3 for k in active_scan):
+                    active_scan[f_khz] = p
+
+            for f_khz in sorted(active_scan, key=lambda k: -active_scan[k]):  # strongest first
+                if f_khz not in self._bins:
+                    # Don't spawn if within 300 Hz of an already-running channel
+                    nearby = next((k for k in self._bins if abs(f_khz - k) < 0.3), None)
+                    if nearby is not None:
+                        self._bins[nearby]['last_active'] = now
+                        continue
+                    if len(self._bins) >= self.max_bins:
+                        continue  # hard cap — don't OOM
+                    self._bins[f_khz] = self._make_bin()
+                    log.info("ITILA scanner: spawned %.1f kHz", f_khz)
+                self._bins[f_khz]['last_active'] = now
+        else:
+            # Buffer not full yet — keep all existing bins alive so they aren't
+            # evicted between energy scans
+            for st in self._bins.values():
+                st['last_active'] = now
 
         # --- Route complex IQ to each active bin ---
         # Vectorized: mix all bins simultaneously to avoid per-bin np.exp overhead.
-        z_full = i_arr + 1j * q_arr
-        n = len(z_full)
+        # Prepend carry-over residual so no samples are silently dropped when
+        # chunk size isn't a multiple of dec_factor (126 mod 16 = 14 = 11% loss).
         fac = self._dec_factor
+        i_route = np.concatenate([self._iq_res_i, i_arr])
+        q_route = np.concatenate([self._iq_res_q, q_arr])
+        n = len(i_route)
         n_dec = (n // fac) * fac
+        self._iq_res_i = i_route[n_dec:].copy()
+        self._iq_res_q = q_route[n_dec:].copy()
         if n_dec == 0:
             return
+        z_full = i_route[:n_dec] + 1j * q_route[:n_dec]
+        n = n_dec
 
         # Evict stale bins first
         for f_khz in [f for f, st in self._bins.items()
@@ -1471,8 +1505,9 @@ class _ItilaScanner:
                 (phases[i, -1] + step_per_sample[i]) % (2.0 * np.pi))
 
         # Mix all bins at once, then decimate 192k→12k
-        z_mix = z_full[None, :] * np.exp(1j * phases)           # (B, n)
-        z12k_all = z_mix[:, :n_dec].reshape(B, -1, fac).mean(axis=2)  # (B, n//fac)
+        # n is already n_dec (exact multiple of fac) so no truncation needed
+        z_mix = z_full[None, :] * np.exp(1j * phases)           # (B, n_dec)
+        z12k_all = z_mix.reshape(B, -1, fac).mean(axis=2)       # (B, n_dec//fac)
 
         for idx, f_khz in enumerate(active_fkhz):
             st   = self._bins[f_khz]
@@ -1500,8 +1535,6 @@ class _ItilaScanner:
                     st[env_key].extend(env_all[:n60].reshape(-1, 60).mean(axis=1).tolist())
 
             n_env = len(st['env100'])
-            if n_env > 0 and n_env % 1000 < 20:
-                log.info("ITILA env %.1f kHz: %d/%d samples", f_khz, n_env, self._window_samples)
             while n_env >= self._window_samples:
                 self._decode_bin(f_khz, st)
                 n_env = len(st['env100'])
@@ -1512,7 +1545,6 @@ class _ItilaScanner:
         if not lib:
             return
 
-        log.info("ITILA decode firing %.1f kHz (env100=%d)", f_khz, len(st['env100']))
         env100 = np.array(st['env100'][:self._window_samples], dtype=np.float64)
         env200 = np.array(st['env200'][:self._window_samples], dtype=np.float64)
         st['env100'] = st['env100'][self._window_samples:]
@@ -1530,7 +1562,7 @@ class _ItilaScanner:
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
-                log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+                log.debug("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
             else:
                 log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
             if raw:
