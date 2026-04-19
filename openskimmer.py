@@ -1090,52 +1090,67 @@ def _itila_extract_cq_call(text):
       Split tokens — slash decoded as space: ['PJ2', 'AG3I'] → PJ2/AG3I
     Returns callsign string (with slash) or None.
     """
-    # Tokenize preserving slashes; collapse whitespace
     tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
+
+    # Collect ALL callsign candidates from each CQ window.
+    # Returning the most-frequent (last among ties) beats grabbing the first
+    # because ITILA sometimes garbles the first occurrence of a repeated
+    # callsign (e.g. "CQ CQ E E A2JD K2JD K" → prefer K2JD over A2JD).
+    candidates = []
 
     for i, tok in enumerate(tokens):
         if tok not in _ITILA_CQ_WORDS:
             continue
-        # Look at next few tokens for a callsign
-        for j in range(i + 1, min(i + 5, len(tokens))):
+        # Expanded window: 8 tokens after CQ (was 5) to see both callsign repeats
+        for j in range(i + 1, min(i + 8, len(tokens))):
             t = tokens[j]
 
-            # Case 1: already a slash call in one token (CALL_RE already handles CALL/SUFFIX;
-            # also handle PREFIX/CALL: short-prefix/base-call)
+            # Case 1: already a slash call in one token
             if '/' in t:
                 parts = t.split('/', 1)
                 left, right = parts[0], parts[1]
                 if _is_base_call(left) and right:
-                    # CALL/SUFFIX — W1AW/0, K9MA/MM
-                    return t if len(right) <= 4 else left
+                    candidates.append(t if len(right) <= 4 else left)
+                    break  # unambiguous — stop scanning this CQ window
                 if _is_base_call(right) and re.match(r'^[A-Z]{1,2}[0-9]', left):
-                    # PREFIX/CALL — PJ2/AG3I, VE3/WF8Z (prefix must have letter+digit)
-                    return t
-                # Not a valid slash call — try to salvage the base call part
+                    candidates.append(t)
+                    break
                 for part in (right, left):
                     if _is_base_call(part):
-                        return part
-                continue
+                        candidates.append(part)
+                        break
+                break
 
-            # Case 2: plain base call
+            # Case 2: plain base call — continue scanning (don't break) so we
+            # collect both occurrences when callsign is repeated after garble
             if _is_base_call(t):
-                # Check if next token looks like a slash suffix (slash decoded as space)
-                if j + 1 < min(i + 6, len(tokens)):
+                if j + 1 < min(i + 9, len(tokens)):
                     nxt = tokens[j + 1]
                     if _SLASH_SUFFIX_PAT.match(nxt):
-                        # CALL/SUFFIX: K9MA P → K9MA/P
-                        return f'{t}/{nxt}'
-                return t
+                        candidates.append(f'{t}/{nxt}')
+                        break  # slash suffix found — unambiguous
+                candidates.append(t)
+                continue  # keep scanning for possible second clean copy
 
             # Case 3: short DX prefix (e.g. PJ2, VE3) — slash decoded as space
-            # Pattern: 1-2 letters + 1 digit, like PJ2, VE3, W1, DL0
-            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 6, len(tokens)):
+            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 9, len(tokens)):
                 nxt = tokens[j + 1]
                 if _is_base_call(nxt):
-                    # PREFIX CALL → PREFIX/CALL
-                    return f'{t}/{nxt}'
+                    candidates.append(f'{t}/{nxt}')
+                    break
 
-    return None
+    if not candidates:
+        return None
+
+    # Return most frequent candidate; break ties by last occurrence
+    # (later occurrences of a repeated callsign tend to be cleaner)
+    from collections import Counter
+    counts = Counter(candidates)
+    max_count = max(counts.values())
+    for c in reversed(candidates):
+        if counts[c] == max_count:
+            return c
+    return candidates[-1]
 
 
 _itila_lib = None
@@ -1484,8 +1499,12 @@ class _ItilaScanner:
                 if n60 > 0:
                     st[env_key].extend(env_all[:n60].reshape(-1, 60).mean(axis=1).tolist())
 
-            while len(st['env100']) >= self._window_samples:
+            n_env = len(st['env100'])
+            if n_env > 0 and n_env % 1000 < 20:
+                log.info("ITILA env %.1f kHz: %d/%d samples", f_khz, n_env, self._window_samples)
+            while n_env >= self._window_samples:
                 self._decode_bin(f_khz, st)
+                n_env = len(st['env100'])
 
     def _decode_bin(self, f_khz, st):
         import ctypes as _ct
@@ -1493,6 +1512,7 @@ class _ItilaScanner:
         if not lib:
             return
 
+        log.info("ITILA decode firing %.1f kHz (env100=%d)", f_khz, len(st['env100']))
         env100 = np.array(st['env100'][:self._window_samples], dtype=np.float64)
         env200 = np.array(st['env200'][:self._window_samples], dtype=np.float64)
         st['env100'] = st['env100'][self._window_samples:]
@@ -1509,7 +1529,10 @@ class _ItilaScanner:
                                     _ct.c_double(f_khz),
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
-            log.debug("ITILA scan %.1f kHz: %r", f_khz, raw[:60])
+            if raw:
+                log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+            else:
+                log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
             if raw:
                 call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
