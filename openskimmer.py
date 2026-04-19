@@ -1534,7 +1534,10 @@ class _ItilaScanner:
                     st[env_key].extend(env_all[:n60].reshape(-1, 60).mean(axis=1).tolist())
 
             n_env = len(st['env100'])
+            if n_env > 0 and n_env % 1000 < 8:
+                log.info("ITILA env %.1f kHz: %d/%d", f_khz, n_env, self._window_samples)
             while n_env >= self._window_samples:
+                log.info("ITILA decode firing %.1f kHz env=%d", f_khz, n_env)
                 self._decode_bin(f_khz, st)
                 n_env = len(st['env100'])
 
@@ -1561,7 +1564,7 @@ class _ItilaScanner:
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
-                log.debug("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+                log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
             else:
                 log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
             if raw:
