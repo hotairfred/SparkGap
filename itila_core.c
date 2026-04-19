@@ -221,6 +221,7 @@ static double estimate_wpm_from_gamma(const double *gamma, int T) {
 static void em_estimate(
     itila_state_t *st,
     const double *env_raw, int T,
+    double wpm_seed,   /* initial WPM; 0 = use default 25 */
     double *A_out, double *noise_mean_out, double *sigma2_out, double *wpm_out)
 {
     /* Normalize to [0,1] via p99 */
@@ -255,7 +256,7 @@ static void em_estimate(
     for (int i = 0; i < T; i++) if (env[i] > thresh) { A += env[i]; nhi++; }
     if (nhi > 10) A /= nhi; else A = p95;
 
-    double wpm = 25.0;
+    double wpm = 25.0; (void)wpm_seed;
     int half = 5;
 
     /* One EM step: update A, nm, s2 given current wpm */
@@ -782,27 +783,21 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 
     /* EM estimation */
     double A, noise_mean, sigma2_obs, wpm_em;
-    em_estimate(st, envelope, n, &A, &noise_mean, &sigma2_obs, &wpm_em);
+    em_estimate(st, envelope, n, 0.0, &A, &noise_mean, &sigma2_obs, &wpm_em);
 
     /* Evidence ratio — calls decode_marginal internally */
     double log_bf = signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
     if (log_bf < ev_thresh) return st->result_buf;
 
-    /* Re-run decode_marginal to get gamma_marg (already computed in ev ratio,
-     * but speed_post/gamma_marg are fresh from that call — reuse them) */
     /* gamma_marg is already filled by signal_evidence_ratio → decode_marginal */
-
-    /* Posterior to marks */
     posterior_to_marks(st->gamma_marg, n, st->marks);
 
     /* M8: multi-station WPM detection */
     double wpm_cands[2]; int n_cands;
     n_cands = fit_mark_wpm_components(st->marks, n, wpm_em, wpm_cands, 2);
 
-    /* Collect callsigns across all WPM candidates; save primary path text */
     static callsign_t calls[MAX_CALLS];
     int n_calls = 0;
-
     static char out_texts[MAX_TEXTS][MAX_TEXT];
     static char primary_text[MAX_TEXT];
     primary_text[0] = '\0';
@@ -810,7 +805,6 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     for (int ci = 0; ci < n_cands; ci++) {
         int n_texts = decode_runs_beam(st->marks, n, wpm_cands[ci],
                                        out_texts, MAX_TEXTS);
-        /* Save top beam text from primary WPM candidate — has CQ/TEST context */
         if (ci == 0 && n_texts > 0)
             strncpy(primary_text, out_texts[0], MAX_TEXT-1);
         for (int ti = 0; ti < n_texts; ti++)
@@ -819,14 +813,12 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 
     if (n_calls == 0) return st->result_buf;
 
-    /* Return full primary text — preserves CQ/TEST context for caller */
     if (primary_text[0]) {
         strncpy(st->result_buf, primary_text, RESULT_BUF-1);
         st->result_buf[RESULT_BUF-1] = '\0';
         return st->result_buf;
     }
 
-    /* Fallback: no primary text, return top-1 callsign */
     int best = 0;
     for (int i = 1; i < n_calls; i++)
         if (calls[i].count > calls[best].count) best = i;
@@ -849,5 +841,5 @@ void itila_free(itila_t h) {
 void itila_debug_em(itila_t h, const double* envelope, int n,
                     double *A_out, double *nm_out, double *s2_out, double *wpm_out) {
     itila_state_t *st = (itila_state_t*)h;
-    em_estimate(st, envelope, n, A_out, nm_out, s2_out, wpm_out);
+    em_estimate(st, envelope, n, 0.0, A_out, nm_out, s2_out, wpm_out);
 }

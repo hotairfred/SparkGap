@@ -1282,13 +1282,14 @@ class _ItilaChannel:
             result = lib.itila_feed(h, ptr, _ct.c_int(n),
                                     _ct.c_double(self.rf_khz),
                                     _ct.c_double(self._ev_thresh))
-            if result:
-                text = result.decode('ascii', errors='replace').strip()
-                call = _itila_extract_cq_call(text)
+            raw = result.decode('ascii', errors='replace').strip() if result else ''
+            log.debug("ITILA window %.1f kHz: thresh=%.1f raw=%r", self.rf_khz, self._ev_thresh, raw[:80])
+            if raw:
+                call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
                     seen.add(call)
                     self._pending.append(f'CQ {call} ')
-                    log.info("ITILA %.1f kHz: %s (from: %s)", self.rf_khz, call, text[:60])
+                    log.info("ITILA %.1f kHz: %s (from: %s)", self.rf_khz, call, raw[:60])
 
     def read(self):
         if not self._pending:
@@ -2377,6 +2378,9 @@ class SignalGroup:
         self.bmorse = None
         self.hamfist = None
         self._secondary_decoders = []  # uhsdr instances for co-channel secondary pitches
+        self._secondary_itila    = []  # _ItilaChannel instances for co-channel secondary pitches
+        self._itila_ev_thresh    = itila_ev_thresh
+        self._itila_window_sec   = itila_window_sec
 
         # WPM speed lock-in: after two consecutive scans with uhsdr_wpm > 0,
         # prune all but the best-matching speed instance to free channel slots.
@@ -2388,6 +2392,8 @@ class SignalGroup:
         self._itila = (_ItilaChannel(rf_khz, ev_thresh=itila_ev_thresh,
                                      window_sec=itila_window_sec)
                        if use_itila else None)
+        if self._itila:
+            self._itila._pitch_hz = CW_TONE  # default; updated dynamically via feed_pcm
 
     @property
     def _decoders_started(self):
@@ -2397,7 +2403,7 @@ class SignalGroup:
     def _start_bmorse(self, wpm, pitch):
         """Start bmorse/hamfist with detected WPM and pitch.
         Also respawn uhsdr at the detected pitch if it differs from CW_TONE."""
-        if not self._speeds:
+        if not self._speeds and not self._bmorse_bin:
             self._bmorse_started = True
             return
         # Respawn uhsdr at detected pitch (was started at CW_TONE initially)
@@ -2604,8 +2610,23 @@ class SignalGroup:
         pcm_12k = self._ch_uhsdr.process(i_samples, q_samples)
 
         # ITILA path: tap Channelizer's 12kHz PCM; mix CW tone at detected_pitch to DC
-        if self._itila and pcm_12k:
-            self._itila.feed_pcm(pcm_12k, self._ch_uhsdr.detected_pitch)
+        if pcm_12k:
+            if self._itila:
+                self._itila.feed_pcm(pcm_12k, self._ch_uhsdr.detected_pitch)
+            # Spawn secondary ITILA channels when new pitches are detected — independent
+            # of _start_bmorse so ITILA-only mode (decoder_speeds=[]) still gets them.
+            if self._itila and self._ch_uhsdr.secondary_pitches:
+                existing = {ch._pitch_hz for ch in self._secondary_itila}
+                for sec_pitch in self._ch_uhsdr.secondary_pitches:
+                    if sec_pitch not in existing:
+                        ch = _ItilaChannel(self.rf_khz, ev_thresh=self._itila_ev_thresh,
+                                           window_sec=self._itila_window_sec)
+                        ch._pitch_hz = sec_pitch
+                        self._secondary_itila.append(ch)
+                        log.info("ITILA secondary channel spawned at %d Hz for %.1f kHz",
+                                 sec_pitch, self.rf_khz)
+            for ch in self._secondary_itila:
+                ch.feed_pcm(pcm_12k, ch._pitch_hz)
 
         if self._ch_4k:
             pcm_4k = self._ch_4k.process(i_samples, q_samples)
@@ -2738,12 +2759,12 @@ class SignalGroup:
                 results.append((self.rf_khz, self.snr, text, d.decoded_text, id(d), 'secondary', d.detected_wpm))
                 self.last_output = time.time()
         # ITILA decoder: emits space-separated callsigns as 'primary' text
-        if self._itila:
-            text = self._itila.read()
+        for itila_ch in ([self._itila] if self._itila else []) + self._secondary_itila:
+            text = itila_ch.read()
             if text:
                 results.append((self.rf_khz, self.snr, text,
-                                 text, id(self._itila),
-                                 'itila', self._itila.detected_wpm))
+                                 text, id(itila_ch),
+                                 'itila', itila_ch.detected_wpm))
                 self.last_output = time.time()
 
         # Track CQ state: if any new text contains a CQ/QRZ pattern, mark time
@@ -2760,6 +2781,9 @@ class SignalGroup:
         if self._itila:
             self._itila.kill()
             self._itila = None
+        for ch in self._secondary_itila:
+            ch.kill()
+        self._secondary_itila = []
         for d in self.decoders:
             d.kill()
         for d in self._secondary_decoders:
@@ -2868,7 +2892,7 @@ class InstanceManager:
         matched_keys = set()
         for offset, snr in signals:
             best_key = None
-            best_dist = 150  # Hz — hysteresis window
+            best_dist = 150  # Hz — hysteresis window; FFT peaks can wander ±50 Hz
             for k in self.instances:
                 d = abs(offset - k)
                 if d < best_dist:
@@ -3513,18 +3537,10 @@ class SpotTracker:
                 self._record_sighting(call, freq_bin, now)
                 recent_count = self._count_recent_sightings(call, freq_bin, now)
                 if dec_type == 'itila':
-                    # ITILA already applies a Bayesian quality gate per window.
-                    # Require 2 decodes at the same (call, freq_bin) — noise rarely
-                    # produces the same SCP call twice at the same frequency across
-                    # separate 120s windows. Use per-(call,freq_bin) count, not
-                    # global info['count'], to avoid cross-channel false promotions.
-                    if not hasattr(self, '_itila_counts'):
-                        self._itila_counts = defaultdict(int)
-                    itila_key = (call, freq_bin)
-                    self._itila_counts[itila_key] += 1
-                    itila_n = self._itila_counts[itila_key]
-                    log.debug("ITILA gate: %s at %.1f kHz count=%d", call, freq_khz, itila_n)
-                    gate = itila_n >= 2
+                    # ITILA's Bayesian ev_thresh is the quality gate — one clean
+                    # window decode is sufficient. CW engine FPs are now gated
+                    # at source (decoder_speeds=[]).
+                    gate = True
                 else:
                     # Context check: only look at RECENT text (last ~500 chars)
                     # to avoid "CQ" appearing by chance in hours of noise output.
