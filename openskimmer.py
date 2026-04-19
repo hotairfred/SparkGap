@@ -1459,12 +1459,6 @@ class _ItilaScanner:
                     self._bins[f_khz] = self._make_bin()
                     log.info("ITILA scanner: spawned %.1f kHz", f_khz)
                 self._bins[f_khz]['last_active'] = now
-        else:
-            # Buffer not full yet — keep all existing bins alive so they aren't
-            # evicted between energy scans
-            for st in self._bins.values():
-                st['last_active'] = now
-
         # --- Route complex IQ to each active bin ---
         # Vectorized: mix all bins simultaneously to avoid per-bin np.exp overhead.
         # Prepend carry-over residual so no samples are silently dropped when
@@ -1481,7 +1475,12 @@ class _ItilaScanner:
         z_full = i_route[:n_dec] + 1j * q_route[:n_dec]
         n = n_dec
 
-        # Evict stale bins first
+        # Keep all bins alive while IQ is flowing — eviction only fires if
+        # the IQ stream goes silent for > window_sec+30s (proxy stopped/OOM)
+        for st in self._bins.values():
+            st['last_active'] = now
+
+        # Evict bins whose stream has gone silent
         for f_khz in [f for f, st in self._bins.items()
                       if now - st['last_active'] > self.window_sec + 30]:
             self._free_bin(f_khz)
