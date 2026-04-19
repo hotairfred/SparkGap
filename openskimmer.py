@@ -1424,27 +1424,45 @@ class _ItilaScanner:
             self._bins[f_khz]['last_active'] = now
 
         # --- Route complex IQ to each active bin ---
+        # Vectorized: mix all bins simultaneously to avoid per-bin np.exp overhead.
         z_full = i_arr + 1j * q_arr
         n = len(z_full)
         fac = self._dec_factor
+        n_dec = (n // fac) * fac
+        if n_dec == 0:
+            return
 
-        for f_khz, st in list(self._bins.items()):
-            if now - st['last_active'] > self.window_sec + 30:
-                self._free_bin(f_khz)
-                continue
+        # Evict stale bins first
+        for f_khz in [f for f, st in self._bins.items()
+                      if now - st['last_active'] > self.window_sec + 30]:
+            self._free_bin(f_khz)
 
-            offset_hz = (f_khz - self.center_khz) * 1000.0
-            phases = st['phase'] + np.arange(n) * (-2.0 * np.pi * offset_hz / self.sample_rate)
-            st['phase'] = float((phases[-1] + (-2.0 * np.pi * offset_hz / self.sample_rate)) % (2.0 * np.pi))
-            z_dc = z_full * np.exp(1j * phases)
+        if not self._bins:
+            return
 
-            # Decimate 192k→12k by block-average
-            n_dec = (n // fac) * fac
-            if n_dec == 0:
-                continue
-            z12k = z_dc[:n_dec].reshape(-1, fac).mean(axis=1)
-            i12k = z12k.real
-            q12k = z12k.imag
+        active_fkhz = list(self._bins.keys())
+        B = len(active_fkhz)
+
+        # Compute all per-bin mix phases in one matrix operation: (B, n)
+        offsets_hz = np.array([(f - self.center_khz) * 1000.0 for f in active_fkhz])
+        phase0     = np.array([self._bins[f]['phase'] for f in active_fkhz])
+        step_per_sample = -2.0 * np.pi * offsets_hz / self.sample_rate  # (B,)
+        t = np.arange(n, dtype=np.float64)
+        phases = phase0[:, None] + np.outer(step_per_sample, t)  # (B, n)
+
+        # Update per-bin phase state
+        for i, f in enumerate(active_fkhz):
+            self._bins[f]['phase'] = float(
+                (phases[i, -1] + step_per_sample[i]) % (2.0 * np.pi))
+
+        # Mix all bins at once, then decimate 192k→12k
+        z_mix = z_full[None, :] * np.exp(1j * phases)           # (B, n)
+        z12k_all = z_mix[:, :n_dec].reshape(B, -1, fac).mean(axis=2)  # (B, n//fac)
+
+        for idx, f_khz in enumerate(active_fkhz):
+            st   = self._bins[f_khz]
+            i12k = z12k_all[idx].real
+            q12k = z12k_all[idx].imag
 
             # LPF 100 Hz and 200 Hz (complex)
             i100, st['zi100i'] = sosfilt(self._sos_100, i12k, zi=st['zi100i'])
@@ -4147,6 +4165,8 @@ class OpenSkimmer:
                 use_itila=bool(self.cfg.get('use_itila', False)),
                 itila_ev_thresh=float(self.cfg.get('itila_ev_thresh', 2.0)),
                 itila_window_sec=float(self.cfg.get('itila_window_sec', 120.0)),
+                cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
+                cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
