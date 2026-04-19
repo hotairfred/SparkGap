@@ -3796,7 +3796,10 @@ class SpotTracker:
                     _slash_base = _parts[0]
                 elif _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
                     _slash_base = _parts[1]
-            if call in self.valid_calls or _slash_base is not None:
+            # ITILA's Bayesian ev_thresh is the quality gate — accept any
+            # structurally-valid callsign from ITILA without SCP check.
+            _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            if call in self.valid_calls or _slash_base is not None or _itila_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
                 if dec_type in ('primary', 'itila'):
