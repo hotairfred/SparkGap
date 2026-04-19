@@ -1310,6 +1310,222 @@ class _ItilaChannel:
 
 
 # ---------------------------------------------------------------------------
+# _ItilaScanner — band-wide ITILA channelizer (FFT energy scan)
+# ---------------------------------------------------------------------------
+
+class _ItilaScanner:
+    """Band-wide ITILA channelizer independent of the signal-peak channelizer.
+
+    Runs a coarse FFT power scan on the full wideband IQ each block and
+    spawns an _ItilaChannel-equivalent accumulator for every 0.1 kHz bin
+    that exceeds noise + min_snr dB.  No dependence on SignalGroup peak
+    detection — finds co-channel and buried signals the peak picker misses.
+
+    Pipeline per bin per block:
+      192 kHz complex IQ
+        → mix at -(f_bin - center_khz)*1000 Hz to DC
+        → block-average decimate 192 kHz → 12 kHz
+        → IIR Butterworth LPF 100 Hz + 200 Hz (complex)
+        → |z|  →  envelope at 12 kHz
+        → 60:1 block-avg  →  200 Hz envelope
+        → accumulated window_sec → itila_feed()
+    """
+
+    GRID_KHZ   = 0.1    # channel spacing
+    ENERGY_WIN = 4096   # FFT window for energy scan
+
+    def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
+                 window_sec=120.0, min_snr=12.0,
+                 band_min_khz=0.0, band_max_khz=99999.0,
+                 max_bins=80):
+        from scipy.signal import butter, sosfilt_zi
+        self.sample_rate   = sample_rate
+        self.center_khz    = center_khz
+        self.ev_thresh     = ev_thresh
+        self.window_sec    = window_sec
+        self.min_snr       = min_snr
+        self.band_min_khz  = band_min_khz
+        self.band_max_khz  = band_max_khz
+        self.max_bins      = max_bins
+
+        self._window_samples = int(window_sec * 200)
+        self._dec_factor     = sample_rate // 12000  # 192k→12k = 16
+
+        fs_pcm = DECODER_RATE  # 12000 Hz
+        self._sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
+        self._sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
+        self._zi_proto_100 = sosfilt_zi(self._sos_100)
+        self._zi_proto_200 = sosfilt_zi(self._sos_200)
+
+        # f_khz -> bin state dict
+        self._bins = {}
+
+    def _make_bin(self):
+        import ctypes as _ct
+        lib = _get_itila_lib()
+        h100 = h200 = None
+        if lib:
+            h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
+            h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
+        return {
+            'phase':    0.0,
+            'zi100i':   self._zi_proto_100.copy(),
+            'zi100q':   self._zi_proto_100.copy(),
+            'zi200i':   self._zi_proto_200.copy(),
+            'zi200q':   self._zi_proto_200.copy(),
+            'res100':   np.zeros(0, dtype=np.float64),
+            'res200':   np.zeros(0, dtype=np.float64),
+            'env100':   [],
+            'env200':   [],
+            'pending':  [],
+            'last_active': time.time(),
+            'h100': h100,
+            'h200': h200,
+        }
+
+    def feed_iq(self, i_arr, q_arr):
+        from scipy.signal import sosfilt
+        now = time.time()
+
+        # --- Energy scan: find active 0.1 kHz bins ---
+        n_fft = min(self.ENERGY_WIN, len(i_arr))
+        z_seg = (i_arr[-n_fft:] + 1j * q_arr[-n_fft:]) * np.blackman(n_fft)
+        psd_db = 10 * np.log10(np.abs(np.fft.fft(z_seg)) ** 2 + 1e-20)
+        noise  = np.median(psd_db)
+        freqs_hz = np.fft.fftfreq(n_fft, 1.0 / self.sample_rate)
+
+        # Collect (power, freq_khz) pairs above threshold, then cluster within
+        # 300 Hz so one CW signal (which spreads across 3-5 adjacent 0.1 kHz
+        # bins) produces a single channel at its peak-power bin.
+        raw_peaks = []
+        for f_hz, p in zip(freqs_hz, psd_db):
+            if p > noise + self.min_snr:
+                f_khz = self.center_khz + f_hz / 1000.0
+                if self.band_min_khz <= f_khz <= self.band_max_khz:
+                    raw_peaks.append((p, round(round(f_khz / self.GRID_KHZ) * self.GRID_KHZ, 1)))
+
+        # Cluster: 300 Hz window, keep strongest bin per cluster
+        active = {}  # f_khz -> power
+        for p, f_khz in sorted(raw_peaks, reverse=True):
+            if not any(abs(f_khz - k) < 0.3 for k in active):
+                active[f_khz] = p
+
+        for f_khz in sorted(active, key=lambda k: -active[k]):  # strongest first
+            if f_khz not in self._bins:
+                # Don't spawn if within 300 Hz of an already-running channel
+                nearby = next((k for k in self._bins if abs(f_khz - k) < 0.3), None)
+                if nearby is not None:
+                    self._bins[nearby]['last_active'] = now
+                    continue
+                if len(self._bins) >= self.max_bins:
+                    continue  # hard cap — don't OOM
+                self._bins[f_khz] = self._make_bin()
+                log.info("ITILA scanner: spawned %.1f kHz", f_khz)
+            self._bins[f_khz]['last_active'] = now
+
+        # --- Route complex IQ to each active bin ---
+        z_full = i_arr + 1j * q_arr
+        n = len(z_full)
+        fac = self._dec_factor
+
+        for f_khz, st in list(self._bins.items()):
+            if now - st['last_active'] > self.window_sec + 30:
+                self._free_bin(f_khz)
+                continue
+
+            offset_hz = (f_khz - self.center_khz) * 1000.0
+            phases = st['phase'] + np.arange(n) * (-2.0 * np.pi * offset_hz / self.sample_rate)
+            st['phase'] = float((phases[-1] + (-2.0 * np.pi * offset_hz / self.sample_rate)) % (2.0 * np.pi))
+            z_dc = z_full * np.exp(1j * phases)
+
+            # Decimate 192k→12k by block-average
+            n_dec = (n // fac) * fac
+            if n_dec == 0:
+                continue
+            z12k = z_dc[:n_dec].reshape(-1, fac).mean(axis=1)
+            i12k = z12k.real
+            q12k = z12k.imag
+
+            # LPF 100 Hz and 200 Hz (complex)
+            i100, st['zi100i'] = sosfilt(self._sos_100, i12k, zi=st['zi100i'])
+            q100, st['zi100q'] = sosfilt(self._sos_100, q12k, zi=st['zi100q'])
+            i200, st['zi200i'] = sosfilt(self._sos_200, i12k, zi=st['zi200i'])
+            q200, st['zi200q'] = sosfilt(self._sos_200, q12k, zi=st['zi200q'])
+
+            env100_12k = np.sqrt(i100 ** 2 + q100 ** 2)
+            env200_12k = np.sqrt(i200 ** 2 + q200 ** 2)
+
+            # Decimate 12k→200 Hz by block-average (factor 60)
+            for env_12k, res_key, env_key in (
+                (env100_12k, 'res100', 'env100'),
+                (env200_12k, 'res200', 'env200'),
+            ):
+                env_all = np.concatenate([st[res_key], env_12k])
+                n60 = (len(env_all) // 60) * 60
+                st[res_key] = env_all[n60:]
+                if n60 > 0:
+                    st[env_key].extend(env_all[:n60].reshape(-1, 60).mean(axis=1).tolist())
+
+            while len(st['env100']) >= self._window_samples:
+                self._decode_bin(f_khz, st)
+
+    def _decode_bin(self, f_khz, st):
+        import ctypes as _ct
+        lib = _get_itila_lib()
+        if not lib:
+            return
+
+        env100 = np.array(st['env100'][:self._window_samples], dtype=np.float64)
+        env200 = np.array(st['env200'][:self._window_samples], dtype=np.float64)
+        st['env100'] = st['env100'][self._window_samples:]
+        st['env200'] = st['env200'][self._window_samples:]
+
+        seen = set()
+        for h, env in ((st['h100'], env100), (st['h200'], env200)):
+            if h is None or h.value is None:
+                continue
+            n = len(env)
+            env_c = np.ascontiguousarray(env, dtype=np.float64)
+            ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
+            result = lib.itila_feed(h, ptr, _ct.c_int(n),
+                                    _ct.c_double(f_khz),
+                                    _ct.c_double(self.ev_thresh))
+            raw = result.decode('ascii', errors='replace').strip() if result else ''
+            log.debug("ITILA scan %.1f kHz: %r", f_khz, raw[:60])
+            if raw:
+                call = _itila_extract_cq_call(raw)
+                if call and call not in seen:
+                    seen.add(call)
+                    st['pending'].append(f'CQ {call} ')
+                    log.info("ITILA scan %.1f kHz: %s (raw: %s)", f_khz, call, raw[:60])
+
+    def collect(self):
+        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""
+        results = []
+        for f_khz, st in self._bins.items():
+            if st['pending']:
+                text = ''.join(st['pending'])
+                st['pending'] = []
+                results.append((f_khz, 0.0, text, text, id(st), 'itila', 0))
+        return results
+
+    def _free_bin(self, f_khz):
+        st = self._bins.pop(f_khz, None)
+        if not st:
+            return
+        lib = _get_itila_lib()
+        if lib:
+            for h in (st['h100'], st['h200']):
+                if h and h.value:
+                    lib.itila_free(h)
+        log.info("ITILA scanner: evicted %.1f kHz", f_khz)
+
+    def kill(self):
+        for f_khz in list(self._bins.keys()):
+            self._free_bin(f_khz)
+
+
+# ---------------------------------------------------------------------------
 # libcw_dispatcher.so — batched parallel uhsdr fan-out
 # ---------------------------------------------------------------------------
 # One shared pool is created lazily the first time a _DispDecoder is spawned.
@@ -2820,7 +3036,8 @@ class InstanceManager:
                  hamfist_scp=None, ml_model_path=None, ml_min_confidence=0.7,
                  ml_max_channels=20, use_dispatcher=False,
                  use_pfb_dispatcher=False, use_itila=False,
-                 itila_ev_thresh=2.0, itila_window_sec=120.0):
+                 itila_ev_thresh=2.0, itila_window_sec=120.0,
+                 cw_min_khz=0.0, cw_max_khz=99999.0):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -2832,6 +3049,9 @@ class InstanceManager:
         self.use_itila = bool(use_itila)
         self.itila_ev_thresh = float(itila_ev_thresh)
         self.itila_window_sec = float(itila_window_sec)
+        self.cw_min_khz = float(cw_min_khz)
+        self.cw_max_khz = float(cw_max_khz)
+        self._itila_scanner = None  # created lazily in update_signals once center_khz is known
         self.max_instances = max_instances  # total decoder process cap (legacy)
         # max_channels: max simultaneous signals — decoupled from decoder count
         # defaults to max_instances for backwards compat
@@ -2884,6 +3104,26 @@ class InstanceManager:
         """
         self.center_khz = center_khz
         now = time.time()
+
+        # Lazily create or re-center the ITILA scanner when center_khz is known.
+        if self.use_itila:
+            if self._itila_scanner is None:
+                self._itila_scanner = _ItilaScanner(
+                    self.sample_rate, center_khz,
+                    ev_thresh=self.itila_ev_thresh,
+                    window_sec=self.itila_window_sec,
+                    min_snr=12.0,
+                    band_min_khz=self.cw_min_khz,
+                    band_max_khz=self.cw_max_khz)
+            else:
+                self._itila_scanner.center_khz = center_khz
+
+        # In ITILA-only mode (no decoders) the scanner handles everything;
+        # skip the SignalGroup machinery entirely.
+        itila_only = (self.use_itila and not self.speeds and not self.bmorse_bin
+                      and not self.hamfist_bin and not self.ml_model_path)
+        if itila_only:
+            return
 
         # Mark existing groups as seen if signal still present.
         # Use 150 Hz hysteresis: FFT peaks can wander ±50 Hz between rescans
@@ -3028,6 +3268,8 @@ class InstanceManager:
             self._pfb.process(i_samples, q_samples)
         for group in list(self.instances.values()):
             group.feed_iq(i_samples, q_samples)
+        if self._itila_scanner is not None:
+            self._itila_scanner.feed_iq(i_samples, q_samples)
 
         # If the C++ dispatcher is enabled, every _DispDecoder.feed_pcm call
         # above just stashed bytes. Now drive one batched feed + drain for
@@ -3045,6 +3287,8 @@ class InstanceManager:
         results = []
         for group in list(self.instances.values()):
             results.extend(group.read())
+        if self._itila_scanner is not None:
+            results.extend(self._itila_scanner.collect())
         return results
 
     def collect_engine_spots(self):
@@ -3088,6 +3332,9 @@ class InstanceManager:
                 try: p.kill()
                 except: pass
         self.instances.clear()
+        if self._itila_scanner is not None:
+            self._itila_scanner.kill()
+            self._itila_scanner = None
 
     def detect_pileups(self, spotted_freqs=None, now=None):
         """Detect confirmed pileup clusters — corrected geometry.
@@ -3524,7 +3771,14 @@ class SpotTracker:
             if call in self.blacklist:
                 continue
 
-            if call in self.valid_calls:
+            _slash_base = None
+            if '/' in call:
+                _parts = call.split('/', 1)
+                if _is_base_call(_parts[0]) and _parts[0] in self.valid_calls:
+                    _slash_base = _parts[0]
+                elif _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
+                    _slash_base = _parts[1]
+            if call in self.valid_calls or _slash_base is not None:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
                 if dec_type in ('primary', 'itila'):
@@ -4274,6 +4528,8 @@ def run_file_mode(args, config):
         use_itila=bool(config.get('use_itila', False)),
         itila_ev_thresh=float(config.get('itila_ev_thresh', 2.0)),
         itila_window_sec=float(config.get('itila_window_sec', 120.0)),
+        cw_min_khz=float(config.get('cw_min_khz', 0)),
+        cw_max_khz=float(config.get('cw_max_khz', 99999)),
     )
 
     center_khz = args.center_khz
