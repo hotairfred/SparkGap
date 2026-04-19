@@ -1380,6 +1380,11 @@ class _ItilaScanner:
         self._scan_buf_i = np.zeros(0, dtype=np.float64)
         self._scan_buf_q = np.zeros(0, dtype=np.float64)
 
+        # Residual IQ carry-over — ensures every sample is decimated even when
+        # chunk size is not a multiple of dec_factor (126 mod 16 = 14 drops 11% otherwise)
+        self._iq_res_i = np.zeros(0, dtype=np.float64)
+        self._iq_res_q = np.zeros(0, dtype=np.float64)
+
     def _make_bin(self):
         import ctypes as _ct
         lib = _get_itila_lib()
@@ -1462,12 +1467,19 @@ class _ItilaScanner:
 
         # --- Route complex IQ to each active bin ---
         # Vectorized: mix all bins simultaneously to avoid per-bin np.exp overhead.
-        z_full = i_arr + 1j * q_arr
-        n = len(z_full)
+        # Prepend carry-over residual so no samples are silently dropped when
+        # chunk size isn't a multiple of dec_factor (126 mod 16 = 14 = 11% loss).
         fac = self._dec_factor
+        i_route = np.concatenate([self._iq_res_i, i_arr])
+        q_route = np.concatenate([self._iq_res_q, q_arr])
+        n = len(i_route)
         n_dec = (n // fac) * fac
+        self._iq_res_i = i_route[n_dec:].copy()
+        self._iq_res_q = q_route[n_dec:].copy()
         if n_dec == 0:
             return
+        z_full = i_route[:n_dec] + 1j * q_route[:n_dec]
+        n = n_dec
 
         # Evict stale bins first
         for f_khz in [f for f, st in self._bins.items()
@@ -1493,8 +1505,9 @@ class _ItilaScanner:
                 (phases[i, -1] + step_per_sample[i]) % (2.0 * np.pi))
 
         # Mix all bins at once, then decimate 192k→12k
-        z_mix = z_full[None, :] * np.exp(1j * phases)           # (B, n)
-        z12k_all = z_mix[:, :n_dec].reshape(B, -1, fac).mean(axis=2)  # (B, n//fac)
+        # n is already n_dec (exact multiple of fac) so no truncation needed
+        z_mix = z_full[None, :] * np.exp(1j * phases)           # (B, n_dec)
+        z12k_all = z_mix.reshape(B, -1, fac).mean(axis=2)       # (B, n_dec//fac)
 
         for idx, f_khz in enumerate(active_fkhz):
             st   = self._bins[f_khz]
