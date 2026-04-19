@@ -1492,13 +1492,16 @@ class _ItilaScanner:
         B = len(active_fkhz)
 
         # Compute all per-bin mix phases in one matrix operation: (B, n)
-        # Use float32 throughout to halve memory bandwidth and compute time.
         # Phase is tracked in float64 per-bin to avoid drift over long runs.
+        # All intermediate arrays stay float32 — np.exp(1j * float32) silently
+        # upcasts to complex128, so we use cos+sin directly to keep complex64
+        # throughout. This halves memory traffic vs the complex128 path.
         offsets_hz = np.array([(f - self.center_khz) * 1000.0 for f in active_fkhz])
         phase0     = np.array([self._bins[f]['phase'] for f in active_fkhz])
         step_per_sample = -2.0 * np.pi * offsets_hz / self.sample_rate  # (B,) float64
         t = np.arange(n, dtype=np.float32)
-        phases = (phase0[:, None] + np.outer(step_per_sample, t)).astype(np.float32)
+        phases = (phase0.astype(np.float32)[:, None]
+                  + np.outer(step_per_sample.astype(np.float32), t))  # (B, n) float32
 
         # Update per-bin phase state (keep in float64 to avoid accumulation drift)
         for i, f in enumerate(active_fkhz):
@@ -1508,8 +1511,11 @@ class _ItilaScanner:
         # Mix all bins at once, then decimate 192k→12k
         # n is already n_dec (exact multiple of fac) so no truncation needed
         z_f32 = z_full.astype(np.complex64)
-        z_mix = z_f32[None, :] * np.exp(1j * phases).astype(np.complex64)  # (B, n_dec)
-        z12k_all = z_mix.reshape(B, -1, fac).mean(axis=2)                  # (B, n_dec//fac)
+        exp_phases = np.empty(phases.shape, dtype=np.complex64)
+        exp_phases.real = np.cos(phases)   # float32 → float32, no upcast
+        exp_phases.imag = np.sin(phases)
+        z_mix = z_f32[None, :] * exp_phases                             # (B, n_dec) complex64
+        z12k_all = z_mix.reshape(B, -1, fac).mean(axis=2)              # (B, n_dec//fac)
 
         for idx, f_khz in enumerate(active_fkhz):
             st   = self._bins[f_khz]
