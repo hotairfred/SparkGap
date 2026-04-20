@@ -1490,7 +1490,6 @@ class _ItilaScanner:
 
         active_fkhz = list(self._bins.keys())
         B = len(active_fkhz)
-
         # Compute all per-bin mix phases in one matrix operation: (B, n)
         # Phase is tracked in float64 per-bin to avoid drift over long runs.
         # All intermediate arrays stay float32 — np.exp(1j * float32) silently
@@ -1517,24 +1516,35 @@ class _ItilaScanner:
         z_mix = z_f32[None, :] * exp_phases                             # (B, n_dec) complex64
         z12k_all = z_mix.reshape(B, -1, fac).mean(axis=2)              # (B, n_dec//fac)
 
+        # Batch sosfilt: 4 calls across all B bins instead of 4×B sequential calls.
+        # sosfilt accepts (B, n) input with axis=1; zi shape is (n_sections, B, 2).
+        i12k_all = z12k_all.real.astype(np.float64)  # (B, n_dec//fac)
+        q12k_all = z12k_all.imag.astype(np.float64)
+
+        zi100i = np.stack([self._bins[f]['zi100i'] for f in active_fkhz], axis=1)
+        zi100q = np.stack([self._bins[f]['zi100q'] for f in active_fkhz], axis=1)
+        zi200i = np.stack([self._bins[f]['zi200i'] for f in active_fkhz], axis=1)
+        zi200q = np.stack([self._bins[f]['zi200q'] for f in active_fkhz], axis=1)
+
+        i100_all, zi100i = sosfilt(self._sos_100, i12k_all, axis=1, zi=zi100i)
+        q100_all, zi100q = sosfilt(self._sos_100, q12k_all, axis=1, zi=zi100q)
+        i200_all, zi200i = sosfilt(self._sos_200, i12k_all, axis=1, zi=zi200i)
+        q200_all, zi200q = sosfilt(self._sos_200, q12k_all, axis=1, zi=zi200q)
+
+        env100_all = np.sqrt(i100_all**2 + q100_all**2)  # (B, n_dec//fac)
+        env200_all = np.sqrt(i200_all**2 + q200_all**2)
+
         for idx, f_khz in enumerate(active_fkhz):
-            st   = self._bins[f_khz]
-            i12k = z12k_all[idx].real
-            q12k = z12k_all[idx].imag
-
-            # LPF 100 Hz and 200 Hz (complex)
-            i100, st['zi100i'] = sosfilt(self._sos_100, i12k, zi=st['zi100i'])
-            q100, st['zi100q'] = sosfilt(self._sos_100, q12k, zi=st['zi100q'])
-            i200, st['zi200i'] = sosfilt(self._sos_200, i12k, zi=st['zi200i'])
-            q200, st['zi200q'] = sosfilt(self._sos_200, q12k, zi=st['zi200q'])
-
-            env100_12k = np.sqrt(i100 ** 2 + q100 ** 2)
-            env200_12k = np.sqrt(i200 ** 2 + q200 ** 2)
+            st = self._bins[f_khz]
+            st['zi100i'] = zi100i[:, idx, :]
+            st['zi100q'] = zi100q[:, idx, :]
+            st['zi200i'] = zi200i[:, idx, :]
+            st['zi200q'] = zi200q[:, idx, :]
 
             # Decimate 12k→200 Hz by block-average (factor 60)
             for env_12k, res_key, env_key in (
-                (env100_12k, 'res100', 'env100'),
-                (env200_12k, 'res200', 'env200'),
+                (env100_all[idx], 'res100', 'env100'),
+                (env200_all[idx], 'res200', 'env200'),
             ):
                 env_all = np.concatenate([st[res_key], env_12k])
                 n60 = (len(env_all) // 60) * 60
@@ -3151,8 +3161,11 @@ class InstanceManager:
         # Pileup persistence tracker: centroid_bin -> {'centroid': kHz, 'passes': int, 'last': time}
         # centroid_bin = round(freq_khz * 5) / 5  (200 Hz grid)
         self._pileup_history = {}
-        # Shared PFB channelizer — processes full-band IQ once for all signals
-        self._pfb = PFBChannelizer(input_rate=sample_rate) if sample_rate == 192000 else None
+        # Shared PFB channelizer — only needed by uhsdr/bmorse decoders.
+        # Skip when decoder_speeds is empty and bmorse is unconfigured to
+        # avoid ~200ms of wasted Python filtering per feed_all_iq call.
+        _need_pfb = (bool(speeds) or bmorse_bin is not None) and sample_rate == 192000
+        self._pfb = PFBChannelizer(input_rate=sample_rate) if _need_pfb else None
         # libcw_dispatcher.so fan-out (experimental). When enabled, uhsdr
         # decoders are routed via the C++ dispatcher so the per-IQ-block
         # fanout runs in OpenMP instead of a GIL-serialized Python loop.
@@ -4206,6 +4219,7 @@ class OpenSkimmer:
             self._band_meta.append((name, center_hz, rx_idx))
             self._band_bufs[rx_idx] = {
                 'iq': deque(),
+                'raw': [],   # raw iq_samples lists from receiver thread (no numpy)
                 'i': [],
                 'q': [],
             }
@@ -4314,16 +4328,10 @@ class OpenSkimmer:
             buf = self._band_bufs.get(rx_index)
             if buf is None:
                 return
-            iq_arr = np.asarray(iq_samples, dtype=np.float64)
-            i_chunk = iq_arr[:, 0] * 8388608.0
-            q_chunk = iq_arr[:, 1] * 8388608.0
+            # Minimal GIL work: just stash the raw sample list.
+            # Numpy conversion and deque update happen in the async loop.
             with self._iq_lock:
-                buf['iq'].extend(iq_samples)
-                max_buf = self.cfg.get('sample_rate', 48000) * 10
-                while len(buf['iq']) > max_buf:
-                    buf['iq'].popleft()
-                buf['i'].append(i_chunk)
-                buf['q'].append(q_chunk)
+                buf['raw'].append(iq_samples)
             if self._wav_record and rx_index == 0:
                 scaled32 = np.clip(iq_arr * 8388607.0, -8388608, 8388607).astype('<i4')
                 frames = scaled32.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
@@ -4348,7 +4356,6 @@ class OpenSkimmer:
         while self.running:
             now = time.time()
             live_rate = self.cfg.get('sample_rate', 48000)
-
             # ----------------------------------------------------------------
             # Per-band: drain feed buffers and push IQ to decoders
             # 200ms cap per band to stay real-time even under backlog.
@@ -4356,14 +4363,28 @@ class OpenSkimmer:
             for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
                 with self._iq_lock:
                     buf = self._band_bufs[rx_idx]
-                    feed_i, feed_q = buf['i'], buf['q']
-                    buf['i'], buf['q'] = [], []
-                if feed_i:
-                    chunk_size = len(feed_i[0]) if feed_i else 126
-                    max_chunks = max(1, live_rate // 5 // chunk_size)  # ~200ms
-                    if len(feed_i) > max_chunks:
-                        feed_i = feed_i[-max_chunks:]
-                        feed_q = feed_q[-max_chunks:]
+                    raw_chunks = buf['raw']
+                    buf['raw'] = []
+                if raw_chunks:
+                    # Convert raw iq_samples lists → numpy in the main thread.
+                    # Cap to ~200ms of backlog before feeding decoders.
+                    chunk_size = len(raw_chunks[0])
+                    max_chunks = max(1, live_rate // 5 // chunk_size)
+                    if len(raw_chunks) > max_chunks:
+                        raw_chunks = raw_chunks[-max_chunks:]
+                    feed_i = []
+                    feed_q = []
+                    for chunk in raw_chunks:
+                        iq_arr = np.asarray(chunk, dtype=np.float64)
+                        feed_i.append(iq_arr[:, 0] * 8388608.0)
+                        feed_q.append(iq_arr[:, 1] * 8388608.0)
+                    # Maintain FFT deque for the periodic scan
+                    max_iq_buf = live_rate * 10
+                    iq_deq = buf['iq']
+                    for chunk in raw_chunks:
+                        iq_deq.extend(chunk)
+                    while len(iq_deq) > max_iq_buf:
+                        iq_deq.popleft()
                     i_cat = np.concatenate(feed_i)
                     q_cat = np.concatenate(feed_q)
                     mgr.feed_all_iq(i_cat, q_cat)
