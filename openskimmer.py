@@ -1177,6 +1177,86 @@ def _get_itila_lib():
     return _itila_lib if _itila_lib else None
 
 
+class _ItilaDsp:
+    """Python wrapper around libitila_dsp.so — scanner DSP core."""
+
+    def __init__(self, lib, handle):
+        self._lib = lib
+        self._h   = handle
+
+    def add_bin(self, f_hz):
+        return self._lib.itila_dsp_add_bin(self._h, f_hz)
+
+    def remove_bin(self, f_hz):
+        self._lib.itila_dsp_remove_bin(self._h, f_hz)
+
+    def feed(self, i_arr, q_arr):
+        import ctypes as _ct
+        n = len(i_arr)
+        ip = i_arr.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        qp = q_arr.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        self._lib.itila_dsp_feed(self._h, ip, qp, _ct.c_int(n))
+
+    def env_n(self, f_hz):
+        return self._lib.itila_dsp_env_n(self._h, f_hz)
+
+    def drain_env(self, f_hz, env100, env200, max_n):
+        import ctypes as _ct
+        p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = env200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        return self._lib.itila_dsp_drain_env(
+            self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
+
+    def free(self):
+        self._lib.itila_dsp_free(self._h)
+        self._h = None
+
+
+def _get_itila_dsp(sample_rate, center_hz, max_bins, sos100, sos200):
+    import ctypes as _ct
+    try:
+        lib = _ct.CDLL('./libitila_dsp.so')
+        lib.itila_dsp_create.restype  = _ct.c_void_p
+        lib.itila_dsp_create.argtypes = [
+            _ct.c_int, _ct.c_double, _ct.c_int,
+            _ct.POINTER(_ct.c_double), _ct.c_int,
+            _ct.POINTER(_ct.c_double)]
+        lib.itila_dsp_free.restype    = None
+        lib.itila_dsp_free.argtypes   = [_ct.c_void_p]
+        lib.itila_dsp_add_bin.restype    = _ct.c_int
+        lib.itila_dsp_add_bin.argtypes   = [_ct.c_void_p, _ct.c_double]
+        lib.itila_dsp_remove_bin.restype  = None
+        lib.itila_dsp_remove_bin.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_dsp_feed.restype    = None
+        lib.itila_dsp_feed.argtypes   = [
+            _ct.c_void_p,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_dsp_env_n.restype    = _ct.c_int
+        lib.itila_dsp_env_n.argtypes   = [_ct.c_void_p, _ct.c_double]
+        lib.itila_dsp_drain_env.restype  = _ct.c_int
+        lib.itila_dsp_drain_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+
+        n_sos = sos100.shape[0]
+        s100  = np.ascontiguousarray(sos100, dtype=np.float64)
+        s200  = np.ascontiguousarray(sos200, dtype=np.float64)
+        p100  = s100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200  = s200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        h = lib.itila_dsp_create(
+            _ct.c_int(sample_rate), _ct.c_double(center_hz),
+            _ct.c_int(max_bins), p100, _ct.c_int(n_sos), p200)
+        if not h:
+            log.warning("itila_dsp_create returned NULL")
+            return None
+        log.info("Loaded libitila_dsp.so (sample_rate=%d center=%.1f Hz max_bins=%d)",
+                 sample_rate, center_hz, max_bins)
+        return _ItilaDsp(lib, _ct.c_void_p(h))
+    except OSError:
+        log.warning("libitila_dsp.so not found — falling back to Python DSP")
+        return None
+
+
 class _ItilaChannel:
     """Streaming Bayesian CW decoder via libitila.so.
 
@@ -1353,7 +1433,7 @@ class _ItilaScanner:
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
                  max_bins=80):
-        from scipy.signal import butter, sosfilt_zi
+        from scipy.signal import butter
         self.sample_rate   = sample_rate
         self.center_khz    = center_khz
         self.ev_thresh     = ev_thresh
@@ -1364,15 +1444,12 @@ class _ItilaScanner:
         self.max_bins      = max_bins
 
         self._window_samples = int(window_sec * 200)
-        self._dec_factor     = sample_rate // 12000  # 192k→12k = 16
 
         fs_pcm = DECODER_RATE  # 12000 Hz
-        self._sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
-        self._sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
-        self._zi_proto_100 = sosfilt_zi(self._sos_100)
-        self._zi_proto_200 = sosfilt_zi(self._sos_200)
+        sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
+        sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
 
-        # f_khz -> bin state dict
+        # f_khz -> itila handle dict (h100, h200, pending)
         self._bins = {}
 
         # Rolling buffer for energy scan — accumulate ENERGY_WIN samples before
@@ -1380,10 +1457,11 @@ class _ItilaScanner:
         self._scan_buf_i = np.zeros(0, dtype=np.float64)
         self._scan_buf_q = np.zeros(0, dtype=np.float64)
 
-        # Residual IQ carry-over — ensures every sample is decimated even when
-        # chunk size is not a multiple of dec_factor (126 mod 16 = 14 drops 11% otherwise)
-        self._iq_res_i = np.zeros(0, dtype=np.float64)
-        self._iq_res_q = np.zeros(0, dtype=np.float64)
+        # C DSP engine — mixing, decimation, IIR, envelope, accumulation
+        self._dsp = _get_itila_dsp(
+            sample_rate, center_khz * 1000.0, max_bins,
+            sos_100.astype(np.float64), sos_200.astype(np.float64),
+        )
 
     def _make_bin(self):
         import ctypes as _ct
@@ -1393,23 +1471,13 @@ class _ItilaScanner:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
         return {
-            'phase':    0.0,
-            'zi100i':   self._zi_proto_100.copy(),
-            'zi100q':   self._zi_proto_100.copy(),
-            'zi200i':   self._zi_proto_200.copy(),
-            'zi200q':   self._zi_proto_200.copy(),
-            'res100':   np.zeros(0, dtype=np.float64),
-            'res200':   np.zeros(0, dtype=np.float64),
-            'env100':   [],
-            'env200':   [],
-            'pending':  [],
+            'pending':     [],
             'last_active': time.time(),
             'h100': h100,
             'h200': h200,
         }
 
     def feed_iq(self, i_arr, q_arr):
-        from scipy.signal import sosfilt
         now = time.time()
 
         # --- Energy scan: find active 0.1 kHz bins ---
@@ -1456,25 +1524,13 @@ class _ItilaScanner:
                         continue
                     if len(self._bins) >= self.max_bins:
                         continue  # hard cap — don't OOM
+                    if self._dsp:
+                        self._dsp.add_bin(f_khz * 1000.0)
                     self._bins[f_khz] = self._make_bin()
                     log.info("ITILA scanner: spawned %.1f kHz", f_khz)
                 self._bins[f_khz]['last_active'] = now
-        # --- Route complex IQ to each active bin ---
-        # Vectorized: mix all bins simultaneously to avoid per-bin np.exp overhead.
-        # Prepend carry-over residual so no samples are silently dropped when
-        # chunk size isn't a multiple of dec_factor (126 mod 16 = 14 = 11% loss).
-        fac = self._dec_factor
-        i_route = np.concatenate([self._iq_res_i, i_arr])
-        q_route = np.concatenate([self._iq_res_q, q_arr])
-        n = len(i_route)
-        n_dec = (n // fac) * fac
-        self._iq_res_i = i_route[n_dec:].copy()
-        self._iq_res_q = q_route[n_dec:].copy()
-        if n_dec == 0:
-            return
-        z_full = i_route[:n_dec] + 1j * q_route[:n_dec]
-        n = n_dec
 
+        # --- DSP: mix, decimate, filter, envelope, accumulate (C) ---
         # Keep all bins alive while IQ is flowing — eviction only fires if
         # the IQ stream goes silent for > window_sec+30s (proxy stopped/OOM)
         for st in self._bins.values():
@@ -1488,88 +1544,37 @@ class _ItilaScanner:
         if not self._bins:
             return
 
-        active_fkhz = list(self._bins.keys())
-        B = len(active_fkhz)
-        # Compute all per-bin mix phases in one matrix operation: (B, n)
-        # Phase is tracked in float64 per-bin to avoid drift over long runs.
-        # All intermediate arrays stay float32 — np.exp(1j * float32) silently
-        # upcasts to complex128, so we use cos+sin directly to keep complex64
-        # throughout. This halves memory traffic vs the complex128 path.
-        offsets_hz = np.array([(f - self.center_khz) * 1000.0 for f in active_fkhz])
-        phase0     = np.array([self._bins[f]['phase'] for f in active_fkhz])
-        step_per_sample = -2.0 * np.pi * offsets_hz / self.sample_rate  # (B,) float64
-        t = np.arange(n, dtype=np.float32)
-        phases = (phase0.astype(np.float32)[:, None]
-                  + np.outer(step_per_sample.astype(np.float32), t))  # (B, n) float32
+        if self._dsp:
+            i_c = np.ascontiguousarray(i_arr, dtype=np.float64)
+            q_c = np.ascontiguousarray(q_arr, dtype=np.float64)
+            self._dsp.feed(i_c, q_c)
+        else:
+            return
 
-        # Update per-bin phase state (keep in float64 to avoid accumulation drift)
-        for i, f in enumerate(active_fkhz):
-            self._bins[f]['phase'] = float(
-                (float(phase0[i]) + step_per_sample[i] * n) % (2.0 * np.pi))
-
-        # Mix all bins at once, then decimate 192k→12k
-        # n is already n_dec (exact multiple of fac) so no truncation needed
-        z_f32 = z_full.astype(np.complex64)
-        exp_phases = np.empty(phases.shape, dtype=np.complex64)
-        exp_phases.real = np.cos(phases)   # float32 → float32, no upcast
-        exp_phases.imag = np.sin(phases)
-        z_mix = z_f32[None, :] * exp_phases                             # (B, n_dec) complex64
-        z12k_all = z_mix.reshape(B, -1, fac).mean(axis=2)              # (B, n_dec//fac)
-
-        # Batch sosfilt: 4 calls across all B bins instead of 4×B sequential calls.
-        # sosfilt accepts (B, n) input with axis=1; zi shape is (n_sections, B, 2).
-        i12k_all = z12k_all.real.astype(np.float64)  # (B, n_dec//fac)
-        q12k_all = z12k_all.imag.astype(np.float64)
-
-        zi100i = np.stack([self._bins[f]['zi100i'] for f in active_fkhz], axis=1)
-        zi100q = np.stack([self._bins[f]['zi100q'] for f in active_fkhz], axis=1)
-        zi200i = np.stack([self._bins[f]['zi200i'] for f in active_fkhz], axis=1)
-        zi200q = np.stack([self._bins[f]['zi200q'] for f in active_fkhz], axis=1)
-
-        i100_all, zi100i = sosfilt(self._sos_100, i12k_all, axis=1, zi=zi100i)
-        q100_all, zi100q = sosfilt(self._sos_100, q12k_all, axis=1, zi=zi100q)
-        i200_all, zi200i = sosfilt(self._sos_200, i12k_all, axis=1, zi=zi200i)
-        q200_all, zi200q = sosfilt(self._sos_200, q12k_all, axis=1, zi=zi200q)
-
-        env100_all = np.sqrt(i100_all**2 + q100_all**2)  # (B, n_dec//fac)
-        env200_all = np.sqrt(i200_all**2 + q200_all**2)
-
-        for idx, f_khz in enumerate(active_fkhz):
-            st = self._bins[f_khz]
-            st['zi100i'] = zi100i[:, idx, :]
-            st['zi100q'] = zi100q[:, idx, :]
-            st['zi200i'] = zi200i[:, idx, :]
-            st['zi200q'] = zi200q[:, idx, :]
-
-            # Decimate 12k→200 Hz by block-average (factor 60)
-            for env_12k, res_key, env_key in (
-                (env100_all[idx], 'res100', 'env100'),
-                (env200_all[idx], 'res200', 'env200'),
-            ):
-                env_all = np.concatenate([st[res_key], env_12k])
-                n60 = (len(env_all) // 60) * 60
-                st[res_key] = env_all[n60:]
-                if n60 > 0:
-                    st[env_key].extend(env_all[:n60].reshape(-1, 60).mean(axis=1).tolist())
-
-            n_env = len(st['env100'])
+        # --- Check each bin for decode readiness ---
+        for f_khz, st in list(self._bins.items()):
+            n_env = self._dsp.env_n(f_khz * 1000.0)
             if n_env > 0 and n_env % 1000 < 8:
                 log.info("ITILA env %.1f kHz: %d/%d", f_khz, n_env, self._window_samples)
             while n_env >= self._window_samples:
                 log.info("ITILA decode firing %.1f kHz env=%d", f_khz, n_env)
                 self._decode_bin(f_khz, st)
-                n_env = len(st['env100'])
+                n_env = self._dsp.env_n(f_khz * 1000.0)
 
     def _decode_bin(self, f_khz, st):
         import ctypes as _ct
         lib = _get_itila_lib()
-        if not lib:
+        if not lib or not self._dsp:
             return
 
-        env100 = np.array(st['env100'][:self._window_samples], dtype=np.float64)
-        env200 = np.array(st['env200'][:self._window_samples], dtype=np.float64)
-        st['env100'] = st['env100'][self._window_samples:]
-        st['env200'] = st['env200'][self._window_samples:]
+        env100 = np.empty(self._window_samples, dtype=np.float64)
+        env200 = np.empty(self._window_samples, dtype=np.float64)
+        n_drained = self._dsp.drain_env(f_khz * 1000.0, env100, env200,
+                                         self._window_samples)
+        if n_drained < self._window_samples:
+            return
+        env100 = env100[:n_drained]
+        env200 = env200[:n_drained]
 
         seen = set()
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
@@ -1612,11 +1617,16 @@ class _ItilaScanner:
             for h in (st['h100'], st['h200']):
                 if h and h.value:
                     lib.itila_free(h)
+        if self._dsp:
+            self._dsp.remove_bin(f_khz * 1000.0)
         log.info("ITILA scanner: evicted %.1f kHz", f_khz)
 
     def kill(self):
         for f_khz in list(self._bins.keys()):
             self._free_bin(f_khz)
+        if self._dsp:
+            self._dsp.free()
+            self._dsp = None
 
 
 # ---------------------------------------------------------------------------
