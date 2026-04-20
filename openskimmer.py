@@ -1257,6 +1257,109 @@ def _get_itila_dsp(sample_rate, center_hz, max_bins, sos100, sos200):
         return None
 
 
+class _ItilaSc:
+    """Python wrapper around libitila_scanner.so."""
+
+    def __init__(self, lib, handle):
+        self._lib = lib
+        self._h   = handle
+        self._max_bins = 128
+
+    def feed_iq(self, i_arr, q_arr):
+        import ctypes as _ct
+        n = len(i_arr)
+        ip = i_arr.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        qp = q_arr.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        self._lib.itila_sc_feed_iq(self._h, ip, qp, _ct.c_int(n))
+
+    def ready_bins(self):
+        import ctypes as _ct
+        buf = np.empty(self._max_bins, dtype=np.float64)
+        ptr = buf.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        n = self._lib.itila_sc_ready_bins(self._h, ptr, _ct.c_int(self._max_bins))
+        return set(buf[:n].tolist())
+
+    def list_bins(self):
+        import ctypes as _ct
+        buf = np.empty(self._max_bins, dtype=np.float64)
+        ptr = buf.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        n = self._lib.itila_sc_list_bins(self._h, ptr, _ct.c_int(self._max_bins))
+        return set(buf[:n].tolist())
+
+    def env_n(self, f_hz):
+        import ctypes as _ct
+        return self._lib.itila_sc_env_n(self._h, _ct.c_double(f_hz))
+
+    def drain_env(self, f_hz, env100, env200, max_n):
+        import ctypes as _ct
+        p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = env200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        return self._lib.itila_sc_drain_env(
+            self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
+
+    def free(self):
+        self._lib.itila_sc_free(self._h)
+        self._h = None
+
+
+def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
+                        window_samples, energy_win, grid_hz,
+                        band_min_hz, band_max_hz,
+                        sos100, sos200):
+    import ctypes as _ct
+    try:
+        lib = _ct.CDLL('./libitila_scanner.so')
+        lib.itila_sc_create.restype  = _ct.c_void_p
+        lib.itila_sc_create.argtypes = [
+            _ct.c_int, _ct.c_double, _ct.c_int, _ct.c_double,
+            _ct.c_int, _ct.c_int, _ct.c_double,
+            _ct.c_double, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.c_int,
+            _ct.POINTER(_ct.c_double)]
+        lib.itila_sc_free.restype    = None
+        lib.itila_sc_free.argtypes   = [_ct.c_void_p]
+        lib.itila_sc_feed_iq.restype  = None
+        lib.itila_sc_feed_iq.argtypes = [
+            _ct.c_void_p,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_sc_ready_bins.restype  = _ct.c_int
+        lib.itila_sc_ready_bins.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_sc_list_bins.restype  = _ct.c_int
+        lib.itila_sc_list_bins.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_sc_drain_env.restype  = _ct.c_int
+        lib.itila_sc_drain_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_sc_bin_count.restype  = _ct.c_int
+        lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
+        lib.itila_sc_env_n.restype  = _ct.c_int
+        lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
+
+        n_sos = sos100.shape[0]
+        s100  = np.ascontiguousarray(sos100, dtype=np.float64)
+        s200  = np.ascontiguousarray(sos200, dtype=np.float64)
+        p100  = s100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200  = s200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        h = lib.itila_sc_create(
+            _ct.c_int(sample_rate), _ct.c_double(center_hz),
+            _ct.c_int(max_bins),    _ct.c_double(min_snr),
+            _ct.c_int(window_samples), _ct.c_int(energy_win),
+            _ct.c_double(grid_hz),
+            _ct.c_double(band_min_hz), _ct.c_double(band_max_hz),
+            p100, _ct.c_int(n_sos), p200)
+        if not h:
+            log.warning("itila_sc_create returned NULL")
+            return None
+        log.info("Loaded libitila_scanner.so (sr=%d center=%.0f Hz bins=%d)",
+                 sample_rate, center_hz, max_bins)
+        return _ItilaSc(lib, _ct.c_void_p(h))
+    except OSError:
+        log.warning("libitila_scanner.so not found")
+        return None
+
+
 class _ItilaChannel:
     """Streaming Bayesian CW decoder via libitila.so.
 
@@ -1409,186 +1512,107 @@ class _ItilaChannel:
 # ---------------------------------------------------------------------------
 
 class _ItilaScanner:
-    """Band-wide ITILA channelizer independent of the signal-peak channelizer.
+    """Band-wide ITILA channelizer — thin Python wrapper over libitila_scanner.so.
 
-    Runs a coarse FFT power scan on the full wideband IQ each block and
-    spawns an _ItilaChannel-equivalent accumulator for every 0.1 kHz bin
-    that exceeds noise + min_snr dB.  No dependence on SignalGroup peak
-    detection — finds co-channel and buried signals the peak picker misses.
+    The full pipeline (FFT energy scan, bin spawn, mix+decimate+IIR+envelope,
+    200 Hz accumulation) runs in C.  Python only calls itila_feed() on ready
+    windows and routes spots.
 
-    Pipeline per bin per block:
-      192 kHz complex IQ
-        → mix at -(f_bin - center_khz)*1000 Hz to DC
-        → block-average decimate 192 kHz → 12 kHz
-        → IIR Butterworth LPF 100 Hz + 200 Hz (complex)
-        → |z|  →  envelope at 12 kHz
-        → 60:1 block-avg  →  200 Hz envelope
-        → accumulated window_sec → itila_feed()
+    Pipeline per bin per block (C):
+      192 kHz IQ → FFT scan → spawn → mix DC → 16:1 → IIR 100/200 Hz
+                → |z| → 60:1 → 200 Hz accum → window ready
+    Python:
+      window ready → itila_feed() → callsign → collect()
     """
-
-    GRID_KHZ   = 0.1    # channel spacing
-    ENERGY_WIN = 4096   # FFT window for energy scan
 
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
                  max_bins=80):
         from scipy.signal import butter
-        self.sample_rate   = sample_rate
-        self.center_khz    = center_khz
-        self.ev_thresh     = ev_thresh
-        self.window_sec    = window_sec
-        self.min_snr       = min_snr
-        self.band_min_khz  = band_min_khz
-        self.band_max_khz  = band_max_khz
-        self.max_bins      = max_bins
-
+        self.ev_thresh       = ev_thresh
         self._window_samples = int(window_sec * 200)
+        self._window_sec     = window_sec
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
         sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
 
-        # f_khz -> itila handle dict (h100, h200, pending)
-        self._spotted_cooldown = {}  # f_khz -> evict_timestamp
+        # f_hz -> {h100, h200, pending} — itila decoder handles per bin
         self._bins = {}
 
-        # Rolling buffer for energy scan — accumulate ENERGY_WIN samples before
-        # running FFT so proxy's small 126-sample chunks don't cause coarse-bin jitter
-        self._scan_buf_i = np.zeros(0, dtype=np.float64)
-        self._scan_buf_q = np.zeros(0, dtype=np.float64)
-
-        # C DSP engine — mixing, decimation, IIR, envelope, accumulation
-        self._dsp = _get_itila_dsp(
-            sample_rate, center_khz * 1000.0, max_bins,
+        self._sc = _get_itila_scanner(
+            sample_rate, center_khz * 1000.0, max_bins, min_snr,
+            self._window_samples, 4096,
+            100.0,                          # grid_hz
+            band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
         )
 
-    def _make_bin(self):
+    def _ensure_bin_handles(self, f_hz):
+        """Create itila decoder handles for a C-spawned bin if not yet tracked."""
+        if f_hz in self._bins:
+            return
         import ctypes as _ct
         lib = _get_itila_lib()
         h100 = h200 = None
         if lib:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
-        return {
-            'pending':     [],
-            'last_active': time.time(),
-            'h100': h100,
-            'h200': h200,
-        }
+        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': []}
+        log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
-        now = time.time()
-
-        # --- Energy scan: find active 0.1 kHz bins ---
-        # Accumulate into rolling buffer so we always run a full ENERGY_WIN FFT.
-        # With proxy delivering ~126-sample chunks the FFT would otherwise be only
-        # 126 points → 1524 Hz resolution → ±762 Hz bin jitter → premature eviction.
-        self._scan_buf_i = np.concatenate([self._scan_buf_i, i_arr])
-        self._scan_buf_q = np.concatenate([self._scan_buf_q, q_arr])
-
-        if len(self._scan_buf_i) >= self.ENERGY_WIN:
-            seg_i = self._scan_buf_i[-self.ENERGY_WIN:]
-            seg_q = self._scan_buf_q[-self.ENERGY_WIN:]
-            self._scan_buf_i = np.zeros(0, dtype=np.float64)
-            self._scan_buf_q = np.zeros(0, dtype=np.float64)
-
-            win = np.blackman(self.ENERGY_WIN)
-            z_seg = (seg_i + 1j * seg_q) * win
-            psd_db = 10 * np.log10(np.abs(np.fft.fft(z_seg)) ** 2 + 1e-20)
-            noise  = np.median(psd_db)
-            freqs_hz = np.fft.fftfreq(self.ENERGY_WIN, 1.0 / self.sample_rate)
-
-            # Collect (power, freq_khz) pairs above threshold, then cluster within
-            # 300 Hz so one CW signal (which spreads across 3-5 adjacent 0.1 kHz
-            # bins) produces a single channel at its peak-power bin.
-            raw_peaks = []
-            for f_hz, p in zip(freqs_hz, psd_db):
-                if p > noise + self.min_snr:
-                    f_khz = self.center_khz + f_hz / 1000.0
-                    if self.band_min_khz <= f_khz <= self.band_max_khz:
-                        raw_peaks.append((p, round(round(f_khz / self.GRID_KHZ) * self.GRID_KHZ, 1)))
-
-            # Cluster: 300 Hz window, keep strongest bin per cluster
-            active_scan = {}  # f_khz -> power
-            for p, f_khz in sorted(raw_peaks, reverse=True):
-                if not any(abs(f_khz - k) < 0.3 for k in active_scan):
-                    active_scan[f_khz] = p
-
-            for f_khz in sorted(active_scan, key=lambda k: -active_scan[k]):  # strongest first
-                if f_khz not in self._bins:
-                    # Don't spawn if within 300 Hz of an already-running channel
-                    nearby = next((k for k in self._bins if abs(f_khz - k) < 0.3), None)
-                    if nearby is not None:
-                        self._bins[nearby]['last_active'] = now
-                        continue
-                    if len(self._bins) >= self.max_bins:
-                        continue  # hard cap — don't OOM
-                    # Skip frequencies in post-spot cooldown (5 min)
-                    if any(abs(f_khz - ck) < 0.15 and now - ct < 300
-                           for ck, ct in self._spotted_cooldown.items()):
-                        continue
-                    if self._dsp:
-                        self._dsp.add_bin(f_khz * 1000.0)
-                    self._bins[f_khz] = self._make_bin()
-                    log.info("ITILA scanner: spawned %.1f kHz", f_khz)
-                self._bins[f_khz]['last_active'] = now
-
-        # --- DSP: mix, decimate, filter, envelope, accumulate (C) ---
-        # Keep all bins alive while IQ is flowing — eviction only fires if
-        # the IQ stream goes silent for > window_sec+30s (proxy stopped/OOM)
-        for st in self._bins.values():
-            st['last_active'] = now
-
-        # Evict bins whose stream has gone silent
-        for f_khz in [f for f, st in self._bins.items()
-                      if now - st['last_active'] > self.window_sec + 30]:
-            self._free_bin(f_khz)
-
-        if not self._bins:
+        if not self._sc:
             return
+        i_c = np.ascontiguousarray(i_arr, dtype=np.float64)
+        q_c = np.ascontiguousarray(q_arr, dtype=np.float64)
+        self._sc.feed_iq(i_c, q_c)
 
-        if self._dsp:
-            i_c = np.ascontiguousarray(i_arr, dtype=np.float64)
-            q_c = np.ascontiguousarray(q_arr, dtype=np.float64)
-            self._dsp.feed(i_c, q_c)
-        else:
-            return
+        # Sync Python bin handles with C-spawned bins
+        active_hz = self._sc.list_bins()
+        for f_hz in active_hz:
+            self._ensure_bin_handles(f_hz)
+        # Drop handles for bins the C scanner has evicted
+        for f_hz in list(self._bins):
+            if f_hz not in active_hz:
+                self._free_bin_handles(f_hz)
 
-        # --- Check each bin for decode readiness ---
-        for f_khz, st in list(self._bins.items()):
-            n_env = self._dsp.env_n(f_khz * 1000.0)
+        # Fire decode on any ready windows
+        ready = self._sc.ready_bins()
+        for f_hz in ready:
+            st = self._bins.get(f_hz)
+            if st is None:
+                continue
+            n_env = self._sc.env_n(f_hz)
             if n_env > 0 and n_env % 1000 < 8:
-                log.info("ITILA env %.1f kHz: %d/%d", f_khz, n_env, self._window_samples)
+                log.info("ITILA env %.1f kHz: %d/%d",
+                         f_hz/1000.0, n_env, self._window_samples)
             while n_env >= self._window_samples:
-                log.info("ITILA decode firing %.1f kHz env=%d", f_khz, n_env)
-                self._decode_bin(f_khz, st)
-                n_env = self._dsp.env_n(f_khz * 1000.0)
+                log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_env)
+                self._decode_bin(f_hz, st)
+                n_env = self._sc.env_n(f_hz)
 
-    def _decode_bin(self, f_khz, st):
+    def _decode_bin(self, f_hz, st):
         import ctypes as _ct
         lib = _get_itila_lib()
-        if not lib or not self._dsp:
+        if not lib or not self._sc:
             return
 
         env100 = np.empty(self._window_samples, dtype=np.float64)
         env200 = np.empty(self._window_samples, dtype=np.float64)
-        n_drained = self._dsp.drain_env(f_khz * 1000.0, env100, env200,
-                                         self._window_samples)
+        n_drained = self._sc.drain_env(f_hz, env100, env200, self._window_samples)
         if n_drained < self._window_samples:
             return
-        env100 = env100[:n_drained]
-        env200 = env200[:n_drained]
 
+        f_khz = f_hz / 1000.0
         seen = set()
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
-            n = len(env)
-            env_c = np.ascontiguousarray(env, dtype=np.float64)
+            env_c = np.ascontiguousarray(env[:n_drained], dtype=np.float64)
             ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
-            result = lib.itila_feed(h, ptr, _ct.c_int(n),
+            result = lib.itila_feed(h, ptr, _ct.c_int(n_drained),
                                     _ct.c_double(f_khz),
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
@@ -1606,27 +1630,15 @@ class _ItilaScanner:
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""
         results = []
-        for f_khz, st in self._bins.items():
+        for f_hz, st in self._bins.items():
             if st['pending']:
                 text = ''.join(st['pending'])
                 st['pending'] = []
-                results.append((f_khz, 0.0, text, text, id(st), 'itila', 0))
+                results.append((f_hz/1000.0, 0.0, text, text, id(st), 'itila', 0))
         return results
 
-    def evict_spotted(self, freq_khz):
-        """Evict a bin after SpotTracker confirms a real spot. Frees the slot
-        for new frequencies. 5-minute cooldown prevents immediate respawn."""
-        nearby = next((k for k in self._bins if abs(freq_khz - k) < 0.15), None)
-        if nearby is not None:
-            self._spotted_cooldown[nearby] = time.time()
-            self._free_bin(nearby)
-        # Expire old cooldowns
-        now = time.time()
-        self._spotted_cooldown = {k: v for k, v in self._spotted_cooldown.items()
-                                  if now - v < 300}
-
-    def _free_bin(self, f_khz):
-        st = self._bins.pop(f_khz, None)
+    def _free_bin_handles(self, f_hz):
+        st = self._bins.pop(f_hz, None)
         if not st:
             return
         lib = _get_itila_lib()
@@ -1634,16 +1646,13 @@ class _ItilaScanner:
             for h in (st['h100'], st['h200']):
                 if h and h.value:
                     lib.itila_free(h)
-        if self._dsp:
-            self._dsp.remove_bin(f_khz * 1000.0)
-        log.info("ITILA scanner: evicted %.1f kHz", f_khz)
 
     def kill(self):
-        for f_khz in list(self._bins.keys()):
-            self._free_bin(f_khz)
-        if self._dsp:
-            self._dsp.free()
-            self._dsp = None
+        for f_hz in list(self._bins.keys()):
+            self._free_bin_handles(f_hz)
+        if self._sc:
+            self._sc.free()
+            self._sc = None
 
 
 # ---------------------------------------------------------------------------
@@ -2779,9 +2788,8 @@ class SignalGroup:
         # Secondary pitch decoders — co-channel signals at different audio pitches
         # Uses the uhsdr channelizer (always available) to detect secondary peaks.
         # Only auto+detected-wpm (2 decoders per secondary pitch) to control CPU.
-        # Skip if no uhsdr speeds configured (ITILA-only mode).
         sec_pitches = self._ch_uhsdr.secondary_pitches
-        if sec_pitches and self._speeds:
+        if sec_pitches:
             lib = _get_uhsdr_lib()
             sec_speeds = [0, wpm]  # auto + detected-wpm only (vs all 7 speeds)
             for sec_pitch in sec_pitches:
@@ -4113,47 +4121,6 @@ class SpotTracker:
         self._cycle_calls.clear()
 
 
-class _IQWavWriter:
-    """24-bit stereo WAV writer that handles files > 4 GB."""
-
-    def __init__(self, path, sample_rate):
-        self._path = path
-        self._rate = sample_rate
-        self._f = open(path, 'wb')
-        self._data_written = 0
-        ch, bps, align = 2, 24, 6
-        byterate = sample_rate * align
-        self._f.write(struct.pack('<4sI4s', b'RIFF', 0, b'WAVE'))
-        self._f.write(struct.pack('<4sIHHIIHH', b'fmt ', 16,
-                                  1, ch, sample_rate, byterate, align, bps))
-        self._f.write(struct.pack('<4sI', b'data', 0))
-
-    def writeframes(self, data):
-        self._f.write(data)
-        self._data_written += len(data)
-
-    def close(self):
-        if self._f is None:
-            return
-        try:
-            self._f.flush()
-            file_size = self._f.tell()
-            riff_size = min(file_size - 8, 0xFFFFFFFF)
-            data_size = min(self._data_written, 0xFFFFFFFF)
-            self._f.seek(4)
-            self._f.write(struct.pack('<I', riff_size))
-            self._f.seek(40)
-            self._f.write(struct.pack('<I', data_size))
-            self._f.close()
-            dur = self._data_written / (self._rate * 6)
-            log.info("Recording closed: %s (%.1fs, %.0f MB)",
-                     self._path, dur, file_size / 1e6)
-        except Exception as e:
-            log.error("Error closing WAV %s: %s", self._path, e)
-        finally:
-            self._f = None
-
-
 class OpenSkimmer:
     """Main daemon — streaming architecture with dynamic decoder instances."""
 
@@ -4209,11 +4176,14 @@ class OpenSkimmer:
         self._wav_record = None
         record_wav = self.cfg.get('record_wav')
         if record_wav:
-            import datetime as _dt
+            import wave as _wave, datetime as _dt
             ts = _dt.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
             band_khz = self.cfg.get('bands', [0])[0] // 1000
             rec_path = record_wav.format(ts=ts, band=band_khz)
-            self._wav_record = _IQWavWriter(rec_path, self.cfg.get('sample_rate', 192000))
+            self._wav_record = _wave.open(rec_path, 'wb')
+            self._wav_record.setnchannels(2)
+            self._wav_record.setsampwidth(2)
+            self._wav_record.setframerate(self.cfg.get('sample_rate', 192000))
             log.info("Recording IQ to %s", rec_path)
         calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
@@ -4360,9 +4330,13 @@ class OpenSkimmer:
             with self._iq_lock:
                 buf['raw'].append(iq_samples)
             if self._wav_record and rx_index == 0:
-                scaled32 = np.clip(iq_arr * 8388607.0, -8388608, 8388607).astype('<i4')
-                frames = scaled32.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
-                self._wav_record.writeframes(frames)
+                import struct as _struct
+                frames = bytearray()
+                for i_val, q_val in iq_samples:
+                    i16 = max(-32768, min(32767, int(i_val * 32767)))
+                    q16 = max(-32768, min(32767, int(q_val * 32767)))
+                    frames += _struct.pack('<hh', i16, q16)
+                self._wav_record.writeframes(bytes(frames))
         except Exception:
             pass  # Don't let errors kill the receiver thread
 
@@ -4444,21 +4418,17 @@ class OpenSkimmer:
                             log.info("add_calls reloaded: +%d -%d calls", len(added), len(removed))
 
                 fft_size = 8192
-                n_avg = 200
                 min_snr = self.cfg.get('signal_min_snr', 12)
                 cw_min  = self.cfg.get('cw_min_khz', 0)
                 cw_max  = self.cfg.get('cw_max_khz', 99999)
 
                 for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
                     center_khz = center_hz / 1000
-                    needed = fft_size * n_avg
                     with self._iq_lock:
                         iq_deque = self._band_bufs[rx_idx]['iq']
-                        buf_len = len(iq_deque)
-                        actual = min(buf_len, needed)
-                        if actual >= fft_size:
+                        if len(iq_deque) >= fft_size:
                             raw = list(itertools.islice(iq_deque,
-                                                        buf_len - actual,
+                                                        len(iq_deque) - fft_size,
                                                         None))
                         else:
                             raw = None
@@ -4466,17 +4436,11 @@ class OpenSkimmer:
                     if raw is None:
                         continue
 
-                    iq_arr = np.array(raw, dtype=np.float64)
-                    iq_c = iq_arr[:, 0] + 1j * iq_arr[:, 1]
-                    n_ffts = len(iq_c) // fft_size
-                    window = np.hanning(fft_size)
-                    avg = np.zeros(fft_size)
-                    for fi in range(n_ffts):
-                        seg = iq_c[fi * fft_size:(fi + 1) * fft_size]
-                        avg += np.abs(np.fft.fft(seg * window)) ** 2
-                    avg /= max(n_ffts, 1)
-                    psd_db = 10 * np.log10(avg + 1e-20)
-                    noise = np.median(psd_db)
+                    iq_arr = np.array([complex(i, q) for i, q in raw])
+                    window  = np.blackman(fft_size)
+                    psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
+                    psd_db  = 10 * np.log10(psd + 1e-20)
+                    noise   = np.median(psd_db)
 
                     signals = []
                     N = fft_size
