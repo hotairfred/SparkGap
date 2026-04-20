@@ -19,7 +19,7 @@
 #include <string.h>
 
 /* ---- compile-time limits ---- */
-#define SC_MAX_BINS   128
+#define SC_MAX_BINS   256
 #define SC_MAX_SOS    6
 #define SC_DEC1       16      /* 192 kHz → 12 kHz */
 #define SC_DEC2       60      /* 12 kHz → 200 Hz  */
@@ -492,4 +492,18 @@ int itila_sc_list_bins(ItilaSc *sc, double *f_hz_out, int max_out)
             f_hz_out[count++] = sc->bins[i].f_hz;
     }
     return count;
+}
+
+int itila_sc_peek_env(ItilaSc *sc, double f_hz,
+                       double *env100_out, double *env200_out, int max_n)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        ScBin *b = &sc->bins[i];
+        if (!b->active || fabs(b->f_hz - f_hz) >= 1.0) continue;
+        int n = b->env_n < max_n ? b->env_n : max_n;
+        memcpy(env100_out, b->env100, n * sizeof(double));
+        memcpy(env200_out, b->env200, n * sizeof(double));
+        return n;  /* no drain — data stays in place */
+    }
+    return 0;
 }

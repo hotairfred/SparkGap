@@ -78,3 +78,4 @@ int itila_sc_list_bins(ItilaSc *sc, double *f_hz_out, int max_out);
 #endif
 
 #endif /* ITILA_SCANNER_H */
+int itila_sc_peek_env(ItilaSc *sc, double f_hz, double *env100_out, double *env200_out, int max_n);

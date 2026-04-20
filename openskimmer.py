@@ -1297,6 +1297,13 @@ class _ItilaSc:
         return self._lib.itila_sc_drain_env(
             self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
 
+    def peek_env(self, f_hz, env100, env200, max_n):
+        import ctypes as _ct
+        p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = env200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        return self._lib.itila_sc_peek_env(
+            self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
+
     def free(self):
         self._lib.itila_sc_free(self._h)
         self._h = None
@@ -1336,6 +1343,10 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
         lib.itila_sc_env_n.restype  = _ct.c_int
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_peek_env.restype  = _ct.c_int
+        lib.itila_sc_peek_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1528,11 +1539,13 @@ class _ItilaScanner:
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
-                 max_bins=80):
+                 max_bins=80, early_thresh=4.0, early_interval_sec=15):
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_samples = int(window_sec * 200)
         self._window_sec     = window_sec
+        self._early_thresh   = early_thresh
+        self._early_interval_sec = early_interval_sec
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
@@ -1592,6 +1605,51 @@ class _ItilaScanner:
                 log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_env)
                 self._decode_bin(f_hz, st)
                 n_env = self._sc.env_n(f_hz)
+
+        # Early exit: try strong-signal decode at 15s intervals before full window
+        early_interval = int(self._early_interval_sec * 200)  # samples at 200 Hz
+        if early_interval > 0:
+            for f_hz, st in self._bins.items():
+                n_env = self._sc.env_n(f_hz)
+                if n_env < early_interval:
+                    continue
+                if n_env >= self._window_samples:
+                    continue  # handled by ready_bins above
+                last_early = st.get('_last_early', 0)
+                if n_env - last_early >= early_interval:
+                    st['_last_early'] = n_env
+                    self._decode_bin_early(f_hz, st, n_env)
+
+    def _decode_bin_early(self, f_hz, st, n_env):
+        """Try decode with higher threshold on partial envelope (strong signals)."""
+        import ctypes as _ct
+        lib = _get_itila_lib()
+        if not lib or not self._sc:
+            return
+
+        env100 = np.empty(n_env, dtype=np.float64)
+        env200 = np.empty(n_env, dtype=np.float64)
+        n_peek = self._sc.peek_env(f_hz, env100, env200, n_env)
+        if n_peek < n_env:
+            return
+
+        f_khz = f_hz / 1000.0
+        for h, env in ((st['h100'], env100), (st['h200'], env200)):
+            if h is None or h.value is None:
+                continue
+            env_c = np.ascontiguousarray(env[:n_peek], dtype=np.float64)
+            ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
+            result = lib.itila_feed(h, ptr, _ct.c_int(n_peek),
+                                    _ct.c_double(f_khz),
+                                    _ct.c_double(self._early_thresh))
+            raw = result.decode('ascii', errors='replace').strip() if result else ''
+            if raw:
+                call = _itila_extract_cq_call(raw)
+                if call:
+                    st['pending'].append(f'CQ {call} ')
+                    log.info("ITILA EARLY %.1f kHz: %s at %ds (raw: %s)",
+                             f_khz, call, n_peek // 200, raw[:60])
+                    return
 
     def _decode_bin(self, f_hz, st):
         import ctypes as _ct
@@ -3167,6 +3225,7 @@ class InstanceManager:
                  ml_max_channels=20, use_dispatcher=False,
                  use_pfb_dispatcher=False, use_itila=False,
                  itila_ev_thresh=2.0, itila_window_sec=120.0,
+                 itila_early_thresh=4.0, itila_early_interval_sec=15,
                  cw_min_khz=0.0, cw_max_khz=99999.0):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -3179,6 +3238,8 @@ class InstanceManager:
         self.use_itila = bool(use_itila)
         self.itila_ev_thresh = float(itila_ev_thresh)
         self.itila_window_sec = float(itila_window_sec)
+        self.itila_early_thresh = float(itila_early_thresh)
+        self.itila_early_interval_sec = float(itila_early_interval_sec)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
@@ -3247,7 +3308,9 @@ class InstanceManager:
                     window_sec=self.itila_window_sec,
                     min_snr=12.0,
                     band_min_khz=self.cw_min_khz,
-                    band_max_khz=self.cw_max_khz)
+                    band_max_khz=self.cw_max_khz,
+                    early_thresh=self.itila_early_thresh,
+                    early_interval_sec=self.itila_early_interval_sec)
             else:
                 self._itila_scanner.center_khz = center_khz
 
