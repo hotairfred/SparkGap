@@ -1450,6 +1450,7 @@ class _ItilaScanner:
         sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
 
         # f_khz -> itila handle dict (h100, h200, pending)
+        self._spotted_cooldown = {}  # f_khz -> evict_timestamp
         self._bins = {}
 
         # Rolling buffer for energy scan — accumulate ENERGY_WIN samples before
@@ -1524,6 +1525,10 @@ class _ItilaScanner:
                         continue
                     if len(self._bins) >= self.max_bins:
                         continue  # hard cap — don't OOM
+                    # Skip frequencies in post-spot cooldown (5 min)
+                    if any(abs(f_khz - ck) < 0.15 and now - ct < 300
+                           for ck, ct in self._spotted_cooldown.items()):
+                        continue
                     if self._dsp:
                         self._dsp.add_bin(f_khz * 1000.0)
                     self._bins[f_khz] = self._make_bin()
@@ -1607,6 +1612,18 @@ class _ItilaScanner:
                 st['pending'] = []
                 results.append((f_khz, 0.0, text, text, id(st), 'itila', 0))
         return results
+
+    def evict_spotted(self, freq_khz):
+        """Evict a bin after SpotTracker confirms a real spot. Frees the slot
+        for new frequencies. 5-minute cooldown prevents immediate respawn."""
+        nearby = next((k for k in self._bins if abs(freq_khz - k) < 0.15), None)
+        if nearby is not None:
+            self._spotted_cooldown[nearby] = time.time()
+            self._free_bin(nearby)
+        # Expire old cooldowns
+        now = time.time()
+        self._spotted_cooldown = {k: v for k, v in self._spotted_cooldown.items()
+                                  if now - v < 300}
 
     def _free_bin(self, f_khz):
         st = self._bins.pop(f_khz, None)
