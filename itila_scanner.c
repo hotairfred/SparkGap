@@ -172,14 +172,20 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
     double thresh  = noise + sc->min_snr;
     double bin_hz  = (double)sc->sample_rate / N;
 
-    /* Collect peaks above threshold */
+    /* Collect LOCAL MAXIMA above threshold with parabolic interpolation */
     ScPeak *peaks = (ScPeak *)malloc(N * sizeof(ScPeak));
     if (!peaks) { free(psd); return; }
     int np = 0;
-    for (int k = 0; k < N; k++) {
+    for (int k = 1; k < N - 1; k++) {
         if (psd[k] <= thresh) continue;
-        double fft_hz = k < N/2 ? k*bin_hz : (k-N)*bin_hz;
-        double f_abs  = sc->center_hz + fft_hz;
+        if (psd[k] <= psd[k-1] || psd[k] <= psd[k+1]) continue;  /* not a peak */
+        /* Parabolic interpolation for sub-bin accuracy */
+        double delta = 0.5 * (psd[k-1] - psd[k+1]) /
+                       (psd[k-1] - 2.0*psd[k] + psd[k+1]);
+        double exact = (double)k + delta;
+        if (exact >= N/2) exact -= N;
+        double f_hz_interp = exact * bin_hz;
+        double f_abs  = sc->center_hz + f_hz_interp;
         if (f_abs < sc->band_min_hz || f_abs > sc->band_max_hz) continue;
         double f_grid = round(f_abs / sc->grid_hz) * sc->grid_hz;
         peaks[np].power = psd[k];
