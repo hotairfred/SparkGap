@@ -203,36 +203,84 @@ static double forward_backward_fast(
 }
 
 /* -------------------------------------------------------------------------
- * estimate_wpm_from_gamma — P25 of mark run lengths
+ * estimate_wpm_from_gamma — GMM dit-component estimation
+ *
+ * Fits a 2-component Gaussian mixture to log mark-run durations.
+ * The lower-mean component is the dit cluster; WPM = 240 / exp(mu_dit).
+ * Falls back to P25 if insufficient runs or GMM doesn't converge.
  * ---------------------------------------------------------------------- */
 static double estimate_wpm_from_gamma(const double *gamma, int T) {
     /* Extract mark runs */
-    int runs[16384], n_runs = 0;
+    double runs[8192]; int n_runs = 0;
     int val = gamma[1] > 0.5 ? 1 : 0, cnt = 1;
     for (int i = 1; i < T; i++) {
         int v = gamma[i*2+1] > 0.5 ? 1 : 0;
         if (v == val) { cnt++; }
         else {
-            if (val == 1 && cnt >= 2 && n_runs < 16384) runs[n_runs++] = cnt;
+            if (val == 1 && cnt >= 2 && n_runs < 8192)
+                runs[n_runs++] = log((double)cnt + 0.5);
             val = v; cnt = 1;
         }
     }
-    if (val == 1 && cnt >= 2 && n_runs < 16384) runs[n_runs++] = cnt;
+    if (val == 1 && cnt >= 2 && n_runs < 8192)
+        runs[n_runs++] = log((double)cnt + 0.5);
     if (n_runs < 5) return -1.0;
 
-    /* P25 via sort */
-    int scratch[16384];
-    memcpy(scratch, runs, n_runs * sizeof(int));
-    /* Simple insertion sort for small arrays; qsort for large */
-    for (int i = 1; i < n_runs; i++) {
-        int k = scratch[i], j = i-1;
-        while (j >= 0 && scratch[j] > k) { scratch[j+1] = scratch[j]; j--; }
-        scratch[j+1] = k;
+    /* K=1 mean and variance */
+    double mu1 = 0.0;
+    for (int i = 0; i < n_runs; i++) mu1 += runs[i];
+    mu1 /= n_runs;
+    double var1 = 0.0;
+    for (int i = 0; i < n_runs; i++) { double d = runs[i]-mu1; var1 += d*d; }
+    var1 = var1/n_runs + 1e-6;
+
+    /* Check if there's enough spread for bimodality (dit vs dah) */
+    double sorted[8192];
+    memcpy(sorted, runs, n_runs * sizeof(double));
+    qsort(sorted, n_runs, sizeof(double), cmp_double);
+    double q25 = sorted[(int)(0.25*(n_runs-1))];
+    double q75 = sorted[(int)(0.75*(n_runs-1))];
+
+    if (q75 - q25 < 0.3 || n_runs < 15) {
+        /* Unimodal — use median as dit estimate (more robust than P25) */
+        double dit_samples = exp(sorted[n_runs/2]);
+        if (dit_samples < 1.0) return -1.0;
+        double wpm = 240.0 / dit_samples;
+        if (wpm < WPM_MIN) wpm = WPM_MIN;
+        if (wpm > WPM_MAX) wpm = WPM_MAX;
+        return wpm;
     }
-    int idx = (int)(0.25 * (n_runs - 1));
-    double dit_samples = (double)scratch[idx];
+
+    /* K=2 EM in log-space: separate dit and dah clusters */
+    double mu[2] = {q25, q75};
+    double vr[2] = {var1*0.5, var1*0.5};
+    double pi[2] = {0.5, 0.5};
+    double g0[8192];
+
+    for (int iter = 0; iter < 20; iter++) {
+        for (int i = 0; i < n_runs; i++) {
+            double lr0 = log(pi[0]+1e-300) - 0.5*(runs[i]-mu[0])*(runs[i]-mu[0])/vr[0] - 0.5*log(2*M_PI*vr[0]);
+            double lr1 = log(pi[1]+1e-300) - 0.5*(runs[i]-mu[1])*(runs[i]-mu[1])/vr[1] - 0.5*log(2*M_PI*vr[1]);
+            double lZ  = lr0 > lr1 ? lr0 + log(1+exp(lr1-lr0)) : lr1 + log(1+exp(lr0-lr1));
+            g0[i] = exp(lr0 - lZ);
+        }
+        double N0=1e-10, N1=1e-10, s0=0, s1=0;
+        for (int i=0;i<n_runs;i++){N0+=g0[i];N1+=(1-g0[i]);s0+=g0[i]*runs[i];s1+=(1-g0[i])*runs[i];}
+        pi[0]=N0/n_runs; pi[1]=N1/n_runs;
+        mu[0]=s0/N0; mu[1]=s1/N1;
+        double v0=1e-6,v1=1e-6;
+        for(int i=0;i<n_runs;i++){
+            double d0=runs[i]-mu[0],d1=runs[i]-mu[1];
+            v0+=g0[i]*d0*d0; v1+=(1-g0[i])*d1*d1;
+        }
+        vr[0]=v0/N0; vr[1]=v1/N1;
+    }
+
+    /* Dit component is the one with the smaller mean (shorter runs) */
+    double mu_dit = mu[0] < mu[1] ? mu[0] : mu[1];
+    double dit_samples = exp(mu_dit);
     if (dit_samples < 1.0) return -1.0;
-    double wpm = 1200.0 / (dit_samples / BAYES_RATE * 1000.0);
+    double wpm = 240.0 / dit_samples;
     if (wpm < WPM_MIN) wpm = WPM_MIN;
     if (wpm > WPM_MAX) wpm = WPM_MAX;
     return wpm;
