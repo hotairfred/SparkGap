@@ -43,6 +43,31 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 /* Free handle and all associated memory. */
 void itila_free(itila_t h);
 
+/*
+ * Online EM feed — accumulates evidence incrementally with λ forgetting.
+ *
+ * Each call runs one FB pass (E-step) on `envelope`, updates per-handle
+ * sufficient statistics (N0,S0,Q0,N1,S1,Q1,wpm_ema) with λ forgetting,
+ * runs the M-step to refine params, then checks evidence.  Decode only
+ * fires when log Bayes factor exceeds ev_thresh.
+ *
+ * Call with the full rolling buffer (up to 60s) every 5s.  The oss stats
+ * accumulate across calls — no window resets, no cold-starts.  Strong
+ * signals decode in 5-15s; weak signals accumulate until evidence suffices.
+ *
+ *   lambda:  forgetting factor, 0 < λ ≤ 1.  λ=1 = full accumulation (no
+ *            forgetting).  λ=0.95 → ~20-call half-life at 5s stride = ~100s.
+ *
+ * Returns decoded text (same format as itila_feed) or "" if below threshold.
+ * Valid until the next call on this handle.
+ */
+const char* itila_feed_online(itila_t h, const double *envelope, int n,
+                              double lambda, double freq_khz, double ev_thresh);
+
+/* Reset online sufficient statistics (e.g., after a bin is evicted and
+ * a fresh handle is reused).  Equivalent to freeing and recreating. */
+void itila_reset_online(itila_t h);
+
 /* BAYES_RATE: envelope sample rate this library expects */
 #define ITILA_BAYES_RATE 200
 
