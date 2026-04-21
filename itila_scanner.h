@@ -90,6 +90,9 @@ void itila_sc_advance(ItilaSc *sc, double f_hz);
 int itila_sc_drain_env(ItilaSc *sc, double f_hz,
                         double *env100_out, double *env200_out, int max_n);
 
+/* Remove a bin by frequency (deactivates and frees the slot). */
+void itila_sc_remove_bin(ItilaSc *sc, double f_hz);
+
 /* Current number of active bins. */
 int itila_sc_bin_count(ItilaSc *sc);
 

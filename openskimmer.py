@@ -1322,6 +1322,10 @@ class _ItilaSc:
         self._lib.itila_sc_set_bin_interval(
             self._h, _ct.c_double(f_hz), _ct.c_int(interval))
 
+    def remove_bin(self, f_hz):
+        import ctypes as _ct
+        self._lib.itila_sc_remove_bin(self._h, _ct.c_double(f_hz))
+
     def free(self):
         self._lib.itila_sc_free(self._h)
         self._h = None
@@ -1369,6 +1373,8 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
         lib.itila_sc_set_bin_interval.restype  = None
         lib.itila_sc_set_bin_interval.argtypes = [_ct.c_void_p, _ct.c_double, _ct.c_int]
+        lib.itila_sc_remove_bin.restype  = None
+        lib.itila_sc_remove_bin.argtypes = [_ct.c_void_p, _ct.c_double]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1559,6 +1565,11 @@ class _ItilaScanner:
       window ready → itila_feed() → callsign → collect()
     """
 
+    # Evict a bin if it has never produced evidence after this many seconds
+    EVICT_NO_EVIDENCE_SEC = 120.0
+    # Evict a bin if its last evidence was more than this many seconds ago
+    EVICT_STALE_SEC       = 600.0
+
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=60.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
@@ -1572,7 +1583,7 @@ class _ItilaScanner:
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
         sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
 
-        # f_hz -> {h100, h200, pending, last_spot} — per-bin state
+        # f_hz -> {h100, h200, pending, last_spot, created_at, last_evidence}
         self._bins = {}
         self._respot_interval = 300  # seconds between respots on same bin
 
@@ -1594,8 +1605,10 @@ class _ItilaScanner:
         if lib:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
+        now = time.time()
         self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': [],
-                            'last_spot': 0.0}
+                            'last_spot': 0.0, 'created_at': now,
+                            'last_evidence': 0.0}
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
@@ -1614,8 +1627,20 @@ class _ItilaScanner:
             if f_hz not in active_hz:
                 self._free_bin_handles(f_hz)
 
-        # Fire batch decode on bins that have accumulated a full window
+        # Evict stale bins so their grid slots open up for new signals
         now = time.time()
+        for f_hz in list(self._bins):
+            st = self._bins[f_hz]
+            age = now - st['created_at']
+            since_ev = now - st['last_evidence'] if st['last_evidence'] else age
+            if (st['last_evidence'] == 0.0 and age > self.EVICT_NO_EVIDENCE_SEC) or \
+               (st['last_evidence'] > 0.0 and since_ev > self.EVICT_STALE_SEC):
+                log.info("ITILA evict %.1f kHz (age=%.0fs, last_ev=%.0fs)",
+                         f_hz/1000.0, age, since_ev)
+                self._sc.remove_bin(f_hz)
+                self._free_bin_handles(f_hz)
+
+        # Fire batch decode on bins that have accumulated a full window
         ready = self._sc.ready_bins()
         for f_hz in ready:
             st = self._bins.get(f_hz)
@@ -1651,6 +1676,7 @@ class _ItilaScanner:
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
                 log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+                st['last_evidence'] = now
             else:
                 log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
             if raw:

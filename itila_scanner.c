@@ -522,6 +522,17 @@ int itila_sc_drain_env(ItilaSc *sc, double f_hz,
     return 0;
 }
 
+void itila_sc_remove_bin(ItilaSc *sc, double f_hz)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        if (sc->bins[i].active && fabs(sc->bins[i].f_hz - f_hz) < 1.0) {
+            sc->bins[i].active = 0;
+            sc->n_bins--;
+            return;
+        }
+    }
+}
+
 int itila_sc_bin_count(ItilaSc *sc)
 {
     return sc->n_bins;
