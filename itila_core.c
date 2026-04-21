@@ -69,6 +69,21 @@ typedef struct {
     double ws_nm_norm;
     double ws_s2_norm;
 
+    /* Online EM sufficient statistics (raw envelope units, λ-weighted).
+     *
+     * oss_N{0,1}: sum of per-sample responsibilities for noise/signal state.
+     * oss_S{0,1}: sum of responsibility-weighted envelope values.
+     * oss_Q{0,1}: sum of responsibility-weighted envelope squares.
+     * oss_{nm,A,s2}: current M-step params (raw units).
+     * oss_wpm: EMA of per-call wpm estimates.
+     * oss_init: 0 = first call (cold-start needed).
+     */
+    double oss_N0, oss_S0, oss_Q0;
+    double oss_N1, oss_S1, oss_Q1;
+    double oss_nm, oss_A, oss_s2;
+    double oss_wpm;
+    int    oss_init;
+
     /* Output */
     char result_buf[RESULT_BUF];
 } itila_state_t;
@@ -188,36 +203,84 @@ static double forward_backward_fast(
 }
 
 /* -------------------------------------------------------------------------
- * estimate_wpm_from_gamma — P25 of mark run lengths
+ * estimate_wpm_from_gamma — GMM dit-component estimation
+ *
+ * Fits a 2-component Gaussian mixture to log mark-run durations.
+ * The lower-mean component is the dit cluster; WPM = 240 / exp(mu_dit).
+ * Falls back to P25 if insufficient runs or GMM doesn't converge.
  * ---------------------------------------------------------------------- */
 static double estimate_wpm_from_gamma(const double *gamma, int T) {
     /* Extract mark runs */
-    int runs[16384], n_runs = 0;
+    double runs[8192]; int n_runs = 0;
     int val = gamma[1] > 0.5 ? 1 : 0, cnt = 1;
     for (int i = 1; i < T; i++) {
         int v = gamma[i*2+1] > 0.5 ? 1 : 0;
         if (v == val) { cnt++; }
         else {
-            if (val == 1 && cnt >= 2 && n_runs < 16384) runs[n_runs++] = cnt;
+            if (val == 1 && cnt >= 2 && n_runs < 8192)
+                runs[n_runs++] = log((double)cnt + 0.5);
             val = v; cnt = 1;
         }
     }
-    if (val == 1 && cnt >= 2 && n_runs < 16384) runs[n_runs++] = cnt;
+    if (val == 1 && cnt >= 2 && n_runs < 8192)
+        runs[n_runs++] = log((double)cnt + 0.5);
     if (n_runs < 5) return -1.0;
 
-    /* P25 via sort */
-    int scratch[16384];
-    memcpy(scratch, runs, n_runs * sizeof(int));
-    /* Simple insertion sort for small arrays; qsort for large */
-    for (int i = 1; i < n_runs; i++) {
-        int k = scratch[i], j = i-1;
-        while (j >= 0 && scratch[j] > k) { scratch[j+1] = scratch[j]; j--; }
-        scratch[j+1] = k;
+    /* K=1 mean and variance */
+    double mu1 = 0.0;
+    for (int i = 0; i < n_runs; i++) mu1 += runs[i];
+    mu1 /= n_runs;
+    double var1 = 0.0;
+    for (int i = 0; i < n_runs; i++) { double d = runs[i]-mu1; var1 += d*d; }
+    var1 = var1/n_runs + 1e-6;
+
+    /* Check if there's enough spread for bimodality (dit vs dah) */
+    double sorted[8192];
+    memcpy(sorted, runs, n_runs * sizeof(double));
+    qsort(sorted, n_runs, sizeof(double), cmp_double);
+    double q25 = sorted[(int)(0.25*(n_runs-1))];
+    double q75 = sorted[(int)(0.75*(n_runs-1))];
+
+    if (q75 - q25 < 0.3 || n_runs < 15) {
+        /* Unimodal (single station) — P25 targets the dit cluster naturally */
+        double dit_samples = exp(sorted[(int)(0.25*(n_runs-1))]);
+        if (dit_samples < 1.0) return -1.0;
+        double wpm = 240.0 / dit_samples;
+        if (wpm < WPM_MIN) wpm = WPM_MIN;
+        if (wpm > WPM_MAX) wpm = WPM_MAX;
+        return wpm;
     }
-    int idx = (int)(0.25 * (n_runs - 1));
-    double dit_samples = (double)scratch[idx];
+
+    /* K=2 EM in log-space: separate dit and dah clusters */
+    double mu[2] = {q25, q75};
+    double vr[2] = {var1*0.5, var1*0.5};
+    double pi[2] = {0.5, 0.5};
+    double g0[8192];
+
+    for (int iter = 0; iter < 20; iter++) {
+        for (int i = 0; i < n_runs; i++) {
+            double lr0 = log(pi[0]+1e-300) - 0.5*(runs[i]-mu[0])*(runs[i]-mu[0])/vr[0] - 0.5*log(2*M_PI*vr[0]);
+            double lr1 = log(pi[1]+1e-300) - 0.5*(runs[i]-mu[1])*(runs[i]-mu[1])/vr[1] - 0.5*log(2*M_PI*vr[1]);
+            double lZ  = lr0 > lr1 ? lr0 + log(1+exp(lr1-lr0)) : lr1 + log(1+exp(lr0-lr1));
+            g0[i] = exp(lr0 - lZ);
+        }
+        double N0=1e-10, N1=1e-10, s0=0, s1=0;
+        for (int i=0;i<n_runs;i++){N0+=g0[i];N1+=(1-g0[i]);s0+=g0[i]*runs[i];s1+=(1-g0[i])*runs[i];}
+        pi[0]=N0/n_runs; pi[1]=N1/n_runs;
+        mu[0]=s0/N0; mu[1]=s1/N1;
+        double v0=1e-6,v1=1e-6;
+        for(int i=0;i<n_runs;i++){
+            double d0=runs[i]-mu[0],d1=runs[i]-mu[1];
+            v0+=g0[i]*d0*d0; v1+=(1-g0[i])*d1*d1;
+        }
+        vr[0]=v0/N0; vr[1]=v1/N1;
+    }
+
+    /* Dit component is the one with the smaller mean (shorter runs) */
+    double mu_dit = mu[0] < mu[1] ? mu[0] : mu[1];
+    double dit_samples = exp(mu_dit);
     if (dit_samples < 1.0) return -1.0;
-    double wpm = 1200.0 / (dit_samples / BAYES_RATE * 1000.0);
+    double wpm = 240.0 / dit_samples;
     if (wpm < WPM_MIN) wpm = WPM_MIN;
     if (wpm > WPM_MAX) wpm = WPM_MAX;
     return wpm;
@@ -313,6 +376,44 @@ static void em_estimate(
     EM_STEP(wpm, 10 - half);
 
     #undef EM_STEP
+
+    /* Post-hoc sharpening: one extra FB pass with per-state variances
+     * for sharper mark/space boundaries at decode time. Does NOT feed
+     * back into EM — parameters (A, nm, wpm) are already converged. */
+    {
+        double dm = 1e-10, ds = 1e-10, vs_post = 0, vm_post = 0;
+        for (int i = 0; i < T; i++) {
+            double gm = st->gamma[i*2+1], gs = st->gamma[i*2+0];
+            dm += gm; ds += gs;
+            vm_post += gm * (env[i]-A)*(env[i]-A);
+            vs_post += gs * (env[i]-nm)*(env[i]-nm);
+        }
+        double s2s = vs_post / ds, s2m = vm_post / dm;
+        if (s2s < 0.1 * s2) s2s = 0.1 * s2;  /* floor prevents collapse */
+        if (s2m < 0.1 * s2) s2m = 0.1 * s2;
+        /* Shared normalization (geometric mean) with separate exponents */
+        double s2_norm = sqrt(s2s * s2m);
+        double ln_norm = -0.5 * log(2.0 * M_PI * s2_norm);
+        for (int t = 0; t < T; t++) {
+            st->log_B[t*2+0] = ln_norm - 0.5*(env[t]-nm)*(env[t]-nm)/s2s;
+            st->log_B[t*2+1] = ln_norm - 0.5*(env[t]-A)*(env[t]-A)/s2m;
+        }
+        double p01, p10;
+        transition_probs(wpm, &p01, &p10);
+        double log_T[4] = {
+            log(1.0-p01+1e-300), log(p01+1e-300),
+            log(p10+1e-300),     log(1.0-p10+1e-300)
+        };
+        double log_Z_post;
+        fb_core(st->log_B, log_T, T, st->log_alpha, st->log_beta, &log_Z_post);
+        for (int t = 0; t < T; t++) {
+            double lg0 = st->log_alpha[t*2+0] + st->log_beta[t*2+0];
+            double lg1 = st->log_alpha[t*2+1] + st->log_beta[t*2+1];
+            double lZ  = logaddexp(lg0, lg1);
+            st->gamma[t*2+0] = exp(lg0 - lZ);
+            st->gamma[t*2+1] = exp(lg1 - lZ);
+        }
+    }
 
     /* Save normalized params for warm-start on next call */
     st->ws_wpm    = wpm;
@@ -855,6 +956,181 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     st->result_buf[l]   = '\n';
     st->result_buf[l+1] = '\0';
     return st->result_buf;
+}
+
+/* -------------------------------------------------------------------------
+ * itila_feed_online — online EM with λ-forgetting sufficient statistics
+ * ---------------------------------------------------------------------- */
+const char* itila_feed_online(itila_t h, const double *envelope, int n,
+                              double lambda, double freq_khz, double ev_thresh)
+{
+    itila_state_t *st = (itila_state_t*)h;
+    st->result_buf[0] = '\0';
+    if (n < 10 || n > MAX_ENV) return st->result_buf;
+
+    /* Normalize to [0,1] via p99 — keeps FB numerics stable */
+    double env_scale = percentile(envelope, n, 99.0, st->env_norm);
+    if (env_scale < 1e-30) return st->result_buf;
+    double *env = st->env_norm;
+    for (int i = 0; i < n; i++) env[i] = envelope[i] / env_scale;
+
+    /* Current params in normalized space */
+    double nm, A, s2, wpm;
+    if (!st->oss_init) {
+        /* Cold-start: percentile heuristics (same as em_estimate cold path) */
+        nm = percentile(env, n, 30.0, st->gamma);
+        double p95 = percentile(env, n, 95.0, st->gamma);
+        double p5  = percentile(env, n, 5.0,  st->gamma);
+        double p40 = percentile(env, n, 40.0, st->gamma);
+        double var_lo = 0.0; int nlo = 0;
+        for (int i = 0; i < n; i++)
+            if (env[i] < p40) { var_lo += (env[i]-nm)*(env[i]-nm); nlo++; }
+        if (nlo > 2) var_lo /= nlo; else var_lo = 0.0;
+        double env_spread = p95 - p5;
+        s2 = var_lo;
+        double floor1 = (env_spread * 0.15) * (env_spread * 0.15);
+        if (s2 < floor1) s2 = floor1;
+        if (s2 < 1e-6) s2 = 1e-6;
+        double thresh_init = nm + 3.0 * sqrt(s2);
+        A = 0.0; int nhi = 0;
+        for (int i = 0; i < n; i++) if (env[i] > thresh_init) { A += env[i]; nhi++; }
+        if (nhi > 10) A /= nhi; else A = p95;
+        wpm = 25.0;
+        /* Store in raw units */
+        st->oss_nm  = nm  * env_scale;
+        st->oss_A   = A   * env_scale;
+        st->oss_s2  = s2  * env_scale * env_scale;
+        st->oss_wpm = 25.0;
+        st->oss_N0 = st->oss_S0 = st->oss_Q0 = 0.0;
+        st->oss_N1 = st->oss_S1 = st->oss_Q1 = 0.0;
+        st->oss_init = 1;
+    } else {
+        /* Convert stored raw params to normalized space */
+        nm  = st->oss_nm / env_scale;
+        A   = st->oss_A  / env_scale;
+        s2  = st->oss_s2 / (env_scale * env_scale);
+        wpm = st->oss_wpm > 0.0 ? st->oss_wpm : 25.0;
+        if (nm  < 0)         nm  = 0.0;
+        if (A   < nm + 1e-10) A  = nm + 1e-10;
+        if (s2  < 1e-20)     s2  = 1e-20;
+    }
+
+    /* E-step: one forward-backward pass with current params */
+    forward_backward_fast(st, env, n, wpm, A, nm, s2, st->gamma);
+
+    /* Sufficient stat contributions from this call (raw units) */
+    double dN0=0, dS0=0, dQ0=0, dN1=0, dS1=0, dQ1=0;
+    for (int i = 0; i < n; i++) {
+        double g0 = st->gamma[i*2+0], g1 = st->gamma[i*2+1];
+        double x  = envelope[i];   /* raw */
+        dN0 += g0; dS0 += g0 * x; dQ0 += g0 * x * x;
+        dN1 += g1; dS1 += g1 * x; dQ1 += g1 * x * x;
+    }
+
+    /* Update sufficient stats with λ forgetting */
+    st->oss_N0 = lambda * st->oss_N0 + dN0;
+    st->oss_S0 = lambda * st->oss_S0 + dS0;
+    st->oss_Q0 = lambda * st->oss_Q0 + dQ0;
+    st->oss_N1 = lambda * st->oss_N1 + dN1;
+    st->oss_S1 = lambda * st->oss_S1 + dS1;
+    st->oss_Q1 = lambda * st->oss_Q1 + dQ1;
+
+    /* M-step: update params from accumulated sufficient stats */
+    if (st->oss_N0 > 1.0 && st->oss_N1 > 1.0) {
+        double nm_new = st->oss_S0 / st->oss_N0;
+        double A_new  = st->oss_S1 / st->oss_N1;
+        if (A_new < nm_new + 1e-30) A_new = nm_new + 1e-30;
+        /* Variance from E[x^2] - mean^2 */
+        double var0 = st->oss_Q0 / st->oss_N0 - nm_new * nm_new;
+        double var1 = st->oss_Q1 / st->oss_N1 - A_new  * A_new;
+        if (var0 < 0.0) var0 = 0.0;
+        if (var1 < 0.0) var1 = 0.0;
+        double s2_new = (var0 + var1) / 2.0;
+        if (s2_new < 1e-30) s2_new = 1e-30;
+        st->oss_nm = nm_new;
+        st->oss_A  = A_new;
+        st->oss_s2 = s2_new;
+    }
+
+    /* WPM: estimate from E-step gamma, EMA update (α=0.3: fast adaptation) */
+    double wpm_est = estimate_wpm_from_gamma(st->gamma, n);
+    if (wpm_est > 0.0) {
+        if (st->oss_wpm <= 0.0) st->oss_wpm = wpm_est;
+        else                    st->oss_wpm = 0.7 * st->oss_wpm + 0.3 * wpm_est;
+    }
+
+    /* Re-normalized params for evidence check and decode */
+    double nm2  = st->oss_nm / env_scale;
+    double A2   = st->oss_A  / env_scale;
+    double s2_2 = st->oss_s2 / (env_scale * env_scale);
+    double wpm2 = st->oss_wpm > 0.0 ? st->oss_wpm : 25.0;
+    if (nm2 < 0.0)           nm2  = 0.0;
+    if (A2  < nm2 + 1e-10)   A2   = nm2 + 1e-10;
+    if (s2_2 < 1e-20)        s2_2 = 1e-20;
+
+    /* Quick evidence check: one FB pass vs noise-only log-likelihood.
+     * Avoids the 32-FB-pass decode_marginal unless evidence is sufficient. */
+    double log_Z_cw = forward_backward_fast(st, env, n, wpm2, A2, nm2, s2_2,
+                                             st->gamma);
+    double log_lik_noise = 0.0;
+    {
+        double lc = -0.5 * log(2.0 * M_PI * s2_2);
+        for (int i = 0; i < n; i++) {
+            double d = env[i] - nm2;
+            log_lik_noise += lc - 0.5 * d * d / s2_2;
+        }
+    }
+    double log_bf = log_Z_cw - log_lik_noise;
+    if (log_bf < ev_thresh) return st->result_buf;
+
+    /* Evidence sufficient — run full decode_marginal for accurate marks */
+    decode_marginal(st, env, n, A2, nm2, s2_2);
+    posterior_to_marks(st->gamma_marg, n, st->marks);
+
+    double wpm_cands[2]; int n_cands;
+    n_cands = fit_mark_wpm_components(st->marks, n, wpm2, wpm_cands, 2);
+
+    static callsign_t calls_ol[MAX_CALLS];
+    int n_calls = 0;
+    static char out_texts_ol[MAX_TEXTS][MAX_TEXT];
+    static char primary_ol[MAX_TEXT];
+    primary_ol[0] = '\0';
+
+    for (int ci = 0; ci < n_cands; ci++) {
+        int n_texts = decode_runs_beam(st->marks, n, wpm_cands[ci],
+                                       out_texts_ol, MAX_TEXTS);
+        if (ci == 0 && n_texts > 0)
+            strncpy(primary_ol, out_texts_ol[0], MAX_TEXT - 1);
+        for (int ti = 0; ti < n_texts; ti++)
+            extract_callsigns(out_texts_ol[ti], calls_ol, &n_calls);
+    }
+
+    if (n_calls == 0) return st->result_buf;
+
+    if (primary_ol[0]) {
+        strncpy(st->result_buf, primary_ol, RESULT_BUF - 1);
+        st->result_buf[RESULT_BUF - 1] = '\0';
+        return st->result_buf;
+    }
+
+    int best = 0;
+    for (int i = 1; i < n_calls; i++)
+        if (calls_ol[i].count > calls_ol[best].count) best = i;
+    int l = (int)strlen(calls_ol[best].call);
+    memcpy(st->result_buf, calls_ol[best].call, l);
+    st->result_buf[l]   = '\n';
+    st->result_buf[l+1] = '\0';
+    return st->result_buf;
+}
+
+void itila_reset_online(itila_t h)
+{
+    itila_state_t *st = (itila_state_t*)h;
+    st->oss_N0 = st->oss_S0 = st->oss_Q0 = 0.0;
+    st->oss_N1 = st->oss_S1 = st->oss_Q1 = 0.0;
+    st->oss_nm = st->oss_A  = st->oss_s2 = 0.0;
+    st->oss_wpm  = 0.0;
+    st->oss_init = 0;
 }
 
 void itila_free(itila_t h) {

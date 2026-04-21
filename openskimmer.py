@@ -59,7 +59,7 @@ FALSE_POSITIVES = {
     'QSL', 'QTH', 'QRL', 'CFM', 'PSE', 'TNX', 'TKS',
     'BT', 'AR', 'SK', 'KN', 'AS', 'EE5E', 'TT5T',
 }
-CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|CWT|SST|TU|UP|DE)\b', re.IGNORECASE)
+CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|CWT|SST|MST|TU|UP|DE)\b', re.IGNORECASE)
 
 BANDS = {
     '160m': 1891000, '80m': 3591000, '40m': 7100000, '30m': 10191000,
@@ -256,7 +256,7 @@ class BmorseInstance:
     """
 
     def __init__(self, freq_offset, rf_khz, sample_rate, snr,
-                 bmorse_bin=None, wpm=30):
+                 bmorse_bin='/home/fred/morse-wip/src/bmorse', wpm=30):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
         self.snr = snr
@@ -375,7 +375,7 @@ class HamFistInstance:
     """
 
     def __init__(self, freq_offset, rf_khz, sample_rate, snr,
-                 hamfist_bin=None,
+                 hamfist_bin='/home/fred/csdr-skimmer/research/HamFist/hamfist',
                  scp_path=None, wpm=30):
         self.freq_offset = freq_offset
         self.rf_khz = rf_khz
@@ -1072,7 +1072,7 @@ def _get_bmorse_lib():
 # libitila.so — Bayesian CW decoder (envelope in, callsigns out)
 # ---------------------------------------------------------------------------
 
-_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'CWT', 'SST'}
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'CWT', 'SST', 'MST'}
 # Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
 _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]{1,4}$')
 # Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
@@ -1092,17 +1092,58 @@ def _itila_extract_cq_call(text):
     """
     tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
 
+    # Split merged CQ+callsign tokens (e.g. "CQCWTWJ9B" → "CQ", "CWT", "WJ9B")
+    _SPLIT_PREFIXES = ('CWT', 'CQ', 'TEST', 'MST', 'SST', 'QRZ')
+    expanded = []
+    for tok in tokens:
+        remaining = tok
+        while remaining:
+            matched = False
+            for prefix in _SPLIT_PREFIXES:
+                if remaining.startswith(prefix) and len(remaining) > len(prefix):
+                    tail = remaining[len(prefix):]
+                    if re.match(r'[A-Z]{1,2}\d', tail):
+                        expanded.append(prefix)
+                        expanded.append(tail)
+                        remaining = ''
+                        matched = True
+                        break
+                    else:
+                        expanded.append(prefix)
+                        remaining = tail
+                        matched = True
+                        break
+            if not matched:
+                expanded.append(remaining)
+                break
+    tokens = expanded
+
     # Collect ALL callsign candidates from each CQ window.
     # Returning the most-frequent (last among ties) beats grabbing the first
     # because ITILA sometimes garbles the first occurrence of a repeated
     # callsign (e.g. "CQ CQ E E A2JD K2JD K" → prefer K2JD over A2JD).
     candidates = []
 
+    # Fuzzy CQ trigger matching: allow 1-char substitution (FWT→CWT, TES→TEST, CWE→CWT)
+    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ'}
+    def _is_cq_trigger(tok):
+        if tok in _ITILA_CQ_WORDS:
+            return True
+        if len(tok) < 2 or len(tok) > 5:
+            return False
+        for cq in _FUZZY_CQ:
+            if len(tok) == len(cq) and sum(a != b for a, b in zip(tok, cq)) == 1:
+                return True
+            if len(tok) == len(cq) - 1 and cq.startswith(tok):
+                return True
+        return False
+
     for i, tok in enumerate(tokens):
-        if tok not in _ITILA_CQ_WORDS:
+        if not _is_cq_trigger(tok):
             continue
-        # Expanded window: 8 tokens after CQ (was 5) to see both callsign repeats
-        for j in range(i + 1, min(i + 8, len(tokens))):
+        # 5 tokens after CQ trigger — wide enough for "CQ NA NA E HZ1TT" pattern
+        # but narrow enough to block answering stations (6+ tokens out)
+        for j in range(i + 1, min(i + 6, len(tokens))):
             t = tokens[j]
 
             # Case 1: already a slash call in one token
@@ -1124,7 +1165,7 @@ def _itila_extract_cq_call(text):
             # Case 2: plain base call — continue scanning (don't break) so we
             # collect both occurrences when callsign is repeated after garble
             if _is_base_call(t):
-                if j + 1 < min(i + 9, len(tokens)):
+                if j + 1 < min(i + 6, len(tokens)):
                     nxt = tokens[j + 1]
                     if _SLASH_SUFFIX_PAT.match(nxt):
                         candidates.append(f'{t}/{nxt}')
@@ -1133,7 +1174,7 @@ def _itila_extract_cq_call(text):
                 continue  # keep scanning for possible second clean copy
 
             # Case 3: short DX prefix (e.g. PJ2, VE3) — slash decoded as space
-            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 9, len(tokens)):
+            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 6, len(tokens)):
                 nxt = tokens[j + 1]
                 if _is_base_call(nxt):
                     candidates.append(f'{t}/{nxt}')
@@ -1279,17 +1320,6 @@ class _ItilaSc:
         n = self._lib.itila_sc_ready_bins(self._h, ptr, _ct.c_int(self._max_bins))
         return set(buf[:n].tolist())
 
-    def peek_env(self, f_hz, env100, env200, max_n):
-        import ctypes as _ct
-        p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
-        p200 = env200.ctypes.data_as(_ct.POINTER(_ct.c_double))
-        return self._lib.itila_sc_peek_env(
-            self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
-
-    def advance(self, f_hz):
-        import ctypes as _ct
-        self._lib.itila_sc_advance(self._h, _ct.c_double(f_hz))
-
     def list_bins(self):
         import ctypes as _ct
         buf = np.empty(self._max_bins, dtype=np.float64)
@@ -1308,18 +1338,13 @@ class _ItilaSc:
         return self._lib.itila_sc_drain_env(
             self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
 
-    def set_bin_interval(self, f_hz, interval):
-        import ctypes as _ct
-        self._lib.itila_sc_set_bin_interval(
-            self._h, _ct.c_double(f_hz), _ct.c_int(interval))
-
     def free(self):
         self._lib.itila_sc_free(self._h)
         self._h = None
 
 
 def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
-                        window_samples, feed_interval, energy_win, grid_hz,
+                        window_samples, energy_win, grid_hz,
                         band_min_hz, band_max_hz,
                         sos100, sos200):
     import ctypes as _ct
@@ -1328,7 +1353,7 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_create.restype  = _ct.c_void_p
         lib.itila_sc_create.argtypes = [
             _ct.c_int, _ct.c_double, _ct.c_int, _ct.c_double,
-            _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_double,
+            _ct.c_int, _ct.c_int, _ct.c_double,
             _ct.c_double, _ct.c_double,
             _ct.POINTER(_ct.c_double), _ct.c_int,
             _ct.POINTER(_ct.c_double)]
@@ -1348,18 +1373,10 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_drain_env.argtypes = [
             _ct.c_void_p, _ct.c_double,
             _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
-        lib.itila_sc_peek_env.restype  = _ct.c_int
-        lib.itila_sc_peek_env.argtypes = [
-            _ct.c_void_p, _ct.c_double,
-            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
-        lib.itila_sc_advance.restype  = None
-        lib.itila_sc_advance.argtypes = [_ct.c_void_p, _ct.c_double]
         lib.itila_sc_bin_count.restype  = _ct.c_int
         lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
         lib.itila_sc_env_n.restype  = _ct.c_int
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
-        lib.itila_sc_set_bin_interval.restype  = None
-        lib.itila_sc_set_bin_interval.argtypes = [_ct.c_void_p, _ct.c_double, _ct.c_int]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1369,8 +1386,7 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         h = lib.itila_sc_create(
             _ct.c_int(sample_rate), _ct.c_double(center_hz),
             _ct.c_int(max_bins),    _ct.c_double(min_snr),
-            _ct.c_int(window_samples), _ct.c_int(feed_interval),
-            _ct.c_int(energy_win),
+            _ct.c_int(window_samples), _ct.c_int(energy_win),
             _ct.c_double(grid_hz),
             _ct.c_double(band_min_hz), _ct.c_double(band_max_hz),
             p100, _ct.c_int(n_sos), p200)
@@ -1550,31 +1566,25 @@ class _ItilaScanner:
       window ready → itila_feed() → callsign → collect()
     """
 
-    # Adaptive feed interval bounds (seconds → samples at 200 Hz)
-    MIN_INTERVAL_SEC = 60.0
-    MAX_INTERVAL_SEC = 60.0
-
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
-                 window_sec=60.0, min_snr=12.0,
+                 window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
                  max_bins=80):
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_samples = int(window_sec * 200)
-        self._min_interval   = int(self.MIN_INTERVAL_SEC * 200)   # 1000 samples = 5s
-        self._max_interval   = int(self.MAX_INTERVAL_SEC * 200)   # 12000 samples = 60s
+        self._window_sec     = window_sec
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
         sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
 
-        # f_hz -> {h100, h200, pending, last_spot, interval} — per-bin state
+        # f_hz -> {h100, h200, pending} — itila decoder handles per bin
         self._bins = {}
-        self._respot_interval = 300  # seconds between respots on same bin
 
         self._sc = _get_itila_scanner(
             sample_rate, center_khz * 1000.0, max_bins, min_snr,
-            self._window_samples, self._min_interval, 4096,
+            self._window_samples, 4096,
             100.0,                          # grid_hz
             band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
@@ -1590,8 +1600,7 @@ class _ItilaScanner:
         if lib:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
-        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': [],
-                            'last_spot': 0.0, 'interval': self._min_interval}
+        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': []}
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
@@ -1610,48 +1619,45 @@ class _ItilaScanner:
             if f_hz not in active_hz:
                 self._free_bin_handles(f_hz)
 
-        # Fire decode on bins that have accumulated next_interval new samples
-        now = time.time()
+        # Fire decode on any ready windows
         ready = self._sc.ready_bins()
         for f_hz in ready:
             st = self._bins.get(f_hz)
             if st is None:
                 continue
             n_env = self._sc.env_n(f_hz)
-            log.debug("ITILA env %.1f kHz: %d samples interval=%d",
-                      f_hz/1000.0, n_env, st['interval'])
-            # Peek the latest window (no drain)
-            env100 = np.empty(self._window_samples, dtype=np.float64)
-            env200 = np.empty(self._window_samples, dtype=np.float64)
-            n_peek = self._sc.peek_env(f_hz, env100, env200, self._window_samples)
-            if n_peek >= self._window_samples:
-                log.info("ITILA decode firing %.1f kHz env=%d",
-                         f_hz/1000.0, n_peek)
-                self._decode_bin(f_hz, st, env100[:n_peek], env200[:n_peek], now)
-            self._sc.advance(f_hz)
+            if n_env > 0 and n_env % 1000 < 8:
+                log.info("ITILA env %.1f kHz: %d/%d",
+                         f_hz/1000.0, n_env, self._window_samples)
+            while n_env >= self._window_samples:
+                log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_env)
+                self._decode_bin(f_hz, st)
+                n_env = self._sc.env_n(f_hz)
 
-    def _decode_bin(self, f_hz, st, env100, env200, now):
-        """Decode one bin. Returns True if either decoder produced non-empty output."""
+    def _decode_bin(self, f_hz, st):
         import ctypes as _ct
         lib = _get_itila_lib()
         if not lib or not self._sc:
-            return False
+            return
 
-        n = len(env100)
+        env100 = np.empty(self._window_samples, dtype=np.float64)
+        env200 = np.empty(self._window_samples, dtype=np.float64)
+        n_drained = self._sc.drain_env(f_hz, env100, env200, self._window_samples)
+        if n_drained < self._window_samples:
+            return
+
         f_khz = f_hz / 1000.0
         seen = set()
-        had_result = False
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
-            env_c = np.ascontiguousarray(env, dtype=np.float64)
+            env_c = np.ascontiguousarray(env[:n_drained], dtype=np.float64)
             ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
-            result = lib.itila_feed(h, ptr, _ct.c_int(n),
+            result = lib.itila_feed(h, ptr, _ct.c_int(n_drained),
                                     _ct.c_double(f_khz),
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
-                had_result = True
                 log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
             else:
                 log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
@@ -1659,28 +1665,8 @@ class _ItilaScanner:
                 call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
                     seen.add(call)
-                    # Respot cooldown: suppress if same bin spotted recently
-                    if now - st['last_spot'] >= self._respot_interval:
-                        st['pending'].append(f'CQ {call} ')
-                        st['last_spot'] = now
-                        log.info("ITILA spot %.1f kHz: %s (raw: %s)",
-                                 f_khz, call, raw[:60])
-                    else:
-                        log.debug("ITILA respot suppressed %.1f kHz: %s", f_khz, call)
-        return had_result
-
-    def _cold_start_bin(self, f_hz, st):
-        """Recreate itila decoder handles to clear warm-start EM state."""
-        import ctypes as _ct
-        lib = _get_itila_lib()
-        if not lib:
-            return
-        for key in ('h100', 'h200'):
-            h = st[key]
-            if h and h.value:
-                lib.itila_free(h)
-        st['h100'] = _ct.c_void_p(lib.itila_create(200, 100.0))
-        st['h200'] = _ct.c_void_p(lib.itila_create(200, 200.0))
+                    st['pending'].append(f'CQ {call} ')
+                    log.info("ITILA scan %.1f kHz: %s (raw: %s)", f_khz, call, raw[:60])
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""
@@ -3966,9 +3952,15 @@ class SpotTracker:
                     _slash_base = _parts[0]
                 elif _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
                     _slash_base = _parts[1]
-            # ITILA's Bayesian ev_thresh is the quality gate — accept any
-            # structurally-valid callsign from ITILA without SCP check.
-            _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            # SCP bypass was disabled 2026-04-21. Originally added because
+            # ITILA's noisy raw text produced garbled callsigns that needed
+            # ev_thresh as the only quality gate. After GMM WPM estimation +
+            # fuzzy extraction + recursive token splitting, extraction quality
+            # improved enough that SCP validation catches ~84 false spots per
+            # 15-min eval without losing real calls. If a future decoder change
+            # degrades extraction quality, re-enable bypass by uncommenting:
+            # _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            _itila_bypass = False
             if call in self.valid_calls or _slash_base is not None or _itila_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
@@ -4254,7 +4246,7 @@ class OpenSkimmer:
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
-            callsign=self.cfg.get('callsign', 'NOCALL'),
+            callsign=self.cfg.get('callsign', 'WF8Z-2'),
             node_call=self.cfg.get('node_call', 'SPARK-2'),
         )
         await self.telnet.start()
@@ -4592,9 +4584,9 @@ class OpenSkimmer:
 
 def load_config(path):
     defaults = {
-        'callsign': 'NOCALL',
+        'callsign': 'WF8Z-2',
         'node_call': 'SPARK-2',
-        'sdr_ip': '127.0.0.1',
+        'sdr_ip': '192.168.1.54',
         'bands': ['20m'],
         'lna_gain': 20,
         'decoder_bin': './uhsdr_cw',
