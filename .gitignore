@@ -1,0 +1,29 @@
+# Built artifacts
+*.o
+*.so
+*.a
+csdr-cwskimmer*
+csdr-rttyskimmer
+threshold-cwskimmer
+bayes-cwskimmer*
+uhsdr_cw
+cw_dispatcher_test
+cw_dispatcher_pfb_test
+fldigi_cw
+
+# Recordings and logs
+*.wav
+*.log
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+
+# Model checkpoints
+*.pth
+training_data/
+training.log
+
+# Binary databases
+MASTER.DTA
