@@ -23,7 +23,7 @@
 #define SC_MAX_SOS    6
 #define SC_DEC1       16      /* 192 kHz → 12 kHz */
 #define SC_DEC2       60      /* 12 kHz → 200 Hz  */
-#define SC_ENV_CAP    48000   /* 4 × 12000 — 4 decode windows at 200 Hz × 60 s */
+#define SC_ENV_CAP    15000   /* 75s at 200 Hz — rolling window cap */
 
 /* ---- per-bin state ---- */
 typedef struct {
@@ -39,6 +39,7 @@ typedef struct {
     int    res_n;                      /* shared — always equal for both paths */
     double env100[SC_ENV_CAP];
     double env200[SC_ENV_CAP];
+    int    decoded_at;                 /* env_n when decode was last triggered */
     int    env_n;
 } ScBin;
 
@@ -48,7 +49,8 @@ struct ItilaSc {
     double center_hz;
     int    max_bins;
     double min_snr;
-    int    window_samples;
+    int    window_samples;     /* how much env to pass per itila_feed() call */
+    int    feed_interval;      /* trigger decode when this many new samples arrive */
     int    energy_win;
     double grid_hz;
     double band_min_hz;
@@ -354,8 +356,8 @@ static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full
 
 ItilaSc *itila_sc_create(int sample_rate, double center_hz,
                           int max_bins, double min_snr,
-                          int window_samples, int energy_win,
-                          double grid_hz,
+                          int window_samples, int feed_interval,
+                          int energy_win, double grid_hz,
                           double band_min_hz, double band_max_hz,
                           const double *sos100_flat, int n_sos,
                           const double *sos200_flat)
@@ -372,6 +374,7 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     sc->max_bins       = max_bins;
     sc->min_snr        = min_snr;
     sc->window_samples = window_samples;
+    sc->feed_interval  = feed_interval > 0 ? feed_interval : window_samples;
     sc->energy_win     = energy_win;
     sc->grid_hz        = grid_hz;
     sc->band_min_hz    = band_min_hz;
@@ -446,10 +449,47 @@ int itila_sc_ready_bins(ItilaSc *sc, double *f_hz_out, int max_out)
 {
     int count = 0;
     for (int i = 0; i < SC_MAX_BINS && count < max_out; i++) {
-        if (sc->bins[i].active && sc->bins[i].env_n >= sc->window_samples)
-            f_hz_out[count++] = sc->bins[i].f_hz;
+        ScBin *b = &sc->bins[i];
+        if (b->active && (b->env_n - b->decoded_at) >= sc->feed_interval)
+            f_hz_out[count++] = b->f_hz;
     }
     return count;
+}
+
+int itila_sc_peek_env(ItilaSc *sc, double f_hz,
+                       double *env100_out, double *env200_out, int max_n)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        ScBin *b = &sc->bins[i];
+        if (!b->active || fabs(b->f_hz - f_hz) >= 1.0) continue;
+        int n = b->env_n < max_n ? b->env_n : max_n;
+        /* Copy the most recent n samples */
+        int start = b->env_n - n;
+        memcpy(env100_out, b->env100 + start, n * sizeof(double));
+        memcpy(env200_out, b->env200 + start, n * sizeof(double));
+        return n;
+    }
+    return 0;
+}
+
+void itila_sc_advance(ItilaSc *sc, double f_hz)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        ScBin *b = &sc->bins[i];
+        if (!b->active || fabs(b->f_hz - f_hz) >= 1.0) continue;
+        b->decoded_at = b->env_n;
+        /* Trim buffer to at most window_samples to cap memory */
+        if (b->env_n > sc->window_samples) {
+            int trim = b->env_n - sc->window_samples;
+            memmove(b->env100, b->env100 + trim,
+                    sc->window_samples * sizeof(double));
+            memmove(b->env200, b->env200 + trim,
+                    sc->window_samples * sizeof(double));
+            b->env_n       = sc->window_samples;
+            b->decoded_at  = sc->window_samples;
+        }
+        return;
+    }
 }
 
 int itila_sc_drain_env(ItilaSc *sc, double f_hz,
