@@ -1092,14 +1092,54 @@ def _itila_extract_cq_call(text):
     """
     tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
 
+    # Split merged CQ+callsign tokens (e.g. "CQCWTWJ9B" → "CQ", "CWT", "WJ9B")
+    _SPLIT_PREFIXES = ('CWT', 'CQ', 'TEST', 'MST', 'SST', 'QRZ')
+    expanded = []
+    for tok in tokens:
+        remaining = tok
+        while remaining:
+            matched = False
+            for prefix in _SPLIT_PREFIXES:
+                if remaining.startswith(prefix) and len(remaining) > len(prefix):
+                    tail = remaining[len(prefix):]
+                    if re.match(r'[A-Z]{1,2}\d', tail):
+                        expanded.append(prefix)
+                        expanded.append(tail)
+                        remaining = ''
+                        matched = True
+                        break
+                    else:
+                        expanded.append(prefix)
+                        remaining = tail
+                        matched = True
+                        break
+            if not matched:
+                expanded.append(remaining)
+                break
+    tokens = expanded
+
     # Collect ALL callsign candidates from each CQ window.
     # Returning the most-frequent (last among ties) beats grabbing the first
     # because ITILA sometimes garbles the first occurrence of a repeated
     # callsign (e.g. "CQ CQ E E A2JD K2JD K" → prefer K2JD over A2JD).
     candidates = []
 
+    # Fuzzy CQ trigger matching: allow 1-char substitution (FWT→CWT, TES→TEST, CWE→CWT)
+    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ'}
+    def _is_cq_trigger(tok):
+        if tok in _ITILA_CQ_WORDS:
+            return True
+        if len(tok) < 2 or len(tok) > 5:
+            return False
+        for cq in _FUZZY_CQ:
+            if len(tok) == len(cq) and sum(a != b for a, b in zip(tok, cq)) == 1:
+                return True
+            if len(tok) == len(cq) - 1 and cq.startswith(tok):
+                return True
+        return False
+
     for i, tok in enumerate(tokens):
-        if tok not in _ITILA_CQ_WORDS:
+        if not _is_cq_trigger(tok):
             continue
         # 5 tokens after CQ trigger — wide enough for "CQ NA NA E HZ1TT" pattern
         # but narrow enough to block answering stations (6+ tokens out)
