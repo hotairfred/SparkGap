@@ -1308,6 +1308,11 @@ class _ItilaSc:
         return self._lib.itila_sc_drain_env(
             self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
 
+    def set_bin_interval(self, f_hz, interval):
+        import ctypes as _ct
+        self._lib.itila_sc_set_bin_interval(
+            self._h, _ct.c_double(f_hz), _ct.c_int(interval))
+
     def free(self):
         self._lib.itila_sc_free(self._h)
         self._h = None
@@ -1353,6 +1358,8 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
         lib.itila_sc_env_n.restype  = _ct.c_int
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_set_bin_interval.restype  = None
+        lib.itila_sc_set_bin_interval.argtypes = [_ct.c_void_p, _ct.c_double, _ct.c_int]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1543,9 +1550,9 @@ class _ItilaScanner:
       window ready → itila_feed() → callsign → collect()
     """
 
-    # feed_interval_sec: how often to call itila_feed per bin
-    # window_sec: how much history to pass to each itila_feed call
-    FEED_INTERVAL_SEC = 5.0
+    # Adaptive feed interval bounds (seconds → samples at 200 Hz)
+    MIN_INTERVAL_SEC = 5.0
+    MAX_INTERVAL_SEC = 60.0
 
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=60.0, min_snr=12.0,
@@ -1554,19 +1561,20 @@ class _ItilaScanner:
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_samples = int(window_sec * 200)
-        self._feed_interval  = int(self.FEED_INTERVAL_SEC * 200)  # 1000 samples = 5s
+        self._min_interval   = int(self.MIN_INTERVAL_SEC * 200)   # 1000 samples = 5s
+        self._max_interval   = int(self.MAX_INTERVAL_SEC * 200)   # 12000 samples = 60s
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
         sos_200 = butter(6, 200.0 / (fs_pcm / 2.0), btype='low', output='sos')
 
-        # f_hz -> {h100, h200, pending, last_spot} — itila decoder handles per bin
+        # f_hz -> {h100, h200, pending, last_spot, interval} — per-bin state
         self._bins = {}
         self._respot_interval = 300  # seconds between respots on same bin
 
         self._sc = _get_itila_scanner(
             sample_rate, center_khz * 1000.0, max_bins, min_snr,
-            self._window_samples, self._feed_interval, 4096,
+            self._window_samples, self._min_interval, 4096,
             100.0,                          # grid_hz
             band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
@@ -1583,7 +1591,7 @@ class _ItilaScanner:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
         self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': [],
-                            'last_spot': 0.0}
+                            'last_spot': 0.0, 'interval': self._min_interval}
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
@@ -1602,7 +1610,7 @@ class _ItilaScanner:
             if f_hz not in active_hz:
                 self._free_bin_handles(f_hz)
 
-        # Fire decode on bins that have feed_interval new samples
+        # Fire decode on bins that have accumulated next_interval new samples
         now = time.time()
         ready = self._sc.ready_bins()
         for f_hz in ready:
@@ -1610,25 +1618,42 @@ class _ItilaScanner:
             if st is None:
                 continue
             n_env = self._sc.env_n(f_hz)
-            log.debug("ITILA env %.1f kHz: %d samples", f_hz/1000.0, n_env)
+            log.debug("ITILA env %.1f kHz: %d samples interval=%d",
+                      f_hz/1000.0, n_env, st['interval'])
             # Peek the latest window (no drain)
             env100 = np.empty(self._window_samples, dtype=np.float64)
             env200 = np.empty(self._window_samples, dtype=np.float64)
             n_peek = self._sc.peek_env(f_hz, env100, env200, self._window_samples)
+            had_result = False
             if n_peek > 0:
-                log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_peek)
-                self._decode_bin(f_hz, st, env100[:n_peek], env200[:n_peek], now)
+                log.info("ITILA decode firing %.1f kHz env=%d interval=%d",
+                         f_hz/1000.0, n_peek, st['interval'])
+                had_result = self._decode_bin(f_hz, st, env100[:n_peek], env200[:n_peek], now)
             self._sc.advance(f_hz)
 
+            # Adaptive interval: reset to min on signal, double on miss (→ max)
+            if had_result:
+                new_interval = self._min_interval
+            else:
+                new_interval = min(st['interval'] * 2, self._max_interval)
+                # Cold-start: clear warm-start state so EM doesn't compound bad params
+                self._cold_start_bin(f_hz, st)
+                log.debug("ITILA miss %.1f kHz — cold-start, interval %d→%d",
+                          f_hz/1000.0, st['interval'], new_interval)
+            st['interval'] = new_interval
+            self._sc.set_bin_interval(f_hz, new_interval)
+
     def _decode_bin(self, f_hz, st, env100, env200, now):
+        """Decode one bin. Returns True if either decoder produced non-empty output."""
         import ctypes as _ct
         lib = _get_itila_lib()
         if not lib or not self._sc:
-            return
+            return False
 
         n = len(env100)
         f_khz = f_hz / 1000.0
         seen = set()
+        had_result = False
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
@@ -1639,6 +1664,7 @@ class _ItilaScanner:
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
+                had_result = True
                 log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
             else:
                 log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
@@ -1654,6 +1680,20 @@ class _ItilaScanner:
                                  f_khz, call, raw[:60])
                     else:
                         log.debug("ITILA respot suppressed %.1f kHz: %s", f_khz, call)
+        return had_result
+
+    def _cold_start_bin(self, f_hz, st):
+        """Recreate itila decoder handles to clear warm-start EM state."""
+        import ctypes as _ct
+        lib = _get_itila_lib()
+        if not lib:
+            return
+        for key in ('h100', 'h200'):
+            h = st[key]
+            if h and h.value:
+                lib.itila_free(h)
+        st['h100'] = _ct.c_void_p(lib.itila_create(200, 100.0))
+        st['h200'] = _ct.c_void_p(lib.itila_create(200, 200.0))
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""

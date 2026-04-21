@@ -41,6 +41,7 @@ typedef struct {
     double env200[SC_ENV_CAP];
     int    decoded_at;                 /* env_n when decode was last triggered */
     int    env_n;
+    int    next_interval;              /* per-bin adaptive feed interval (samples) */
 } ScBin;
 
 /* ---- scanner ---- */
@@ -215,10 +216,11 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 
         ScBin *bin = &sc->bins[slot];
         memset(bin, 0, sizeof(ScBin));
-        bin->f_hz    = f_hz;
-        bin->active  = 1;
-        bin->c_phase = 1.0;
-        bin->s_phase = 0.0;
+        bin->f_hz          = f_hz;
+        bin->active        = 1;
+        bin->c_phase       = 1.0;
+        bin->s_phase       = 0.0;
+        bin->next_interval = sc->feed_interval;
         sc->n_bins++;
     }
     free(peaks);
@@ -450,10 +452,20 @@ int itila_sc_ready_bins(ItilaSc *sc, double *f_hz_out, int max_out)
     int count = 0;
     for (int i = 0; i < SC_MAX_BINS && count < max_out; i++) {
         ScBin *b = &sc->bins[i];
-        if (b->active && (b->env_n - b->decoded_at) >= sc->feed_interval)
+        if (b->active && (b->env_n - b->decoded_at) >= b->next_interval)
             f_hz_out[count++] = b->f_hz;
     }
     return count;
+}
+
+void itila_sc_set_bin_interval(ItilaSc *sc, double f_hz, int interval)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        if (sc->bins[i].active && fabs(sc->bins[i].f_hz - f_hz) < 1.0) {
+            sc->bins[i].next_interval = interval;
+            return;
+        }
+    }
 }
 
 int itila_sc_peek_env(ItilaSc *sc, double f_hz,
