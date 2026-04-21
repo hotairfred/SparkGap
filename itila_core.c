@@ -242,8 +242,8 @@ static double estimate_wpm_from_gamma(const double *gamma, int T) {
     double q75 = sorted[(int)(0.75*(n_runs-1))];
 
     if (q75 - q25 < 0.3 || n_runs < 15) {
-        /* Unimodal — use median as dit estimate (more robust than P25) */
-        double dit_samples = exp(sorted[n_runs/2]);
+        /* Unimodal (single station) — P25 targets the dit cluster naturally */
+        double dit_samples = exp(sorted[(int)(0.25*(n_runs-1))]);
         if (dit_samples < 1.0) return -1.0;
         double wpm = 240.0 / dit_samples;
         if (wpm < WPM_MIN) wpm = WPM_MIN;

@@ -1101,9 +1101,9 @@ def _itila_extract_cq_call(text):
     for i, tok in enumerate(tokens):
         if tok not in _ITILA_CQ_WORDS:
             continue
-        # 3 tokens after CQ trigger — prevents extracting answering station's
-        # callsign which appears later in the decoded text
-        for j in range(i + 1, min(i + 4, len(tokens))):
+        # 5 tokens after CQ trigger — wide enough for "CQ NA NA E HZ1TT" pattern
+        # but narrow enough to block answering stations (6+ tokens out)
+        for j in range(i + 1, min(i + 6, len(tokens))):
             t = tokens[j]
 
             # Case 1: already a slash call in one token
@@ -1125,7 +1125,7 @@ def _itila_extract_cq_call(text):
             # Case 2: plain base call — continue scanning (don't break) so we
             # collect both occurrences when callsign is repeated after garble
             if _is_base_call(t):
-                if j + 1 < min(i + 4, len(tokens)):
+                if j + 1 < min(i + 6, len(tokens)):
                     nxt = tokens[j + 1]
                     if _SLASH_SUFFIX_PAT.match(nxt):
                         candidates.append(f'{t}/{nxt}')
@@ -1134,7 +1134,7 @@ def _itila_extract_cq_call(text):
                 continue  # keep scanning for possible second clean copy
 
             # Case 3: short DX prefix (e.g. PJ2, VE3) — slash decoded as space
-            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 4, len(tokens)):
+            if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 6, len(tokens)):
                 nxt = tokens[j + 1]
                 if _is_base_call(nxt):
                     candidates.append(f'{t}/{nxt}')
