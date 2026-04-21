@@ -1377,6 +1377,8 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
         lib.itila_sc_env_n.restype  = _ct.c_int
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_mark_evidence.restype  = None
+        lib.itila_sc_mark_evidence.argtypes = [_ct.c_void_p, _ct.c_double]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1667,6 +1669,9 @@ class _ItilaScanner:
                     seen.add(call)
                     st['pending'].append(f'CQ {call} ')
                     log.info("ITILA scan %.1f kHz: %s (raw: %s)", f_khz, call, raw[:60])
+                    if self._sc:
+                        self._sc._lib.itila_sc_mark_evidence(
+                            self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""

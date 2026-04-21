@@ -61,6 +61,9 @@ int itila_sc_ready_bins(ItilaSc *sc, double *f_hz_out, int max_out);
 int itila_sc_drain_env(ItilaSc *sc, double f_hz,
                         double *env100_out, double *env200_out, int max_n);
 
+/* Mark a bin as having produced evidence (call after itila_feed returns non-empty). */
+void itila_sc_mark_evidence(ItilaSc *sc, double f_hz);
+
 /* Current number of active bins. */
 int itila_sc_bin_count(ItilaSc *sc);
 

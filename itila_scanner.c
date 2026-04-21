@@ -40,6 +40,8 @@ typedef struct {
     double env100[SC_ENV_CAP];
     double env200[SC_ENV_CAP];
     int    env_n;
+    int    created_sample;     /* sample count when bin was spawned */
+    int    last_evidence;      /* sample count when itila_feed returned non-empty */
 } ScBin;
 
 /* ---- scanner ---- */
@@ -60,6 +62,7 @@ struct ItilaSc {
     double iq_res_i[SC_DEC1];
     double iq_res_q[SC_DEC1];
     int    iq_res_n;
+    int    total_samples;      /* running sample count for eviction timing */
 
     double *scan_i;
     double *scan_q;
@@ -209,7 +212,36 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
             }
         }
         if (found) continue;
-        if (sc->n_bins >= sc->max_bins) continue;
+
+        /* Evict stale bins if at capacity: bins that never produced evidence
+         * after 120s, or produced evidence but went silent for 300s */
+        if (sc->n_bins >= sc->max_bins) {
+            int evicted = -1;
+            int oldest_age = 0;
+            for (int b = 0; b < SC_MAX_BINS; b++) {
+                if (!sc->bins[b].active) continue;
+                int age = sc->total_samples - sc->bins[b].created_sample;
+                int since_ev = sc->total_samples - sc->bins[b].last_evidence;
+                /* Never produced evidence and >120s old
+                 * total_samples counts in 12kHz units (n/SC_DEC1) */
+                int rate_12k = sc->sample_rate / SC_DEC1;
+                if (sc->bins[b].last_evidence == 0 &&
+                    age > 300 * rate_12k) {
+                    if (age > oldest_age) { oldest_age = age; evicted = b; }
+                }
+                /* Had evidence but silent for >300s */
+                else if (sc->bins[b].last_evidence > 0 &&
+                         since_ev > 300 * rate_12k) {
+                    if (age > oldest_age) { oldest_age = age; evicted = b; }
+                }
+            }
+            if (evicted >= 0) {
+                sc->bins[evicted].active = 0;
+                sc->n_bins--;
+            } else {
+                continue;  /* all bins active and producing — can't evict */
+            }
+        }
 
         int slot = -1;
         for (int b = 0; b < SC_MAX_BINS; b++) {
@@ -219,7 +251,8 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 
         ScBin *bin = &sc->bins[slot];
         memset(bin, 0, sizeof(ScBin));
-        bin->f_hz    = f_hz;
+        bin->f_hz           = f_hz;
+        bin->created_sample = sc->total_samples;
         bin->active  = 1;
         bin->c_phase = 1.0;
         bin->s_phase = 0.0;
@@ -404,9 +437,20 @@ void itila_sc_free(ItilaSc *sc)
     free(sc);
 }
 
+void itila_sc_mark_evidence(ItilaSc *sc, double f_hz)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        if (sc->bins[i].active && fabs(sc->bins[i].f_hz - f_hz) < 1.0) {
+            sc->bins[i].last_evidence = sc->total_samples;
+            return;
+        }
+    }
+}
+
 void itila_sc_feed_iq(ItilaSc *sc,
                        const double *i_arr, const double *q_arr, int n)
 {
+    sc->total_samples += n / SC_DEC1;  /* count in 12kHz samples */
     /* --- FFT energy scan: fill rolling scan buffer --- */
     int i_pos = 0;
     while (i_pos < n) {
