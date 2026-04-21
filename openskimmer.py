@@ -1559,9 +1559,6 @@ class _ItilaScanner:
       window ready → itila_feed() → callsign → collect()
     """
 
-    FEED_INTERVAL_SEC = 5.0     # stride between online EM updates
-    ONLINE_LAMBDA     = 1.0     # forgetting factor: 1.0 = full accumulation
-
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=60.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
@@ -1569,7 +1566,7 @@ class _ItilaScanner:
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_samples = int(window_sec * 200)
-        self._feed_interval  = int(self.FEED_INTERVAL_SEC * 200)  # 1000 samples = 5s
+        self._feed_interval  = self._window_samples  # tumbling 60s window
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
@@ -1617,7 +1614,7 @@ class _ItilaScanner:
             if f_hz not in active_hz:
                 self._free_bin_handles(f_hz)
 
-        # Fire online EM update on bins that have feed_interval new samples
+        # Fire batch decode on bins that have accumulated a full window
         now = time.time()
         ready = self._sc.ready_bins()
         for f_hz in ready:
@@ -1626,37 +1623,37 @@ class _ItilaScanner:
                 continue
             n_env = self._sc.env_n(f_hz)
             log.debug("ITILA env %.1f kHz: %d samples", f_hz/1000.0, n_env)
-            # Peek the latest window (no drain)
             env100 = np.empty(self._window_samples, dtype=np.float64)
             env200 = np.empty(self._window_samples, dtype=np.float64)
             n_peek = self._sc.peek_env(f_hz, env100, env200, self._window_samples)
             if n_peek > 0:
-                log.info("ITILA online update %.1f kHz env=%d", f_hz/1000.0, n_peek)
+                log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_peek)
                 self._decode_bin(f_hz, st, env100[:n_peek], env200[:n_peek], now)
             self._sc.advance(f_hz)
 
     def _decode_bin(self, f_hz, st, env100, env200, now):
-        """Online EM update for one bin. Accumulates sufficient stats; decodes if evidence sufficient."""
         import ctypes as _ct
         lib = _get_itila_lib()
         if not lib or not self._sc:
             return
 
+        n = len(env100)
         f_khz = f_hz / 1000.0
         seen = set()
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
-            n = len(env)
             env_c = np.ascontiguousarray(env, dtype=np.float64)
             ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
-            result = lib.itila_feed_online(h, ptr, _ct.c_int(n),
-                                           _ct.c_double(self.ONLINE_LAMBDA),
-                                           _ct.c_double(f_khz),
-                                           _ct.c_double(self.ev_thresh))
+            result = lib.itila_feed(h, ptr, _ct.c_int(n),
+                                    _ct.c_double(f_khz),
+                                    _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
                 log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+            else:
+                log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
+            if raw:
                 call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
                     seen.add(call)
@@ -1667,8 +1664,6 @@ class _ItilaScanner:
                                  f_khz, call, raw[:60])
                     else:
                         log.debug("ITILA respot suppressed %.1f kHz: %s", f_khz, call)
-            else:
-                log.debug("ITILA online %.1f kHz: (accumulating)", f_khz)
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""
