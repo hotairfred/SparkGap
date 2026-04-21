@@ -377,6 +377,44 @@ static void em_estimate(
 
     #undef EM_STEP
 
+    /* Post-hoc sharpening: one extra FB pass with per-state variances
+     * for sharper mark/space boundaries at decode time. Does NOT feed
+     * back into EM — parameters (A, nm, wpm) are already converged. */
+    {
+        double dm = 1e-10, ds = 1e-10, vs_post = 0, vm_post = 0;
+        for (int i = 0; i < T; i++) {
+            double gm = st->gamma[i*2+1], gs = st->gamma[i*2+0];
+            dm += gm; ds += gs;
+            vm_post += gm * (env[i]-A)*(env[i]-A);
+            vs_post += gs * (env[i]-nm)*(env[i]-nm);
+        }
+        double s2s = vs_post / ds, s2m = vm_post / dm;
+        if (s2s < 0.1 * s2) s2s = 0.1 * s2;  /* floor prevents collapse */
+        if (s2m < 0.1 * s2) s2m = 0.1 * s2;
+        /* Shared normalization (geometric mean) with separate exponents */
+        double s2_norm = sqrt(s2s * s2m);
+        double ln_norm = -0.5 * log(2.0 * M_PI * s2_norm);
+        for (int t = 0; t < T; t++) {
+            st->log_B[t*2+0] = ln_norm - 0.5*(env[t]-nm)*(env[t]-nm)/s2s;
+            st->log_B[t*2+1] = ln_norm - 0.5*(env[t]-A)*(env[t]-A)/s2m;
+        }
+        double p01, p10;
+        transition_probs(wpm, &p01, &p10);
+        double log_T[4] = {
+            log(1.0-p01+1e-300), log(p01+1e-300),
+            log(p10+1e-300),     log(1.0-p10+1e-300)
+        };
+        double log_Z_post;
+        fb_core(st->log_B, log_T, T, st->log_alpha, st->log_beta, &log_Z_post);
+        for (int t = 0; t < T; t++) {
+            double lg0 = st->log_alpha[t*2+0] + st->log_beta[t*2+0];
+            double lg1 = st->log_alpha[t*2+1] + st->log_beta[t*2+1];
+            double lZ  = logaddexp(lg0, lg1);
+            st->gamma[t*2+0] = exp(lg0 - lZ);
+            st->gamma[t*2+1] = exp(lg1 - lZ);
+        }
+    }
+
     /* Save normalized params for warm-start on next call */
     st->ws_wpm    = wpm;
     st->ws_A_norm  = A;

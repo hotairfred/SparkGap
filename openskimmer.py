@@ -3952,9 +3952,15 @@ class SpotTracker:
                     _slash_base = _parts[0]
                 elif _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
                     _slash_base = _parts[1]
-            # ITILA's Bayesian ev_thresh is the quality gate — accept any
-            # structurally-valid callsign from ITILA without SCP check.
-            _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            # SCP bypass was disabled 2026-04-21. Originally added because
+            # ITILA's noisy raw text produced garbled callsigns that needed
+            # ev_thresh as the only quality gate. After GMM WPM estimation +
+            # fuzzy extraction + recursive token splitting, extraction quality
+            # improved enough that SCP validation catches ~84 false spots per
+            # 15-min eval without losing real calls. If a future decoder change
+            # degrades extraction quality, re-enable bypass by uncommenting:
+            # _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            _itila_bypass = False
             if call in self.valid_calls or _slash_base is not None or _itila_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
