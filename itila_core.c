@@ -61,6 +61,14 @@ typedef struct {
     double log_Z_bins[N_SPEED_BINS];
     double speed_post[N_SPEED_BINS];
 
+    /* Warm-start: converged EM params from the previous itila_feed() call.
+     * Stored normalized (divided by env_scale) so they survive envelope
+     * scale changes between calls.  All zero = cold start. */
+    double ws_wpm;
+    double ws_A_norm;
+    double ws_nm_norm;
+    double ws_s2_norm;
+
     /* Output */
     char result_buf[RESULT_BUF];
 } itila_state_t;
@@ -234,30 +242,44 @@ static void em_estimate(
     double *env = st->env_norm;
     for (int i = 0; i < T; i++) env[i] = env_raw[i] / env_scale;
 
-    /* Initialize */
-    double nm = percentile(env, T, 30.0, st->gamma);  /* scratch: gamma buf */
-    double p95 = percentile(env, T, 95.0, st->gamma);
-    double p5  = percentile(env, T, 5.0,  st->gamma);
-    double p40 = percentile(env, T, 40.0, st->gamma);
+    /* Initialize — warm-start if valid params passed, else use percentile heuristics */
+    double nm, A, s2, wpm;
+    int half;
 
-    /* var of lower 40% */
-    double var_lo = 0.0; int nlo = 0;
-    for (int i = 0; i < T; i++) if (env[i] < p40) { var_lo += (env[i]-nm)*(env[i]-nm); nlo++; }
-    if (nlo > 2) var_lo /= nlo; else var_lo = 0.0;
+    if (wpm_seed > 0.0 && st->ws_A_norm > 0.0 && st->ws_nm_norm > 0.0) {
+        /* Warm start: rescale stored normalized params to current envelope scale */
+        nm  = st->ws_nm_norm;
+        A   = st->ws_A_norm;
+        s2  = st->ws_s2_norm;
+        wpm = wpm_seed;
+        /* All 10 iterations on warm WPM — no need for phase-1 cold search */
+        half = 0;
+    } else {
+        /* Cold start: percentile initialization */
+        nm = percentile(env, T, 30.0, st->gamma);  /* scratch: gamma buf */
+        double p95 = percentile(env, T, 95.0, st->gamma);
+        double p5  = percentile(env, T, 5.0,  st->gamma);
+        double p40 = percentile(env, T, 40.0, st->gamma);
 
-    double env_spread = p95 - p5;
-    double s2 = var_lo;
-    double floor1 = (env_spread * 0.15) * (env_spread * 0.15);
-    if (s2 < floor1) s2 = floor1;
-    if (s2 < 1e-6)   s2 = 1e-6;
+        double var_lo = 0.0; int nlo = 0;
+        for (int i = 0; i < T; i++)
+            if (env[i] < p40) { var_lo += (env[i]-nm)*(env[i]-nm); nlo++; }
+        if (nlo > 2) var_lo /= nlo; else var_lo = 0.0;
 
-    double thresh = nm + 3.0 * sqrt(s2);
-    double A = 0.0; int nhi = 0;
-    for (int i = 0; i < T; i++) if (env[i] > thresh) { A += env[i]; nhi++; }
-    if (nhi > 10) A /= nhi; else A = p95;
+        double env_spread = p95 - p5;
+        s2 = var_lo;
+        double floor1 = (env_spread * 0.15) * (env_spread * 0.15);
+        if (s2 < floor1) s2 = floor1;
+        if (s2 < 1e-6)   s2 = 1e-6;
 
-    double wpm = 25.0; (void)wpm_seed;
-    int half = 5;
+        double thresh = nm + 3.0 * sqrt(s2);
+        A = 0.0; int nhi = 0;
+        for (int i = 0; i < T; i++) if (env[i] > thresh) { A += env[i]; nhi++; }
+        if (nhi > 10) A /= nhi; else A = p95;
+
+        wpm = 25.0;
+        half = 5;
+    }
 
     /* One EM step: update A, nm, s2 given current wpm */
     #define EM_STEP(wpm_val, n_iter)  do { \
@@ -285,12 +307,18 @@ static void em_estimate(
 
     EM_STEP(wpm, half);
 
-    /* Phase 2: re-estimate WPM from gamma */
+    /* Phase 2: re-estimate WPM from gamma (always — even warm start refines it) */
     double wpm_new = estimate_wpm_from_gamma(st->gamma, T);
     if (wpm_new > 0.0) wpm = wpm_new;
     EM_STEP(wpm, 10 - half);
 
     #undef EM_STEP
+
+    /* Save normalized params for warm-start on next call */
+    st->ws_wpm    = wpm;
+    st->ws_A_norm  = A;
+    st->ws_nm_norm = nm;
+    st->ws_s2_norm = s2;
 
     /* Denormalize */
     *A_out          = A  * env_scale;
@@ -781,9 +809,9 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 
     if (n < st->sample_rate || n > MAX_ENV) return st->result_buf;
 
-    /* EM estimation */
+    /* EM estimation — warm-start from previous call if available */
     double A, noise_mean, sigma2_obs, wpm_em;
-    em_estimate(st, envelope, n, 0.0, &A, &noise_mean, &sigma2_obs, &wpm_em);
+    em_estimate(st, envelope, n, st->ws_wpm, &A, &noise_mean, &sigma2_obs, &wpm_em);
 
     /* Evidence ratio — calls decode_marginal internally */
     double log_bf = signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
