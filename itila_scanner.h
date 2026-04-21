@@ -56,11 +56,17 @@ void itila_sc_feed_iq(ItilaSc *sc,
                        const double *i_arr, const double *q_arr, int n);
 
 /*
- * Fill f_hz_out[] with bins that have accumulated >= feed_interval new
- * samples since the last itila_sc_advance() call.
+ * Fill f_hz_out[] with bins that have accumulated >= their per-bin interval
+ * of new samples since the last itila_sc_advance() call.
  * Returns the count written (≤ max_out).
  */
 int itila_sc_ready_bins(ItilaSc *sc, double *f_hz_out, int max_out);
+
+/*
+ * Set the per-bin adaptive feed interval (samples).
+ * Call after each decode: reset to feed_interval on success, double on miss.
+ */
+void itila_sc_set_bin_interval(ItilaSc *sc, double f_hz, int interval);
 
 /*
  * Peek: copy up to max_n of the most recent env samples into the output
