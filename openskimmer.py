@@ -1551,7 +1551,7 @@ class _ItilaScanner:
     """
 
     # Adaptive feed interval bounds (seconds → samples at 200 Hz)
-    MIN_INTERVAL_SEC = 5.0
+    MIN_INTERVAL_SEC = 60.0
     MAX_INTERVAL_SEC = 60.0
 
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
@@ -1624,24 +1624,11 @@ class _ItilaScanner:
             env100 = np.empty(self._window_samples, dtype=np.float64)
             env200 = np.empty(self._window_samples, dtype=np.float64)
             n_peek = self._sc.peek_env(f_hz, env100, env200, self._window_samples)
-            had_result = False
-            if n_peek > 0:
-                log.info("ITILA decode firing %.1f kHz env=%d interval=%d",
-                         f_hz/1000.0, n_peek, st['interval'])
-                had_result = self._decode_bin(f_hz, st, env100[:n_peek], env200[:n_peek], now)
+            if n_peek >= self._window_samples:
+                log.info("ITILA decode firing %.1f kHz env=%d",
+                         f_hz/1000.0, n_peek)
+                self._decode_bin(f_hz, st, env100[:n_peek], env200[:n_peek], now)
             self._sc.advance(f_hz)
-
-            # Adaptive interval: reset to min on signal, double on miss (→ max)
-            if had_result:
-                new_interval = self._min_interval
-            else:
-                new_interval = min(st['interval'] * 2, self._max_interval)
-                # Cold-start: clear warm-start state so EM doesn't compound bad params
-                self._cold_start_bin(f_hz, st)
-                log.debug("ITILA miss %.1f kHz — cold-start, interval %d→%d",
-                          f_hz/1000.0, st['interval'], new_interval)
-            st['interval'] = new_interval
-            self._sc.set_bin_interval(f_hz, new_interval)
 
     def _decode_bin(self, f_hz, st, env100, env200, now):
         """Decode one bin. Returns True if either decoder produced non-empty output."""
