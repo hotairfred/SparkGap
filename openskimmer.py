@@ -1173,6 +1173,7 @@ def _itila_extract_cq_call(text):
                 candidates.append(t)
                 continue  # keep scanning for possible second clean copy
 
+
             # Case 3: short DX prefix (e.g. PJ2, VE3) — slash decoded as space
             if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 6, len(tokens)):
                 nxt = tokens[j + 1]
