@@ -172,16 +172,34 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
     double noise = (N & 1) ? sorted[N/2] : 0.5*(sorted[N/2-1]+sorted[N/2]);
     free(sorted);
 
-    double thresh  = noise + sc->min_snr;
     double bin_hz  = (double)sc->sample_rate / N;
 
-    /* Collect LOCAL MAXIMA above threshold with parabolic interpolation */
+    /* Collect LOCAL MAXIMA using CFAR detection — local noise estimate per bin.
+     * For each candidate peak, compute median of nearby bins (excluding the peak
+     * and its immediate neighbors). Self-calibrates to local QRM conditions. */
     ScPeak *peaks = (ScPeak *)malloc(N * sizeof(ScPeak));
     if (!peaks) { free(psd); return; }
     int np = 0;
+    int guard = 3;   /* bins to exclude around candidate */
+    int window = 20; /* bins each side for local noise estimate */
     for (int k = 1; k < N - 1; k++) {
-        if (psd[k] <= thresh) continue;
         if (psd[k] <= psd[k-1] || psd[k] <= psd[k+1]) continue;  /* not a peak */
+        /* Local noise: median of bins within ±window, excluding ±guard */
+        double local[64]; int nl = 0;
+        for (int j = k - window; j <= k + window && nl < 64; j++) {
+            int jj = ((j % N) + N) % N;  /* wrap around */
+            if (abs(j - k) <= guard) continue;
+            local[nl++] = psd[jj];
+        }
+        if (nl < 5) continue;
+        /* Sort for median */
+        for (int a = 1; a < nl; a++) {
+            double tmp = local[a]; int b = a-1;
+            while (b >= 0 && local[b] > tmp) { local[b+1] = local[b]; b--; }
+            local[b+1] = tmp;
+        }
+        double local_noise = local[nl/2];
+        if (psd[k] <= local_noise + sc->min_snr) continue;
         /* Parabolic interpolation for sub-bin accuracy */
         double delta = 0.5 * (psd[k-1] - psd[k+1]) /
                        (psd[k-1] - 2.0*psd[k] + psd[k+1]);
