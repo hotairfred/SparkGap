@@ -3965,7 +3965,7 @@ class SpotTracker:
             # improved enough that SCP validation catches ~84 false spots per
             # 15-min eval without losing real calls. If a future decoder change
             # degrades extraction quality, re-enable bypass by uncommenting:
-            # _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            # _itila_bypass = False
             # Fuzzy SCP reverted 2026-04-22: corrected correct calls into wrong
             # ones (NY3J→NY3B). Using scp_bypass_threshold instead — requires
             # N consistent decodes of the same non-SCP call before spotting.
