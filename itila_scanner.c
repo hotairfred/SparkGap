@@ -3,7 +3,10 @@
  *
  * Implements the complete per-feed pipeline:
  *   IQ residual → FFT energy scan → bin spawn →
- *   per-bin mix+decimate+IIR+envelope+decimate → 200 Hz accumulator
+ *   per-bin mix+FIR-decimate+envelope+FIR-decimate → 200 Hz accumulator
+ *   All-FIR linear-phase chain. Deterministic: same envelope regardless
+ *   of chunk boundaries. Replaces Butterworth IIR (nonlinear phase,
+ *   chunk-dependent state was the root cause of file-vs-live decode gap).
  *
  * Python calls only: itila_sc_feed_iq(), itila_sc_ready_bins(),
  * itila_sc_drain_env().  itila_feed() (the decoder) stays in Python.
@@ -20,28 +23,41 @@
 
 /* ---- compile-time limits ---- */
 #define SC_MAX_BINS   128
-#define SC_MAX_SOS    6
-#define SC_DEC1       16      /* 192 kHz → 12 kHz */
-#define SC_DEC2       60      /* 12 kHz → 200 Hz  */
+#define SC_DEC1       16      /* 192 kHz → 12 kHz  (FIR stage 1) */
+#define SC_DEC2       6       /* 12 kHz → 2 kHz    (FIR stage 2) */
+#define SC_DEC3       10      /* 2 kHz → 200 Hz    (FIR stage 3) */
 #define SC_ENV_CAP    48000   /* 4 × 12000 — 4 decode windows at 200 Hz × 60 s */
+
+#include "itila_fir_coeffs.h"
 
 /* ---- per-bin state ---- */
 typedef struct {
     double f_hz;
     int    active;
     double c_phase, s_phase;           /* oscillator state */
-    double zi100i[SC_MAX_SOS][2];
-    double zi100q[SC_MAX_SOS][2];
-    double zi200i[SC_MAX_SOS][2];
-    double zi200q[SC_MAX_SOS][2];
-    double res100[SC_DEC2];            /* 12k→200Hz decimation residuals */
-    double res200[SC_DEC2];
-    int    res_n;                      /* shared — always equal for both paths */
+
+    /* FIR stage 1: 192k→12k (32 taps, complex I/Q) */
+    double dl1_i[FIR_STAGE1_LEN];
+    double dl1_q[FIR_STAGE1_LEN];
+    int    dl1_count;                  /* samples fed since last output */
+
+    /* FIR stage 2: 12k→2k (96 taps, complex I/Q, two paths) */
+    double dl2_100i[FIR_S2_100_LEN];
+    double dl2_100q[FIR_S2_100_LEN];
+    double dl2_200i[FIR_S2_200_LEN];
+    double dl2_200q[FIR_S2_200_LEN];
+    int    dl2_count;
+
+    /* FIR stage 3: 2k→200Hz (60 taps, real envelope, two paths) */
+    double dl3_100[FIR_STAGE3_LEN];
+    double dl3_200[FIR_STAGE3_LEN];
+    int    dl3_count;
+
     double env100[SC_ENV_CAP];
     double env200[SC_ENV_CAP];
     int    env_n;
-    int    created_sample;     /* sample count when bin was spawned */
-    int    last_evidence;      /* sample count when itila_feed returned non-empty */
+    int    created_sample;
+    int    last_evidence;
 } ScBin;
 
 /* ---- scanner ---- */
@@ -55,9 +71,7 @@ struct ItilaSc {
     double grid_hz;
     double band_min_hz;
     double band_max_hz;
-    int    n_sos;
-    double sos100[SC_MAX_SOS][6];
-    double sos200[SC_MAX_SOS][6];
+    /* IIR SOS removed — replaced by per-bin FIR delay lines */
 
     double iq_res_i[SC_DEC1];
     double iq_res_q[SC_DEC1];
@@ -279,132 +293,92 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
     free(peaks);
 }
 
-/* ---- per-bin DSP ---- */
+/* ---- FIR convolution helper: dot product of delay line with filter ---- */
+static double fir_dot(const double *dl, int pos, const double *h, int len)
+{
+    double acc = 0.0;
+    for (int k = 0; k < len; k++) {
+        int idx = (pos - k + len) % len;
+        acc += dl[idx] * h[k];
+    }
+    return acc;
+}
+
+/* ---- per-bin DSP: all-FIR linear-phase chain ---- */
 static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full, int n)
 {
-    int dec_n = n / SC_DEC1;
-    if (dec_n == 0) return;
-
-    double *dec_i = (double *)malloc(dec_n * sizeof(double));
-    double *dec_q = (double *)malloc(dec_n * sizeof(double));
-    double *fi100 = (double *)malloc(dec_n * sizeof(double));
-    double *fq100 = (double *)malloc(dec_n * sizeof(double));
-    double *fi200 = (double *)malloc(dec_n * sizeof(double));
-    double *fq200 = (double *)malloc(dec_n * sizeof(double));
-    double *e100  = (double *)malloc(dec_n * sizeof(double));
-    double *e200  = (double *)malloc(dec_n * sizeof(double));
-    if (!dec_i || !dec_q || !fi100 || !fq100 ||
-        !fi200 || !fq200 || !e100  || !e200) {
-        free(dec_i); free(dec_q); free(fi100); free(fq100);
-        free(fi200); free(fq200); free(e100);  free(e200);
-        return;
-    }
-
     for (int bi = 0; bi < SC_MAX_BINS; bi++) {
         ScBin *b = &sc->bins[bi];
         if (!b->active) continue;
 
-        /* mix + 16:1 block-average decimation */
+        /* Oscillator for mixing to baseband */
         double step   = -2.0 * M_PI * (b->f_hz - sc->center_hz) / sc->sample_rate;
         double c_step = cos(step);
         double s_step = sin(step);
         double cp = b->c_phase, sp = b->s_phase;
 
-        for (int k = 0; k < dec_n; k++) {
-            double si = 0.0, sq = 0.0;
-            for (int j = 0; j < SC_DEC1; j++) {
-                int t = k*SC_DEC1 + j;
-                double ii = i_full[t], qi = q_full[t];
-                si += ii*cp - qi*sp;
-                sq += ii*sp + qi*cp;
-                double cn = cp*c_step - sp*s_step;
-                double sn = sp*c_step + cp*s_step;
-                cp = cn; sp = sn;
+        for (int t = 0; t < n; t++) {
+            double ii = i_full[t], qi = q_full[t];
+            double mixed_i = ii*cp - qi*sp;
+            double mixed_q = ii*sp + qi*cp;
+            double cn = cp*c_step - sp*s_step;
+            double sn = sp*c_step + cp*s_step;
+            cp = cn; sp = sn;
+
+            /* Stage 1: push into FIR1 delay line, decimate 16:1 */
+            int pos1 = b->dl1_count % FIR_STAGE1_LEN;
+            b->dl1_i[pos1] = mixed_i;
+            b->dl1_q[pos1] = mixed_q;
+            b->dl1_count++;
+
+            if (b->dl1_count % SC_DEC1 != 0) continue;
+            /* Output one 12k sample */
+            double s1_i = fir_dot(b->dl1_i, pos1, FIR_STAGE1, FIR_STAGE1_LEN);
+            double s1_q = fir_dot(b->dl1_q, pos1, FIR_STAGE1, FIR_STAGE1_LEN);
+
+            /* Stage 2: push into FIR2 delay lines (100 Hz + 200 Hz paths), decimate 6:1 */
+            int pos2_100 = b->dl2_count % FIR_S2_100_LEN;
+            int pos2_200 = b->dl2_count % FIR_S2_200_LEN;
+            b->dl2_100i[pos2_100] = s1_i;
+            b->dl2_100q[pos2_100] = s1_q;
+            b->dl2_200i[pos2_200] = s1_i;
+            b->dl2_200q[pos2_200] = s1_q;
+            b->dl2_count++;
+
+            if (b->dl2_count % SC_DEC2 != 0) continue;
+            /* Output one 2k sample per path */
+            double s2_100i = fir_dot(b->dl2_100i, pos2_100, FIR_S2_100, FIR_S2_100_LEN);
+            double s2_100q = fir_dot(b->dl2_100q, pos2_100, FIR_S2_100, FIR_S2_100_LEN);
+            double s2_200i = fir_dot(b->dl2_200i, pos2_200, FIR_S2_200, FIR_S2_200_LEN);
+            double s2_200q = fir_dot(b->dl2_200q, pos2_200, FIR_S2_200, FIR_S2_200_LEN);
+
+            /* Envelope at 2 kHz */
+            double env2_100 = sqrt(s2_100i*s2_100i + s2_100q*s2_100q);
+            double env2_200 = sqrt(s2_200i*s2_200i + s2_200q*s2_200q);
+
+            /* Stage 3: push envelope into FIR3 delay lines, decimate 10:1 */
+            int pos3 = b->dl3_count % FIR_STAGE3_LEN;
+            b->dl3_100[pos3] = env2_100;
+            b->dl3_200[pos3] = env2_200;
+            b->dl3_count++;
+
+            if (b->dl3_count % SC_DEC3 != 0) continue;
+            /* Output one 200 Hz envelope sample */
+            double env_100 = fir_dot(b->dl3_100, pos3, FIR_STAGE3, FIR_STAGE3_LEN);
+            double env_200 = fir_dot(b->dl3_200, pos3, FIR_STAGE3, FIR_STAGE3_LEN);
+
+            if (b->env_n < SC_ENV_CAP) {
+                b->env100[b->env_n] = env_100;
+                b->env200[b->env_n] = env_200;
+                b->env_n++;
             }
-            dec_i[k] = si * (1.0 / SC_DEC1);
-            dec_q[k] = sq * (1.0 / SC_DEC1);
         }
-        /* renormalize oscillator to unit circle */
+
+        /* Renormalize oscillator */
         double norm = 1.0 / sqrt(cp*cp + sp*sp);
         b->c_phase = cp * norm;
         b->s_phase = sp * norm;
-
-        /* IIR sosfilt */
-        memcpy(fi100, dec_i, dec_n * sizeof(double));
-        memcpy(fq100, dec_q, dec_n * sizeof(double));
-        sosfilt(sc->sos100, sc->n_sos, fi100, dec_n, b->zi100i);
-        sosfilt(sc->sos100, sc->n_sos, fq100, dec_n, b->zi100q);
-        memcpy(fi200, dec_i, dec_n * sizeof(double));
-        memcpy(fq200, dec_q, dec_n * sizeof(double));
-        sosfilt(sc->sos200, sc->n_sos, fi200, dec_n, b->zi200i);
-        sosfilt(sc->sos200, sc->n_sos, fq200, dec_n, b->zi200q);
-
-        /* envelope */
-        for (int k = 0; k < dec_n; k++) {
-            e100[k] = sqrt(fi100[k]*fi100[k] + fq100[k]*fq100[k]);
-            e200[k] = sqrt(fi200[k]*fi200[k] + fq200[k]*fq200[k]);
-        }
-
-        /* 60:1 block-average decimation with residual.
-         *
-         * Both env100 and env200 use the same res_n counter since dec_n
-         * is identical each call and they are always in sync.
-         * We write both arrays starting at the same base index (b->env_n)
-         * and increment env_n once after both are written.
-         */
-        int tot2  = b->res_n + dec_n;
-        int n60   = (tot2 / SC_DEC2) * SC_DEC2;
-        int n_new = n60 / SC_DEC2;
-        int rem2  = tot2 - n60;
-
-        if (n_new > 0) {
-            double *comb100 = (double *)malloc(tot2 * sizeof(double));
-            double *comb200 = (double *)malloc(tot2 * sizeof(double));
-            if (comb100 && comb200) {
-                memcpy(comb100,           b->res100, b->res_n * sizeof(double));
-                memcpy(comb100 + b->res_n, e100,      dec_n    * sizeof(double));
-                memcpy(comb200,           b->res200, b->res_n * sizeof(double));
-                memcpy(comb200 + b->res_n, e200,      dec_n    * sizeof(double));
-
-                int base = b->env_n;
-                for (int k = 0; k < n_new && base + k < SC_ENV_CAP; k++) {
-                    double s100 = 0.0, s200 = 0.0;
-                    for (int j = 0; j < SC_DEC2; j++) {
-                        s100 += comb100[k*SC_DEC2+j];
-                        s200 += comb200[k*SC_DEC2+j];
-                    }
-                    b->env100[base+k] = s100 * (1.0/SC_DEC2);
-                    b->env200[base+k] = s200 * (1.0/SC_DEC2);
-                }
-                int actual = n_new < (SC_ENV_CAP - b->env_n) ?
-                             n_new : (SC_ENV_CAP - b->env_n);
-                b->env_n += actual;
-
-                /* save residual */
-                memcpy(b->res100, comb100 + n60, rem2 * sizeof(double));
-                memcpy(b->res200, comb200 + n60, rem2 * sizeof(double));
-                b->res_n = rem2;
-            }
-            free(comb100); free(comb200);
-        } else {
-            /* No full DEC2 blocks yet — just append to residual */
-            double *comb100 = (double *)malloc(tot2 * sizeof(double));
-            double *comb200 = (double *)malloc(tot2 * sizeof(double));
-            if (comb100 && comb200) {
-                memcpy(comb100,           b->res100, b->res_n * sizeof(double));
-                memcpy(comb100 + b->res_n, e100,      dec_n    * sizeof(double));
-                memcpy(comb200,           b->res200, b->res_n * sizeof(double));
-                memcpy(comb200 + b->res_n, e200,      dec_n    * sizeof(double));
-                memcpy(b->res100, comb100, tot2 * sizeof(double));
-                memcpy(b->res200, comb200, tot2 * sizeof(double));
-                b->res_n = tot2;
-            }
-            free(comb100); free(comb200);
-        }
     }
-
-    free(dec_i); free(dec_q); free(fi100); free(fq100);
-    free(fi200); free(fq200); free(e100);  free(e200);
 }
 
 /* ---- public API ---- */
@@ -417,7 +391,9 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
                           const double *sos100_flat, int n_sos,
                           const double *sos200_flat)
 {
-    if (n_sos > SC_MAX_SOS) n_sos = SC_MAX_SOS;
+    /* SOS coefficients ignored — FIR chain replaces IIR.
+     * Signature kept for backward compatibility with Python wrapper. */
+    (void)sos100_flat; (void)n_sos; (void)sos200_flat;
     if (max_bins > SC_MAX_BINS) max_bins = SC_MAX_BINS;
     if (energy_win < 4) energy_win = 4096;
 
@@ -433,12 +409,6 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     sc->grid_hz        = grid_hz;
     sc->band_min_hz    = band_min_hz;
     sc->band_max_hz    = band_max_hz;
-    sc->n_sos          = n_sos;
-
-    for (int s = 0; s < n_sos; s++) {
-        memcpy(sc->sos100[s], sos100_flat + s*6, 6*sizeof(double));
-        memcpy(sc->sos200[s], sos200_flat + s*6, 6*sizeof(double));
-    }
 
     sc->scan_i = (double *)calloc(energy_win, sizeof(double));
     sc->scan_q = (double *)calloc(energy_win, sizeof(double));
