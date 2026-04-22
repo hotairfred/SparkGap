@@ -8,7 +8,7 @@ Open source Linux CW skimmer with ITILA Bayesian decoder. Spots CW stations from
 SDR (HPSDR Protocol 1) → 192 kHz IQ
   → FFT energy scan (signal detection)
   → Per-bin channelization (mix + decimate → 12 kHz)
-  → Dual-path IIR envelope (100 Hz + 200 Hz LPF)
+  → Dual-path FIR envelope (150 Hz + 300 Hz linear-phase)
   → ITILA Bayesian decoder (HMM forward-backward + EM)
   → Callsign extraction + SCP validation
   → SpotTracker (sighting accumulation, Morse weight scoring)
@@ -41,10 +41,13 @@ make
 
 B1 40m CWT, 15-minute segment, 56-call CQ-only key:
 
-| Mode | Score | Recall |
-|---|---|---|
-| File mode | 47/56 | 83.9% |
-| Proxy (real-time) | 44/56 | 78.6% |
+| Mode | Score | Recall | Precision |
+|---|---|---|---|
+| Proxy (real-time, FIR) | 43/56 | 76.8% | 90%+ |
+| Proxy (real-time, IIR) | 48/56 | 85.7% | 94% |
+| File mode | 47/56 | 83.9% | — |
+
+FIR linear-phase chain is the production default. CY0S pile-up signal decoded for the first time with FIR — IIR phase smearing was the root cause of "impossible" decode failures. Score expected to improve with extraction tuning on the FIR envelope.
 
 ## WAV Replay
 

@@ -1173,6 +1173,7 @@ def _itila_extract_cq_call(text):
                 candidates.append(t)
                 continue  # keep scanning for possible second clean copy
 
+
             # Case 3: short DX prefix (e.g. PJ2, VE3) — slash decoded as space
             if re.match(r'^[A-Z]{1,2}[0-9]$', t) and j + 1 < min(i + 6, len(tokens)):
                 nxt = tokens[j + 1]
@@ -1587,7 +1588,7 @@ class _ItilaScanner:
         self._sc = _get_itila_scanner(
             sample_rate, center_khz * 1000.0, max_bins, min_snr,
             self._window_samples, 4096,
-            100.0,                          # grid_hz
+            50.0,                           # grid_hz (50 Hz for FIR selectivity)
             band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
         )
@@ -3965,15 +3966,10 @@ class SpotTracker:
             # 15-min eval without losing real calls. If a future decoder change
             # degrades extraction quality, re-enable bypass by uncommenting:
             # _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
+            # Fuzzy SCP reverted 2026-04-22: corrected correct calls into wrong
+            # ones (NY3J→NY3B). Using scp_bypass_threshold instead — requires
+            # N consistent decodes of the same non-SCP call before spotting.
             _itila_bypass = False
-            # Fuzzy SCP for ITILA: if call not in SCP but edit distance 1
-            # from a real call, substitute. Catches "A9RE"→"HA9RE" etc.
-            if dec_type == 'itila' and call not in self.valid_calls and _is_base_call(call):
-                fuzzy = self._fuzzy_match(call, max_dist=1)
-                if fuzzy:
-                    best_call, best_dist = min(fuzzy, key=lambda x: x[1])
-                    log.info("ITILA fuzzy SCP: %s → %s (d=%d)", call, best_call, best_dist)
-                    call = best_call
             if call in self.valid_calls or _slash_base is not None or _itila_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
