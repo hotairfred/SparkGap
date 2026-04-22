@@ -59,7 +59,7 @@ FALSE_POSITIVES = {
     'QSL', 'QTH', 'QRL', 'CFM', 'PSE', 'TNX', 'TKS',
     'BT', 'AR', 'SK', 'KN', 'AS', 'EE5E', 'TT5T',
 }
-CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|CWT|SST|MST|TU|UP|DE)\b', re.IGNORECASE)
+CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|QRL|CWT|SST|MST|TU|UP|DE)\b', re.IGNORECASE)
 
 BANDS = {
     '160m': 1891000, '80m': 3591000, '40m': 7100000, '30m': 10191000,
@@ -1072,7 +1072,7 @@ def _get_bmorse_lib():
 # libitila.so — Bayesian CW decoder (envelope in, callsigns out)
 # ---------------------------------------------------------------------------
 
-_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'CWT', 'SST', 'MST'}
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST'}
 # Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
 _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]{1,4}$')
 # Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
@@ -1125,7 +1125,7 @@ def _itila_extract_cq_call(text):
     candidates = []
 
     # Fuzzy CQ trigger matching: allow 1-char substitution (FWT→CWT, TES→TEST, CWE→CWT)
-    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ'}
+    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ', 'QRL'}
     def _is_cq_trigger(tok):
         if tok in _ITILA_CQ_WORDS:
             return True
@@ -3966,6 +3966,14 @@ class SpotTracker:
             # degrades extraction quality, re-enable bypass by uncommenting:
             # _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
             _itila_bypass = False
+            # Fuzzy SCP for ITILA: if call not in SCP but edit distance 1
+            # from a real call, substitute. Catches "A9RE"→"HA9RE" etc.
+            if dec_type == 'itila' and call not in self.valid_calls and _is_base_call(call):
+                fuzzy = self._fuzzy_match(call, max_dist=1)
+                if fuzzy:
+                    best_call, best_dist = min(fuzzy, key=lambda x: x[1])
+                    log.info("ITILA fuzzy SCP: %s → %s (d=%d)", call, best_call, best_dist)
+                    call = best_call
             if call in self.valid_calls or _slash_base is not None or _itila_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
