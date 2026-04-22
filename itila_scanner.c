@@ -22,11 +22,11 @@
 #include <string.h>
 
 /* ---- compile-time limits ---- */
-#define SC_MAX_BINS   128
+#define SC_MAX_BINS   512
 #define SC_DEC1       16      /* 192 kHz → 12 kHz  (FIR stage 1) */
 #define SC_DEC2       6       /* 12 kHz → 2 kHz    (FIR stage 2) */
 #define SC_DEC3       10      /* 2 kHz → 200 Hz    (FIR stage 3) */
-#define SC_ENV_CAP    48000   /* 4 × 12000 — 4 decode windows at 200 Hz × 60 s */
+#define SC_ENV_CAP    15000   /* 75s at 200 Hz — 1.25 decode windows */
 
 #include "itila_fir_coeffs.h"
 

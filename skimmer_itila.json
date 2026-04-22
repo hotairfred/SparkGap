@@ -6,7 +6,7 @@
     "decoder_bin": "./uhsdr_cw",
     "decoder_speeds": [],
     "max_channels": 300,
-    "signal_min_snr": 6,
+    "signal_min_snr": 12,
     "rescan_interval_sec": 30,
     "use_itila": true,
     "itila_window_sec": 60,
@@ -22,5 +22,6 @@
         7090000
     ],
     "telnet_port": 7300,
-    "scp_bypass_threshold": 3
+    "scp_bypass_threshold": 3,
+    "max_bins": 300
 }
