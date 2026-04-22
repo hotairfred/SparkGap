@@ -1,6 +1,6 @@
 {
   "callsign": "WF8Z",
-  "grid": "EN82",
+  "grid": "EM79",
   "master_scp": "MASTER.SCP",
   "add_calls": "add_calls.txt",
   "decoder_bin": "./uhsdr_cw",

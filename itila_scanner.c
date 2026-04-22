@@ -58,6 +58,7 @@ typedef struct {
     int    env_n;
     int    created_sample;
     int    last_evidence;
+    double snr_db;
 } ScBin;
 
 /* ---- scanner ---- */
@@ -128,7 +129,7 @@ static int cmp_dbl_asc(const void *a, const void *b)
     return da < db ? -1 : da > db ? 1 : 0;
 }
 
-typedef struct { double power; double f_hz; } ScPeak;
+typedef struct { double power; double f_hz; double snr; } ScPeak;
 static int cmp_peak_desc(const void *a, const void *b)
 {
     double da = ((const ScPeak*)a)->power, db = ((const ScPeak*)b)->power;
@@ -225,6 +226,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         double f_grid = round(f_abs / sc->grid_hz) * sc->grid_hz;
         peaks[np].power = psd[k];
         peaks[np].f_hz  = f_grid;
+        peaks[np].snr   = psd[k] - local_noise;
         np++;
     }
     free(psd);
@@ -237,10 +239,11 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
     for (int i = 0; i < np; i++) {
         double f_hz = peaks[i].f_hz;
 
-        /* Skip if within 300 Hz of any active bin */
+        /* Skip if within 150 Hz of any active bin — but update its SNR */
         int found = 0;
         for (int b = 0; b < SC_MAX_BINS; b++) {
             if (sc->bins[b].active && fabs(sc->bins[b].f_hz - f_hz) < cluster_hz) {
+                sc->bins[b].snr_db = peaks[i].snr;
                 found = 1; break;
             }
         }
@@ -289,6 +292,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         bin->active  = 1;
         bin->c_phase = 1.0;
         bin->s_phase = 0.0;
+        bin->snr_db  = peaks[i].snr;
         sc->n_bins++;
     }
     free(peaks);
@@ -424,6 +428,15 @@ void itila_sc_free(ItilaSc *sc)
     free(sc->scan_i);
     free(sc->scan_q);
     free(sc);
+}
+
+double itila_sc_get_snr(ItilaSc *sc, double f_hz)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        if (sc->bins[i].active && fabs(sc->bins[i].f_hz - f_hz) < 1.0)
+            return sc->bins[i].snr_db;
+    }
+    return 0.0;
 }
 
 void itila_sc_mark_evidence(ItilaSc *sc, double f_hz)

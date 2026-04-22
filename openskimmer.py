@@ -59,7 +59,7 @@ FALSE_POSITIVES = {
     'QSL', 'QTH', 'QRL', 'CFM', 'PSE', 'TNX', 'TKS',
     'BT', 'AR', 'SK', 'KN', 'AS', 'EE5E', 'TT5T',
 }
-CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|QRL|CWT|SST|MST|TU|UP|DE)\b', re.IGNORECASE)
+CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|QRL|CWT|SST|MST|FD|SS|NA|UP)\b', re.IGNORECASE)
 
 BANDS = {
     '160m': 1891000, '80m': 3591000, '40m': 7100000, '30m': 10191000,
@@ -1072,7 +1072,7 @@ def _get_bmorse_lib():
 # libitila.so — Bayesian CW decoder (envelope in, callsigns out)
 # ---------------------------------------------------------------------------
 
-_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST', 'TU'}
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST', 'FD', 'SS', 'NA', 'UP'}
 # Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
 _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]{1,4}$')
 # Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
@@ -1091,6 +1091,20 @@ def _itila_extract_cq_call(text):
     Returns callsign string (with slash) or None.
     """
     tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
+
+    # Split on DE boundary: "EC7RDE" → "EC7R", "DE"; "EC7RDEN1MX" → "EC7R", "DE", "N1MX"
+    # Only split when the part before DE looks like a callsign (letter+digit pattern)
+    split_de = []
+    for tok in tokens:
+        m = re.match(r'^([A-Z]{1,2}\d[A-Z0-9]*?)DE([A-Z0-9].*)?$', tok)
+        if m and m.group(1) and len(m.group(1)) >= 4:
+            split_de.append(m.group(1))
+            split_de.append('DE')
+            if m.group(2):
+                split_de.append(m.group(2))
+        else:
+            split_de.append(tok)
+    tokens = split_de
 
     # Split merged CQ+callsign tokens (e.g. "CQCWTWJ9B" → "CQ", "CWT", "WJ9B")
     _SPLIT_PREFIXES = ('CWT', 'CQ', 'TEST', 'MST', 'SST', 'QRZ')
@@ -1125,7 +1139,7 @@ def _itila_extract_cq_call(text):
     candidates = []
 
     # Fuzzy CQ trigger matching: allow 1-char substitution (FWT→CWT, TES→TEST, CWE→CWT)
-    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ', 'QRL'}
+    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ', 'QRL', 'FD', 'SS', 'NA', 'UP'}
     def _is_cq_trigger(tok):
         if tok in _ITILA_CQ_WORDS:
             return True
@@ -1212,6 +1226,8 @@ def _get_itila_lib():
                                                _ct.c_double, _ct.c_double]
             _itila_lib.itila_free.restype  = None
             _itila_lib.itila_free.argtypes = [_ct.c_void_p]
+            _itila_lib.itila_get_wpm.restype  = _ct.c_double
+            _itila_lib.itila_get_wpm.argtypes = [_ct.c_void_p]
             log.info("Loaded libitila.so")
         except OSError:
             log.warning("libitila.so not found — ITILA decoder unavailable")
@@ -1380,6 +1396,8 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
         lib.itila_sc_mark_evidence.restype  = None
         lib.itila_sc_mark_evidence.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_get_snr.restype  = _ct.c_double
+        lib.itila_sc_get_snr.argtypes = [_ct.c_void_p, _ct.c_double]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1527,11 +1545,14 @@ class _ItilaChannel:
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             log.debug("ITILA window %.1f kHz: thresh=%.1f raw=%r", self.rf_khz, self._ev_thresh, raw[:80])
             if raw:
+                wpm = int(round(lib.itila_get_wpm(h)))
                 call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
                     seen.add(call)
                     self._pending.append(f'CQ {call} ')
-                    log.info("ITILA %.1f kHz: %s (from: %s)", self.rf_khz, call, raw[:60])
+                    if wpm > 0:
+                        self.detected_wpm = wpm
+                    log.info("ITILA %.1f kHz: %s %d WPM (from: %s)", self.rf_khz, call, wpm, raw[:60])
 
     def read(self):
         if not self._pending:
@@ -1603,7 +1624,7 @@ class _ItilaScanner:
         if lib:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
-        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': []}
+        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': [], 'wpm': 0, 'snr': 0.0}
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
@@ -1650,6 +1671,9 @@ class _ItilaScanner:
             return
 
         f_khz = f_hz / 1000.0
+        snr = self._sc._lib.itila_sc_get_snr(self._sc._h, _ct.c_double(f_hz))
+        if snr > 0:
+            st['snr'] = snr
         seen = set()
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
@@ -1665,23 +1689,26 @@ class _ItilaScanner:
             else:
                 log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
             if raw:
+                wpm = int(round(lib.itila_get_wpm(h)))
                 call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
                     seen.add(call)
                     st['pending'].append(f'CQ {call} ')
-                    log.info("ITILA scan %.1f kHz: %s (raw: %s)", f_khz, call, raw[:60])
+                    if wpm > 0:
+                        st['wpm'] = wpm
+                    log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
                     if self._sc:
                         self._sc._lib.itila_sc_mark_evidence(
                             self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
-        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""
+        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm)."""
         results = []
         for f_hz, st in self._bins.items():
             if st['pending']:
                 text = ''.join(st['pending'])
                 st['pending'] = []
-                results.append((f_hz/1000.0, 0.0, text, text, id(st), 'itila', 0))
+                results.append((f_hz/1000.0, st['snr'], text, text, id(st), 'itila', st['wpm']))
         return results
 
     def _free_bin_handles(self, f_hz):
@@ -4735,6 +4762,17 @@ def run_file_mode(args, config):
     )
 
     center_khz = args.center_khz
+    cw_min = float(config.get('cw_min_khz', 0))
+    cw_max = float(config.get('cw_max_khz', 99999))
+    if cw_min > 0 and (center_khz < cw_min - 100 or center_khz > cw_max + 100):
+        log.warning("Center freq %.0f kHz is outside config band limits %.0f-%.0f kHz — "
+                    "overriding to center ±100 kHz", center_khz, cw_min, cw_max)
+        cw_min = center_khz - 100
+        cw_max = center_khz - 20
+        config['cw_min_khz'] = cw_min
+        config['cw_max_khz'] = cw_max
+        manager.cw_min_khz = cw_min
+        manager.cw_max_khz = cw_max
     all_spots = []
     chunk_sec = 300  # 5-minute chunks
 

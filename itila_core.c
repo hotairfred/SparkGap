@@ -86,6 +86,7 @@ typedef struct {
 
     /* Output */
     char result_buf[RESULT_BUF];
+    double last_wpm;       /* WPM from most recent successful decode */
 } itila_state_t;
 
 /* -------------------------------------------------------------------------
@@ -942,6 +943,8 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 
     if (n_calls == 0) return st->result_buf;
 
+    st->last_wpm = wpm_cands[0];
+
     if (primary_text[0]) {
         strncpy(st->result_buf, primary_text, RESULT_BUF-1);
         st->result_buf[RESULT_BUF-1] = '\0';
@@ -1139,6 +1142,11 @@ void itila_free(itila_t h) {
     free(st->log_B); free(st->log_alpha); free(st->log_beta);
     free(st->gamma); free(st->gamma_marg); free(st->env_norm); free(st->marks);
     free(st);
+}
+
+double itila_get_wpm(itila_t h) {
+    if (!h) return 0.0;
+    return ((itila_state_t*)h)->last_wpm;
 }
 
 /* Debug: expose EM estimate for testing */
