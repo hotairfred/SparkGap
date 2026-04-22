@@ -1588,7 +1588,7 @@ class _ItilaScanner:
         self._sc = _get_itila_scanner(
             sample_rate, center_khz * 1000.0, max_bins, min_snr,
             self._window_samples, 4096,
-            100.0,                          # grid_hz
+            50.0,                           # grid_hz (50 Hz for FIR selectivity)
             band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
         )

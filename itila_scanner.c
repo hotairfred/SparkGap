@@ -231,8 +231,9 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 
     qsort(peaks, np, sizeof(ScPeak), cmp_peak_desc);
 
-    /* Cluster (300 Hz), keep strongest per cluster, spawn new bins */
-    double cluster_hz = 300.0;
+    /* Cluster (150 Hz), keep strongest per cluster, spawn new bins.
+     * Tightened from 300 Hz to match 50 Hz grid + FIR selectivity. */
+    double cluster_hz = 150.0;
     for (int i = 0; i < np; i++) {
         double f_hz = peaks[i].f_hz;
 
