@@ -1072,7 +1072,7 @@ def _get_bmorse_lib():
 # libitila.so — Bayesian CW decoder (envelope in, callsigns out)
 # ---------------------------------------------------------------------------
 
-_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST'}
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST', 'TU'}
 # Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
 _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]{1,4}$')
 # Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
