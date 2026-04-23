@@ -522,6 +522,20 @@ int itila_sc_drain_env(ItilaSc *sc, double f_hz,
     return 0;
 }
 
+int itila_sc_peek_env(ItilaSc *sc, double f_hz,
+                       double *env100_out, double *env200_out, int max_n)
+{
+    for (int i = 0; i < SC_MAX_BINS; i++) {
+        ScBin *b = &sc->bins[i];
+        if (!b->active || fabs(b->f_hz - f_hz) >= 1.0) continue;
+        int n = b->env_n < max_n ? b->env_n : max_n;
+        memcpy(env100_out, b->env100, n * sizeof(double));
+        memcpy(env200_out, b->env200, n * sizeof(double));
+        return n;
+    }
+    return 0;
+}
+
 int itila_sc_bin_count(ItilaSc *sc)
 {
     return sc->n_bins;

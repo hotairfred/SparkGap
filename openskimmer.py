@@ -1081,6 +1081,22 @@ _SLASH_SUFFIX_PAT = re.compile(r'^([0-9]|P|M|MM|QRP|A|B)$')
 def _is_base_call(tok):
     return bool(_BASE_CALL_PAT.match(tok)) and len(tok) >= 4
 
+def _itila_extract_all_calls(text, min_count=2):
+    """Extract callsigns that appear at least min_count times in raw decoded text.
+
+    Used for context extraction when a CQ was seen on this bin recently.
+    Requires repetition to filter noise — real calls get repeated in QSOs.
+    Returns list of unique callsign strings, most-repeated first.
+    """
+    tokens = re.findall(r'[A-Z0-9]{4,10}', text.upper())
+    from collections import Counter
+    counts = Counter()
+    for tok in tokens:
+        if _is_base_call(tok) and tok not in FALSE_POSITIVES:
+            counts[tok] += 1
+    return [call for call, cnt in counts.most_common() if cnt >= min_count]
+
+
 def _itila_extract_cq_call(text):
     """Extract callsign adjacent to CQ/TEST in decoded Morse text.
 
@@ -1355,6 +1371,13 @@ class _ItilaSc:
         return self._lib.itila_sc_drain_env(
             self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
 
+    def peek_env(self, f_hz, env100, env200, max_n):
+        import ctypes as _ct
+        p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = env200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        return self._lib.itila_sc_peek_env(
+            self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
+
     def free(self):
         self._lib.itila_sc_free(self._h)
         self._h = None
@@ -1398,6 +1421,10 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_mark_evidence.argtypes = [_ct.c_void_p, _ct.c_double]
         lib.itila_sc_get_snr.restype  = _ct.c_double
         lib.itila_sc_get_snr.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_peek_env.restype  = _ct.c_int
+        lib.itila_sc_peek_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1624,7 +1651,12 @@ class _ItilaScanner:
         if lib:
             h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
             h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
-        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': [], 'wpm': 0, 'snr': 0.0}
+        self._bins[f_hz] = {
+            'h100': h100, 'h200': h200, 'pending': [], 'wpm': 0, 'snr': 0.0,
+            'text_buf': '',       # rolling accumulated raw decode text
+            'spotted': set(),     # calls already spotted on this bin
+            'last_cq_time': 0.0,  # wall time of last CQ trigger on this bin
+        }
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
@@ -1638,23 +1670,17 @@ class _ItilaScanner:
         active_hz = self._sc.list_bins()
         for f_hz in active_hz:
             self._ensure_bin_handles(f_hz)
-        # Drop handles for bins the C scanner has evicted
         for f_hz in list(self._bins):
             if f_hz not in active_hz:
                 self._free_bin_handles(f_hz)
 
-        # Fire decode on any ready windows
         ready = self._sc.ready_bins()
         for f_hz in ready:
             st = self._bins.get(f_hz)
             if st is None:
                 continue
             n_env = self._sc.env_n(f_hz)
-            if n_env > 0 and n_env % 1000 < 8:
-                log.info("ITILA env %.1f kHz: %d/%d",
-                         f_hz/1000.0, n_env, self._window_samples)
             while n_env >= self._window_samples:
-                log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_env)
                 self._decode_bin(f_hz, st)
                 n_env = self._sc.env_n(f_hz)
 
@@ -1674,7 +1700,8 @@ class _ItilaScanner:
         snr = self._sc._lib.itila_sc_get_snr(self._sc._h, _ct.c_double(f_hz))
         if snr > 0:
             st['snr'] = snr
-        seen = set()
+        now = time.time()
+
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
@@ -1684,22 +1711,44 @@ class _ItilaScanner:
                                     _ct.c_double(f_khz),
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
-            if raw:
-                log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
-            else:
-                log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
-            if raw:
-                wpm = int(round(lib.itila_get_wpm(h)))
-                call = _itila_extract_cq_call(raw)
-                if call and call not in seen:
-                    seen.add(call)
-                    st['pending'].append(f'CQ {call} ')
-                    if wpm > 0:
-                        st['wpm'] = wpm
-                    log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
-                    if self._sc:
-                        self._sc._lib.itila_sc_mark_evidence(
-                            self._sc._h, _ct.c_double(f_hz))
+            if not raw:
+                continue
+            log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+            wpm = int(round(lib.itila_get_wpm(h)))
+            if wpm > 0:
+                st['wpm'] = wpm
+
+            # Accumulate raw text in rolling buffer (last 512 chars)
+            st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
+
+            # Check for CQ trigger in this window's raw text
+            if CQ_PATTERNS.search(raw):
+                st['last_cq_time'] = now
+
+            # Path 1: direct extraction from this window (standard)
+            call = _itila_extract_cq_call(raw)
+            if call and call not in st['spotted']:
+                st['spotted'].add(call)
+                st['pending'].append(f'CQ {call} ')
+                log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
+                if self._sc:
+                    self._sc._lib.itila_sc_mark_evidence(
+                        self._sc._h, _ct.c_double(f_hz))
+
+            # Path 2: context extraction — if CQ was seen on this bin recently,
+            # extract callsigns from accumulated buffer (not just this window).
+            # This catches stations in QSO after calling CQ in a previous window.
+            elif now - st['last_cq_time'] < 120.0:
+                calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                for c in calls_in_raw:
+                    if c not in st['spotted']:
+                        st['spotted'].add(c)
+                        st['pending'].append(f'CQ {c} ')
+                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, raw: %s)",
+                                 f_khz, c, wpm, int(now - st['last_cq_time']), raw[:60])
+                        if self._sc:
+                            self._sc._lib.itila_sc_mark_evidence(
+                                self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm)."""
