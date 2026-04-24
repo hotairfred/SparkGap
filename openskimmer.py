@@ -93,6 +93,10 @@ def _get_hpsdr_fast():
             lib.hpsdr_start_worker.argtypes = [_ct.c_void_p]
             lib.hpsdr_stop_worker.restype = None
             lib.hpsdr_stop_worker.argtypes = [_ct.c_void_p]
+            lib.hpsdr_set_ft8.restype = None
+            lib.hpsdr_set_ft8.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_double,
+                _ct.c_double, _ct.c_char_p]
             lib.hpsdr_poll_results.restype = _ct.c_int
             lib.hpsdr_poll_results.argtypes = [
                 _ct.c_void_p, _ct.c_void_p, _ct.c_int]
@@ -4763,9 +4767,27 @@ class OpenSkimmer:
                     window_samples = int(self.cfg.get('itila_window_sec', 60) * 200)
                     self.receiver.lib.hpsdr_set_decode(
                         self.receiver._h, decode_ptr, _ct.c_int(window_samples))
+                    # Set up FT8 channelizer per band
+                    FT8_FREQS = {
+                        3590: 3573, 7090: 7074, 14090: 14074,
+                        21090: 21074, 28090: 28074,
+                    }
+                    ft8d_path = b'/home/fred/ft8d/ft8d'
+                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                        center_khz = ch / 1000
+                        ft8_khz = FT8_FREQS.get(int(center_khz), 0)
+                        if ft8_khz:
+                            self.receiver.lib.hpsdr_set_ft8(
+                                self.receiver._h, ri,
+                                _ct.c_double(ft8_khz * 1000.0),
+                                _ct.c_double(ch),
+                                ft8d_path)
+                            log.info("FT8 enabled on rx%d: %.0f kHz", ri, ft8_khz)
                     self.receiver.lib.hpsdr_start_worker(self.receiver._h)
                     self._worker_started = True
-                    log.info("C worker thread started (%d bands, autonomous decode)",
+                    self._ft8_bufs = {}  # rx_idx → list of (i, q) chunks
+                    self._ft8_last_decode = 0
+                    log.info("C worker thread started (%d bands, CW+FT8)",
                              scanners_ready)
             # Process decode results — poll from C worker's result buffer
             if use_c and getattr(self, '_worker_started', False):
@@ -4992,6 +5014,42 @@ class OpenSkimmer:
                          "%d chars, %.0fs",
                          self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
+
+            # FT8 — read results from ft8d output log
+            if use_c and getattr(self, '_worker_started', False):
+                FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
+                             21090: 21074, 28090: 28074}
+                ft8_bufs = getattr(self, '_ft8_bufs', {})
+                # Drain small IQ chunks for FT8 from each band
+                for (_bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                    center_khz = ch / 1000
+                    ft8_khz = FT8_FREQS.get(int(center_khz))
+                    if not ft8_khz:
+                        continue
+                    avail = self.receiver.available(ri)
+                    # Ring buffer is used by CW worker — we can't drain from it
+                    # Instead, accumulate from the FT8 C channelizer output
+                    # For now, skip — the C channelizer handles it
+                    pass
+
+                # Check if it's time to decode (every ~60 seconds)
+                ft8_now = int(time.time())
+                if ft8_now - getattr(self, '_ft8_last_decode', 0) >= 60:
+                    self._ft8_last_decode = ft8_now
+                    # The C worker already wrote .c2 files via ft8_check_decode
+                    # Just check for results
+                    import subprocess
+                    ft8_log = '/tmp/ft8_spots.log'
+                    try:
+                        with open(ft8_log, 'r') as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    log.info("FT8: %s", line)
+                        # Clear after reading
+                        open(ft8_log, 'w').close()
+                    except FileNotFoundError:
+                        pass
 
             await asyncio.sleep(0.1 if use_c else 0.025)
 

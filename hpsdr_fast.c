@@ -22,6 +22,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
+#include <math.h>
 
 #define MAX_RX        8
 typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
@@ -58,6 +60,19 @@ typedef struct {
 
     uint8_t rx_enabled[MAX_RX]; /* only store samples for enabled receivers */
 
+    /* FT8 IQ accumulator — separate from CW ring, not consumed by worker.
+     * Python drains this every 60 seconds for FT8 extraction. */
+    #define FT8_IQ_SIZE (4000 * 65)  /* 65 seconds at 4000 sps (pre-decimated) */
+    struct {
+        float i[FT8_IQ_SIZE];
+        float q[FT8_IQ_SIZE];
+        volatile int write_pos;
+        int enabled;
+        double freq_hz;
+        double center_hz;
+        double mix_phase;
+    } ft8_iq[MAX_RX];
+
     /* Per-receiver scanner handles for worker thread */
     void *scanners[MAX_RX];         /* ItilaSc* per enabled receiver */
     sc_feed_iq_fn scanner_feed;     /* itila_sc_feed_iq function pointer */
@@ -75,6 +90,35 @@ typedef struct {
     volatile int result_read;
     volatile int result_count;
     pthread_mutex_t result_lock;
+
+    /* FT8 channelizer per band — 2-stage decimation like CW */
+    #define FT8_RATE 4000
+    #define FT8_DEC1 16       /* 192000 → 12000 */
+    #define FT8_DEC2 3        /* 12000 → 4000 */
+    #define FT8_WIN  (FT8_RATE * 60)  /* 60 seconds at 4000 sps */
+    #define FT8_S1_LEN 32
+    #define FT8_S2_LEN 32
+    struct {
+        int    enabled;
+        double ft8_freq_hz;
+        double center_hz;
+        float  buf_i[FT8_RATE * 60];
+        float  buf_q[FT8_RATE * 60];
+        int    buf_n;
+        double mix_phase;
+        /* Stage 1: 192k→12k FIR delay line */
+        double s1_dl_i[FT8_S1_LEN];
+        double s1_dl_q[FT8_S1_LEN];
+        int    s1_pos;
+        int    s1_count;
+        /* Stage 2: 12k→4k FIR delay line */
+        double s2_dl_i[FT8_S2_LEN];
+        double s2_dl_q[FT8_S2_LEN];
+        int    s2_pos;
+        int    s2_count;
+    } ft8[MAX_RX];
+    int  ft8_last_slot;         /* last 15-second slot we decoded */
+    char ft8d_path[256];        /* path to ft8d binary */
 
     /* Worker thread: drains ring buffers, feeds scanners, decodes */
     pthread_t worker_thread;
@@ -315,6 +359,160 @@ void hpsdr_set_scanner(HpsdrFast *h, int rx_index, void *scanner_handle,
     }
 }
 
+/* ---- FT8 setup and decode ---- */
+
+void hpsdr_set_ft8(HpsdrFast *h, int rx_index, double ft8_freq_hz,
+                    double center_hz, const char *ft8d_path) {
+    if (rx_index < 0 || rx_index >= MAX_RX) return;
+    h->ft8[rx_index].enabled = 1;
+    h->ft8[rx_index].ft8_freq_hz = ft8_freq_hz;
+    h->ft8[rx_index].center_hz = center_hz;
+    h->ft8[rx_index].buf_n = 0;
+    h->ft8[rx_index].mix_phase = 0;
+    h->ft8[rx_index].s1_pos = 0;
+    h->ft8[rx_index].s1_count = 0;
+    h->ft8[rx_index].s2_pos = 0;
+    h->ft8[rx_index].s2_count = 0;
+    memset(h->ft8[rx_index].s1_dl_i, 0, sizeof(h->ft8[rx_index].s1_dl_i));
+    memset(h->ft8[rx_index].s1_dl_q, 0, sizeof(h->ft8[rx_index].s1_dl_q));
+    memset(h->ft8[rx_index].s2_dl_i, 0, sizeof(h->ft8[rx_index].s2_dl_i));
+    memset(h->ft8[rx_index].s2_dl_q, 0, sizeof(h->ft8[rx_index].s2_dl_q));
+    if (ft8d_path)
+        strncpy(h->ft8d_path, ft8d_path, sizeof(h->ft8d_path) - 1);
+}
+
+/* FT8 2-stage FIR coefficients (scipy.signal.firwin) */
+static const double ft8_s1[32] = {
+    0.0001941042, 0.0006868266, 0.0015712643, 0.0031632958,
+    0.0057532538, 0.0095608923, 0.0146958011, 0.0211287766,
+    0.0286784589, 0.0370157426, 0.0456862828, 0.0541491260,
+    0.0618274047, 0.0681654164, 0.0726854808, 0.0750378728,
+    0.0750378728, 0.0726854808, 0.0681654164, 0.0618274047,
+    0.0541491260, 0.0456862828, 0.0370157426, 0.0286784589,
+    0.0211287766, 0.0146958011, 0.0095608923, 0.0057532538,
+    0.0031632958, 0.0015712643, 0.0006868266, 0.0001941042,
+};
+static const double ft8_s2[32] = {
+    0.0014602599, 0.0017446978, 0.0004315304, -0.0029179815,
+    -0.0060836525, -0.0040731620, 0.0057699424, 0.0173542913,
+    0.0168637213, -0.0050078389, -0.0381991061, -0.0516539187,
+    -0.0126174382, 0.0846211315, 0.2046726384, 0.2876348849,
+    0.2876348849, 0.2046726384, 0.0846211315, -0.0126174382,
+    -0.0516539187, -0.0381991061, -0.0050078389, 0.0168637213,
+    0.0173542913, 0.0057699424, -0.0040731620, -0.0060836525,
+    -0.0029179815, 0.0004315304, 0.0017446978, 0.0014602599,
+};
+
+static inline double fir_conv(const double *dl, int pos, const double *h, int len) {
+    double acc = 0;
+    for (int j = 0; j < len; j++)
+        acc += dl[(pos + j) % len] * h[j];
+    return acc;
+}
+
+/* Feed raw IQ samples into FT8 channelizer — 2-stage decimation */
+static void ft8_feed(HpsdrFast *h, int rx, const double *i_arr,
+                      const double *q_arr, int n, double scale) {
+    if (!h->ft8[rx].enabled) return;
+
+    double offset_hz = h->ft8[rx].ft8_freq_hz - h->ft8[rx].center_hz;
+    double phase = h->ft8[rx].mix_phase;
+    double step = 2.0 * M_PI * offset_hz / 192000.0;
+
+    for (int k = 0; k < n; k++) {
+        /* Mix to FT8 baseband */
+        double ci = cos(phase), si = sin(phase);
+        double ii = i_arr[k], qi = q_arr[k];
+        double mi = ii * ci + qi * si;
+        double mq = -ii * si + qi * ci;
+        phase += step;
+
+        /* Stage 1: FIR + decimate 16:1 → 12 kHz */
+        int p1 = h->ft8[rx].s1_pos;
+        h->ft8[rx].s1_dl_i[p1] = mi;
+        h->ft8[rx].s1_dl_q[p1] = mq;
+        h->ft8[rx].s1_pos = (p1 + 1) % FT8_S1_LEN;
+        h->ft8[rx].s1_count++;
+
+        if (h->ft8[rx].s1_count % FT8_DEC1 != 0) continue;
+        double o1_i = fir_conv(h->ft8[rx].s1_dl_i, h->ft8[rx].s1_pos, ft8_s1, FT8_S1_LEN);
+        double o1_q = fir_conv(h->ft8[rx].s1_dl_q, h->ft8[rx].s1_pos, ft8_s1, FT8_S1_LEN);
+
+        /* Stage 2: FIR + decimate 3:1 → 4 kHz */
+        int p2 = h->ft8[rx].s2_pos;
+        h->ft8[rx].s2_dl_i[p2] = o1_i;
+        h->ft8[rx].s2_dl_q[p2] = o1_q;
+        h->ft8[rx].s2_pos = (p2 + 1) % FT8_S2_LEN;
+        h->ft8[rx].s2_count++;
+
+        if (h->ft8[rx].s2_count % FT8_DEC2 != 0) continue;
+        double o2_i = fir_conv(h->ft8[rx].s2_dl_i, h->ft8[rx].s2_pos, ft8_s2, FT8_S2_LEN);
+        double o2_q = fir_conv(h->ft8[rx].s2_dl_q, h->ft8[rx].s2_pos, ft8_s2, FT8_S2_LEN);
+
+        /* Store 4 kHz sample — scale to match ft8d expected amplitude */
+        int bn = h->ft8[rx].buf_n;
+        if (bn < FT8_WIN) {
+            h->ft8[rx].buf_i[bn] = (float)o2_i;
+            h->ft8[rx].buf_q[bn] = (float)o2_q;
+            h->ft8[rx].buf_n = bn + 1;
+        }
+    }
+    while (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+    while (phase < -2.0 * M_PI) phase += 2.0 * M_PI;
+    h->ft8[rx].mix_phase = phase;
+}
+
+/* Dump rolling 60-second window every 15 seconds */
+static void ft8_check_decode(HpsdrFast *h) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int slot = (int)(ts.tv_sec) / 15;
+    if (slot == h->ft8_last_slot) return;
+    h->ft8_last_slot = slot;
+
+    int target = FT8_RATE * 60;  /* 240000 samples */
+
+    for (int rx = 0; rx < MAX_RX; rx++) {
+        if (!h->ft8[rx].enabled) continue;
+        int bn = h->ft8[rx].buf_n;
+        if (bn < target) continue;  /* need 60 seconds */
+
+        /* Write last 60 seconds from the rolling buffer */
+        char fname[128];
+        snprintf(fname, sizeof(fname), "/tmp/ft8_rx%d.c2", rx);
+        FILE *fp = fopen(fname, "wb");
+        if (!fp) continue;
+
+        double dial = h->ft8[rx].ft8_freq_hz;
+        fwrite(&dial, 1, 8, fp);
+
+        int start = bn - target;
+        for (int k = start; k < start + target; k++) {
+            fwrite(&h->ft8[rx].buf_i[k], sizeof(float), 1, fp);
+            fwrite(&h->ft8[rx].buf_q[k], sizeof(float), 1, fp);
+        }
+        fclose(fp);
+
+        /* Compact buffer — keep last 60 seconds */
+        if (bn > target) {
+            int keep = target;  /* keep a full window for overlap */
+            memmove(h->ft8[rx].buf_i, h->ft8[rx].buf_i + bn - keep,
+                    keep * sizeof(float));
+            memmove(h->ft8[rx].buf_q, h->ft8[rx].buf_q + bn - keep,
+                    keep * sizeof(float));
+            h->ft8[rx].buf_n = keep;
+        }
+
+        /* Spawn ft8d */
+        if (h->ft8d_path[0]) {
+            char cmd[384];
+            snprintf(cmd, sizeof(cmd), "%s %s >> /tmp/ft8_spots.log 2>/dev/null &",
+                     h->ft8d_path, fname);
+            (void)system(cmd);
+        }
+    }
+}
+
 void hpsdr_set_decode(HpsdrFast *h,
                        int (*decode_fn)(void*, int, void*, int),
                        int window_samples) {
@@ -405,6 +603,16 @@ static void *scanner_worker(void *arg) {
                 }
                 r->read_pos = rp;
                 h->scanner_feed(h->scanners[rx], i_tmp, q_tmp, n);
+                /* Feed FT8 with raw (unscaled) IQ from the same chunk */
+                {
+                    double ft8_tmp[WCHUNK];
+                    double ft8_q_tmp[WCHUNK];
+                    for (int s = 0; s < n; s++) {
+                        ft8_tmp[s] = i_tmp[s] / h->iq_scale;
+                        ft8_q_tmp[s] = q_tmp[s] / h->iq_scale;
+                    }
+                    /* ft8_feed disabled — needs debugging */
+                }
                 did_work = 1;
                 avail = ring_avail(r);
             }
@@ -429,6 +637,9 @@ static void *scanner_worker(void *arg) {
                 }
             }
         }
+        /* Check FT8 decode timing */
+        /* ft8_check_decode disabled */
+
         if (!did_work) usleep(5000); /* 5ms idle sleep */
     }
     return NULL;
