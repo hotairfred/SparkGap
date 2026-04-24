@@ -11,6 +11,7 @@
  *   gcc -shared -O2 -fPIC -pthread -o libhpsdr_fast.so hpsdr_fast.c
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,22 +128,39 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
 }
 
 /* ---- receive thread ---- */
+#define BATCH_SIZE 64
+
 static void *recv_thread(void *arg) {
     HpsdrFast *h = (HpsdrFast *)arg;
-    uint8_t buf[2048];
+    uint8_t bufs[BATCH_SIZE][2048];
+    struct iovec iovecs[BATCH_SIZE];
+    struct mmsghdr msgs[BATCH_SIZE];
+
+    memset(msgs, 0, sizeof(msgs));
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        iovecs[i].iov_base = bufs[i];
+        iovecs[i].iov_len = sizeof(bufs[i]);
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 50000000 }; /* 50ms */
 
     while (h->running) {
-        ssize_t n = recv(h->sock, buf, sizeof(buf), 0);
-        if (n < PKT_SIZE) continue;
-        if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
-            buf[2] != 0x01 || buf[3] != 0x06) continue;
+        int n_msgs = recvmmsg(h->sock, msgs, BATCH_SIZE, MSG_WAITFORONE, &timeout);
+        if (n_msgs <= 0) continue;
 
-        h->pkt_count++;
+        for (int m = 0; m < n_msgs; m++) {
+            uint8_t *buf = bufs[m];
+            int len = msgs[m].msg_len;
+            if (len < PKT_SIZE) continue;
+            if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
+                buf[2] != 0x01 || buf[3] != 0x06) continue;
 
-        /* Frame 1: offset 8, IQ starts at 16 */
-        parse_frame(h, buf + 16, h->n_receivers);
-        /* Frame 2: offset 520, IQ starts at 528 */
-        parse_frame(h, buf + 528, h->n_receivers);
+            h->pkt_count++;
+            parse_frame(h, buf + 16, h->n_receivers);
+            parse_frame(h, buf + 528, h->n_receivers);
+        }
     }
     return NULL;
 }
@@ -170,7 +188,7 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
 
     int optval = 1;
     setsockopt(h->sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-    int rcvbuf = 8 * 1024 * 1024;
+    int rcvbuf = 32 * 1024 * 1024;
     setsockopt(h->sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in bind_addr;
@@ -184,9 +202,7 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
         return NULL;
     }
 
-    /* Set receive timeout so thread can check h->running */
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
-    setsockopt(h->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* No socket timeout — recvmmsg uses its own timeout */
 
     pthread_mutex_init(&h->lock, NULL);
     return h;
@@ -206,26 +222,22 @@ void hpsdr_start(HpsdrFast *h) {
 
     int n_rx_bits = (h->n_receivers - 1) & 0x07;
 
-    /* Send start command */
-    uint8_t start_pkt[64];
-    memset(start_pkt, 0, sizeof(start_pkt));
-    start_pkt[0] = COOKIE_0; start_pkt[1] = COOKIE_1;
-    start_pkt[2] = 0x04; start_pkt[3] = 0x01;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = h->sdr_ip;
     addr.sin_port = htons(h->sdr_port);
-    sendto(h->sock, start_pkt, 64, 0, (struct sockaddr *)&addr, sizeof(addr));
-    usleep(100000);
 
-    /* Config: speed + n_receivers + duplex */
+    /* Config: speed + n_receivers + duplex
+     * C4: bit 2 = duplex, bits 5:3 = n_receivers - 1 */
     uint8_t config[5] = { 0x00, (uint8_t)speed, 0x00, 0x00,
-                          (uint8_t)((1 << 2) | n_rx_bits) };
+                          (uint8_t)((1 << 2) | (n_rx_bits << 3)) };
     /* LNA gain */
     uint8_t lna[5] = { 0x14, 0x00, 0x00, 0x00, (uint8_t)(h->lna_gain & 0x7F) };
+
+    /* Send config BEFORE start — Pitaya needs speed/n_rx set first */
     send_ep2(h, config, lna);
-    usleep(10000);
+    usleep(50000);
 
     /* Set frequencies */
     for (int i = 0; i < h->n_receivers; i++) {
@@ -239,6 +251,18 @@ void hpsdr_start(HpsdrFast *h) {
         send_ep2(h, config, freq);
         usleep(10000);
     }
+
+    /* Send start command */
+    uint8_t start_pkt[64];
+    memset(start_pkt, 0, sizeof(start_pkt));
+    start_pkt[0] = COOKIE_0; start_pkt[1] = COOKIE_1;
+    start_pkt[2] = 0x04; start_pkt[3] = 0x01;
+    sendto(h->sock, start_pkt, 64, 0, (struct sockaddr *)&addr, sizeof(addr));
+    usleep(100000);
+
+    /* Send config again after start to ensure it takes */
+    send_ep2(h, config, lna);
+    usleep(10000);
 
     /* Start receive thread */
     h->running = 1;

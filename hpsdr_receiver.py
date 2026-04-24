@@ -300,7 +300,7 @@ class HPSDRReceiver:
         # C1 bits 1:0 = speed: 0=48k, 1=96k, 2=192k, 3=384k
         n_rx_bits = (self.n_receivers - 1) & 0x07
         speed_bits = _SPEED_BITS.get(self.sample_rate, 0)
-        config_c0c4 = bytes([0x00, speed_bits, 0x00, 0x00, (1 << 2) | n_rx_bits])  # duplex + n_rx
+        config_c0c4 = bytes([0x00, speed_bits, 0x00, 0x00, (1 << 2) | (n_rx_bits << 3)])  # duplex + n_rx (bits 5:3)
 
         # Set LNA gain — C0 address 0x0A (sent as 0x14 = 0x0A << 1)
         # Bits 6:0 = gain in dB (0-60), bit 7 = 0
@@ -348,7 +348,7 @@ class HPSDRReceiver:
                 if not self.passive and time.time() - last_report > 1.0:
                     speed_bits = _SPEED_BITS.get(self.sample_rate, 0)
                     config_c0c4 = bytes([0x00, speed_bits, 0x00, 0x00,
-                                         (1 << 2) | ((self.n_receivers - 1) & 0x07)])
+                                         (1 << 2) | (((self.n_receivers - 1) & 0x07) << 3)])
                     freq_c0c4 = build_freq_packet(0, self.frequencies[0])
                     self._send_packet(config_c0c4, freq_c0c4)
                 continue
