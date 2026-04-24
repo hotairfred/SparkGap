@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -52,6 +53,8 @@ typedef struct {
     RxRing rx[MAX_RX];
     pthread_t thread;
     pthread_mutex_t lock;
+
+    uint8_t rx_enabled[MAX_RX]; /* only store samples for enabled receivers */
 
     /* stats */
     volatile uint64_t pkt_count;
@@ -98,12 +101,15 @@ static void send_ep2(HpsdrFast *h, const uint8_t *c0c4_f1, const uint8_t *c0c4_f
 
 /* ---- parse one IQ frame (504 bytes) ---- */
 static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
-    int group_size = n_rx * 6 + 2;
+    /* Pavel's sdr_receiver_hpsdr sends size-2 bytes per group (no mic) */
+    int group_size = n_rx * 6;
     int n_groups = IQ_DATA_SIZE / group_size;
 
     for (int g = 0; g < n_groups; g++) {
         const uint8_t *gp = iq_data + g * group_size;
         for (int rx = 0; rx < n_rx; rx++) {
+            if (!h->rx_enabled[rx]) continue;
+
             const uint8_t *s = gp + rx * 6;
 
             int32_t iv = (s[0] << 16) | (s[1] << 8) | s[2];
@@ -209,8 +215,11 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
 }
 
 void hpsdr_set_freq(HpsdrFast *h, int rx_index, uint32_t freq_hz) {
-    if (rx_index >= 0 && rx_index < MAX_RX)
-        h->frequencies[rx_index] = freq_hz;
+    if (rx_index >= 0 && rx_index < MAX_RX) {
+        /* -3.9 ppm frequency calibration for Red Pitaya STEMlab 125-14 */
+        h->frequencies[rx_index] = (uint32_t)(freq_hz * 0.9999961);
+        h->rx_enabled[rx_index] = 1;
+    }
 }
 
 void hpsdr_start(HpsdrFast *h) {
@@ -239,7 +248,7 @@ void hpsdr_start(HpsdrFast *h) {
     send_ep2(h, config, lna);
     usleep(50000);
 
-    /* Set frequencies */
+    /* Set frequencies — send each twice with delay for reliability */
     for (int i = 0; i < h->n_receivers; i++) {
         uint8_t freq[5];
         freq[0] = (uint8_t)((i + 2) * 2);
@@ -249,7 +258,9 @@ void hpsdr_start(HpsdrFast *h) {
         freq[3] = (f >>  8) & 0xFF;
         freq[4] = (f      ) & 0xFF;
         send_ep2(h, config, freq);
-        usleep(10000);
+        usleep(50000);
+        send_ep2(h, config, freq);
+        usleep(50000);
     }
 
     /* Send start command */
@@ -307,6 +318,47 @@ int hpsdr_drain(HpsdrFast *h, int rx_index, double *i_out, double *q_out, int ma
     }
     r->read_pos = rp;
     return n;
+}
+
+/* Drain ring buffer and feed directly to scanner via dlopen — pure C, no Python */
+typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
+static sc_feed_iq_fn sc_feed_iq = NULL;
+
+int hpsdr_drain_to_scanner(HpsdrFast *h, int rx_index,
+                            void *scanner_handle, double scale) {
+    if (rx_index < 0 || rx_index >= h->n_receivers || !scanner_handle) return 0;
+
+    /* Lazy-load itila_sc_feed_iq from libitila_scanner.so */
+    if (!sc_feed_iq) {
+        void *lib = dlopen("./libitila_scanner.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!lib) { fprintf(stderr, "dlopen scanner: %s\n", dlerror()); return 0; }
+        sc_feed_iq = (sc_feed_iq_fn)dlsym(lib, "itila_sc_feed_iq");
+        if (!sc_feed_iq) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 0; }
+    }
+
+    RxRing *r = &h->rx[rx_index];
+    int avail = ring_avail(r);
+    if (avail == 0) return 0;
+
+    #define CHUNK 19200  /* 100ms at 192 kHz */
+    double i_tmp[CHUNK], q_tmp[CHUNK];
+    int total = 0;
+
+    while (avail > 0) {
+        int n = avail < CHUNK ? avail : CHUNK;
+        int rp = r->read_pos;
+        for (int k = 0; k < n; k++) {
+            i_tmp[k] = r->i[rp] * scale;
+            q_tmp[k] = r->q[rp] * scale;
+            rp = (rp + 1) % RING_SIZE;
+        }
+        r->read_pos = rp;
+        sc_feed_iq(scanner_handle, i_tmp, q_tmp, n);
+        total += n;
+        avail = ring_avail(r);
+    }
+    return total;
+    #undef CHUNK
 }
 
 int hpsdr_available(HpsdrFast *h, int rx_index) {

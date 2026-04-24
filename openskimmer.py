@@ -78,6 +78,9 @@ def _get_hpsdr_fast():
             lib.hpsdr_drop_count.argtypes = [_ct.c_void_p]
             lib.hpsdr_n_receivers.restype = _ct.c_int
             lib.hpsdr_n_receivers.argtypes = [_ct.c_void_p]
+            lib.hpsdr_drain_to_scanner.restype = _ct.c_int
+            lib.hpsdr_drain_to_scanner.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_double]
             _hpsdr_fast_lib = lib
             log.info("Loaded libhpsdr_fast.so (C receiver)")
         except OSError:
@@ -136,6 +139,15 @@ class _CReceiver:
         if not self._h or not self.lib:
             return 0
         return self.lib.hpsdr_available(self._h, rx_index)
+
+    def drain_to_scanner(self, rx_index, scanner_sc):
+        """Drain IQ and feed directly to ITILA scanner in C — zero Python overhead."""
+        if not self._h or not self.lib or not scanner_sc or not scanner_sc._h:
+            return 0
+        import ctypes as _ct
+        return self.lib.hpsdr_drain_to_scanner(
+            self._h, rx_index,
+            scanner_sc._h, _ct.c_double(8388608.0))
 
     def destroy(self):
         if self._h and self.lib:
@@ -1762,8 +1774,12 @@ class _ItilaScanner:
         i_c = np.ascontiguousarray(i_arr, dtype=np.float64)
         q_c = np.ascontiguousarray(q_arr, dtype=np.float64)
         self._sc.feed_iq(i_c, q_c)
+        self._process_ready()
 
-        # Sync Python bin handles with C-spawned bins
+    def _process_ready(self):
+        """Sync bin handles with C scanner and decode any ready windows."""
+        if not self._sc:
+            return
         active_hz = self._sc.list_bins()
         for f_hz in active_hz:
             self._ensure_bin_handles(f_hz)
@@ -4613,26 +4629,15 @@ class OpenSkimmer:
             # ----------------------------------------------------------------
             for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
                 if use_c:
-                    # C receiver path: drain directly from ring buffer
-                    avail = self.receiver.available(rx_idx)
-                    if avail > 0:
-                        max_drain = min(avail, live_rate // 5)  # ~200ms cap
-                        i_cat, q_cat = self.receiver.drain(rx_idx, max_drain)
-                        if len(i_cat) > 0:
-                            # C receiver returns normalized floats; scale for scanner
-                            i_scaled = i_cat * 8388608.0
-                            q_scaled = q_cat * 8388608.0
-                            # Maintain FFT deque for periodic scan (keep last 10s)
-                            buf = self._band_bufs[rx_idx]
-                            iq_deq = buf['iq']
-                            iq_pairs = list(zip(i_cat.tolist(), q_cat.tolist()))
-                            iq_deq.extend(iq_pairs)
-                            max_iq_buf = live_rate * 10
-                            excess = len(iq_deq) - max_iq_buf
-                            if excess > 0:
-                                for _ in range(excess):
-                                    iq_deq.popleft()
-                            mgr.feed_all_iq(i_scaled, q_scaled)
+                    # C receiver path: drain ring → scanner entirely in C
+                    # Force-create scanner on first pass if needed
+                    if mgr._itila_scanner is None and mgr.use_itila:
+                        center_khz = center_hz / 1000
+                        mgr.update_signals([], center_khz)
+                    scanner = mgr._itila_scanner
+                    if scanner and scanner._sc:
+                        self.receiver.drain_to_scanner(rx_idx, scanner._sc)
+                        scanner._process_ready()
                 else:
                     # Python receiver path: drain from callback buffers
                     with self._iq_lock:
@@ -4687,65 +4692,66 @@ class OpenSkimmer:
                         if added or removed:
                             log.info("add_calls reloaded: +%d -%d calls", len(added), len(removed))
 
-                fft_size = 8192
-                min_snr = self.cfg.get('signal_min_snr', 12)
-                cw_min  = self.cfg.get('cw_min_khz', 0)
-                cw_max  = self.cfg.get('cw_max_khz', 99999)
+                # In C receiver mode, scanner has its own FFT scan — skip Python FFT
+                if not use_c:
+                    fft_size = 8192
+                    min_snr = self.cfg.get('signal_min_snr', 12)
+                    cw_min  = self.cfg.get('cw_min_khz', 0)
+                    cw_max  = self.cfg.get('cw_max_khz', 99999)
 
-                for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
-                    center_khz = center_hz / 1000
-                    with self._iq_lock:
-                        iq_deque = self._band_bufs[rx_idx]['iq']
-                        if len(iq_deque) >= fft_size:
-                            raw = list(itertools.islice(iq_deque,
-                                                        len(iq_deque) - fft_size,
-                                                        None))
-                        else:
-                            raw = None
+                    for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
+                        center_khz = center_hz / 1000
+                        with self._iq_lock:
+                            iq_deque = self._band_bufs[rx_idx]['iq']
+                            if len(iq_deque) >= fft_size:
+                                raw = list(itertools.islice(iq_deque,
+                                                            len(iq_deque) - fft_size,
+                                                            None))
+                            else:
+                                raw = None
 
-                    if raw is None:
-                        continue
+                        if raw is None:
+                            continue
 
-                    iq_arr = np.array([complex(i, q) for i, q in raw])
-                    window  = np.blackman(fft_size)
-                    psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
-                    psd_db  = 10 * np.log10(psd + 1e-20)
-                    noise   = np.median(psd_db)
+                        iq_arr = np.array([complex(i, q) for i, q in raw])
+                        window  = np.blackman(fft_size)
+                        psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
+                        psd_db  = 10 * np.log10(psd + 1e-20)
+                        noise   = np.median(psd_db)
 
-                    signals = []
-                    N = fft_size
-                    for i in range(1, N - 1):
-                        if psd_db[i] > noise + min_snr and \
-                           psd_db[i] > psd_db[i - 1] and psd_db[i] > psd_db[i + 1]:
-                            delta = 0.5 * (psd_db[i-1] - psd_db[i+1]) / \
-                                    (psd_db[i-1] - 2*psd_db[i] + psd_db[i+1])
-                            exact = i + delta
-                            if exact >= N / 2:
-                                exact -= N
-                            f = exact * live_rate / N
-                            signals.append((f, psd_db[i] - noise))
+                        signals = []
+                        N = fft_size
+                        for i in range(1, N - 1):
+                            if psd_db[i] > noise + min_snr and \
+                               psd_db[i] > psd_db[i - 1] and psd_db[i] > psd_db[i + 1]:
+                                delta = 0.5 * (psd_db[i-1] - psd_db[i+1]) / \
+                                        (psd_db[i-1] - 2*psd_db[i] + psd_db[i+1])
+                                exact = i + delta
+                                if exact >= N / 2:
+                                    exact -= N
+                                f = exact * live_rate / N
+                                signals.append((f, psd_db[i] - noise))
 
-                    # Cluster peaks within 100 Hz
-                    clustered = []
-                    for freq, snr in sorted(signals):
-                        if not clustered or abs(freq - clustered[-1][0]) > 100:
-                            clustered.append((freq, snr))
-                        elif snr > clustered[-1][1]:
-                            clustered[-1] = (freq, snr)
+                        clustered = []
+                        for freq, snr in sorted(signals):
+                            if not clustered or abs(freq - clustered[-1][0]) > 100:
+                                clustered.append((freq, snr))
+                            elif snr > clustered[-1][1]:
+                                clustered[-1] = (freq, snr)
 
-                    log.info("[%s] noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
-                             band_name, noise, noise + min_snr, len(iq_deque))
-                    top = sorted(signals, key=lambda x: -x[1])[:10]
-                    for f, s in top:
-                        log.info("  [%s] PEAK %.3f kHz %.1f dB",
-                                 band_name, center_khz + f/1000, s)
-                    if not top:
-                        log.info("  [%s] (no peaks above threshold)", band_name)
+                        log.info("[%s] noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
+                                 band_name, noise, noise + min_snr, len(iq_deque))
+                        top = sorted(signals, key=lambda x: -x[1])[:10]
+                        for f, s in top:
+                            log.info("  [%s] PEAK %.3f kHz %.1f dB",
+                                     band_name, center_khz + f/1000, s)
+                        if not top:
+                            log.info("  [%s] (no peaks above threshold)", band_name)
 
-                    if cw_min or cw_max < 99999:
-                        clustered = [(f, s) for f, s in clustered
-                                     if cw_min <= center_khz + f/1000 <= cw_max]
-                    mgr.update_signals(clustered, center_khz)
+                        if cw_min or cw_max < 99999:
+                            clustered = [(f, s) for f, s in clustered
+                                         if cw_min <= center_khz + f/1000 <= cw_max]
+                        mgr.update_signals(clustered, center_khz)
 
             # ----------------------------------------------------------------
             # Collect decoder output from every band — spots to shared telnet
