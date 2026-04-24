@@ -320,21 +320,13 @@ int hpsdr_drain(HpsdrFast *h, int rx_index, double *i_out, double *q_out, int ma
     return n;
 }
 
-/* Drain ring buffer and feed directly to scanner via dlopen — pure C, no Python */
+/* Drain ring buffer and feed directly to scanner — pure C, no Python */
 typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
-static sc_feed_iq_fn sc_feed_iq = NULL;
 
 int hpsdr_drain_to_scanner(HpsdrFast *h, int rx_index,
-                            void *scanner_handle, double scale) {
-    if (rx_index < 0 || rx_index >= h->n_receivers || !scanner_handle) return 0;
-
-    /* Lazy-load itila_sc_feed_iq from libitila_scanner.so */
-    if (!sc_feed_iq) {
-        void *lib = dlopen("./libitila_scanner.so", RTLD_NOW | RTLD_GLOBAL);
-        if (!lib) { fprintf(stderr, "dlopen scanner: %s\n", dlerror()); return 0; }
-        sc_feed_iq = (sc_feed_iq_fn)dlsym(lib, "itila_sc_feed_iq");
-        if (!sc_feed_iq) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 0; }
-    }
+                            void *scanner_handle, double scale,
+                            sc_feed_iq_fn feed_fn) {
+    if (rx_index < 0 || rx_index >= h->n_receivers || !scanner_handle || !feed_fn) return 0;
 
     RxRing *r = &h->rx[rx_index];
     int avail = ring_avail(r);
@@ -353,7 +345,7 @@ int hpsdr_drain_to_scanner(HpsdrFast *h, int rx_index,
             rp = (rp + 1) % RING_SIZE;
         }
         r->read_pos = rp;
-        sc_feed_iq(scanner_handle, i_tmp, q_tmp, n);
+        feed_fn(scanner_handle, i_tmp, q_tmp, n);
         total += n;
         avail = ring_avail(r);
     }

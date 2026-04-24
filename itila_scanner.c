@@ -17,6 +17,7 @@
  */
 
 #include "itila_scanner.h"
+#include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,11 +242,22 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 
         /* Skip if within 150 Hz of any active bin — but update its SNR */
         int found = 0;
+        int blocking_bin = -1;
         for (int b = 0; b < SC_MAX_BINS; b++) {
             if (sc->bins[b].active && fabs(sc->bins[b].f_hz - f_hz) < cluster_hz) {
                 sc->bins[b].snr_db = peaks[i].snr;
-                found = 1; break;
+                found = 1; blocking_bin = b; break;
             }
+        }
+        /* Debug: log why peaks near 7047-7048 kHz are blocked */
+        if (f_hz > 7047000 && f_hz < 7049000) {
+            if (found)
+                fprintf(stderr, "PEAK %.1f Hz (%.1f dB) BLOCKED by bin %.1f Hz (dist=%.0f)\n",
+                        f_hz, peaks[i].snr,
+                        sc->bins[blocking_bin].f_hz,
+                        fabs(sc->bins[blocking_bin].f_hz - f_hz));
+            else
+                fprintf(stderr, "PEAK %.1f Hz (%.1f dB) NEW\n", f_hz, peaks[i].snr);
         }
         if (found) continue;
 

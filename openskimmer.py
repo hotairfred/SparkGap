@@ -80,7 +80,8 @@ def _get_hpsdr_fast():
             lib.hpsdr_n_receivers.argtypes = [_ct.c_void_p]
             lib.hpsdr_drain_to_scanner.restype = _ct.c_int
             lib.hpsdr_drain_to_scanner.argtypes = [
-                _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_double]
+                _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_double,
+                _ct.c_void_p]  # feed_fn pointer
             _hpsdr_fast_lib = lib
             log.info("Loaded libhpsdr_fast.so (C receiver)")
         except OSError:
@@ -145,9 +146,13 @@ class _CReceiver:
         if not self._h or not self.lib or not scanner_sc or not scanner_sc._h:
             return 0
         import ctypes as _ct
+        # Get raw function pointer from the SAME library Python loaded
+        feed_ptr = _ct.cast(scanner_sc._lib.itila_sc_feed_iq,
+                            _ct.c_void_p)
         return self.lib.hpsdr_drain_to_scanner(
             self._h, rx_index,
-            scanner_sc._h, _ct.c_double(8388608.0))
+            scanner_sc._h, _ct.c_double(8388608.0),
+            feed_ptr)
 
     def destroy(self):
         if self._h and self.lib:
@@ -4630,7 +4635,6 @@ class OpenSkimmer:
             for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
                 if use_c:
                     # C receiver path: drain ring → scanner entirely in C
-                    # Force-create scanner on first pass if needed
                     if mgr._itila_scanner is None and mgr.use_itila:
                         center_khz = center_hz / 1000
                         mgr.update_signals([], center_khz)
