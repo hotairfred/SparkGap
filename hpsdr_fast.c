@@ -62,8 +62,21 @@ typedef struct {
     void *scanners[MAX_RX];         /* ItilaSc* per enabled receiver */
     sc_feed_iq_fn scanner_feed;     /* itila_sc_feed_iq function pointer */
     double iq_scale;                /* 8388608.0 */
+    int window_samples;             /* ITILA decode window size */
 
-    /* Worker thread: drains ring buffers and feeds scanners */
+    /* Decode function pointer (itila_sc_decode_ready) */
+    int (*scanner_decode)(void *sc, int window_samples, void *results, int max);
+
+    /* Result ring buffer — worker writes, Python reads */
+    #define RESULT_MAX 256
+    #define RESULT_SIZE 280   /* ScDecodeResult: 8+8+4+4+256 bytes */
+    uint8_t result_buf[RESULT_MAX * RESULT_SIZE];
+    volatile int result_write;
+    volatile int result_read;
+    volatile int result_count;
+    pthread_mutex_t result_lock;
+
+    /* Worker thread: drains ring buffers, feeds scanners, decodes */
     pthread_t worker_thread;
     int worker_running;
 
@@ -302,8 +315,19 @@ void hpsdr_set_scanner(HpsdrFast *h, int rx_index, void *scanner_handle,
     }
 }
 
+void hpsdr_set_decode(HpsdrFast *h,
+                       int (*decode_fn)(void*, int, void*, int),
+                       int window_samples) {
+    h->scanner_decode = decode_fn;
+    h->window_samples = window_samples;
+}
+
 void hpsdr_start_worker(HpsdrFast *h) {
     if (h->worker_running) return;
+    pthread_mutex_init(&h->result_lock, NULL);
+    h->result_write = 0;
+    h->result_read = 0;
+    h->result_count = 0;
     h->worker_running = 1;
     pthread_create(&h->worker_thread, NULL, scanner_worker, h);
 }
@@ -355,17 +379,20 @@ int hpsdr_drain(HpsdrFast *h, int rx_index, double *i_out, double *q_out, int ma
     return n;
 }
 
-/* ---- worker thread: drain ring buffers → feed scanners ---- */
+/* ---- worker thread: drain ring buffers → feed scanners → decode ---- */
 static void *scanner_worker(void *arg) {
     HpsdrFast *h = (HpsdrFast *)arg;
     #define WCHUNK 19200  /* 100ms at 192 kHz */
     double i_tmp[WCHUNK], q_tmp[WCHUNK];
+    uint8_t dec_buf[64 * RESULT_SIZE];  /* temp decode results */
 
     while (h->worker_running) {
         int did_work = 0;
         for (int rx = 0; rx < h->n_receivers; rx++) {
             if (!h->rx_enabled[rx] || !h->scanners[rx] || !h->scanner_feed)
                 continue;
+
+            /* Drain ring buffer → feed scanner */
             RxRing *r = &h->rx[rx];
             int avail = ring_avail(r);
             while (avail > 0) {
@@ -381,11 +408,46 @@ static void *scanner_worker(void *arg) {
                 did_work = 1;
                 avail = ring_avail(r);
             }
+
+            /* Decode ready windows */
+            if (h->scanner_decode && h->window_samples > 0) {
+                int n_dec = h->scanner_decode(h->scanners[rx],
+                                               h->window_samples,
+                                               dec_buf, 64);
+                if (n_dec > 0) {
+                    pthread_mutex_lock(&h->result_lock);
+                    for (int d = 0; d < n_dec; d++) {
+                        if (h->result_count >= RESULT_MAX) break;
+                        int wp = h->result_write;
+                        memcpy(h->result_buf + wp * RESULT_SIZE,
+                               dec_buf + d * RESULT_SIZE, RESULT_SIZE);
+                        h->result_write = (wp + 1) % RESULT_MAX;
+                        h->result_count++;
+                    }
+                    pthread_mutex_unlock(&h->result_lock);
+                    did_work = 1;
+                }
+            }
         }
         if (!did_work) usleep(5000); /* 5ms idle sleep */
     }
     return NULL;
     #undef WCHUNK
+}
+
+/* Poll decoded results — called from Python */
+int hpsdr_poll_results(HpsdrFast *h, void *out_buf, int max_results) {
+    pthread_mutex_lock(&h->result_lock);
+    int n = h->result_count < max_results ? h->result_count : max_results;
+    for (int i = 0; i < n; i++) {
+        int rp = h->result_read;
+        memcpy((uint8_t *)out_buf + i * RESULT_SIZE,
+               h->result_buf + rp * RESULT_SIZE, RESULT_SIZE);
+        h->result_read = (rp + 1) % RESULT_MAX;
+        h->result_count--;
+    }
+    pthread_mutex_unlock(&h->result_lock);
+    return n;
 }
 
 /* Drain ring buffer and feed directly to scanner — pure C, no Python */

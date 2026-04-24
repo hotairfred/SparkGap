@@ -86,10 +86,16 @@ def _get_hpsdr_fast():
             lib.hpsdr_set_scanner.argtypes = [
                 _ct.c_void_p, _ct.c_int, _ct.c_void_p,
                 _ct.c_void_p, _ct.c_double]
+            lib.hpsdr_set_decode.restype = None
+            lib.hpsdr_set_decode.argtypes = [
+                _ct.c_void_p, _ct.c_void_p, _ct.c_int]
             lib.hpsdr_start_worker.restype = None
             lib.hpsdr_start_worker.argtypes = [_ct.c_void_p]
             lib.hpsdr_stop_worker.restype = None
             lib.hpsdr_stop_worker.argtypes = [_ct.c_void_p]
+            lib.hpsdr_poll_results.restype = _ct.c_int
+            lib.hpsdr_poll_results.argtypes = [
+                _ct.c_void_p, _ct.c_void_p, _ct.c_int]
             _hpsdr_fast_lib = lib
             log.info("Loaded libhpsdr_fast.so (C receiver)")
         except OSError:
@@ -4750,17 +4756,73 @@ class OpenSkimmer:
                 scanners_ready = sum(1 for mgr in self.managers
                                      if mgr._itila_scanner and mgr._itila_scanner._sc)
                 if scanners_ready == len(self.managers):
+                    import ctypes as _ct
+                    # Set decode function pointer (itila_sc_decode_ready)
+                    sc_lib = self.managers[0]._itila_scanner._sc._lib
+                    decode_ptr = _ct.cast(sc_lib.itila_sc_decode_ready, _ct.c_void_p)
+                    window_samples = int(self.cfg.get('itila_window_sec', 60) * 200)
+                    self.receiver.lib.hpsdr_set_decode(
+                        self.receiver._h, decode_ptr, _ct.c_int(window_samples))
                     self.receiver.lib.hpsdr_start_worker(self.receiver._h)
                     self._worker_started = True
-                    log.info("C worker thread started (%d bands)", scanners_ready)
-            # Process ready bins — C decode loop for multi-band
-            if use_c:
-                for (_bn, _ch, _ri), mgr in zip(self._band_meta, self.managers):
-                    if mgr._itila_scanner:
-                        if getattr(mgr._itila_scanner, '_c_decode', False):
-                            mgr._itila_scanner._process_ready_c()
-                        else:
-                            mgr._itila_scanner._process_ready()
+                    log.info("C worker thread started (%d bands, autonomous decode)",
+                             scanners_ready)
+            # Process decode results — poll from C worker's result buffer
+            if use_c and getattr(self, '_worker_started', False):
+                import ctypes as _ct
+                result_size = 280
+                max_poll = 128
+                if not hasattr(self, '_poll_buf'):
+                    self._poll_buf = _ct.create_string_buffer(result_size * max_poll)
+                poll_buf = self._poll_buf
+                n = self.receiver.lib.hpsdr_poll_results(
+                    self.receiver._h, poll_buf, _ct.c_int(max_poll))
+                now = time.time()
+                for i in range(n):
+                    off = i * result_size
+                    f_hz = _ct.c_double.from_buffer(poll_buf, off).value
+                    snr = _ct.c_double.from_buffer(poll_buf, off + 8).value
+                    wpm = _ct.c_int.from_buffer(poll_buf, off + 16).value
+                    raw = poll_buf[off+24:off+result_size].split(b'\0')[0].decode('ascii', errors='replace')
+                    if not raw:
+                        continue
+                    f_khz = f_hz / 1000.0
+                    log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+                    # Find or create bin state for ticker tape
+                    scanner = None
+                    for mgr in self.managers:
+                        if mgr._itila_scanner:
+                            scanner = mgr._itila_scanner
+                            break
+                    if not scanner:
+                        continue
+                    if f_hz not in scanner._bins:
+                        scanner._bins[f_hz] = {
+                            'h100': None, 'h200': None, 'pending': [],
+                            'wpm': 0, 'snr': 0.0, 'text_buf': '',
+                            'spotted': set(), 'last_cq_time': 0.0,
+                        }
+                    st = scanner._bins[f_hz]
+                    st['snr'] = snr
+                    if wpm > 0:
+                        st['wpm'] = wpm
+                    st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
+                    if CQ_PATTERNS.search(raw):
+                        st['last_cq_time'] = now
+                    call = _itila_extract_cq_call(raw)
+                    if call and call not in st['spotted']:
+                        st['spotted'].add(call)
+                        st['pending'].append(f'CQ {call} ')
+                        log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)",
+                                 f_khz, call, wpm, raw[:60])
+                    elif now - st['last_cq_time'] < 120.0:
+                        calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                        for c in calls_in_raw:
+                            if c not in st['spotted']:
+                                st['spotted'].add(c)
+                                st['pending'].append(f'CQ {c} ')
+                                log.info("ITILA context %.1f kHz: %s %d WPM",
+                                         f_khz, c, wpm)
                 else:
                     # Python receiver path: drain from callback buffers
                     with self._iq_lock:
