@@ -4641,7 +4641,11 @@ class OpenSkimmer:
                     scanner = mgr._itila_scanner
                     if scanner and scanner._sc:
                         self.receiver.drain_to_scanner(rx_idx, scanner._sc)
-                        scanner._process_ready()
+            # Process ready bins outside the per-band loop (less frequent)
+            if use_c:
+                for (_bn, _ch, _ri), mgr in zip(self._band_meta, self.managers):
+                    if mgr._itila_scanner:
+                        mgr._itila_scanner._process_ready()
                 else:
                     # Python receiver path: drain from callback buffers
                     with self._iq_lock:
