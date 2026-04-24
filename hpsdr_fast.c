@@ -24,6 +24,8 @@
 #include <arpa/inet.h>
 
 #define MAX_RX        8
+typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
+
 #define RING_SIZE     (192000 * 4)   /* 4 seconds per receiver at 192 kHz */
 #define PKT_SIZE      1032
 #define FRAME_SIZE    512
@@ -55,6 +57,15 @@ typedef struct {
     pthread_mutex_t lock;
 
     uint8_t rx_enabled[MAX_RX]; /* only store samples for enabled receivers */
+
+    /* Per-receiver scanner handles for worker thread */
+    void *scanners[MAX_RX];         /* ItilaSc* per enabled receiver */
+    sc_feed_iq_fn scanner_feed;     /* itila_sc_feed_iq function pointer */
+    double iq_scale;                /* 8388608.0 */
+
+    /* Worker thread: drains ring buffers and feeds scanners */
+    pthread_t worker_thread;
+    int worker_running;
 
     /* stats */
     volatile uint64_t pkt_count;
@@ -280,7 +291,31 @@ void hpsdr_start(HpsdrFast *h) {
     pthread_create(&h->thread, NULL, recv_thread, h);
 }
 
+static void *scanner_worker(void *arg);
+
+void hpsdr_set_scanner(HpsdrFast *h, int rx_index, void *scanner_handle,
+                        sc_feed_iq_fn feed_fn, double scale) {
+    if (rx_index >= 0 && rx_index < MAX_RX) {
+        h->scanners[rx_index] = scanner_handle;
+        h->scanner_feed = feed_fn;
+        h->iq_scale = scale;
+    }
+}
+
+void hpsdr_start_worker(HpsdrFast *h) {
+    if (h->worker_running) return;
+    h->worker_running = 1;
+    pthread_create(&h->worker_thread, NULL, scanner_worker, h);
+}
+
+void hpsdr_stop_worker(HpsdrFast *h) {
+    if (!h->worker_running) return;
+    h->worker_running = 0;
+    pthread_join(h->worker_thread, NULL);
+}
+
 void hpsdr_stop(HpsdrFast *h) {
+    hpsdr_stop_worker(h);
     h->running = 0;
     pthread_join(h->thread, NULL);
 
@@ -320,8 +355,40 @@ int hpsdr_drain(HpsdrFast *h, int rx_index, double *i_out, double *q_out, int ma
     return n;
 }
 
+/* ---- worker thread: drain ring buffers → feed scanners ---- */
+static void *scanner_worker(void *arg) {
+    HpsdrFast *h = (HpsdrFast *)arg;
+    #define WCHUNK 19200  /* 100ms at 192 kHz */
+    double i_tmp[WCHUNK], q_tmp[WCHUNK];
+
+    while (h->worker_running) {
+        int did_work = 0;
+        for (int rx = 0; rx < h->n_receivers; rx++) {
+            if (!h->rx_enabled[rx] || !h->scanners[rx] || !h->scanner_feed)
+                continue;
+            RxRing *r = &h->rx[rx];
+            int avail = ring_avail(r);
+            while (avail > 0) {
+                int n = avail < WCHUNK ? avail : WCHUNK;
+                int rp = r->read_pos;
+                for (int k = 0; k < n; k++) {
+                    i_tmp[k] = r->i[rp] * h->iq_scale;
+                    q_tmp[k] = r->q[rp] * h->iq_scale;
+                    rp = (rp + 1) % RING_SIZE;
+                }
+                r->read_pos = rp;
+                h->scanner_feed(h->scanners[rx], i_tmp, q_tmp, n);
+                did_work = 1;
+                avail = ring_avail(r);
+            }
+        }
+        if (!did_work) usleep(5000); /* 5ms idle sleep */
+    }
+    return NULL;
+    #undef WCHUNK
+}
+
 /* Drain ring buffer and feed directly to scanner — pure C, no Python */
-typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
 
 int hpsdr_drain_to_scanner(HpsdrFast *h, int rx_index,
                             void *scanner_handle, double scale,

@@ -82,6 +82,14 @@ def _get_hpsdr_fast():
             lib.hpsdr_drain_to_scanner.argtypes = [
                 _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_double,
                 _ct.c_void_p]  # feed_fn pointer
+            lib.hpsdr_set_scanner.restype = None
+            lib.hpsdr_set_scanner.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_void_p,
+                _ct.c_void_p, _ct.c_double]
+            lib.hpsdr_start_worker.restype = None
+            lib.hpsdr_start_worker.argtypes = [_ct.c_void_p]
+            lib.hpsdr_stop_worker.restype = None
+            lib.hpsdr_stop_worker.argtypes = [_ct.c_void_p]
             _hpsdr_fast_lib = lib
             log.info("Loaded libhpsdr_fast.so (C receiver)")
         except OSError:
@@ -4725,13 +4733,26 @@ class OpenSkimmer:
             # ----------------------------------------------------------------
             for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
                 if use_c:
-                    # C receiver path: drain ring → scanner entirely in C
+                    # C worker thread handles drain → scanner feed
+                    # Just ensure scanners are created and registered
                     if mgr._itila_scanner is None and mgr.use_itila:
                         center_khz = center_hz / 1000
                         mgr.update_signals([], center_khz)
                     scanner = mgr._itila_scanner
-                    if scanner and scanner._sc:
-                        self.receiver.drain_to_scanner(rx_idx, scanner._sc)
+                    if scanner and scanner._sc and not getattr(self, '_worker_started', False):
+                        import ctypes as _ct
+                        feed_ptr = _ct.cast(scanner._sc._lib.itila_sc_feed_iq, _ct.c_void_p)
+                        self.receiver.lib.hpsdr_set_scanner(
+                            self.receiver._h, rx_idx, scanner._sc._h,
+                            feed_ptr, _ct.c_double(8388608.0))
+            # Start worker thread once all scanners are registered
+            if use_c and not getattr(self, '_worker_started', False):
+                scanners_ready = sum(1 for mgr in self.managers
+                                     if mgr._itila_scanner and mgr._itila_scanner._sc)
+                if scanners_ready == len(self.managers):
+                    self.receiver.lib.hpsdr_start_worker(self.receiver._h)
+                    self._worker_started = True
+                    log.info("C worker thread started (%d bands)", scanners_ready)
             # Process ready bins — C decode loop for multi-band
             if use_c:
                 for (_bn, _ch, _ri), mgr in zip(self._band_meta, self.managers):
@@ -4910,7 +4931,7 @@ class OpenSkimmer:
                          self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
 
-            await asyncio.sleep(0.025)
+            await asyncio.sleep(0.1 if use_c else 0.025)
 
 
 def load_config(path):
