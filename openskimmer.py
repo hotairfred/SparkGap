@@ -45,6 +45,103 @@ from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('openskimmer')
 
+# ---------------------------------------------------------------------------
+# Fast C receiver for HPSDR Protocol 1 (multi-band)
+# ---------------------------------------------------------------------------
+_hpsdr_fast_lib = None
+def _get_hpsdr_fast():
+    global _hpsdr_fast_lib
+    if _hpsdr_fast_lib is None:
+        import ctypes as _ct
+        try:
+            lib = _ct.CDLL('./libhpsdr_fast.so')
+            lib.hpsdr_create.restype = _ct.c_void_p
+            lib.hpsdr_create.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_int,
+                                          _ct.c_int, _ct.c_int]
+            lib.hpsdr_set_freq.restype = None
+            lib.hpsdr_set_freq.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_uint32]
+            lib.hpsdr_start.restype = None
+            lib.hpsdr_start.argtypes = [_ct.c_void_p]
+            lib.hpsdr_stop.restype = None
+            lib.hpsdr_stop.argtypes = [_ct.c_void_p]
+            lib.hpsdr_destroy.restype = None
+            lib.hpsdr_destroy.argtypes = [_ct.c_void_p]
+            lib.hpsdr_drain.restype = _ct.c_int
+            lib.hpsdr_drain.argtypes = [_ct.c_void_p, _ct.c_int,
+                                         _ct.POINTER(_ct.c_double),
+                                         _ct.POINTER(_ct.c_double), _ct.c_int]
+            lib.hpsdr_available.restype = _ct.c_int
+            lib.hpsdr_available.argtypes = [_ct.c_void_p, _ct.c_int]
+            lib.hpsdr_pkt_count.restype = _ct.c_uint64
+            lib.hpsdr_pkt_count.argtypes = [_ct.c_void_p]
+            lib.hpsdr_drop_count.restype = _ct.c_uint64
+            lib.hpsdr_drop_count.argtypes = [_ct.c_void_p]
+            lib.hpsdr_n_receivers.restype = _ct.c_int
+            lib.hpsdr_n_receivers.argtypes = [_ct.c_void_p]
+            _hpsdr_fast_lib = lib
+            log.info("Loaded libhpsdr_fast.so (C receiver)")
+        except OSError:
+            log.warning("libhpsdr_fast.so not found — falling back to Python receiver")
+            _hpsdr_fast_lib = False
+    return _hpsdr_fast_lib if _hpsdr_fast_lib else None
+
+
+class _CReceiver:
+    """Drop-in replacement for HPSDRReceiver using C receive thread."""
+
+    def __init__(self, ip, port, n_receivers, sample_rate, lna_gain=20):
+        import ctypes as _ct
+        self.lib = _get_hpsdr_fast()
+        self.n_receivers = n_receivers
+        self.sample_rate = sample_rate
+        self._h = None
+        if self.lib:
+            self._h = _ct.c_void_p(self.lib.hpsdr_create(
+                ip.encode(), port, n_receivers, sample_rate, lna_gain))
+            if not self._h:
+                log.error("hpsdr_create failed")
+
+    def set_frequency(self, rx_index, freq_hz):
+        if self._h and self.lib:
+            self.lib.hpsdr_set_freq(self._h, rx_index, int(freq_hz))
+
+    def start(self):
+        if self._h and self.lib:
+            self.lib.hpsdr_start(self._h)
+            log.info("C receiver started: %d receivers at %d Hz",
+                     self.n_receivers, self.sample_rate)
+
+    def stop(self):
+        if self._h and self.lib:
+            self.lib.hpsdr_stop(self._h)
+            log.info("C receiver stopped (pkts=%d drops=%d)",
+                     self.lib.hpsdr_pkt_count(self._h),
+                     self.lib.hpsdr_drop_count(self._h))
+
+    def drain(self, rx_index, max_n):
+        """Drain up to max_n IQ samples for receiver rx_index.
+        Returns (i_array, q_array) as numpy float64."""
+        import ctypes as _ct
+        if not self._h or not self.lib:
+            return np.zeros(0), np.zeros(0)
+        i_buf = np.empty(max_n, dtype=np.float64)
+        q_buf = np.empty(max_n, dtype=np.float64)
+        n = self.lib.hpsdr_drain(self._h, rx_index,
+                                  i_buf.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                  q_buf.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                  max_n)
+        return i_buf[:n], q_buf[:n]
+
+    def available(self, rx_index):
+        if not self._h or not self.lib:
+            return 0
+        return self.lib.hpsdr_available(self._h, rx_index)
+
+    def destroy(self):
+        if self._h and self.lib:
+            self.lib.hpsdr_destroy(self._h)
+            self._h = None
+
 CALL_RE = re.compile(
     r'(?<![A-Z0-9])'
     r'('
@@ -3364,13 +3461,19 @@ class InstanceManager:
         # Lazily create or re-center the ITILA scanner when center_khz is known.
         if self.use_itila:
             if self._itila_scanner is None:
+                # Derive per-band CW limits from center frequency if global limits
+                # don't make sense for this band (multi-band operation)
+                bmin, bmax = self.cw_min_khz, self.cw_max_khz
+                if bmin == 0 or center_khz < bmin - 100 or center_khz > bmax + 100:
+                    bmin = center_khz - 100
+                    bmax = center_khz - 20
                 self._itila_scanner = _ItilaScanner(
                     self.sample_rate, center_khz,
                     ev_thresh=self.itila_ev_thresh,
                     window_sec=self.itila_window_sec,
                     min_snr=12.0,
-                    band_min_khz=self.cw_min_khz,
-                    band_max_khz=self.cw_max_khz)
+                    band_min_khz=bmin,
+                    band_max_khz=bmax)
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -4385,13 +4488,21 @@ class OpenSkimmer:
             passive = self.cfg.get('passive', False)
             rx_filter = self.cfg.get('rx_filter', None)
             n_rx = max(self.cfg.get('max_receivers', 1), n_bands)
-            self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
-                                          n_receivers=n_rx, sample_rate=rx_sample_rate,
-                                          listen_port=listen_port,
-                                          passive=passive, rx_filter=rx_filter)
+            lna_gain = self.cfg.get('lna_gain', 20)
+
+            # Use C receiver for multi-band (handles 9600+ pkt/s)
+            self._use_c_receiver = (n_bands > 1 and _get_hpsdr_fast() is not None)
+            if self._use_c_receiver:
+                self.receiver = _CReceiver(device_ip, sdr_port,
+                                            n_rx, rx_sample_rate, lna_gain)
+            else:
+                self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
+                                              n_receivers=n_rx, sample_rate=rx_sample_rate,
+                                              listen_port=listen_port,
+                                              passive=passive, rx_filter=rx_filter)
+                self.receiver.lna_gain = lna_gain
             for _name, center_hz, rx_idx in self._band_meta:
                 self.receiver.set_frequency(rx_idx, center_hz)
-            self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
 
         # ----------------------------------------------------------------
         # One InstanceManager per band
@@ -4436,7 +4547,11 @@ class OpenSkimmer:
     async def stop(self):
         self.running = False
         if self.receiver:
-            self.receiver.close()
+            if getattr(self, '_use_c_receiver', False):
+                self.receiver.stop()
+                self.receiver.destroy()
+            else:
+                self.receiver.close()
         for mgr in self.managers:
             mgr.kill_all()
         if self.telnet:
@@ -4473,12 +4588,16 @@ class OpenSkimmer:
             pass  # Don't let errors kill the receiver thread
 
     async def run(self):
-        rx_thread = threading.Thread(
-            target=self.receiver.receive,
-            args=(self._iq_callback,),
-            daemon=True,
-        )
-        rx_thread.start()
+        use_c = getattr(self, '_use_c_receiver', False)
+        if use_c:
+            self.receiver.start()
+        else:
+            rx_thread = threading.Thread(
+                target=self.receiver.receive,
+                args=(self._iq_callback,),
+                daemon=True,
+            )
+            rx_thread.start()
         log.info("IQ stream started")
 
         scan_interval = self.cfg.get('scan_interval', 5)
@@ -4490,37 +4609,56 @@ class OpenSkimmer:
             now = time.time()
             live_rate = self.cfg.get('sample_rate', 48000)
             # ----------------------------------------------------------------
-            # Per-band: drain feed buffers and push IQ to decoders
-            # 200ms cap per band to stay real-time even under backlog.
+            # Per-band: drain IQ and push to decoders
             # ----------------------------------------------------------------
             for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
-                with self._iq_lock:
-                    buf = self._band_bufs[rx_idx]
-                    raw_chunks = buf['raw']
-                    buf['raw'] = []
-                if raw_chunks:
-                    # Convert raw iq_samples lists → numpy in the main thread.
-                    # Cap to ~200ms of backlog before feeding decoders.
-                    chunk_size = len(raw_chunks[0])
-                    max_chunks = max(1, live_rate // 5 // chunk_size)
-                    if len(raw_chunks) > max_chunks:
-                        raw_chunks = raw_chunks[-max_chunks:]
-                    feed_i = []
-                    feed_q = []
-                    for chunk in raw_chunks:
-                        iq_arr = np.asarray(chunk, dtype=np.float64)
-                        feed_i.append(iq_arr[:, 0] * 8388608.0)
-                        feed_q.append(iq_arr[:, 1] * 8388608.0)
-                    # Maintain FFT deque for the periodic scan
-                    max_iq_buf = live_rate * 10
-                    iq_deq = buf['iq']
-                    for chunk in raw_chunks:
-                        iq_deq.extend(chunk)
-                    while len(iq_deq) > max_iq_buf:
-                        iq_deq.popleft()
-                    i_cat = np.concatenate(feed_i)
-                    q_cat = np.concatenate(feed_q)
-                    mgr.feed_all_iq(i_cat, q_cat)
+                if use_c:
+                    # C receiver path: drain directly from ring buffer
+                    avail = self.receiver.available(rx_idx)
+                    if avail > 0:
+                        max_drain = min(avail, live_rate // 5)  # ~200ms cap
+                        i_cat, q_cat = self.receiver.drain(rx_idx, max_drain)
+                        if len(i_cat) > 0:
+                            # C receiver returns normalized floats; scale for scanner
+                            i_scaled = i_cat * 8388608.0
+                            q_scaled = q_cat * 8388608.0
+                            # Maintain FFT deque for periodic scan (keep last 10s)
+                            buf = self._band_bufs[rx_idx]
+                            iq_deq = buf['iq']
+                            iq_pairs = list(zip(i_cat.tolist(), q_cat.tolist()))
+                            iq_deq.extend(iq_pairs)
+                            max_iq_buf = live_rate * 10
+                            excess = len(iq_deq) - max_iq_buf
+                            if excess > 0:
+                                for _ in range(excess):
+                                    iq_deq.popleft()
+                            mgr.feed_all_iq(i_scaled, q_scaled)
+                else:
+                    # Python receiver path: drain from callback buffers
+                    with self._iq_lock:
+                        buf = self._band_bufs[rx_idx]
+                        raw_chunks = buf['raw']
+                        buf['raw'] = []
+                    if raw_chunks:
+                        chunk_size = len(raw_chunks[0])
+                        max_chunks = max(1, live_rate // 5 // chunk_size)
+                        if len(raw_chunks) > max_chunks:
+                            raw_chunks = raw_chunks[-max_chunks:]
+                        feed_i = []
+                        feed_q = []
+                        for chunk in raw_chunks:
+                            iq_arr = np.asarray(chunk, dtype=np.float64)
+                            feed_i.append(iq_arr[:, 0] * 8388608.0)
+                            feed_q.append(iq_arr[:, 1] * 8388608.0)
+                        max_iq_buf = live_rate * 10
+                        iq_deq = buf['iq']
+                        for chunk in raw_chunks:
+                            iq_deq.extend(chunk)
+                        while len(iq_deq) > max_iq_buf:
+                            iq_deq.popleft()
+                        i_cat = np.concatenate(feed_i)
+                        q_cat = np.concatenate(feed_q)
+                        mgr.feed_all_iq(i_cat, q_cat)
 
             # ----------------------------------------------------------------
             # Periodic signal scan — one FFT per band
