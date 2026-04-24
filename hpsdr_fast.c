@@ -60,18 +60,18 @@ typedef struct {
 
     uint8_t rx_enabled[MAX_RX]; /* only store samples for enabled receivers */
 
-    /* FT8 IQ accumulator — separate from CW ring, not consumed by worker.
-     * Python drains this every 60 seconds for FT8 extraction. */
-    #define FT8_IQ_SIZE (4000 * 65)  /* 65 seconds at 4000 sps (pre-decimated) */
+    /* FT8 raw IQ ring — stores full 192 kHz IQ for Python extraction.
+     * Only enable on bands with FT8 activity (2-3 max).
+     * 65 seconds × 192 kHz × sizeof(float) × 2 = 100 MB per band. */
+    #define FT8_RAW_SIZE (192000 * 65)
     struct {
-        float i[FT8_IQ_SIZE];
-        float q[FT8_IQ_SIZE];
+        float *i;       /* heap allocated — too large for struct */
+        float *q;
         volatile int write_pos;
         int enabled;
         double freq_hz;
         double center_hz;
-        double mix_phase;
-    } ft8_iq[MAX_RX];
+    } ft8_raw[MAX_RX];
 
     /* Per-receiver scanner handles for worker thread */
     void *scanners[MAX_RX];         /* ItilaSc* per enabled receiver */
@@ -197,6 +197,15 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
             r->i[wp] = fi;
             r->q[wp] = fq;
             r->write_pos = (wp + 1) % RING_SIZE;
+
+            /* FT8: store raw 24-bit IQ (not normalized) for Python extraction */
+            if (h->ft8_raw[rx].enabled && h->ft8_raw[rx].i) {
+                int fwp = h->ft8_raw[rx].write_pos;
+                int idx = fwp % FT8_RAW_SIZE;
+                h->ft8_raw[rx].i[idx] = (float)iv;  /* raw 24-bit integer */
+                h->ft8_raw[rx].q[idx] = -(float)qv; /* negate Q */
+                h->ft8_raw[rx].write_pos = fwp + 1;
+            }
         }
     }
 }
@@ -696,6 +705,37 @@ int hpsdr_drain_to_scanner(HpsdrFast *h, int rx_index,
 int hpsdr_available(HpsdrFast *h, int rx_index) {
     if (rx_index < 0 || rx_index >= h->n_receivers) return 0;
     return ring_avail(&h->rx[rx_index]);
+}
+
+/* FT8 IQ accumulator access */
+void hpsdr_enable_ft8(HpsdrFast *h, int rx, double ft8_freq, double center_freq) {
+    if (rx < 0 || rx >= MAX_RX) return;
+    if (!h->ft8_raw[rx].i) {
+        h->ft8_raw[rx].i = (float *)calloc(FT8_RAW_SIZE, sizeof(float));
+        h->ft8_raw[rx].q = (float *)calloc(FT8_RAW_SIZE, sizeof(float));
+        if (!h->ft8_raw[rx].i || !h->ft8_raw[rx].q) return;
+    }
+    h->ft8_raw[rx].enabled = 1;
+    h->ft8_raw[rx].freq_hz = ft8_freq;
+    h->ft8_raw[rx].center_hz = center_freq;
+    h->ft8_raw[rx].write_pos = 0;
+}
+
+int hpsdr_read_ft8(HpsdrFast *h, int rx, float *i_out, float *q_out, int max_n) {
+    if (rx < 0 || rx >= MAX_RX || !h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) return 0;
+    int wp = h->ft8_raw[rx].write_pos;
+    /* Circular read: always read from the buffer using modulo */
+    int avail = wp;
+    if (avail > FT8_RAW_SIZE) avail = FT8_RAW_SIZE;  /* can't read more than buffer */
+    int n = avail < max_n ? avail : max_n;
+    int start = wp - n;
+    for (int k = 0; k < n; k++) {
+        int idx = (start + k) % FT8_RAW_SIZE;
+        if (idx < 0) idx += FT8_RAW_SIZE;
+        i_out[k] = h->ft8_raw[rx].i[idx];
+        q_out[k] = h->ft8_raw[rx].q[idx];
+    }
+    return n;
 }
 
 uint64_t hpsdr_pkt_count(HpsdrFast *h) { return h->pkt_count; }

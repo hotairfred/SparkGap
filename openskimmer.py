@@ -100,6 +100,13 @@ def _get_hpsdr_fast():
             lib.hpsdr_poll_results.restype = _ct.c_int
             lib.hpsdr_poll_results.argtypes = [
                 _ct.c_void_p, _ct.c_void_p, _ct.c_int]
+            lib.hpsdr_enable_ft8.restype = None
+            lib.hpsdr_enable_ft8.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_double, _ct.c_double]
+            lib.hpsdr_read_ft8.restype = _ct.c_int
+            lib.hpsdr_read_ft8.argtypes = [
+                _ct.c_void_p, _ct.c_int,
+                _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float), _ct.c_int]
             _hpsdr_fast_lib = lib
             log.info("Loaded libhpsdr_fast.so (C receiver)")
         except OSError:
@@ -4777,15 +4784,25 @@ class OpenSkimmer:
                         center_khz = ch / 1000
                         ft8_khz = FT8_FREQS.get(int(center_khz), 0)
                         if ft8_khz:
-                            self.receiver.lib.hpsdr_set_ft8(
+                            self.receiver.lib.hpsdr_enable_ft8(
                                 self.receiver._h, ri,
                                 _ct.c_double(ft8_khz * 1000.0),
-                                _ct.c_double(ch),
-                                ft8d_path)
-                            log.info("FT8 enabled on rx%d: %.0f kHz", ri, ft8_khz)
+                                _ct.c_double(float(ch)))
+                            log.info("FT8 raw IQ enabled on rx%d: %.0f kHz", ri, ft8_khz)
+                    # Enable FT8 accumulation per band
+                    FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
+                                 21090: 21074, 28090: 28074}
+                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                        ck = ch / 1000
+                        ft8_khz = FT8_FREQS.get(int(ck))
+                        if ft8_khz:
+                            self.receiver.lib.hpsdr_enable_ft8(
+                                self.receiver._h, ri,
+                                _ct.c_double(ft8_khz * 1000.0),
+                                _ct.c_double(float(ch)))
+                            log.info("FT8 accumulator enabled rx%d: %.0f kHz", ri, ft8_khz)
                     self.receiver.lib.hpsdr_start_worker(self.receiver._h)
                     self._worker_started = True
-                    self._ft8_bufs = {}  # rx_idx → list of (i, q) chunks
                     self._ft8_last_decode = 0
                     log.info("C worker thread started (%d bands, CW+FT8)",
                              scanners_ready)
@@ -5015,7 +5032,65 @@ class OpenSkimmer:
                          self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
 
-            # FT8 — read results from ft8d output log
+            # FT8 decode — every 60 seconds, read accumulated IQ and spawn ft8d
+            if use_c and getattr(self, '_worker_started', False):
+                ft8_now = int(time.time())
+                if ft8_now - getattr(self, '_ft8_last_decode', 0) >= 60:
+                    self._ft8_last_decode = ft8_now
+                    import ctypes as _ct, struct, subprocess
+                    from scipy.signal import firwin, lfilter
+                    FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
+                                 21090: 21074, 28090: 28074}
+                    ft8d_path = '/home/sparkgap/ft8d/ft8d'
+                    ft8_taps = firwin(256, 2000.0 / (192000 / 2))
+                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                        ck = ch / 1000
+                        ft8_khz = FT8_FREQS.get(int(ck))
+                        if not ft8_khz:
+                            continue
+                        # Read raw 192 kHz IQ from accumulator
+                        max_n = 192000 * 62
+                        fi = np.empty(max_n, dtype=np.float32)
+                        fq = np.empty(max_n, dtype=np.float32)
+                        n = self.receiver.lib.hpsdr_read_ft8(
+                            self.receiver._h, ri,
+                            fi.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+                            fq.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+                            max_n)
+                        if n < 192000 * 50:
+                            continue
+                        # Use last 60 seconds
+                        n60 = 192000 * 60
+                        if n > n60:
+                            fi = fi[n-n60:n]
+                            fq = fq[n-n60:n]
+                            n = n60
+                        # Python extraction (proven path — 50 decodes)
+                        iq = fi[:n].astype(np.float64) + 1j * fq[:n].astype(np.float64)
+                        offset_hz = (ft8_khz - ck) * 1000
+                        t = np.arange(len(iq)) / 192000
+                        mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
+                        filtered = lfilter(ft8_taps, 1.0, mixed)
+                        dec = filtered[::48]
+                        # Write .c2
+                        fname = f'/tmp/ft8_live_rx{ri}.c2'
+                        c2 = np.zeros(len(dec)*2, dtype=np.float32)
+                        c2[0::2] = dec.real.astype(np.float32)
+                        c2[1::2] = dec.imag.astype(np.float32)
+                        with open(fname, 'wb') as f:
+                            f.write(struct.pack('<d', ft8_khz * 1000.0))
+                            f.write(c2.tobytes())
+                        try:
+                            result = subprocess.run(
+                                [ft8d_path, fname],
+                                capture_output=True, text=True, timeout=30)
+                            if result.stdout.strip():
+                                for line in result.stdout.strip().split('\n'):
+                                    log.info("FT8 %s: %s", bn, line.strip())
+                        except Exception as e:
+                            log.debug("ft8d error: %s", e)
+
+            # CW decode results from worker
             if use_c and getattr(self, '_worker_started', False):
                 FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
                              21090: 21074, 28090: 28074}
