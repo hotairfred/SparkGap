@@ -28,7 +28,8 @@
 
 /* Baudot/ITA2 tables */
 static const char LTRS[] = "\0E\nA SIU\rDRJNFCKTZLWHYPQOBG\0MXV\0";
-static const char FIGS[] = "\03\n- \a87\r\x05$4',!:(5\")2#6019?&\0./;\0";
+/*                            0 1  2 3 4 5 6 7  8  9 A B  C D E  F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F */
+static const char FIGS[] = {  0,'3','\n','-',' ','\a','8','7','\r', 0,'$','4','\'',',','!',':','(','5','"',')','2','#','6','0','1','9','?','&', 0,'.','/','=', 0 };
 #define BAUDOT_LTRS 0x1F
 #define BAUDOT_FIGS 0x1B
 #define BAUDOT_SPACE 0x04
@@ -112,12 +113,12 @@ rtty_handle_t rtty_create(int sample_rate, double center_freq) {
     st->space_bp_a1 = 2.0 * r * cos(2.0 * M_PI * st->space_freq / sample_rate);
     st->space_bp_b0 = 1.0 - r;
 
-    /* Envelope LPF: time constant ≈ 1 bit period */
+    /* Envelope LPF: time constant ≈ 0.5 bit period (faster tracking) */
     double bit_period = 1.0 / RTTY_BAUD;
-    st->env_alpha = 1.0 - exp(-1.0 / (bit_period * sample_rate));
+    st->env_alpha = 1.0 - exp(-2.0 / (bit_period * sample_rate));
 
-    /* Data LPF: cutoff at 0.6 × baud rate */
-    double data_tc = 1.0 / (0.6 * RTTY_BAUD * 2.0 * M_PI);
+    /* Data LPF: cutoff at baud rate (wider for better bit tracking) */
+    double data_tc = 1.0 / (RTTY_BAUD * 2.0 * M_PI);
     st->data_alpha = 1.0 - exp(-1.0 / (data_tc * sample_rate));
 
     st->samples_per_bit = (int)(sample_rate / RTTY_BAUD + 0.5);
@@ -184,7 +185,9 @@ const char *rtty_feed(rtty_handle_t h, const double *audio, int n,
 
         if ((st->prev_data >= 0 && st->data_lpf < 0) ||
             (st->prev_data < 0 && st->data_lpf >= 0)) {
-            st->bit_counter = 0;  /* resync on transition */
+            /* Only resync if we're past 50% of a bit period (avoid mid-bit glitches) */
+            if (st->bit_counter > st->samples_per_bit / 2)
+                st->bit_counter = 0;
         }
         st->prev_data = st->data_lpf;
 
@@ -206,7 +209,11 @@ const char *rtty_feed(rtty_handle_t h, const double *audio, int n,
                     st->soft_bits[st->bit_count - 1] = soft;
                 } else if (st->bit_count >= 7) {
                     int code = st->bit_buf & 0x1F;
-                    if (code == BAUDOT_SPACE) st->shift = 0;
+                    if (code == BAUDOT_SPACE) {
+                        st->shift = 0;  /* UOS */
+                        if (st->result_len < RESULT_BUF - 1)
+                            st->result_buf[st->result_len++] = ' ';
+                    }
                     else if (code == BAUDOT_LTRS) st->shift = 0;
                     else if (code == BAUDOT_FIGS) st->shift = 1;
                     else {
