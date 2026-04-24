@@ -1539,6 +1539,15 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_peek_env.argtypes = [
             _ct.c_void_p, _ct.c_double,
             _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_sc_set_decoder.restype  = None
+        lib.itila_sc_set_decoder.argtypes = [
+            _ct.c_void_p,
+            _ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
+            _ct.c_double]
+        lib.itila_sc_decode_ready.restype  = _ct.c_int
+        lib.itila_sc_decode_ready.argtypes = [
+            _ct.c_void_p, _ct.c_int,
+            _ct.c_void_p, _ct.c_int]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1755,6 +1764,23 @@ class _ItilaScanner:
             sos_100.astype(np.float64), sos_200.astype(np.float64),
         )
 
+        # Set up C decode loop — decoder handles managed by scanner
+        import ctypes as _ct
+        itila_lib = _get_itila_lib()
+        if self._sc and itila_lib:
+            self._sc._lib.itila_sc_set_decoder(
+                self._sc._h,
+                _ct.cast(itila_lib.itila_create, _ct.c_void_p),
+                _ct.cast(itila_lib.itila_feed, _ct.c_void_p),
+                _ct.cast(itila_lib.itila_free, _ct.c_void_p),
+                _ct.cast(itila_lib.itila_get_wpm, _ct.c_void_p),
+                _ct.c_double(ev_thresh))
+            self._c_decode = True
+            # Pre-allocate result buffer for C decode loop
+            self._decode_results = (_ct.c_char * (280 * 128))()
+        else:
+            self._c_decode = False
+
     def _ensure_bin_handles(self, f_hz):
         """Create itila decoder handles for a C-spawned bin if not yet tracked."""
         if f_hz in self._bins:
@@ -1856,6 +1882,71 @@ class _ItilaScanner:
             # Path 2: context extraction — if CQ was seen on this bin recently,
             # extract callsigns from accumulated buffer (not just this window).
             # This catches stations in QSO after calling CQ in a previous window.
+            elif now - st['last_cq_time'] < 120.0:
+                calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                for c in calls_in_raw:
+                    if c not in st['spotted']:
+                        st['spotted'].add(c)
+                        st['pending'].append(f'CQ {c} ')
+                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, raw: %s)",
+                                 f_khz, c, wpm, int(now - st['last_cq_time']), raw[:60])
+                        if self._sc:
+                            self._sc._lib.itila_sc_mark_evidence(
+                                self._sc._h, _ct.c_double(f_hz))
+
+    def _process_ready_c(self):
+        """C decode loop — all bin iteration + decode happens in C."""
+        import ctypes as _ct
+        if not self._sc or not getattr(self, '_c_decode', False):
+            return
+        # ScDecodeResult: {double f_hz(8), double snr(8), int wpm(4), pad(4), char text[256]}
+        # Total: 280 bytes per result (with padding)
+        max_results = 128
+        result_size = 8 + 8 + 4 + 4 + 256  # 280 bytes
+        buf = _ct.create_string_buffer(result_size * max_results)
+        n = self._sc._lib.itila_sc_decode_ready(
+            self._sc._h, _ct.c_int(self._window_samples),
+            buf, _ct.c_int(max_results))
+
+        now = time.time()
+        for i in range(n):
+            offset = i * result_size
+            f_hz = _ct.c_double.from_buffer(buf, offset).value
+            snr = _ct.c_double.from_buffer(buf, offset + 8).value
+            wpm = _ct.c_int.from_buffer(buf, offset + 16).value
+            raw = buf[offset + 24:offset + result_size].split(b'\0')[0].decode('ascii', errors='replace')
+
+            if not raw:
+                continue
+            f_khz = f_hz / 1000.0
+            log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+
+            # Ensure Python bin state exists for ticker tape
+            if f_hz not in self._bins:
+                self._bins[f_hz] = {
+                    'h100': None, 'h200': None, 'pending': [], 'wpm': 0, 'snr': 0.0,
+                    'text_buf': '', 'spotted': set(), 'last_cq_time': 0.0,
+                }
+            st = self._bins[f_hz]
+            st['snr'] = snr
+            if wpm > 0:
+                st['wpm'] = wpm
+
+            # Ticker tape: accumulate text
+            st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
+            if CQ_PATTERNS.search(raw):
+                st['last_cq_time'] = now
+
+            # Path 1: direct CQ extraction
+            call = _itila_extract_cq_call(raw)
+            if call and call not in st['spotted']:
+                st['spotted'].add(call)
+                st['pending'].append(f'CQ {call} ')
+                log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
+                if self._sc:
+                    self._sc._lib.itila_sc_mark_evidence(
+                        self._sc._h, _ct.c_double(f_hz))
+            # Path 2: context extraction
             elif now - st['last_cq_time'] < 120.0:
                 calls_in_raw = _itila_extract_all_calls(st['text_buf'])
                 for c in calls_in_raw:
@@ -4641,11 +4732,14 @@ class OpenSkimmer:
                     scanner = mgr._itila_scanner
                     if scanner and scanner._sc:
                         self.receiver.drain_to_scanner(rx_idx, scanner._sc)
-            # Process ready bins outside the per-band loop (less frequent)
+            # Process ready bins — C decode loop for multi-band
             if use_c:
                 for (_bn, _ch, _ri), mgr in zip(self._band_meta, self.managers):
                     if mgr._itila_scanner:
-                        mgr._itila_scanner._process_ready()
+                        if getattr(mgr._itila_scanner, '_c_decode', False):
+                            mgr._itila_scanner._process_ready_c()
+                        else:
+                            mgr._itila_scanner._process_ready()
                 else:
                     # Python receiver path: drain from callback buffers
                     with self._iq_lock:

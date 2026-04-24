@@ -60,6 +60,10 @@ typedef struct {
     int    created_sample;
     int    last_evidence;
     double snr_db;
+
+    /* ITILA decoder handles — created lazily, one per LPF path */
+    void  *h100;
+    void  *h200;
 } ScBin;
 
 /* ---- scanner ---- */
@@ -86,7 +90,17 @@ struct ItilaSc {
 
     int    n_bins;
     ScBin  bins[SC_MAX_BINS];
+
+    /* ITILA decoder function pointers — set via itila_sc_set_decoder */
+    void *(*dec_create)(int sample_rate, double lpf_hz);
+    const char *(*dec_feed)(void *h, const double *env, int n,
+                             double freq_khz, double ev_thresh);
+    void (*dec_free)(void *h);
+    double (*dec_get_wpm)(void *h);
+    double ev_thresh;
 };
+
+static void bin_free_decoders(ItilaSc *sc, ScBin *b);
 
 /* ---- FFT (Cooley-Tukey in-place, power-of-2, forward) ---- */
 static void fft_forward(double *re, double *im, int n)
@@ -284,6 +298,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
                 }
             }
             if (evicted >= 0) {
+                bin_free_decoders(sc, &sc->bins[evicted]);
                 sc->bins[evicted].active = 0;
                 sc->n_bins--;
             } else {
@@ -437,6 +452,8 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
 void itila_sc_free(ItilaSc *sc)
 {
     if (!sc) return;
+    for (int i = 0; i < SC_MAX_BINS; i++)
+        if (sc->bins[i].active) bin_free_decoders(sc, &sc->bins[i]);
     free(sc->scan_i);
     free(sc->scan_q);
     free(sc);
@@ -570,4 +587,86 @@ int itila_sc_list_bins(ItilaSc *sc, double *f_hz_out, int max_out)
             f_hz_out[count++] = sc->bins[i].f_hz;
     }
     return count;
+}
+
+/* ---- integrated decode: ready check + drain + itila_feed in C ---- */
+
+void itila_sc_set_decoder(ItilaSc *sc,
+                           void *(*create_fn)(int, double),
+                           const char *(*feed_fn)(void*, const double*, int, double, double),
+                           void (*free_fn)(void*),
+                           double (*get_wpm_fn)(void*),
+                           double ev_thresh) {
+    sc->dec_create  = create_fn;
+    sc->dec_feed    = feed_fn;
+    sc->dec_free    = free_fn;
+    sc->dec_get_wpm = get_wpm_fn;
+    sc->ev_thresh   = ev_thresh;
+}
+
+typedef struct {
+    double f_hz;
+    double snr;
+    int    wpm;
+    char   text[256];
+} ScDecodeResult;
+
+int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
+                           ScDecodeResult *results, int max_results) {
+    if (!sc->dec_create || !sc->dec_feed) return 0;
+
+    int n_results = 0;
+
+    for (int bi = 0; bi < SC_MAX_BINS && n_results < max_results; bi++) {
+        ScBin *b = &sc->bins[bi];
+        if (!b->active || b->env_n < window_samples) continue;
+
+        /* Lazily create decoder handles */
+        if (!b->h100) b->h100 = sc->dec_create(200, 100.0);
+        if (!b->h200) b->h200 = sc->dec_create(200, 200.0);
+
+        double f_khz = b->f_hz / 1000.0;
+
+        while (b->env_n >= window_samples) {
+            /* Decode both 100 Hz and 200 Hz paths */
+            void *handles[2] = { b->h100, b->h200 };
+            double *envs[2]  = { b->env100, b->env200 };
+
+            for (int p = 0; p < 2; p++) {
+                if (!handles[p]) continue;
+                const char *raw = sc->dec_feed(handles[p], envs[p],
+                                                window_samples, f_khz,
+                                                sc->ev_thresh);
+                if (raw && raw[0] && n_results < max_results) {
+                    ScDecodeResult *r = &results[n_results];
+                    r->f_hz = b->f_hz;
+                    r->snr  = b->snr_db;
+                    r->wpm  = (int)(sc->dec_get_wpm(handles[p]) + 0.5);
+                    int len = strlen(raw);
+                    if (len > 255) len = 255;
+                    memcpy(r->text, raw, len);
+                    r->text[len] = '\0';
+                    /* Trim trailing whitespace */
+                    while (len > 0 && (r->text[len-1] == ' ' || r->text[len-1] == '\n'))
+                        r->text[--len] = '\0';
+                    if (len > 0) n_results++;
+                }
+            }
+
+            /* Shift envelope buffer — drain window_samples */
+            int rem = b->env_n - window_samples;
+            memmove(b->env100, b->env100 + window_samples, rem * sizeof(double));
+            memmove(b->env200, b->env200 + window_samples, rem * sizeof(double));
+            b->env_n = rem;
+        }
+    }
+    return n_results;
+}
+
+/* Clean up decoder handles when bins are evicted */
+static void bin_free_decoders(ItilaSc *sc, ScBin *b) {
+    if (sc->dec_free) {
+        if (b->h100) { sc->dec_free(b->h100); b->h100 = NULL; }
+        if (b->h200) { sc->dec_free(b->h200); b->h200 = NULL; }
+    }
 }
