@@ -101,8 +101,8 @@ static void send_ep2(HpsdrFast *h, const uint8_t *c0c4_f1, const uint8_t *c0c4_f
 
 /* ---- parse one IQ frame (504 bytes) ---- */
 static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
-    /* Pavel's sdr_receiver_hpsdr sends size-2 bytes per group (no mic) */
-    int group_size = n_rx * 6;
+    /* Each group: n_rx × 6 bytes IQ + 2 bytes mic padding */
+    int group_size = n_rx * 6 + 2;
     int n_groups = IQ_DATA_SIZE / group_size;
 
     for (int g = 0; g < n_groups; g++) {
