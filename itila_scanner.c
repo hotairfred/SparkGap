@@ -19,6 +19,7 @@
 #include "itila_scanner.h"
 #include <stdio.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -90,6 +91,8 @@ struct ItilaSc {
 
     int    n_bins;
     ScBin  bins[SC_MAX_BINS];
+
+    pthread_mutex_t lock;  /* protects bins/envelope during concurrent feed+decode */
 
     /* ITILA decoder function pointers — set via itila_sc_set_decoder */
     void *(*dec_create)(int sample_rate, double lpf_hz);
@@ -445,6 +448,7 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     sc->scan_i = (double *)calloc(energy_win, sizeof(double));
     sc->scan_q = (double *)calloc(energy_win, sizeof(double));
     if (!sc->scan_i || !sc->scan_q) { itila_sc_free(sc); return NULL; }
+    pthread_mutex_init(&sc->lock, NULL);
 
     return sc;
 }
@@ -454,6 +458,7 @@ void itila_sc_free(ItilaSc *sc)
     if (!sc) return;
     for (int i = 0; i < SC_MAX_BINS; i++)
         if (sc->bins[i].active) bin_free_decoders(sc, &sc->bins[i]);
+    pthread_mutex_destroy(&sc->lock);
     free(sc->scan_i);
     free(sc->scan_q);
     free(sc);
@@ -481,6 +486,7 @@ void itila_sc_mark_evidence(ItilaSc *sc, double f_hz)
 void itila_sc_feed_iq(ItilaSc *sc,
                        const double *i_arr, const double *q_arr, int n)
 {
+    pthread_mutex_lock(&sc->lock);
     sc->total_samples += n / SC_DEC1;  /* count in 12kHz samples */
     /* --- FFT energy scan: fill rolling scan buffer --- */
     int i_pos = 0;
@@ -521,6 +527,7 @@ void itila_sc_feed_iq(ItilaSc *sc,
 
     free(i_full);
     free(q_full);
+    pthread_mutex_unlock(&sc->lock);
 }
 
 int itila_sc_ready_bins(ItilaSc *sc, double *f_hz_out, int max_out)
@@ -615,6 +622,7 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
                            ScDecodeResult *results, int max_results) {
     if (!sc->dec_create || !sc->dec_feed) return 0;
 
+    pthread_mutex_lock(&sc->lock);
     int n_results = 0;
 
     for (int bi = 0; bi < SC_MAX_BINS && n_results < max_results; bi++) {
@@ -660,6 +668,7 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
             b->env_n = rem;
         }
     }
+    pthread_mutex_unlock(&sc->lock);
     return n_results;
 }
 
