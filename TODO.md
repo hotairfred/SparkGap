@@ -1,25 +1,32 @@
 # OpenSkimmer TODO
 
-## Decoder
+## Done (Apr 22-24 2026)
+- [x] WPM + SNR reporting from ITILA decoder
+- [x] CQ triggers aligned with CW Skimmer (CQ/TEST/QRZ/QRL/CWT/SST/MST/FD/SS/NA/UP)
+- [x] DE token boundary fix (EC7RDE → EC7R + DE)
+- [x] Text accumulation ("ticker tape") — 74% → 91% recall vs CW Skimmer
+- [x] File mode auto-override for band limits
+- [x] C receiver (libhpsdr_fast.so) — 9941 pkt/s, 8 DDCs × 192 kHz
+- [x] C worker thread — autonomous drain + FIR + decode
+- [x] C decode loop — ITILA decode in C, Python just polls results
+- [x] Mutex for concurrent scanner access (worker + Python)
+- [x] Multi-band (5 bands on bare metal i5-9500T)
+- [x] RBN-validated scoring methodology
+- [x] Relaxed callsign pattern for special event calls (YT170TESLA etc.)
+- [x] Grid corrected to EM79
 
-- [x] **Token boundary parsing** — fixed DE suffix splitting (`EC7RDE` → `EC7R` + `DE`). Preserves real DE-prefix calls like `DE5FHI`.
+## In Progress
+- [ ] **FT8 live integration** — Python extraction proven (50 decodes), C channelizer has bug. Raw IQ ring approach stores 192 kHz IQ per band, Python does firwin+lfilter. Signals present but ft8d won't decode in integrated pipeline. See memory/feedback_ft8_channelizer.md.
+- [ ] **RTTY decoder** — Phase 1 core works (CQ CONTEST DE K3LR decodes on synthetic). Bit clock drift after ~15 chars. Needs wiring into live pipeline. Design doc on Atlas.
 
-## Channelizer / Scanner
+## Future
+- [ ] **FT4 decoder** — needs extraction from WSJT-X source (no standalone binary exists)
+- [ ] **RTTY Bayesian merging** — GRITTY-style multi-copy bit-level merge (Phase 2)
+- [ ] **Auto mode detection** — detect FT8/RTTY/CW per channel from spectral signature
+- [ ] **LNA gain control** — may not work with Pavel's sdr_receiver_hpsdr (all gains produce same output)
+- [ ] **Proxy eval on localhost** — port binding collision, low priority
+- [ ] **FIR chain optimization** — speed-adaptive filter width for different WPM
 
-- [x] **SNR passthrough** — per-bin SNR from FFT scan stored in C scanner, updated each rescan, wired through to spots.
-
-- [x] **File mode fixed** — was not a code bug. Config band limits (20m) didn't match recording (40m). Added auto-override: file mode detects when center_khz is outside cw_min/cw_max and adjusts. 15 min recording processes in ~2m47s.
-
-- [ ] **Proxy eval on localhost** — port binding collision on localhost. Low priority since file mode works now.
-
-## Infrastructure
-
-- [x] **CQ triggers aligned with CW Skimmer** — CQ, TEST, QRZ, QRL, CWT, SST, MST, FD, SS, NA, UP. Removed TU (not a CQ keyword, spots worked stations). Removed DE (too noisy).
-
-- [x] **WPM reporting** — `itila_get_wpm()` added to C library, wired through scanner → spot output. Live spots now show decoder-estimated WPM.
-
-- [x] **Grid corrected** — EM79 in all configs (was EN82).
-
-- [ ] **RBN daily comparison** — `rbn_pull.sh` + `rbn_compare.py` ready. Awaiting 20260422.zip for definitive CWT validation. Cron set for daily pull at 0617 local.
-
-- [x] **Push to GitHub via Grayline** — done.
+## Contest Schedule
+- UK/EI DX Contest CW: 1200Z Apr 25 - 1200Z Apr 26 (80/40/20/15/10m)
+- RTTY contest also this weekend — opportunity to test RTTY decoder
