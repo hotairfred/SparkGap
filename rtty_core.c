@@ -113,9 +113,15 @@ rtty_handle_t rtty_create(int sample_rate, double center_freq) {
     st->space_bp_a1 = 2.0 * r * cos(2.0 * M_PI * st->space_freq / sample_rate);
     st->space_bp_b0 = 1.0 - r;
 
-    /* Envelope LPF: time constant ≈ 0.5 bit period (faster tracking) */
-    double bit_period = 1.0 / RTTY_BAUD;
-    st->env_alpha = 1.0 - exp(-2.0 / (bit_period * sample_rate));
+    /* Envelope LPF: ~150 Hz cutoff (tc ≈ 1 ms). Must be FAST enough to
+     * track bit transitions cleanly — old value (tc = half bit period =
+     * 132 samples at 12 kHz) needed 5×tc ≈ 2.5 bit periods to settle,
+     * which smeared every transition across neighboring bits → massive
+     * ISI → garbled output. 150 Hz is well above the bit rate (45 baud)
+     * but well below the rectified-carrier ripple from the bandpass
+     * output, so it removes ripple without smearing bits. */
+    double env_tc = 1.0 / (2.0 * M_PI * 150.0);  /* ~1.06 ms */
+    st->env_alpha = 1.0 - exp(-1.0 / (env_tc * sample_rate));
 
     /* Data LPF: cutoff at baud rate (wider for better bit tracking) */
     double data_tc = 1.0 / (RTTY_BAUD * 2.0 * M_PI);
