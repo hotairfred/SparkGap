@@ -37,12 +37,42 @@
       Spawned one worker per RX. Drops dropped to 2.3%, CW spot rate
       went 4 → 12.2/min on 20m, exceeds bare-C reference.
       See memory/feedback_cw_per_rx_workers.md.
+- [x] **CW runner-only spot extraction** (commit e6a0d75 Apr 25 19:25 UTC).
+      Reverted the c042491 caller-spotting that matched CW Skimmer GUI's
+      ticker behavior. RBN convention is runner-only; pile-ups like
+      14011.1 (K1LZ + 5 callers) were producing 6 wrong spots.
+- [x] **CW per-freq winner-takes-all spot filter** (commit 3976dcd).
+      Closes multi-call-per-freq pattern. SDC-style 1:1 freq:call.
+- [x] **CW Path 1b sliding window disabled** (commit f27ab2b).
+      Was scanning all 4-7 char substrings against ~50K SCP entries —
+      noise hallucination factory. Path 1a (regex with word boundaries)
+      catches real calls fine.
+- [x] **CW ring buffer 4s → 16s** (commit f8687aa Apr 25 20:00 UTC).
+      Per-RX workers cut drops 50%→2.3%, but residual drops produced
+      FRAGMENTED text (different from bare-C continuous text). Bigger
+      ring absorbs decode bursts. Drops 2.3% → 0%. Live decode quality
+      now matches bare-C. See memory/feedback_cw_session_2026_04_25.md.
+- [x] **CW slash strip — base call only** (commit 9ab2bbe Apr 25 20:30 UTC).
+      RBN aggregator filters slash spots upstream anyway. SDC's spots
+      have zero slashes. Eliminated 8 OS-only slash FPs (N8KH/B,
+      K8MR/HPT, W4DXM/IDR etc.) from comparison.
 
-## In Progress
-- [ ] **Confirm Grayline contest comparison post-fix** — pull a fresh
-      OS-vs-SDC compare after the per-RX worker fix to verify the EU/DX
-      recall gap closed. Expected: 6 → many more overlap; SDC-only set
-      shrinks substantially.
+## Session results (2026-04-25 ~20:46 UTC, UK/EI contest live)
+**CW: 61 OS / 41 SDC / 7 overlap in 16-min window. 50% ahead on volume,
+clean output. See memory/feedback_cw_session_2026_04_25.md for the arc.**
+
+## In Progress — NEXT INVESTIGATION
+- [ ] **Decoder accuracy on weak DX signals** — the open architecture
+      problem. 24/26 SDC-only DX calls (HB9/MM/GM/M7/CT1/PY5/EW/HB7
+      etc.) had ZERO decodes anywhere in our log. But our bins ARE
+      firing at those freqs — decode produces single-letter garbage
+      ("E T I E T TE W E E A E NT A EJ"). Hypotheses to test:
+      (1) tighter per-channel filter (isolate from adjacent strong
+      runners); (2) per-bin AGC saturation by adjacent strong;
+      (3) ev_thresh too strict for weak signals; (4) Bayesian decoder
+      algorithm gap vs Skimmer's matched filter / HMM. See
+      memory/feedback_cw_weak_signal_decoder_gap.md for the full
+      handoff with diagnostic procedure.
 
 ## Future
 - [ ] **FT4 decoder** — ft8_lib handles FT4 too (already built); just needs second pipeline
