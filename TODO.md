@@ -16,11 +16,16 @@
 - [x] Grid corrected to EM79
 
 ## In Progress
-- [ ] **FT8 live integration** — Python extraction proven (50 decodes), C channelizer has bug. Raw IQ ring approach stores 192 kHz IQ per band, Python does firwin+lfilter. Signals present but ft8d won't decode in integrated pipeline. See memory/feedback_ft8_channelizer.md.
+- [x] **FT8 live integration** — replaced ft8d (Pavel) with kgoba/ft8_lib. Pipeline:
+      192k IQ → mix → 12k complex → zero negative freqs (USB demod) → Re → 12k mono WAV
+      → /home/sparkgap/decode_ft8 → SPOT. **First live decode: CQ N4DWD EM86 on 40m.**
+      WAV pipeline gets 53 decodes/min on known-good data. Live yield depends on band
+      conditions. See memory/feedback_ft8_channelizer.md.
 - [ ] **RTTY decoder** — Phase 1 core works (CQ CONTEST DE K3LR decodes on synthetic). Bit clock drift after ~15 chars. Needs wiring into live pipeline. Design doc on Atlas.
 
 ## Future
-- [ ] **FT4 decoder** — needs extraction from WSJT-X source (no standalone binary exists)
+- [ ] **FT4 decoder** — ft8_lib handles FT4 too (already built); just needs second pipeline
+  with -ft4 flag on 7s slots. Trivial to add once we want it.
 - [ ] **RTTY Bayesian merging** — GRITTY-style multi-copy bit-level merge (Phase 2)
 - [ ] **Auto mode detection** — detect FT8/RTTY/CW per channel from spectral signature
 - [ ] **LNA gain control** — may not work with Pavel's sdr_receiver_hpsdr (all gains produce same output)
