@@ -16,13 +16,11 @@
 - [x] Grid corrected to EM79
 
 ## In Progress
-- [~] **FT8 live integration** — pipeline math correct, decoder works.
-      Bare C capture (c_capture.c) → 69 decodes. Python direct UDP parse
-      → 122 decodes. **libhpsdr_fast.so ring buffer → 0 decodes** —
-      threading/visibility bug between recv_thread writes and Python reads.
-      Memory barriers helped (autocorr 0.21→0.82) but didn't fully fix.
-      Next: replace ring with double-buffer or callback model. See
-      memory/feedback_ft8_channelizer.md for full diagnostic state.
+- [x] **FT8 live integration WORKING** — 12 spots/cycle confirmed across
+      5 bands (DX from Panama HP2NG, Italy IK4LZH, plus US stations on
+      80m/40m/20m). Recipe: ft8_lib + USB demod (zero negative freqs) +
+      C-ring memory barriers + simple recv() loop (no recvmmsg, no
+      zero-padding). See memory/feedback_ft8_channelizer.md.
 - [ ] **RTTY decoder** — Phase 1 core works (CQ CONTEST DE K3LR decodes on synthetic). Bit clock drift after ~15 chars. Needs wiring into live pipeline. Design doc on Atlas.
 
 ## Future
