@@ -15,16 +15,15 @@
 - [x] Relaxed callsign pattern for special event calls (YT170TESLA etc.)
 - [x] Grid corrected to EM79
 
+## Done (this session)
+- [x] **FT8 live integration WORKING** (commit 4b6ca27 Apr 25 05:44 UTC).
+      Replaced racy ring buffer with per-RX double-buffer + atomic swap.
+      75-77 spots/cycle across 5 bands, zero UDP loss.
+      DX: VK2 (Australia), TL8GD (CAR), TY5AD (Benin), ZL3 (NZ),
+      OH3 (Finland), JA2 (Japan).
+      See memory/feedback_ft8_double_buffer.md.
+
 ## In Progress
-- [~] **FT8 live integration PARTIALLY WORKING** — one cycle proved it
-      decodes (12 spots, 5 bands, DX: HP2NG Panama, IK4LZH Italy).
-      Most cycles get 0 because C ring buffer still has subtle data
-      corruption that bare C capture doesn't. Bare C → 40 decodes/60s
-      ONE band; openskimmer ring → 0/cycle most of the time.
-      Pipeline math + sliding-window decode are correct (verified on
-      bare C data). The bug is upstream in the C ring buffer — needs
-      replacement with double-buffer or callback model.
-      See memory/feedback_ft8_channelizer.md.
 - [ ] **RTTY decoder** — Phase 1 core works (CQ CONTEST DE K3LR decodes on synthetic). Bit clock drift after ~15 chars. Needs wiring into live pipeline. Design doc on Atlas.
 
 ## Future
