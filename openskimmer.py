@@ -103,15 +103,11 @@ def _get_hpsdr_fast():
             lib.hpsdr_enable_ft8.restype = None
             lib.hpsdr_enable_ft8.argtypes = [
                 _ct.c_void_p, _ct.c_int, _ct.c_double, _ct.c_double]
-            lib.hpsdr_read_ft8.restype = _ct.c_int
-            lib.hpsdr_read_ft8.argtypes = [
-                _ct.c_void_p, _ct.c_int,
-                _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float), _ct.c_int]
-            lib.hpsdr_read_ft8_aligned.restype = _ct.c_int
-            lib.hpsdr_read_ft8_aligned.argtypes = [
+            lib.hpsdr_ft8_swap_read.restype = _ct.c_int
+            lib.hpsdr_ft8_swap_read.argtypes = [
                 _ct.c_void_p, _ct.c_int,
                 _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
-                _ct.c_int, _ct.c_int]
+                _ct.c_int, _ct.POINTER(_ct.c_double)]
             try:
                 lib.hpsdr_pkt_lost.restype = _ct.c_uint64
                 lib.hpsdr_pkt_lost.argtypes = [_ct.c_void_p]
@@ -5039,7 +5035,7 @@ class OpenSkimmer:
                                  21090: 21074, 28090: 28074}
                     ft8_jobs = []
                     n60 = 192000 * 60
-                    skip = int(ft8_sec * 192000)
+                    buf_cap = 192000 * 65
                     pkt_lost = 0
                     if hasattr(self.receiver.lib, 'hpsdr_pkt_lost'):
                         try:
@@ -5047,27 +5043,37 @@ class OpenSkimmer:
                         except Exception:
                             pass
                     pkts = self.receiver.lib.hpsdr_pkt_count(self.receiver._h)
-                    log.info("FT8 trigger: sec=%.2f skip=%d pkts=%d lost=%d (%.2f%%)",
-                             ft8_sec, skip, pkts, pkt_lost,
+                    log.info("FT8 trigger: sec=%.2f pkts=%d lost=%d (%.2f%%)",
+                             ft8_sec, pkts, pkt_lost,
                              100.0*pkt_lost/max(pkts+pkt_lost, 1))
+                    # Snapshot all bands first (one swap each — fast, atomic).
+                    # Each snapshot is the previous minute's data filling the
+                    # active buffer between the prior swap and this one.
                     for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                         ck = ch / 1000
                         ft8_khz = FT8_FREQS.get(int(ck))
                         if not ft8_khz:
                             continue
-                        fi = np.empty(n60, dtype=np.float32)
-                        fq = np.empty(n60, dtype=np.float32)
-                        n = self.receiver.lib.hpsdr_read_ft8_aligned(
+                        fi = np.empty(buf_cap, dtype=np.float32)
+                        fq = np.empty(buf_cap, dtype=np.float32)
+                        t_first = _ct.c_double(0.0)
+                        n = self.receiver.lib.hpsdr_ft8_swap_read(
                             self.receiver._h, ri,
                             fi.ctypes.data_as(_ct.POINTER(_ct.c_float)),
                             fq.ctypes.data_as(_ct.POINTER(_ct.c_float)),
-                            n60, skip)
-                        log.info("FT8 %s rx%d: aligned read n=%d (need %d)",
-                                 bn, ri, n, n60)
+                            buf_cap, _ct.byref(t_first))
+                        log.info("FT8 %s rx%d: swap n=%d (%.2f s) t_first=%.3f",
+                                 bn, ri, n, n / 192000.0, t_first.value)
                         if n < n60:
+                            log.info("FT8 %s rx%d: short snapshot, skip", bn, ri)
                             continue
+                        # Use the LAST 60 sec of the snapshot — minute-aligned
+                        # because the prior swap fired at the previous minute
+                        # boundary (also at sec≈0).
+                        fi_60 = fi[n - n60:n].copy()
+                        fq_60 = fq[n - n60:n].copy()
                         ft8_jobs.append((bn, ri, ck, ft8_khz,
-                                         fi.copy(), fq.copy(), n))
+                                         fi_60, fq_60, n60))
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
                             import subprocess, wave

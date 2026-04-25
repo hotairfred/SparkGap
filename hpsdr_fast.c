@@ -42,6 +42,15 @@ typedef struct {
     volatile int read_pos;
 } RxRing;
 
+/* FT8 capture buffer — used in pairs for double-buffering */
+#define FT8_BUF_CAP (192000 * 65)
+typedef struct {
+    float *i;
+    float *q;
+    int n;             /* valid samples in buffer */
+    double t_first;    /* time of first sample (sec since epoch) */
+} Ft8Buf;
+
 typedef struct {
     int sock;
     int n_receivers;
@@ -63,18 +72,21 @@ typedef struct {
 
     uint8_t rx_enabled[MAX_RX]; /* only store samples for enabled receivers */
 
-    /* FT8 raw IQ ring — stores full 192 kHz IQ for Python extraction.
-     * Only enable on bands with FT8 activity (2-3 max).
-     * 65 seconds × 192 kHz × sizeof(float) × 2 = 100 MB per band. */
-    #define FT8_RAW_SIZE (192000 * 65)
+    /* FT8 capture — double-buffered. recv_thread writes samples linearly
+     * to bufs[active] under per-RX mutex (held briefly per parse_frame call).
+     * Python at minute boundary calls hpsdr_ft8_swap_read which atomically
+     * swaps the active index, then memcpys the now-frozen snapshot. After
+     * swap, only Python touches the snapshot — no data races, no memory
+     * ordering subtleties. Replaces the previous ring buffer that produced
+     * subtly corrupted data despite memory barriers. */
     struct {
-        float *i;       /* heap allocated — too large for struct */
-        float *q;
-        volatile int write_pos;
         int enabled;
         double freq_hz;
         double center_hz;
-    } ft8_raw[MAX_RX];
+        Ft8Buf bufs[2];
+        int active;        /* recv_thread writes to bufs[active] */
+        pthread_mutex_t mu;
+    } ft8_cap[MAX_RX];
 
     /* Per-receiver scanner handles for worker thread */
     void *scanners[MAX_RX];         /* ItilaSc* per enabled receiver */
@@ -176,6 +188,16 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
     int group_size = n_rx * 6 + 2;
     int n_groups = IQ_DATA_SIZE / group_size;
 
+    /* Acquire FT8 capture mutex once per RX for the entire frame. Cheap
+     * (uncontended), and ensures Python's swap sees a coherent snapshot. */
+    int ft8_locked[MAX_RX] = {0};
+    for (int rx = 0; rx < n_rx; rx++) {
+        if (h->ft8_cap[rx].enabled) {
+            pthread_mutex_lock(&h->ft8_cap[rx].mu);
+            ft8_locked[rx] = 1;
+        }
+    }
+
     for (int g = 0; g < n_groups; g++) {
         const uint8_t *gp = iq_data + g * group_size;
         for (int rx = 0; rx < n_rx; rx++) {
@@ -191,17 +213,20 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
             double fi =  (double)iv / 8388608.0;
             double fq = -(double)qv / 8388608.0;  /* negate Q (Pitaya convention) */
 
-            /* FT8 ring write FIRST — must never drop samples (FSK breaks otherwise) */
-            if (h->ft8_raw[rx].enabled && h->ft8_raw[rx].i) {
-                int fwp = h->ft8_raw[rx].write_pos;
-                int idx = fwp % FT8_RAW_SIZE;
-                h->ft8_raw[rx].i[idx] = (float)iv;
-                h->ft8_raw[rx].q[idx] = -(float)qv;
-                /* Memory barrier: ensure i/q stores are visible BEFORE write_pos
-                 * is incremented. Otherwise the reader might see the new write_pos
-                 * but read stale i/q values. */
-                __atomic_thread_fence(__ATOMIC_RELEASE);
-                h->ft8_raw[rx].write_pos = fwp + 1;
+            /* FT8 capture: linear append to active buffer (no race —
+             * Python swaps the active index before reading the snapshot). */
+            if (ft8_locked[rx]) {
+                Ft8Buf *b = &h->ft8_cap[rx].bufs[h->ft8_cap[rx].active];
+                if (b->n < FT8_BUF_CAP) {
+                    if (b->n == 0) {
+                        struct timespec ts;
+                        clock_gettime(CLOCK_REALTIME, &ts);
+                        b->t_first = ts.tv_sec + ts.tv_nsec / 1e9;
+                    }
+                    b->i[b->n] = (float)iv;
+                    b->q[b->n] = -(float)qv;
+                    b->n++;
+                }
             }
 
             RxRing *r = &h->rx[rx];
@@ -214,6 +239,10 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
             r->q[wp] = fq;
             r->write_pos = (wp + 1) % RING_SIZE;
         }
+    }
+
+    for (int rx = 0; rx < n_rx; rx++) {
+        if (ft8_locked[rx]) pthread_mutex_unlock(&h->ft8_cap[rx].mu);
     }
 }
 
@@ -557,6 +586,15 @@ void hpsdr_destroy(HpsdrFast *h) {
     if (h->running) hpsdr_stop(h);
     close(h->sock);
     pthread_mutex_destroy(&h->lock);
+    for (int i = 0; i < MAX_RX; i++) {
+        if (h->ft8_cap[i].bufs[0].i) {
+            free(h->ft8_cap[i].bufs[0].i);
+            free(h->ft8_cap[i].bufs[0].q);
+            free(h->ft8_cap[i].bufs[1].i);
+            free(h->ft8_cap[i].bufs[1].q);
+            pthread_mutex_destroy(&h->ft8_cap[i].mu);
+        }
+    }
     free(h);
 }
 
@@ -696,53 +734,59 @@ int hpsdr_available(HpsdrFast *h, int rx_index) {
     return ring_avail(&h->rx[rx_index]);
 }
 
-/* FT8 IQ accumulator access */
+/* Enable FT8 capture on this receiver. Allocates two 65-second IQ
+ * buffers (~100 MB total per RX) for double-buffering. Idempotent;
+ * safe to call again to reset. */
 void hpsdr_enable_ft8(HpsdrFast *h, int rx, double ft8_freq, double center_freq) {
     if (rx < 0 || rx >= MAX_RX) return;
-    if (!h->ft8_raw[rx].i) {
-        h->ft8_raw[rx].i = (float *)calloc(FT8_RAW_SIZE, sizeof(float));
-        h->ft8_raw[rx].q = (float *)calloc(FT8_RAW_SIZE, sizeof(float));
-        if (!h->ft8_raw[rx].i || !h->ft8_raw[rx].q) return;
+    if (!h->ft8_cap[rx].bufs[0].i) {
+        h->ft8_cap[rx].bufs[0].i = (float *)calloc(FT8_BUF_CAP, sizeof(float));
+        h->ft8_cap[rx].bufs[0].q = (float *)calloc(FT8_BUF_CAP, sizeof(float));
+        h->ft8_cap[rx].bufs[1].i = (float *)calloc(FT8_BUF_CAP, sizeof(float));
+        h->ft8_cap[rx].bufs[1].q = (float *)calloc(FT8_BUF_CAP, sizeof(float));
+        if (!h->ft8_cap[rx].bufs[0].i || !h->ft8_cap[rx].bufs[0].q ||
+            !h->ft8_cap[rx].bufs[1].i || !h->ft8_cap[rx].bufs[1].q) return;
+        pthread_mutex_init(&h->ft8_cap[rx].mu, NULL);
     }
-    h->ft8_raw[rx].enabled = 1;
-    h->ft8_raw[rx].freq_hz = ft8_freq;
-    h->ft8_raw[rx].center_hz = center_freq;
-    h->ft8_raw[rx].write_pos = 0;
+    pthread_mutex_lock(&h->ft8_cap[rx].mu);
+    h->ft8_cap[rx].freq_hz = ft8_freq;
+    h->ft8_cap[rx].center_hz = center_freq;
+    h->ft8_cap[rx].active = 0;
+    h->ft8_cap[rx].bufs[0].n = 0;
+    h->ft8_cap[rx].bufs[0].t_first = 0;
+    h->ft8_cap[rx].bufs[1].n = 0;
+    h->ft8_cap[rx].bufs[1].t_first = 0;
+    h->ft8_cap[rx].enabled = 1;
+    pthread_mutex_unlock(&h->ft8_cap[rx].mu);
 }
 
-int hpsdr_read_ft8(HpsdrFast *h, int rx, float *i_out, float *q_out, int max_n) {
-    if (rx < 0 || rx >= MAX_RX || !h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) return 0;
-    int wp = h->ft8_raw[rx].write_pos;
-    /* Circular read: always read from the buffer using modulo */
-    int avail = wp;
-    if (avail > FT8_RAW_SIZE) avail = FT8_RAW_SIZE;  /* can't read more than buffer */
-    int n = avail < max_n ? avail : max_n;
-    int start = wp - n;
-    for (int k = 0; k < n; k++) {
-        int idx = (start + k) % FT8_RAW_SIZE;
-        if (idx < 0) idx += FT8_RAW_SIZE;
-        i_out[k] = h->ft8_raw[rx].i[idx];
-        q_out[k] = h->ft8_raw[rx].q[idx];
-    }
-    return n;
-}
+/* Atomically swap the active buffer and copy the now-frozen snapshot.
+ * After the swap completes, recv_thread writes to the new active buffer
+ * and Python owns the snapshot exclusively (no concurrent writers).
+ * Returns number of samples copied. *t_first_out (if non-NULL) gets the
+ * wall-clock time of the first sample. */
+int hpsdr_ft8_swap_read(HpsdrFast *h, int rx,
+                         float *i_out, float *q_out, int max_n,
+                         double *t_first_out) {
+    if (rx < 0 || rx >= MAX_RX || !h->ft8_cap[rx].enabled) return 0;
+    if (!h->ft8_cap[rx].bufs[0].i) return 0;
 
-/* Read n samples ending at (write_pos - skip_from_end). Used to align
- * FT8 reads to minute boundaries. */
-int hpsdr_read_ft8_aligned(HpsdrFast *h, int rx, float *i_out, float *q_out,
-                            int n, int skip_from_end) {
-    if (rx < 0 || rx >= MAX_RX || !h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) return 0;
-    int wp = h->ft8_raw[rx].write_pos;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    int end = wp - skip_from_end;
-    int start = end - n;
-    if (start < 0 || end > wp || (wp - start) > FT8_RAW_SIZE) return 0;
-    for (int k = 0; k < n; k++) {
-        int idx = (start + k) % FT8_RAW_SIZE;
-        if (idx < 0) idx += FT8_RAW_SIZE;
-        i_out[k] = h->ft8_raw[rx].i[idx];
-        q_out[k] = h->ft8_raw[rx].q[idx];
+    pthread_mutex_lock(&h->ft8_cap[rx].mu);
+    int prev_active = h->ft8_cap[rx].active;
+    int new_active = 1 - prev_active;
+    h->ft8_cap[rx].bufs[new_active].n = 0;
+    h->ft8_cap[rx].bufs[new_active].t_first = 0;
+    h->ft8_cap[rx].active = new_active;
+    pthread_mutex_unlock(&h->ft8_cap[rx].mu);
+
+    /* bufs[prev_active] is now frozen — recv_thread writes to bufs[new_active] */
+    Ft8Buf *b = &h->ft8_cap[rx].bufs[prev_active];
+    int n = b->n < max_n ? b->n : max_n;
+    if (n > 0) {
+        memcpy(i_out, b->i, n * sizeof(float));
+        memcpy(q_out, b->q, n * sizeof(float));
     }
+    if (t_first_out) *t_first_out = b->t_first;
     return n;
 }
 
