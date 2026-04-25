@@ -5075,6 +5075,7 @@ class OpenSkimmer:
                             from numpy.fft import fft, ifft
                             ft8_bin = '/home/sparkgap/decode_ft8'
                             total = 0
+                            seen_msgs = set()  # dedupe across sliding windows
                             for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
                                 iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                 offset_hz = (ft8_khz - ck) * 1000
@@ -5082,10 +5083,13 @@ class OpenSkimmer:
                                 mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
                                 # 192k → 12k complex via polyphase
                                 dec12 = resample_poly(mixed, 1, 16)
-                                # Process each 15s sub-period
                                 slot_n = 15 * 12000
-                                for part in range(4):
-                                    chunk = dec12[part*slot_n:(part+1)*slot_n]
+                                # SLIDING window — slot start every 1 second.
+                                # Fixed sub-periods miss decodes due to FT8 transmission
+                                # offset (~0.5s past minute boundary) — we sweep 0–45s
+                                # in 1s steps to align with whatever the actual TX boundary is.
+                                for start in range(0, len(dec12) - slot_n + 1, 12000):
+                                    chunk = dec12[start:start+slot_n]
                                     if len(chunk) < slot_n:
                                         continue
                                     # USB demodulation: zero negative freqs, take real
@@ -5096,6 +5100,7 @@ class OpenSkimmer:
                                     if peak > 0:
                                         audio = audio / peak * 0.9
                                     i16 = (audio * 32767).astype(np.int16)
+                                    part = start // 12000  # used in WAV filename
                                     wav_fn = f'/tmp/ft8_{bn}_p{part}.wav'
                                     with wave.open(wav_fn, 'wb') as wf:
                                         wf.setnchannels(1); wf.setsampwidth(2)
@@ -5143,6 +5148,12 @@ class OpenSkimmer:
                                         if not ft8_call or not re.match(
                                                 r'^[A-Z0-9/]{3,11}$', ft8_call):
                                             continue
+                                        # Dedupe: same band + msg = duplicate from
+                                        # sliding window catching same TX twice
+                                        dedup_key = (bn, msg)
+                                        if dedup_key in seen_msgs:
+                                            continue
+                                        seen_msgs.add(dedup_key)
                                         log.info("FT8 %s p%d: %s", bn, part, line)
                                         total += 1
                                         skimmer.spot_count += 1
