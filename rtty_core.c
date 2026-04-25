@@ -189,11 +189,23 @@ const char *rtty_feed(rtty_handle_t h, const double *audio, int n,
         /* Bit clock: count samples, detect transitions */
         st->bit_counter++;
 
+        /* Resync on every zero-crossing of the data signal — the old
+         * slow envelope LPF lagged transitions by ~132 samples, which
+         * the previous "only if past 50% of bit period" guard was tuned
+         * for. The new fast LPF detects transitions promptly (~12 samples
+         * after actual boundary), so the old guard rejected ALL real
+         * transitions. Soft pull toward 0 (1/4 weight) so a single
+         * noise-induced zero-crossing doesn't fully derail the clock. */
         if ((st->prev_data >= 0 && st->data_lpf < 0) ||
             (st->prev_data < 0 && st->data_lpf >= 0)) {
-            /* Only resync if we're past 50% of a bit period (avoid mid-bit glitches) */
-            if (st->bit_counter > st->samples_per_bit / 2)
-                st->bit_counter = 0;
+            int spb = st->samples_per_bit;
+            int bc = st->bit_counter;
+            /* Treat counter as a phase: wrap large values to negative offsets
+             * so we can pull toward the nearest bit boundary in either dir. */
+            int phase = bc;
+            if (phase > spb / 2) phase -= spb;
+            /* Soft resync: pull 25% of the way toward boundary (phase=0) */
+            st->bit_counter = (bc - phase / 4 + spb) % spb;
         }
         st->prev_data = st->data_lpf;
 
