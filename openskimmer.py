@@ -4569,26 +4569,29 @@ class SpotTracker:
             if call in self.blacklist:
                 continue
 
-            _slash_base = None
+            # Strip slash suffix and spot the BASE call only (RBN convention).
+            # Live SDC comparison 2026-04-25: SDC's spots have ZERO slashes;
+            # they all strip to base. RBN aggregator filters slash spots
+            # against MASTER.SCP (base-only) so they're dropped upstream
+            # anyway — emitting them is wasted work plus it inflates our
+            # FP count with garbled suffixes (N8KH/B, K8MR/HPT, W4DXM/IDR
+            # etc., all from decoder bit errors after the base call).
+            #
+            # Either side of the slash that's a base call in SCP wins.
+            # If BOTH sides are SCP base calls (e.g. W4/N1ABC = N1ABC
+            # operating from W4 area), prefer the longer one (the actual
+            # operator's call, not the regional prefix).
             if '/' in call:
                 _parts = call.split('/', 1)
+                _candidates = []
                 if _is_base_call(_parts[0]) and _parts[0] in self.valid_calls:
-                    _slash_base = _parts[0]
-                elif _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
-                    _slash_base = _parts[1]
-            # SCP bypass was disabled 2026-04-21. Originally added because
-            # ITILA's noisy raw text produced garbled callsigns that needed
-            # ev_thresh as the only quality gate. After GMM WPM estimation +
-            # fuzzy extraction + recursive token splitting, extraction quality
-            # improved enough that SCP validation catches ~84 false spots per
-            # 15-min eval without losing real calls. If a future decoder change
-            # degrades extraction quality, re-enable bypass by uncommenting:
-            # _itila_bypass = False
-            # Fuzzy SCP reverted 2026-04-22: corrected correct calls into wrong
-            # ones (NY3J→NY3B). Using scp_bypass_threshold instead — requires
-            # N consistent decodes of the same non-SCP call before spotting.
-            _itila_bypass = False
-            if call in self.valid_calls or _slash_base is not None or _itila_bypass:
+                    _candidates.append(_parts[0])
+                if _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
+                    _candidates.append(_parts[1])
+                if _candidates:
+                    call = max(_candidates, key=len)
+                # else: leave call as-is, will fail SCP check below
+            if call in self.valid_calls:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
                 if dec_type in ('primary', 'itila'):
