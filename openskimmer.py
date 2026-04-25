@@ -1420,6 +1420,29 @@ def _get_rtty_lib():
     return _rtty_lib if _rtty_lib else None
 
 
+def _rtty_calls_match(a, b):
+    """Two RTTY-decoded callsigns are likely the same station if either
+    is a substring of the other (catches truncations like KD7N ⊂ KD7ND
+    and prefix garbage like K0MK ⊂ ITK0MK), OR they differ by at most
+    one edit (catches single-bit-error substitutions like KD7ND ↔ KD7NB).
+    Used by RTTY confirmation to collapse decoder bit-error variants."""
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) <= 1
+    # len(b) == len(a) + 1: try removing each char from b
+    for i in range(len(b)):
+        if a == b[:i] + b[i+1:]:
+            return True
+    return False
+
+
 # RTTY contest sub-bands per band, as offset (Hz) from band center.
 # Centers in our config are 3590/7090/14090/21090/28090 kHz.
 RTTY_RANGES = {
@@ -1560,16 +1583,37 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
             # Suppress re-emit for 10 min after spotting. Decoder bit errors
             # produce different garbled spellings each cycle — real stations
             # repeat themselves on the same freq.
+            #
+            # Fuzzy matching: a new call merges with an existing pending
+            # entry in the same freq bucket if they're substring-related
+            # or within edit-distance 1 (KD7ND/KD7NB/KD7N/KD7NDR all
+            # collapse to whichever was seen first). Catches the
+            # "ITK0MK / K0MK" smushed-call false positive too.
             now = time.time()
             if not hasattr(skimmer, '_rtty_pending'):
                 skimmer._rtty_pending = {}   # key -> [timestamps]
                 skimmer._rtty_emitted = {}   # key -> last_emit_ts
             freq_bucket = round(rf_hz / 200.0) * 200.0
-            key = (call, freq_bucket)
+
+            # Look for an existing variant of this call in the same bucket
+            canonical = call
+            for (existing_call, existing_bucket) in list(skimmer._rtty_pending.keys()):
+                if existing_bucket == freq_bucket and \
+                        _rtty_calls_match(call, existing_call):
+                    canonical = existing_call
+                    break
+            # Also check emitted (recently spotted) — same-bucket variant
+            # debounce should suppress this even under a different spelling
+            for (existing_call, existing_bucket) in list(skimmer._rtty_emitted.keys()):
+                if existing_bucket == freq_bucket and \
+                        _rtty_calls_match(call, existing_call):
+                    canonical = existing_call
+                    break
+            key = (canonical, freq_bucket)
 
             last_emit = skimmer._rtty_emitted.get(key, 0)
             if now - last_emit < 600:
-                continue  # debounce: already spotted recently
+                continue  # debounce: already spotted recently (any variant)
 
             sightings = [t for t in skimmer._rtty_pending.get(key, [])
                          if now - t < 300]
