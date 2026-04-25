@@ -2160,20 +2160,28 @@ class _ItilaScanner:
                     self._sc._lib.itila_sc_mark_evidence(
                         self._sc._h, _ct.c_double(f_hz))
 
-            # Path 2: context extraction — if CQ was seen on this bin recently,
-            # extract callsigns from accumulated buffer (not just this window).
-            # This catches stations in QSO after calling CQ in a previous window.
+            # Path 2: context extraction — if CQ was seen on this bin
+            # recently, re-extract the RUNNER from the accumulated buffer.
+            # Originally this used _itila_extract_all_calls to ALSO capture
+            # QSO partners (commit c042491, "74% → 91% recall vs CW Skimmer")
+            # — that matched CW Skimmer's GUI behavior of showing every
+            # callsign heard. But for RBN runner-only spotting (which is
+            # our actual product, see /mnt/atlas/skimmer/docs/skimserv_comparison.md),
+            # callers in pile-ups are noise — they're not running the freq.
+            # Live UK/EI 14011.1 produced 6 spots (K1LZ + 5 callers calling
+            # K1LZ), where SDC reported only K1LZ. Switched to runner-only
+            # extraction on the accumulated buffer (the CQ token persists,
+            # so the same _itila_extract_cq_call function works across windows).
             elif now - st['last_cq_time'] < 120.0:
-                calls_in_raw = _itila_extract_all_calls(st['text_buf'])
-                for c in calls_in_raw:
-                    if c not in st['spotted']:
-                        st['spotted'].add(c)
-                        st['pending'].append(f'CQ {c} ')
-                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, raw: %s)",
-                                 f_khz, c, wpm, int(now - st['last_cq_time']), raw[:60])
-                        if self._sc:
-                            self._sc._lib.itila_sc_mark_evidence(
-                                self._sc._h, _ct.c_double(f_hz))
+                call = _itila_extract_cq_call(st['text_buf'])
+                if call and call not in st['spotted']:
+                    st['spotted'].add(call)
+                    st['pending'].append(f'CQ {call} ')
+                    log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
+                             f_khz, call, wpm, int(now - st['last_cq_time']))
+                    if self._sc:
+                        self._sc._lib.itila_sc_mark_evidence(
+                            self._sc._h, _ct.c_double(f_hz))
 
     def _process_ready_c(self):
         """C decode loop — all bin iteration + decode happens in C."""
@@ -2227,18 +2235,17 @@ class _ItilaScanner:
                 if self._sc:
                     self._sc._lib.itila_sc_mark_evidence(
                         self._sc._h, _ct.c_double(f_hz))
-            # Path 2: context extraction
+            # Path 2: context extraction — runner-only (see Python path above)
             elif now - st['last_cq_time'] < 120.0:
-                calls_in_raw = _itila_extract_all_calls(st['text_buf'])
-                for c in calls_in_raw:
-                    if c not in st['spotted']:
-                        st['spotted'].add(c)
-                        st['pending'].append(f'CQ {c} ')
-                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, raw: %s)",
-                                 f_khz, c, wpm, int(now - st['last_cq_time']), raw[:60])
-                        if self._sc:
-                            self._sc._lib.itila_sc_mark_evidence(
-                                self._sc._h, _ct.c_double(f_hz))
+                call = _itila_extract_cq_call(st['text_buf'])
+                if call and call not in st['spotted']:
+                    st['spotted'].add(call)
+                    st['pending'].append(f'CQ {call} ')
+                    log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
+                             f_khz, call, wpm, int(now - st['last_cq_time']))
+                    if self._sc:
+                        self._sc._lib.itila_sc_mark_evidence(
+                            self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm)."""
@@ -5115,13 +5122,13 @@ class OpenSkimmer:
                         log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)",
                                  f_khz, call, wpm, raw[:60])
                     elif now - st['last_cq_time'] < 120.0:
-                        calls_in_raw = _itila_extract_all_calls(st['text_buf'])
-                        for c in calls_in_raw:
-                            if c not in st['spotted']:
-                                st['spotted'].add(c)
-                                st['pending'].append(f'CQ {c} ')
-                                log.info("ITILA context %.1f kHz: %s %d WPM",
-                                         f_khz, c, wpm)
+                        # runner-only context extraction (see _process_ready)
+                        call = _itila_extract_cq_call(st['text_buf'])
+                        if call and call not in st['spotted']:
+                            st['spotted'].add(call)
+                            st['pending'].append(f'CQ {call} ')
+                            log.info("ITILA context %.1f kHz: %s %d WPM",
+                                     f_khz, call, wpm)
                 else:
                     # Python receiver path: drain from callback buffers
                     with self._iq_lock:
