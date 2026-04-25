@@ -5070,63 +5070,88 @@ class OpenSkimmer:
                                          fi.copy(), fq.copy(), n))
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
-                            import subprocess
+                            import subprocess, wave
                             from scipy.signal import resample_poly
-                            ft8d_path = '/home/sparkgap/ft8d/ft8d'
+                            from numpy.fft import fft, ifft
+                            ft8_bin = '/home/sparkgap/decode_ft8'
                             total = 0
                             for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
                                 iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                 offset_hz = (ft8_khz - ck) * 1000
                                 t = np.arange(n) / 192000
                                 mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
-                                # Polyphase decimate 48:1 (192k → 4k) — cleaner than
-                                # firwin+lfilter, uses Kaiser-window FIR
-                                dec = resample_poly(mixed, 1, 48)[:240000]
-                                if len(dec) < 240000:
-                                    dec = np.concatenate(
-                                        [dec, np.zeros(240000 - len(dec), dtype=complex)])
-                                fname = f'/tmp/ft8_live_rx{ri}.c2'
-                                c2 = np.zeros(len(dec)*2, dtype=np.float32)
-                                c2[0::2] = dec.real.astype(np.float32)
-                                c2[1::2] = dec.imag.astype(np.float32)
-                                with open(fname, 'wb') as f:
-                                    f.write(struct.pack('<d', ft8_khz * 1000.0))
-                                    f.write(c2.tobytes())
-                                try:
-                                    result = subprocess.run(
-                                        [ft8d_path, fname],
-                                        capture_output=True, text=True, timeout=30)
-                                    for line in (result.stdout or '').strip().split('\n'):
+                                # 192k → 12k complex via polyphase
+                                dec12 = resample_poly(mixed, 1, 16)
+                                # Process each 15s sub-period
+                                slot_n = 15 * 12000
+                                for part in range(4):
+                                    chunk = dec12[part*slot_n:(part+1)*slot_n]
+                                    if len(chunk) < slot_n:
+                                        continue
+                                    # USB demodulation: zero negative freqs, take real
+                                    spec = fft(chunk)
+                                    spec[len(spec)//2:] = 0
+                                    audio = ifft(spec).real * 2
+                                    peak = np.max(np.abs(audio))
+                                    if peak > 0:
+                                        audio = audio / peak * 0.9
+                                    i16 = (audio * 32767).astype(np.int16)
+                                    wav_fn = f'/tmp/ft8_{bn}_p{part}.wav'
+                                    with wave.open(wav_fn, 'wb') as wf:
+                                        wf.setnchannels(1); wf.setsampwidth(2)
+                                        wf.setframerate(12000)
+                                        wf.writeframes(i16.tobytes())
+                                    try:
+                                        r = subprocess.run([ft8_bin, wav_fn],
+                                            capture_output=True, text=True, timeout=20)
+                                    except Exception as e:
+                                        log.debug("decode_ft8 err %s p%d: %s", bn, part, e)
+                                        continue
+                                    for line in (r.stdout or '').strip().split('\n'):
                                         line = line.strip()
                                         if not line:
                                             continue
-                                        log.info("FT8 %s: %s", bn, line)
-                                        parts = line.split()
-                                        if len(parts) >= 7:
-                                            try:
-                                                ft8_snr = int(parts[3])
-                                                ft8_freq_hz = int(parts[5])
-                                                ft8_call = parts[6].strip()
-                                                ft8_grid = parts[7].strip() if len(parts) > 7 else ''
-                                                ft8_freq_khz = ft8_freq_hz / 1000.0
-                                                if re.match(r'^[A-Z]{1,2}[0-9]{1,4}[A-Z]{1,6}$',
-                                                            ft8_call):
-                                                    total += 1
-                                                    skimmer.spot_count += 1
-                                                    skimmer.telnet.broadcast_spot(
-                                                        freq_khz=ft8_freq_khz,
-                                                        dx_call=ft8_call,
-                                                        snr=ft8_snr,
-                                                        mode='FT8',
-                                                    )
-                                                    log.info("*** SPOT: %10.1f  %-12s  "
-                                                             "%d dB  FT8  [%s] ***",
-                                                             ft8_freq_khz, ft8_call,
-                                                             ft8_snr, ft8_grid)
-                                            except (ValueError, IndexError):
-                                                pass
-                                except Exception as e:
-                                    log.debug("ft8d error on %s: %s", bn, e)
+                                        # Format: "000000 +05.0 +1.12 1803 ~  CQ N4DWD EM86"
+                                        parts_o = line.split(maxsplit=5)
+                                        if len(parts_o) < 6:
+                                            continue
+                                        try:
+                                            snr = int(float(parts_o[1]))
+                                            audio_hz = int(parts_o[3])
+                                            msg = parts_o[5]
+                                        except (ValueError, IndexError):
+                                            continue
+                                        # RF freq = dial + audio offset
+                                        rf_khz = ft8_khz + audio_hz / 1000.0
+                                        # Extract caller from message
+                                        # CQ X Y → X is calling
+                                        # X Y Z → Y is responding to X (spot Y)
+                                        # X Y RR73/grid → spot Y
+                                        msg_parts = msg.split()
+                                        ft8_call = None
+                                        if msg_parts and msg_parts[0] == 'CQ':
+                                            # CQ [DX] CALL GRID — call is at index 1 or 2
+                                            if len(msg_parts) >= 2 and re.match(
+                                                    r'^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}$',
+                                                    msg_parts[1]):
+                                                ft8_call = msg_parts[1]
+                                            elif len(msg_parts) >= 3:
+                                                ft8_call = msg_parts[2]
+                                        elif len(msg_parts) >= 2:
+                                            # Standard QSO: X Y ... — Y is the spotted station
+                                            ft8_call = msg_parts[1]
+                                        if not ft8_call or not re.match(
+                                                r'^[A-Z0-9/]{3,11}$', ft8_call):
+                                            continue
+                                        log.info("FT8 %s p%d: %s", bn, part, line)
+                                        total += 1
+                                        skimmer.spot_count += 1
+                                        skimmer.telnet.broadcast_spot(
+                                            freq_khz=rf_khz, dx_call=ft8_call,
+                                            snr=snr, mode='FT8',
+                                            comment=msg)
+                                        log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
+                                                 rf_khz, ft8_call, snr, msg)
                             log.info("FT8 cycle done: %d spots across %d bands",
                                      total, len(jobs))
                             skimmer._ft8_running = False
