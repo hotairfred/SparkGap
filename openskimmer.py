@@ -1546,12 +1546,42 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
         log.info("RTTY %s @ %.1f kHz (%.0f dB): %s",
                  bn, rf_hz / 1000.0, snr_db, text[:80])
 
-        for call in re.findall(r'\b[A-Z0-9]{1,3}[0-9][A-Z]{1,4}\b', text):
+        # Letter-first prefix: kills "33W"-style garbage from bit errors,
+        # keeps 1x1 special event calls (K0M, K1Y, W2B). Allows 3-8 chars.
+        for call in re.findall(r'\b[A-Z][A-Z0-9]{0,2}[0-9][A-Z]{1,4}\b', text):
             if not (3 <= len(call) <= 7):
                 continue
             if call in seen_calls:
                 continue
             seen_calls.add(call)
+
+            # Multi-cycle confirmation: only spot when same call decoded
+            # ≥2 times within 5 min at the same freq (200 Hz bucket).
+            # Suppress re-emit for 10 min after spotting. Decoder bit errors
+            # produce different garbled spellings each cycle — real stations
+            # repeat themselves on the same freq.
+            now = time.time()
+            if not hasattr(skimmer, '_rtty_pending'):
+                skimmer._rtty_pending = {}   # key -> [timestamps]
+                skimmer._rtty_emitted = {}   # key -> last_emit_ts
+            freq_bucket = round(rf_hz / 200.0) * 200.0
+            key = (call, freq_bucket)
+
+            last_emit = skimmer._rtty_emitted.get(key, 0)
+            if now - last_emit < 600:
+                continue  # debounce: already spotted recently
+
+            sightings = [t for t in skimmer._rtty_pending.get(key, [])
+                         if now - t < 300]
+            sightings.append(now)
+            skimmer._rtty_pending[key] = sightings
+
+            if len(sightings) < 2:
+                log.info("RTTY pending: %s @ %.1f kHz (%d/2 sightings)",
+                         call, rf_hz / 1000.0, len(sightings))
+                continue
+
+            skimmer._rtty_emitted[key] = now
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
                      rf_hz / 1000.0, call, int(snr_db), text[:50])
             skimmer.telnet.broadcast_spot(
