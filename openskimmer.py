@@ -1396,6 +1396,176 @@ def _get_itila_lib():
     return _itila_lib if _itila_lib else None
 
 
+_rtty_lib = None
+
+def _get_rtty_lib():
+    global _rtty_lib
+    if _rtty_lib is None:
+        import ctypes as _ct
+        try:
+            _rtty_lib = _ct.CDLL('./librtty.so')
+            _rtty_lib.rtty_create.restype = _ct.c_void_p
+            _rtty_lib.rtty_create.argtypes = [_ct.c_int, _ct.c_double]
+            _rtty_lib.rtty_feed.restype  = _ct.c_char_p
+            _rtty_lib.rtty_feed.argtypes = [_ct.c_void_p,
+                                             _ct.POINTER(_ct.c_double),
+                                             _ct.c_int,
+                                             _ct.POINTER(_ct.c_double)]
+            _rtty_lib.rtty_free.restype  = None
+            _rtty_lib.rtty_free.argtypes = [_ct.c_void_p]
+            log.info("Loaded librtty.so")
+        except OSError:
+            log.warning("librtty.so not found — RTTY decoder unavailable")
+            _rtty_lib = False
+    return _rtty_lib if _rtty_lib else None
+
+
+# RTTY contest sub-bands per band, as offset (Hz) from band center.
+# Centers in our config are 3590/7090/14090/21090/28090 kHz.
+RTTY_RANGES = {
+    3590:  (-10000,  +10000),  # 80m: 3580-3600
+    7090:  (-55000,  -35000),  # 40m: 7035-7055 (RTTY contest portion)
+    14090: (-10000,  +10000),  # 20m: 14080-14100
+    21090: (-10000,  +10000),  # 15m: 21080-21100
+    28090: (-10000,  +10000),  # 10m: 28080-28100
+}
+
+
+def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
+    """Scan one band's IQ snapshot for RTTY signals; broadcast spots.
+
+    MVP piggyback on the FT8 minute snapshot. Detects pairs of spectral
+    peaks ~170 Hz apart (the RTTY shift) within the band's RTTY sub-range,
+    demodulates each candidate to USB audio at 12 kHz with the signal
+    centered at +1000 Hz, and feeds librtty's decoder. Returns spot count.
+    """
+    import ctypes as _ct
+    from scipy.signal import resample_poly, find_peaks
+    from numpy.fft import fft, ifft
+
+    rng = RTTY_RANGES.get(int(band_center_khz))
+    if rng is None:
+        return 0
+    rtty_lo, rtty_hi = rng
+
+    band_center_hz = band_center_khz * 1000.0
+    iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
+
+    # Peak detection: 2-second FFT → 0.5 Hz bins
+    fft_n = 2 * 192000
+    if len(iq) < fft_n:
+        return 0
+    spec = np.abs(fft(iq[:fft_n]))
+    freqs = np.fft.fftfreq(fft_n, 1.0 / 192000)
+    order = np.argsort(freqs)
+    freqs_s = freqs[order]
+    spec_s = spec[order]
+
+    sel = (freqs_s >= rtty_lo) & (freqs_s <= rtty_hi)
+    sub_freqs = freqs_s[sel]
+    sub_spec = spec_s[sel]
+    if len(sub_spec) < 200:
+        return 0
+
+    # Smooth (~5 Hz) and find peaks above 4× median
+    smoothed = np.convolve(sub_spec, np.ones(11) / 11, mode='same')
+    noise = float(np.median(smoothed))
+    if noise <= 0:
+        return 0
+    bin_hz = float(sub_freqs[1] - sub_freqs[0])
+    peaks_idx, _ = find_peaks(smoothed, height=noise * 4,
+                              distance=max(1, int(60 / bin_hz)))
+    if len(peaks_idx) < 2:
+        return 0
+
+    # Pair peaks ~170 Hz apart (within ±20 Hz)
+    candidates = []  # (rf_hz, snr_db)
+    seen_keys = set()
+    for ii, pi in enumerate(peaks_idx):
+        for pj in peaks_idx[ii + 1:]:
+            d = float(sub_freqs[pj] - sub_freqs[pi])
+            if d > 200:  # past the shift; subsequent js are further
+                break
+            if abs(d - 170.0) <= 20.0:
+                center_off = float(sub_freqs[pi] + sub_freqs[pj]) / 2.0
+                rf_hz = band_center_hz + center_off
+                key = int(round(rf_hz / 100)) * 100
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                amp = float(smoothed[pi] + smoothed[pj]) / 2.0
+                snr_db = 20.0 * np.log10(amp / noise)
+                candidates.append((rf_hz, snr_db))
+                break
+
+    n_peaks = len(peaks_idx)
+    if not candidates:
+        log.info("RTTY %s scan: %d peaks, 0 paired (noise=%.0f, range %d..%d Hz)",
+                 bn, n_peaks, noise, int(rtty_lo), int(rtty_hi))
+        return 0
+    candidates.sort(key=lambda x: -x[1])
+    candidates = candidates[:10]
+    log.info("RTTY %s scan: %d peaks → %d paired candidates (top SNR %.0f dB)",
+             bn, n_peaks, len(candidates), candidates[0][1])
+
+    # Decode each candidate
+    n_spots = 0
+    seen_calls = set()
+    audio_center = 1000.0
+    t = np.arange(n_samples) / 192000.0
+    for rf_hz, snr_db in candidates:
+        offset_hz = (rf_hz - band_center_hz) - audio_center
+        mixed = iq * np.exp(-1j * 2.0 * np.pi * offset_hz * t)
+        dec12 = resample_poly(mixed, 1, 16)
+        sp = fft(dec12)
+        sp[len(sp) // 2:] = 0
+        audio = ifft(sp).real * 2.0
+        peak = float(np.max(np.abs(audio)))
+        if peak <= 0:
+            continue
+        audio = (audio / peak * 0.7).astype(np.float64)
+
+        h = rtty_lib.rtty_create(_ct.c_int(12000), _ct.c_double(audio_center))
+        if not h:
+            continue
+        confidence = _ct.c_double(0.0)
+        try:
+            txt_ptr = rtty_lib.rtty_feed(
+                h,
+                audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                _ct.c_int(len(audio)),
+                _ct.byref(confidence))
+            text = txt_ptr.decode('latin-1', errors='replace') if txt_ptr else ''
+        finally:
+            rtty_lib.rtty_free(h)
+
+        text = text.strip()
+        if not text:
+            log.info("RTTY %s @ %.1f kHz (%.0f dB): no text", bn, rf_hz/1000.0, snr_db)
+            continue
+        log.info("RTTY %s @ %.1f kHz (%.0f dB): %s",
+                 bn, rf_hz / 1000.0, snr_db, text[:80])
+
+        for call in re.findall(r'\b[A-Z0-9]{1,3}[0-9][A-Z]{1,4}\b', text):
+            if not (3 <= len(call) <= 7):
+                continue
+            if call in seen_calls:
+                continue
+            seen_calls.add(call)
+            log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
+                     rf_hz / 1000.0, call, int(snr_db), text[:50])
+            skimmer.telnet.broadcast_spot(
+                freq_khz=rf_hz / 1000.0,
+                dx_call=call,
+                snr=int(snr_db),
+                mode='RTTY',
+                comment=text[:60])
+            skimmer.spot_count += 1
+            n_spots += 1
+
+    return n_spots
+
+
 class _ItilaDsp:
     """Python wrapper around libitila_dsp.so — scanner DSP core."""
 
@@ -5064,16 +5234,20 @@ class OpenSkimmer:
                             buf_cap, _ct.byref(t_first))
                         log.info("FT8 %s rx%d: swap n=%d (%.2f s) t_first=%.3f",
                                  bn, ri, n, n / 192000.0, t_first.value)
-                        if n < n60:
+                        # Allow up to 1 sec slack — swap-to-swap timing can
+                        # land the snapshot just under 60 sec depending on
+                        # where Python triggers within the second.
+                        if n < n60 - 192000:
                             log.info("FT8 %s rx%d: short snapshot, skip", bn, ri)
                             continue
-                        # Use the LAST 60 sec of the snapshot — minute-aligned
-                        # because the prior swap fired at the previous minute
-                        # boundary (also at sec≈0).
-                        fi_60 = fi[n - n60:n].copy()
-                        fq_60 = fq[n - n60:n].copy()
+                        # Take the last min(n, n60) samples — the active buffer
+                        # was reset by the prior swap so this is automatically
+                        # minute-aligned (within ~50 ms).
+                        take = min(n, n60)
+                        fi_60 = fi[n - take:n].copy()
+                        fq_60 = fq[n - take:n].copy()
                         ft8_jobs.append((bn, ri, ck, ft8_khz,
-                                         fi_60, fq_60, n60))
+                                         fi_60, fq_60, take))
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
                             import subprocess, wave
@@ -5171,6 +5345,19 @@ class OpenSkimmer:
                                                  rf_khz, ft8_call, snr, msg)
                             log.info("FT8 cycle done: %d spots across %d bands",
                                      total, len(jobs))
+                            # RTTY scan piggybacks on the same minute snapshot.
+                            # Run after FT8 so the FT8 spots flow first.
+                            rtty_lib = _get_rtty_lib()
+                            if rtty_lib is not None:
+                                rtty_total = 0
+                                for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
+                                    try:
+                                        rtty_total += _rtty_scan_band(
+                                            skimmer, rtty_lib, bn, ck, fi, fq, n)
+                                    except Exception as e:
+                                        log.warning("RTTY scan %s: %s", bn, e)
+                                log.info("RTTY cycle done: %d spots across %d bands",
+                                         rtty_total, len(jobs))
                             skimmer._ft8_running = False
                         import threading
                         threading.Thread(target=_ft8_decode,
