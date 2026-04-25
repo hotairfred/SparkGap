@@ -197,6 +197,10 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
                 int idx = fwp % FT8_RAW_SIZE;
                 h->ft8_raw[rx].i[idx] = (float)iv;
                 h->ft8_raw[rx].q[idx] = -(float)qv;
+                /* Memory barrier: ensure i/q stores are visible BEFORE write_pos
+                 * is incremented. Otherwise the reader might see the new write_pos
+                 * but read stale i/q values. */
+                __atomic_thread_fence(__ATOMIC_RELEASE);
                 h->ft8_raw[rx].write_pos = fwp + 1;
             }
 
@@ -218,63 +222,17 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
 
 static void *recv_thread(void *arg) {
     HpsdrFast *h = (HpsdrFast *)arg;
-    uint8_t bufs[BATCH_SIZE][2048];
-    struct iovec iovecs[BATCH_SIZE];
-    struct mmsghdr msgs[BATCH_SIZE];
-
-    memset(msgs, 0, sizeof(msgs));
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        iovecs[i].iov_base = bufs[i];
-        iovecs[i].iov_len = sizeof(bufs[i]);
-        msgs[i].msg_hdr.msg_iov = &iovecs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-    }
-
-    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 50000000 }; /* 50ms */
+    uint8_t buf[2048];
 
     while (h->running) {
-        int n_msgs = recvmmsg(h->sock, msgs, BATCH_SIZE, MSG_WAITFORONE, &timeout);
-        if (n_msgs <= 0) continue;
+        int len = recv(h->sock, buf, sizeof(buf), 0);
+        if (len < PKT_SIZE) continue;
+        if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
+            buf[2] != 0x01 || buf[3] != 0x06) continue;
 
-        for (int m = 0; m < n_msgs; m++) {
-            uint8_t *buf = bufs[m];
-            int len = msgs[m].msg_len;
-            if (len < PKT_SIZE) continue;
-            if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
-                buf[2] != 0x01 || buf[3] != 0x06) continue;
-
-            uint32_t seq = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
-                         | ((uint32_t)buf[6] << 8)  |  (uint32_t)buf[7];
-            if (h->seq_initialized) {
-                uint32_t expected = h->seq_rx + 1;
-                if (seq != expected) {
-                    /* Packet loss: each missing packet = 2 frames * 10 groups
-                     * = 20 samples per receiver. Pad with zeros to maintain
-                     * time alignment for FT8. */
-                    int32_t lost = (int32_t)(seq - expected);
-                    if (lost > 0 && lost < 1000) {
-                        h->pkt_lost += lost;
-                        for (int rx = 0; rx < h->n_receivers; rx++) {
-                            if (!h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) continue;
-                            int n_pad = lost * 20;
-                            for (int p = 0; p < n_pad; p++) {
-                                int fwp = h->ft8_raw[rx].write_pos;
-                                int idx = fwp % FT8_RAW_SIZE;
-                                h->ft8_raw[rx].i[idx] = 0.0f;
-                                h->ft8_raw[rx].q[idx] = 0.0f;
-                                h->ft8_raw[rx].write_pos = fwp + 1;
-                            }
-                        }
-                    }
-                }
-            } else {
-                h->seq_initialized = 1;
-            }
-            h->seq_rx = seq;
-            h->pkt_count++;
-            parse_frame(h, buf + 16, h->n_receivers);
-            parse_frame(h, buf + 528, h->n_receivers);
-        }
+        h->pkt_count++;
+        parse_frame(h, buf + 16, h->n_receivers);
+        parse_frame(h, buf + 528, h->n_receivers);
     }
     return NULL;
 }
@@ -775,6 +733,7 @@ int hpsdr_read_ft8_aligned(HpsdrFast *h, int rx, float *i_out, float *q_out,
                             int n, int skip_from_end) {
     if (rx < 0 || rx >= MAX_RX || !h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) return 0;
     int wp = h->ft8_raw[rx].write_pos;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     int end = wp - skip_from_end;
     int start = end - n;
     if (start < 0 || end > wp || (wp - start) > FT8_RAW_SIZE) return 0;
