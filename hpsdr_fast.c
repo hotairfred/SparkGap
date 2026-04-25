@@ -28,7 +28,17 @@
 #define MAX_RX        8
 typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
 
-#define RING_SIZE     (192000 * 4)   /* 4 seconds per receiver at 192 kHz */
+#define RING_SIZE     (192000 * 16)  /* 16 seconds per receiver at 192 kHz.
+                                      * Was 4 sec — measured 2.3% drops post
+                                      * per-RX worker fix (commit f3a5640).
+                                      * Bare-C vs live comparison showed
+                                      * structurally different bit error
+                                      * patterns (live = short fragments,
+                                      * bare-C = continuous text), consistent
+                                      * with periodic ring overflow during
+                                      * decode bursts. 16 sec absorbs deeper
+                                      * decode stalls. Memory: 16s × 192k ×
+                                      * 16 bytes × 8 RX = 384 MB max. */
 #define PKT_SIZE      1032
 #define FRAME_SIZE    512
 #define IQ_DATA_SIZE  504
