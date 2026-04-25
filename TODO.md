@@ -16,11 +16,15 @@
 - [x] Grid corrected to EM79
 
 ## In Progress
-- [x] **FT8 live integration WORKING** — 12 spots/cycle confirmed across
-      5 bands (DX from Panama HP2NG, Italy IK4LZH, plus US stations on
-      80m/40m/20m). Recipe: ft8_lib + USB demod (zero negative freqs) +
-      C-ring memory barriers + simple recv() loop (no recvmmsg, no
-      zero-padding). See memory/feedback_ft8_channelizer.md.
+- [~] **FT8 live integration PARTIALLY WORKING** — one cycle proved it
+      decodes (12 spots, 5 bands, DX: HP2NG Panama, IK4LZH Italy).
+      Most cycles get 0 because C ring buffer still has subtle data
+      corruption that bare C capture doesn't. Bare C → 40 decodes/60s
+      ONE band; openskimmer ring → 0/cycle most of the time.
+      Pipeline math + sliding-window decode are correct (verified on
+      bare C data). The bug is upstream in the C ring buffer — needs
+      replacement with double-buffer or callback model.
+      See memory/feedback_ft8_channelizer.md.
 - [ ] **RTTY decoder** — Phase 1 core works (CQ CONTEST DE K3LR decodes on synthetic). Bit clock drift after ~15 chars. Needs wiring into live pipeline. Design doc on Atlas.
 
 ## Future
