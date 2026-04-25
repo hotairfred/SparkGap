@@ -1576,7 +1576,13 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
             sightings.append(now)
             skimmer._rtty_pending[key] = sightings
 
-            if len(sightings) < 2:
+            # High-SNR shortcut: skip 2-cycle confirmation if signal is
+            # strong (≥25 dB). Real loud signals very rarely produce
+            # bit-error garbage that just happens to match a callsign
+            # regex; weak signals are where the false positives come from.
+            strong = snr_db >= 25.0
+
+            if not strong and len(sightings) < 2:
                 log.info("RTTY pending: %s @ %.1f kHz (%d/2 sightings)",
                          call, rf_hz / 1000.0, len(sightings))
                 continue
