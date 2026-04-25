@@ -4601,38 +4601,16 @@ class SpotTracker:
                         'method': 'unverified',
                     })
 
-        # 1b: sliding window on collapsed text — catches calls embedded in
-        # noise like "TUCY0S" where the regex word-boundary check misses them
-        collapsed_new = re.sub(r'[^A-Z0-9]', '', clean)
-        for wlen in range(4, 8):
-            for i in range(len(collapsed_new) - wlen + 1):
-                frag = collapsed_new[i:i+wlen]
-                if frag in seen_p1 or frag in FALSE_POSITIVES or frag in self.blacklist:
-                    continue
-                if frag not in self.valid_calls:
-                    continue
-                seen_p1.add(frag)
-                if dec_type == 'primary':
-                    self._cycle_calls[frag].add(freq_bin)
-                info = self._tracking[frag]
-                info['count'] += 1
-                info['freq'] = freq_khz
-                info['snr'] = max(info['snr'], snr)
-                self._record_sighting(frag, freq_bin, now)
-
-                min_s = self._min_sightings(frag, snr)
-                recent_count = self._count_recent_sightings(frag, freq_bin, now)
-                if recent_count >= min_s and \
-                   self._can_respot(frag, freq_khz, now):
-                    if len(self._cycle_calls[frag]) < 3:
-                        self._mark_spotted(frag, freq_khz, now)
-                        spots.append({
-                            'call': frag,
-                            'freq_khz': freq_khz,
-                            'snr': snr,
-                            'wpm': wpm,
-                            'method': 'exact_window',
-                        })
+        # Path 1b (sliding window on collapsed text) DISABLED 2026-04-25.
+        # It scanned every 4-7 char window across the no-spaces decoded text
+        # and snap-matched against the ~50K SCP entries. With that many calls
+        # in the database, random 4-5 char substrings inside noisy decoder
+        # output match valid SCP calls often enough to slip past the
+        # sightings gate. Live UK/EI DX 17:30 UTC: 14038.8 kHz produced
+        # 5 different SCP-valid spots (N0HJZ, N5KW, VE7ZO, W0PI, WF3T) from
+        # ONE real signal — Path 1b was the source. Path 1a (regex with
+        # word boundaries) catches real calls fine; the "embedded in noise"
+        # recall recovery isn't worth the precision cost.
 
         # --- Path 2: Fragment accumulation + fuzzy match ---
         # Secondary decoders (bmorse) skip fragment accumulation — their noise
