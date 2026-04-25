@@ -135,9 +135,21 @@ typedef struct {
     int  ft8_last_slot;         /* last 15-second slot we decoded */
     char ft8d_path[256];        /* path to ft8d binary */
 
-    /* Worker thread: drains ring buffers, feeds scanners, decodes */
-    pthread_t worker_thread;
+    /* Per-RX worker threads: each handles its own ring + scanner +
+     * decode for one receiver. Originally a single worker serialized
+     * all RXs, but ITILA's per-channel Bayesian decode could stall one
+     * RX long enough that the others' rings overflowed (measured 415M
+     * sample drops vs 8M packets received in 4 min, ~50% loss). Per-RX
+     * workers eliminate the cross-RX head-of-line blocking. */
+    pthread_t worker_threads[MAX_RX];
     int worker_running;
+    /* args for per-RX worker threads (must outlive the thread).
+     * `h` is void* to avoid a forward-decl tangle with the typedef;
+     * the worker casts it back to HpsdrFast*. */
+    struct {
+        void *h;
+        int rx;
+    } worker_arg[MAX_RX];
 
     /* stats */
     volatile uint64_t pkt_count;
@@ -554,13 +566,22 @@ void hpsdr_start_worker(HpsdrFast *h) {
     h->result_read = 0;
     h->result_count = 0;
     h->worker_running = 1;
-    pthread_create(&h->worker_thread, NULL, scanner_worker, h);
+    /* Spawn one worker per receiver. Each handles its own ring +
+     * scanner + decode independently — no cross-RX serialization. */
+    for (int rx = 0; rx < h->n_receivers; rx++) {
+        h->worker_arg[rx].h = h;
+        h->worker_arg[rx].rx = rx;
+        pthread_create(&h->worker_threads[rx], NULL,
+                       scanner_worker, &h->worker_arg[rx]);
+    }
 }
 
 void hpsdr_stop_worker(HpsdrFast *h) {
     if (!h->worker_running) return;
     h->worker_running = 0;
-    pthread_join(h->worker_thread, NULL);
+    for (int rx = 0; rx < h->n_receivers; rx++) {
+        pthread_join(h->worker_threads[rx], NULL);
+    }
 }
 
 void hpsdr_stop(HpsdrFast *h) {
@@ -613,19 +634,20 @@ int hpsdr_drain(HpsdrFast *h, int rx_index, double *i_out, double *q_out, int ma
     return n;
 }
 
-/* ---- worker thread: drain ring buffers → feed scanners → decode ---- */
+/* ---- worker thread: one per RX. Drains its own ring, feeds its
+ * own scanner, calls decode_ready. No cross-RX head-of-line blocking. */
 static void *scanner_worker(void *arg) {
-    HpsdrFast *h = (HpsdrFast *)arg;
+    struct { void *h; int rx; } *wa = arg;
+    HpsdrFast *h = (HpsdrFast *)wa->h;
+    int rx = wa->rx;
     #define WCHUNK 19200  /* 100ms at 192 kHz */
     double i_tmp[WCHUNK], q_tmp[WCHUNK];
-    uint8_t dec_buf[64 * RESULT_SIZE];  /* temp decode results */
+    uint8_t dec_buf[64 * RESULT_SIZE];
 
     while (h->worker_running) {
         int did_work = 0;
-        for (int rx = 0; rx < h->n_receivers; rx++) {
-            if (!h->rx_enabled[rx] || !h->scanners[rx] || !h->scanner_feed)
-                continue;
 
+        if (h->rx_enabled[rx] && h->scanners[rx] && h->scanner_feed) {
             /* Drain ring buffer → feed scanner */
             RxRing *r = &h->rx[rx];
             int avail = ring_avail(r);
@@ -639,16 +661,6 @@ static void *scanner_worker(void *arg) {
                 }
                 r->read_pos = rp;
                 h->scanner_feed(h->scanners[rx], i_tmp, q_tmp, n);
-                /* Feed FT8 with raw (unscaled) IQ from the same chunk */
-                {
-                    double ft8_tmp[WCHUNK];
-                    double ft8_q_tmp[WCHUNK];
-                    for (int s = 0; s < n; s++) {
-                        ft8_tmp[s] = i_tmp[s] / h->iq_scale;
-                        ft8_q_tmp[s] = q_tmp[s] / h->iq_scale;
-                    }
-                    /* ft8_feed disabled — needs debugging */
-                }
                 did_work = 1;
                 avail = ring_avail(r);
             }
@@ -673,8 +685,6 @@ static void *scanner_worker(void *arg) {
                 }
             }
         }
-        /* Check FT8 decode timing */
-        /* ft8_check_decode disabled */
 
         if (!did_work) usleep(5000); /* 5ms idle sleep */
     }
