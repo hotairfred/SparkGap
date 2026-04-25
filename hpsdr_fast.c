@@ -51,6 +51,9 @@ typedef struct {
     uint16_t sdr_port;
     uint16_t listen_port;
     uint32_t seq_tx;
+    uint32_t seq_rx;
+    int seq_initialized;
+    uint64_t pkt_lost;
     uint32_t frequencies[MAX_RX];
     int lna_gain;
 
@@ -188,6 +191,15 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
             double fi =  (double)iv / 8388608.0;
             double fq = -(double)qv / 8388608.0;  /* negate Q (Pitaya convention) */
 
+            /* FT8 ring write FIRST — must never drop samples (FSK breaks otherwise) */
+            if (h->ft8_raw[rx].enabled && h->ft8_raw[rx].i) {
+                int fwp = h->ft8_raw[rx].write_pos;
+                int idx = fwp % FT8_RAW_SIZE;
+                h->ft8_raw[rx].i[idx] = (float)iv;
+                h->ft8_raw[rx].q[idx] = -(float)qv;
+                h->ft8_raw[rx].write_pos = fwp + 1;
+            }
+
             RxRing *r = &h->rx[rx];
             if (ring_free(r) < 1) {
                 h->drop_count++;
@@ -197,15 +209,6 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
             r->i[wp] = fi;
             r->q[wp] = fq;
             r->write_pos = (wp + 1) % RING_SIZE;
-
-            /* FT8: store raw 24-bit IQ (not normalized) for Python extraction */
-            if (h->ft8_raw[rx].enabled && h->ft8_raw[rx].i) {
-                int fwp = h->ft8_raw[rx].write_pos;
-                int idx = fwp % FT8_RAW_SIZE;
-                h->ft8_raw[rx].i[idx] = (float)iv;  /* raw 24-bit integer */
-                h->ft8_raw[rx].q[idx] = -(float)qv; /* negate Q */
-                h->ft8_raw[rx].write_pos = fwp + 1;
-            }
         }
     }
 }
@@ -240,6 +243,34 @@ static void *recv_thread(void *arg) {
             if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
                 buf[2] != 0x01 || buf[3] != 0x06) continue;
 
+            uint32_t seq = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
+                         | ((uint32_t)buf[6] << 8)  |  (uint32_t)buf[7];
+            if (h->seq_initialized) {
+                uint32_t expected = h->seq_rx + 1;
+                if (seq != expected) {
+                    /* Packet loss: each missing packet = 2 frames * 10 groups
+                     * = 20 samples per receiver. Pad with zeros to maintain
+                     * time alignment for FT8. */
+                    int32_t lost = (int32_t)(seq - expected);
+                    if (lost > 0 && lost < 1000) {
+                        h->pkt_lost += lost;
+                        for (int rx = 0; rx < h->n_receivers; rx++) {
+                            if (!h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) continue;
+                            int n_pad = lost * 20;
+                            for (int p = 0; p < n_pad; p++) {
+                                int fwp = h->ft8_raw[rx].write_pos;
+                                int idx = fwp % FT8_RAW_SIZE;
+                                h->ft8_raw[rx].i[idx] = 0.0f;
+                                h->ft8_raw[rx].q[idx] = 0.0f;
+                                h->ft8_raw[rx].write_pos = fwp + 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                h->seq_initialized = 1;
+            }
+            h->seq_rx = seq;
             h->pkt_count++;
             parse_frame(h, buf + 16, h->n_receivers);
             parse_frame(h, buf + 528, h->n_receivers);
@@ -738,6 +769,25 @@ int hpsdr_read_ft8(HpsdrFast *h, int rx, float *i_out, float *q_out, int max_n) 
     return n;
 }
 
+/* Read n samples ending at (write_pos - skip_from_end). Used to align
+ * FT8 reads to minute boundaries. */
+int hpsdr_read_ft8_aligned(HpsdrFast *h, int rx, float *i_out, float *q_out,
+                            int n, int skip_from_end) {
+    if (rx < 0 || rx >= MAX_RX || !h->ft8_raw[rx].enabled || !h->ft8_raw[rx].i) return 0;
+    int wp = h->ft8_raw[rx].write_pos;
+    int end = wp - skip_from_end;
+    int start = end - n;
+    if (start < 0 || end > wp || (wp - start) > FT8_RAW_SIZE) return 0;
+    for (int k = 0; k < n; k++) {
+        int idx = (start + k) % FT8_RAW_SIZE;
+        if (idx < 0) idx += FT8_RAW_SIZE;
+        i_out[k] = h->ft8_raw[rx].i[idx];
+        q_out[k] = h->ft8_raw[rx].q[idx];
+    }
+    return n;
+}
+
 uint64_t hpsdr_pkt_count(HpsdrFast *h) { return h->pkt_count; }
 uint64_t hpsdr_drop_count(HpsdrFast *h) { return h->drop_count; }
+uint64_t hpsdr_pkt_lost(HpsdrFast *h) { return h->pkt_lost; }
 int hpsdr_n_receivers(HpsdrFast *h) { return h->n_receivers; }
