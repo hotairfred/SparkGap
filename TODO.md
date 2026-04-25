@@ -16,11 +16,13 @@
 - [x] Grid corrected to EM79
 
 ## In Progress
-- [x] **FT8 live integration** — replaced ft8d (Pavel) with kgoba/ft8_lib. Pipeline:
-      192k IQ → mix → 12k complex → zero negative freqs (USB demod) → Re → 12k mono WAV
-      → /home/sparkgap/decode_ft8 → SPOT. **First live decode: CQ N4DWD EM86 on 40m.**
-      WAV pipeline gets 53 decodes/min on known-good data. Live yield depends on band
-      conditions. See memory/feedback_ft8_channelizer.md.
+- [~] **FT8 live integration** — pipeline math correct, decoder works.
+      Bare C capture (c_capture.c) → 69 decodes. Python direct UDP parse
+      → 122 decodes. **libhpsdr_fast.so ring buffer → 0 decodes** —
+      threading/visibility bug between recv_thread writes and Python reads.
+      Memory barriers helped (autocorr 0.21→0.82) but didn't fully fix.
+      Next: replace ring with double-buffer or callback model. See
+      memory/feedback_ft8_channelizer.md for full diagnostic state.
 - [ ] **RTTY decoder** — Phase 1 core works (CQ CONTEST DE K3LR decodes on synthetic). Bit clock drift after ~15 chars. Needs wiring into live pipeline. Design doc on Atlas.
 
 ## Future
