@@ -4330,6 +4330,14 @@ class SpotTracker:
         # Cross-channel hallucination filter
         self._cycle_calls = defaultdict(set)
 
+        # Per-freq-bin sighting leader. Only the leader may emit a spot
+        # at a given freq_bin within the recent-sightings window. Closes
+        # the multi-call-per-freq FP pattern Grayline measured 2026-04-25:
+        # 14038.8 was producing 6 different SCP-valid spots from 1 real
+        # signal (K2NV, K2YG, VE3GMZ, VE6RST, WB2FUE, WI5D). Tracked
+        # as freq_bin -> (call, sighting_count).
+        self._freq_leader = {}
+
         # Build SCP prefix index for fast fuzzy matching
         self._scp_by_len = defaultdict(list)
         for call in valid_calls:
@@ -4415,6 +4423,34 @@ class SpotTracker:
             return 0
 
         return sum(1 for _, fb in fresh if fb == freq_bin)
+
+    def _is_freq_leader(self, call, freq_bin, now):
+        """Returns True iff `call` has the most recent sightings at
+        `freq_bin` within SIGHTING_WINDOW. Suppresses non-leader calls
+        so each freq_bin emits at most one spot per window — closes the
+        multi-call-per-freq FP pattern (one real signal producing 5+
+        SCP-valid spots from regex matches inside noise-decoded text).
+
+        Updates the per-bin leader cache when this call is or becomes
+        the leader. A stale leader (window expired → 0 sightings) is
+        replaced by any call with sightings >0."""
+        my_count = self._count_recent_sightings(call, freq_bin, now)
+        leader = self._freq_leader.get(freq_bin)
+        if leader is None:
+            self._freq_leader[freq_bin] = (call, my_count)
+            return True
+        leader_call, _leader_cached = leader
+        if leader_call == call:
+            self._freq_leader[freq_bin] = (call, my_count)
+            return True
+        # Different call leads — recompute their current count (cached
+        # value can be stale if their sightings have aged out).
+        fresh_leader_count = self._count_recent_sightings(
+            leader_call, freq_bin, now)
+        if fresh_leader_count == 0 or my_count > fresh_leader_count:
+            self._freq_leader[freq_bin] = (call, my_count)
+            return True
+        return False
 
     def _can_respot(self, call, freq_khz, now):
         """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
@@ -4569,7 +4605,8 @@ class SpotTracker:
                 # calls that didn't repeat. ITILA now uses the same multi-sighting
                 # gate as other decoders.
                 gate = has_context or recent_count >= min_s
-                if gate and self._can_respot(call, freq_khz, now):
+                if gate and self._can_respot(call, freq_khz, now) \
+                        and self._is_freq_leader(call, freq_bin, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
                         self._mark_spotted(call, freq_khz, now)
                         spots.append({
@@ -4676,7 +4713,8 @@ class SpotTracker:
                 # Check consensus against SCP — exact first, then fuzzy
                 if consensus_str in self.valid_calls:
                     info = self._tracking[consensus_str]
-                    if self._can_respot(consensus_str, freq_khz, now):
+                    if self._can_respot(consensus_str, freq_khz, now) \
+                            and self._is_freq_leader(consensus_str, freq_bin, now):
                         if consensus_str not in self.blacklist:
                             self._mark_spotted(consensus_str, freq_khz, now)
                             info['freq'] = freq_khz
@@ -4699,7 +4737,8 @@ class SpotTracker:
                     if fuzzy and avg_confidence >= 0.90:
                         best_call, best_dist = min(fuzzy, key=lambda x: x[1])
                         info = self._tracking[best_call]
-                        if self._can_respot(best_call, freq_khz, now):
+                        if self._can_respot(best_call, freq_khz, now) \
+                                and self._is_freq_leader(best_call, freq_bin, now):
                             if best_call not in self.blacklist:
                                 self._mark_spotted(best_call, freq_khz, now)
                                 info['freq'] = freq_khz
