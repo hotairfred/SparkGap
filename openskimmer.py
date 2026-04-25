@@ -5071,17 +5071,20 @@ class OpenSkimmer:
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
                             import subprocess
-                            from scipy.signal import firwin, lfilter
+                            from scipy.signal import resample_poly
                             ft8d_path = '/home/sparkgap/ft8d/ft8d'
-                            taps = firwin(256, 2000.0 / (192000 / 2))
                             total = 0
                             for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
                                 iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                 offset_hz = (ft8_khz - ck) * 1000
                                 t = np.arange(n) / 192000
                                 mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
-                                filtered = lfilter(taps, 1.0, mixed)
-                                dec = filtered[::48]
+                                # Polyphase decimate 48:1 (192k → 4k) — cleaner than
+                                # firwin+lfilter, uses Kaiser-window FIR
+                                dec = resample_poly(mixed, 1, 48)[:240000]
+                                if len(dec) < 240000:
+                                    dec = np.concatenate(
+                                        [dec, np.zeros(240000 - len(dec), dtype=complex)])
                                 fname = f'/tmp/ft8_live_rx{ri}.c2'
                                 c2 = np.zeros(len(dec)*2, dtype=np.float32)
                                 c2[0::2] = dec.real.astype(np.float32)
