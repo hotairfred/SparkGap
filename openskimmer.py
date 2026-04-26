@@ -4534,9 +4534,18 @@ class SpotTracker:
         # in O(1) when there's exactly one match: e.g. "T1LZ" → suffix "1LZ" →
         # uniquely "K1LZ".  Skipped when ambiguous to avoid false rewrites.
         self._scp_by_suffix = defaultdict(list)
+        # Prefix index for trailing-letter truncation recovery.
+        # The decoder also drops the trailing character routinely (EI5KF→EI5K,
+        # DF7TV→DF7T).  When exactly one SCP call extends our candidate by one
+        # letter, recover it.  Extensions are usually ambiguous (EI5K → EI5KF
+        # / EI5KG / EI5KI / ...), so this fires less often than leading-letter
+        # but the same force-bypass gate keeps wrong recoveries safe.
+        self._scp_by_prefix = defaultdict(list)
         for call in valid_calls:
             if 4 <= len(call) <= 7 and '/' not in call:
                 self._scp_by_suffix[call[1:]].append(call)
+            if 5 <= len(call) <= 7 and '/' not in call:
+                self._scp_by_prefix[call[:-1]].append(call)
 
     # Window for time-gated sighting counts (seconds). A call must be
     # seen N times within this window to pass the sightings threshold.
@@ -4660,6 +4669,24 @@ class SpotTracker:
             self._respot_times = {}
         key = (call, round(freq_khz))
         self._respot_times[key] = now
+
+    def _extend_truncated_call(self, call):
+        """If `call` looks like a real SCP call with the last letter dropped,
+        return the SCP version when uniquely determined.
+
+        Bayesian decoder also routinely drops the trailing character on weak
+        signals or when the operator's WPM ramps mid-word.  Live RF (2026-04-26
+        05:31 UTC) showed EI5KF being decoded as EI5K and DF7TV as DF7T."""
+        if call in self.valid_calls:
+            return None
+        if len(call) < 4 or len(call) > 6:
+            return None
+        candidates = self._scp_by_prefix.get(call)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def _correct_leading_letter(self, call):
         """If `call` looks like a leading-letter substitution of a single SCP
@@ -4805,22 +4832,35 @@ class SpotTracker:
                 if _candidates:
                     call = max(_candidates, key=len)
                 # else: leave call as-is, will fail SCP check below
-            # Track whether `call` came from a leading-letter correction —
-            # if so, force it through bypass (multi-sighting) instead of
-            # exact (single-shot with context).  The correction is best-
-            # effort: SCP membership of the corrected call doesn't prove
-            # the decoder heard it correctly.  Live-RF data (2026-04-26
-            # 05:17 UTC) showed Bayesian hallucinating N4UL from a clean
-            # DF7TV signal; treating it as "exact" plus context-gated
-            # spotted N4UL.  Multi-sighting catches that drift.
+            # Track whether `call` came from a decoder-error correction.
+            # Force corrected calls through bypass (multi-sighting) instead
+            # of exact (single-shot with context): SCP membership of the
+            # corrected call doesn't prove the decoder heard it correctly.
+            # Live-RF data (2026-04-26 05:17 UTC) showed Bayesian hallucinating
+            # N4UL from a clean DF7TV signal; treating that as "exact" plus
+            # context-gated would spot N4UL.  Multi-sighting catches the drift.
+            #
+            # Two correction modes, both only attempted at sane WPM (decoder
+            # output above 45 WPM is almost always noise hallucination):
+            #   leading-letter — first char garbled (T1LZ → K1LZ)
+            #   prefix-extend  — trailing char dropped (EI5K → EI5KF)
+            # Each requires an unambiguous single SCP match, else stay quiet.
             forced_bypass = False
             if '/' not in call and 0 < wpm <= 45:
-                _corrected = self._correct_leading_letter(call)
+                _corrected = self._correct_leading_letter(call) \
+                          or self._extend_truncated_call(call)
                 if _corrected:
-                    log.info("SCP leading-letter correct: %s → %s @ %.1f kHz wpm=%d",
+                    log.info("SCP correct: %s → %s @ %.1f kHz wpm=%d",
                              call, _corrected, freq_khz, wpm)
                     call = _corrected
                     forced_bypass = True
+
+            # Global WPM sanity gate.  MAX_WPM=50 is defined as a constant
+            # documenting "spots above this are almost certainly noise" but
+            # was never actually enforced — wire it in here.  Contest CW
+            # tops out around 40-45 WPM in practice; 50+ is decoder frenzy.
+            if wpm > self.MAX_WPM:
+                continue
             if call in self.valid_calls and not forced_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
