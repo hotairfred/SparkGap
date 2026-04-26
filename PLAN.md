@@ -132,6 +132,43 @@ Yesterday's hypothesis priority list (the actual diagnosed problem):
 
 ## Systematic plan — each phase is a checkpoint, NOT to be skipped
 
+### Phase 0 (added 2026-04-26 03:30 ET): is the decoder actually the problem?
+
+Fred raised the right question: ITILA decodes recorded IQ cleanly but
+fails live.  If true, the decoder isn't broken — something between
+antenna and decoder is.
+
+**Experiment** (do this BEFORE Phase 1):
+
+1. Live mode running on a band with known-failing weak-DX signal
+   (G8X at 7020.5 with 3 dB SDC SNR is a recurring example).
+2. Bare-C IQ capture (`c_capture.c` → 60 sec float32 IQ) of that
+   exact band/time window.
+3. Replay through the SAME scanner code path: `openskimmer.py
+   --file <capture> --center-khz <band> --start-min 0 --end-min 1`.
+4. **Decision rule:**
+   - Replay produces clean text on the same signals live garbled →
+     bug is in the live delivery path (sample drops we don't see,
+     ring/timing artifact, IQ scaling, concurrent-load coupling).
+     Phase 1 (filter) is the wrong investigation.
+   - Replay also produces garbage → decoder/channelization itself
+     is the problem.  Proceed to Phase 1.
+
+This was the methodology in the Apr 25 session that found the
+per-RX worker bug.  Apply it again before assuming anything about
+the decoder.
+
+Specific things to look at if "live ≠ recorded":
+- HPSDR UDP packet loss before our ring (kernel /proc/net/udp drops)
+- Per-RX worker stalls (sample timing under load — env_drops continued
+  growing in tonight's session at low SNR even when ring_drops looked
+  stable; the env_drops counter is a sample-loss signal we underused)
+- Concurrent-load coupling: 5 bands + FT8 minute thread + RTTY scan
+  all in the same process; recorded replay is single-band quiet
+- Bin spawn FIR transient: first ~16 samples after spawn are
+  FIR-stage-1 delay-line warmup, not real signal — if a signal's
+  decode window starts within those samples, decode quality drops
+
 ### Phase 1: Validate hypothesis #1 (channel filter)
 
 **One change, measured, decided.**
