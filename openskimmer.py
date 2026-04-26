@@ -1238,11 +1238,16 @@ _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,4}[A-Z]{1,6}$')
 _SLASH_SUFFIX_PAT = re.compile(r'^([0-9]|P|M|MM|QRP|A|B)$')
 
 def _is_base_call(tok):
-    # 99%+ of real base callsigns are 4-7 chars (8+ are almost all slash calls
-    # which Case 1 in _itila_extract_cq_call handles separately).  An 8+ char
+    # 99%+ of real base callsigns are 4-7 chars; 8+ are almost all slash calls
+    # which Case 1 in _itila_extract_cq_call handles separately.  An 8+ char
     # match here is almost always trailing decoder garbage glommed onto a real
-    # call (e.g. HB9AMO → "HB9AMOHBM"), so we cap to drop those.
-    return bool(_BASE_CALL_PAT.match(tok)) and 4 <= len(tok) <= 7
+    # call (e.g. HB9AMO → "HB9AMOHBM").
+    #
+    # 3-char minimum — 205 SCP calls are 3 chars (M7Z, M3A, G6M, M2G, M0X,
+    # G3X, G8X — common UK/EU contest 1x1 calls).  Live RF (2026-04-26 07:00)
+    # caught M7Z calling CQ at 7018.6 with raw text containing "M7Z" 4+ times
+    # across windows, but the previous 4-char floor blocked extraction.
+    return bool(_BASE_CALL_PAT.match(tok)) and 3 <= len(tok) <= 7
 
 def _itila_extract_all_calls(text, min_count=2):
     """Extract callsigns that appear at least min_count times in raw decoded text.
@@ -1260,13 +1265,18 @@ def _itila_extract_all_calls(text, min_count=2):
     return [call for call, cnt in counts.most_common() if cnt >= min_count]
 
 
-def _itila_extract_cq_call(text):
+def _itila_extract_cq_call(text, valid_calls=None):
     """Extract callsign adjacent to CQ/TEST in decoded Morse text.
 
     Handles full slash callsigns in all forms:
       CALL/SUFFIX  — W1AW/0, K9MA/P, K9MA/MM, K9MA/QRP
       PREFIX/CALL  — PJ2/AG3I, VE3/WF8Z
       Split tokens — slash decoded as space: ['PJ2', 'AG3I'] → PJ2/AG3I
+
+    `valid_calls` (set of SCP callsigns) is optional but strongly recommended
+    for 3-char-extraction correctness: when both M7Z (real) and M7G (noise)
+    appear as candidates, picking the SCP-valid one beats picking by recency.
+
     Returns callsign string (with slash) or None.
     """
     tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
@@ -1377,9 +1387,21 @@ def _itila_extract_cq_call(text):
     if not candidates:
         return None
 
-    # Return most frequent candidate; break ties by last occurrence
-    # (later occurrences of a repeated callsign tend to be cleaner)
+    # If we have a callsign DB, strongly prefer SCP-valid candidates over
+    # noise candidates of the same shape.  Necessary now that 3-char calls
+    # are allowed: real call M7Z and noise call M7G both pass the regex,
+    # and old recency-based tie-break was picking M7G half the time.
     from collections import Counter
+    if valid_calls is not None:
+        scp_cands = [c for c in candidates if c in valid_calls]
+        if scp_cands:
+            counts = Counter(scp_cands)
+            max_count = max(counts.values())
+            for c in reversed(scp_cands):
+                if counts[c] == max_count:
+                    return c
+
+    # Fallback: most frequent candidate; break ties by last occurrence.
     counts = Counter(candidates)
     max_count = max(counts.values())
     for c in reversed(candidates):
@@ -2181,7 +2203,8 @@ class _ItilaScanner:
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
-                 max_bins=80, use_pfb=False):
+                 max_bins=80, use_pfb=False, valid_calls=None):
+        self.valid_calls = valid_calls or set()
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_sec     = window_sec
@@ -2321,7 +2344,7 @@ class _ItilaScanner:
                 st['last_cq_time'] = now
 
             # Path 1: direct extraction from this window (standard)
-            call = _itila_extract_cq_call(raw)
+            call = _itila_extract_cq_call(raw, self.valid_calls)
             if call and call not in st['spotted']:
                 st['spotted'].add(call)
                 st['pending'].append(f'CQ {call} ')
@@ -2343,7 +2366,7 @@ class _ItilaScanner:
             # extraction on the accumulated buffer (the CQ token persists,
             # so the same _itila_extract_cq_call function works across windows).
             elif now - st['last_cq_time'] < 120.0:
-                call = _itila_extract_cq_call(st['text_buf'])
+                call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
                 if call and call not in st['spotted']:
                     st['spotted'].add(call)
                     st['pending'].append(f'CQ {call} ')
@@ -2397,7 +2420,7 @@ class _ItilaScanner:
                 st['last_cq_time'] = now
 
             # Path 1: direct CQ extraction
-            call = _itila_extract_cq_call(raw)
+            call = _itila_extract_cq_call(raw, self.valid_calls)
             if call and call not in st['spotted']:
                 st['spotted'].add(call)
                 st['pending'].append(f'CQ {call} ')
@@ -2407,7 +2430,7 @@ class _ItilaScanner:
                         self._sc._h, _ct.c_double(f_hz))
             # Path 2: context extraction — runner-only (see Python path above)
             elif now - st['last_cq_time'] < 120.0:
-                call = _itila_extract_cq_call(st['text_buf'])
+                call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
                 if call and call not in st['spotted']:
                     st['spotted'].add(call)
                     st['pending'].append(f'CQ {call} ')
@@ -3958,8 +3981,9 @@ class InstanceManager:
                  use_pfb_dispatcher=False, use_itila=False,
                  itila_ev_thresh=2.0, itila_window_sec=120.0,
                  itila_min_snr=8.0, itila_max_bins=200,
-                 use_pfb_scanner=False,
+                 use_pfb_scanner=False, valid_calls=None,
                  cw_min_khz=0.0, cw_max_khz=99999.0):
+        self.valid_calls = valid_calls or set()
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -4050,7 +4074,8 @@ class InstanceManager:
                     band_min_khz=bmin,
                     band_max_khz=bmax,
                     max_bins=int(self.itila_max_bins),
-                    use_pfb=self.use_pfb_scanner)
+                    use_pfb=self.use_pfb_scanner,
+                    valid_calls=getattr(self, 'valid_calls', None))
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -4805,7 +4830,8 @@ class SpotTracker:
         seen_p1 = set()
         for m in CALL_RE.finditer(clean):
             call = m.group(1)
-            if len(call) < 4 or call in FALSE_POSITIVES:
+            # 3-char minimum: M7Z, M3A, G6M etc. are real contest calls in SCP.
+            if len(call) < 3 or call in FALSE_POSITIVES:
                 continue
             if call in self.blacklist:
                 continue
@@ -5215,11 +5241,19 @@ class OpenSkimmer:
         pfb_bands_raw = self.cfg.get('pfb_scanner_bands', [])
         pfb_band_names = {str(b) for b in pfb_bands_raw}
         pfb_band_hz    = {int(b)  for b in pfb_bands_raw if isinstance(b, int)}
+        # Per-band signal_min_snr override for PFB-using bands.  PFB has fixed
+        # channelization cost regardless of bin count — we can run lower SNR
+        # without the per-RX worker drowning the way per-bin scanners do.
+        # Falls back to the global signal_min_snr when not set.
+        pfb_min_snr = self.cfg.get('pfb_min_snr')
+        global_min_snr = float(self.cfg.get('signal_min_snr', 8.0))
         self.managers = []
         for _name, _center_hz, _rx_idx in self._band_meta:
             use_pfb_here = (pfb_global
                             or _name in pfb_band_names
                             or _center_hz in pfb_band_hz)
+            min_snr_here = (float(pfb_min_snr) if (use_pfb_here and pfb_min_snr is not None)
+                            else global_min_snr)
             mgr = InstanceManager(
                 sample_rate=rx_sample_rate,
                 decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
@@ -5237,9 +5271,10 @@ class OpenSkimmer:
                 use_itila=bool(self.cfg.get('use_itila', False)),
                 itila_ev_thresh=float(self.cfg.get('itila_ev_thresh', 2.0)),
                 itila_window_sec=float(self.cfg.get('itila_window_sec', 120.0)),
-                itila_min_snr=float(self.cfg.get('signal_min_snr', 8.0)),
+                itila_min_snr=min_snr_here,
                 itila_max_bins=int(self.cfg.get('itila_max_bins', 200)),
                 use_pfb_scanner=use_pfb_here,
+                valid_calls=calls,
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
                 cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
             )
@@ -5441,7 +5476,7 @@ class OpenSkimmer:
                     st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
                     if CQ_PATTERNS.search(raw):
                         st['last_cq_time'] = now
-                    call = _itila_extract_cq_call(raw)
+                    call = _itila_extract_cq_call(raw, self.tracker.valid_calls)
                     if call and call not in st['spotted']:
                         st['spotted'].add(call)
                         st['pending'].append(f'CQ {call} ')
@@ -5449,7 +5484,7 @@ class OpenSkimmer:
                                  f_khz, call, wpm, raw[:60])
                     elif now - st['last_cq_time'] < 120.0:
                         # runner-only context extraction (see _process_ready)
-                        call = _itila_extract_cq_call(st['text_buf'])
+                        call = _itila_extract_cq_call(st['text_buf'], self.tracker.valid_calls)
                         if call and call not in st['spotted']:
                             st['spotted'].add(call)
                             st['pending'].append(f'CQ {call} ')
