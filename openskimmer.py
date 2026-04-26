@@ -6007,6 +6007,7 @@ def run_file_mode(args, config):
         use_itila=bool(config.get('use_itila', False)),
         itila_ev_thresh=float(config.get('itila_ev_thresh', 2.0)),
         itila_window_sec=float(config.get('itila_window_sec', 120.0)),
+        valid_calls=calls,  # required for the SCP-bias path in extractor
         cw_min_khz=float(config.get('cw_min_khz', 0)),
         cw_max_khz=float(config.get('cw_max_khz', 99999)),
     )
