@@ -1238,7 +1238,11 @@ _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,4}[A-Z]{1,6}$')
 _SLASH_SUFFIX_PAT = re.compile(r'^([0-9]|P|M|MM|QRP|A|B)$')
 
 def _is_base_call(tok):
-    return bool(_BASE_CALL_PAT.match(tok)) and len(tok) >= 4
+    # 99%+ of real base callsigns are 4-7 chars (8+ are almost all slash calls
+    # which Case 1 in _itila_extract_cq_call handles separately).  An 8+ char
+    # match here is almost always trailing decoder garbage glommed onto a real
+    # call (e.g. HB9AMO → "HB9AMOHBM"), so we cap to drop those.
+    return bool(_BASE_CALL_PAT.match(tok)) and 4 <= len(tok) <= 7
 
 def _itila_extract_all_calls(text, min_count=2):
     """Extract callsigns that appear at least min_count times in raw decoded text.
@@ -4523,6 +4527,17 @@ class SpotTracker:
         for call in valid_calls:
             self._scp_by_len[len(call)].append(call)
 
+        # Suffix index for leading-letter substitution recovery.
+        # The Bayesian decoder routinely garbles the first character of weak
+        # signals (K→T, G→D, H→S, F→E, etc. — they're 1-2 dits apart in Morse).
+        # Indexing valid_calls by call[1:] lets us recover the right SCP call
+        # in O(1) when there's exactly one match: e.g. "T1LZ" → suffix "1LZ" →
+        # uniquely "K1LZ".  Skipped when ambiguous to avoid false rewrites.
+        self._scp_by_suffix = defaultdict(list)
+        for call in valid_calls:
+            if 4 <= len(call) <= 7 and '/' not in call:
+                self._scp_by_suffix[call[1:]].append(call)
+
     # Window for time-gated sighting counts (seconds). A call must be
     # seen N times within this window to pass the sightings threshold.
     # Without this, cumulative counts in live mode let noise fragments
@@ -4646,6 +4661,32 @@ class SpotTracker:
         key = (call, round(freq_khz))
         self._respot_times[key] = now
 
+    def _correct_leading_letter(self, call):
+        """If `call` looks like a leading-letter substitution of a single SCP
+        call, return that SCP call.  Returns None if `call` is already in SCP,
+        if no SCP variant matches, or if multiple variants match (ambiguous).
+
+        Diagnoses the Bayesian decoder's most common failure on weak signals:
+        the first character lands on a Morse-confusable letter.  Examples
+        from live SDC diff (2026-04-26 05:04-05:09 UTC):
+            T1LZ  → K1LZ    SB9BUN → HB9BUN    E5IN → F5IN
+            MM8U  → GM8U    E4HRM  → DL4HRM (2-edit, not handled here)
+        """
+        if call in self.valid_calls:
+            return None
+        if len(call) < 4 or len(call) > 7:
+            return None
+        suffix = call[1:]
+        candidates = self._scp_by_suffix.get(suffix)
+        if not candidates:
+            return None
+        # Single-match policy: only correct when unambiguous.  Many SCP suffixes
+        # (e.g. "1AW") have dozens of valid prefixes — substituting the first
+        # one would be wrong as often as right.
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
     def _fuzzy_match(self, fragment, max_dist=1):
         """Find SCP callsigns within edit distance max_dist of fragment.
 
@@ -4764,7 +4805,23 @@ class SpotTracker:
                 if _candidates:
                     call = max(_candidates, key=len)
                 # else: leave call as-is, will fail SCP check below
-            if call in self.valid_calls:
+            # Track whether `call` came from a leading-letter correction —
+            # if so, force it through bypass (multi-sighting) instead of
+            # exact (single-shot with context).  The correction is best-
+            # effort: SCP membership of the corrected call doesn't prove
+            # the decoder heard it correctly.  Live-RF data (2026-04-26
+            # 05:17 UTC) showed Bayesian hallucinating N4UL from a clean
+            # DF7TV signal; treating it as "exact" plus context-gated
+            # spotted N4UL.  Multi-sighting catches that drift.
+            forced_bypass = False
+            if '/' not in call and 0 < wpm <= 45:
+                _corrected = self._correct_leading_letter(call)
+                if _corrected:
+                    log.info("SCP leading-letter correct: %s → %s @ %.1f kHz wpm=%d",
+                             call, _corrected, freq_khz, wpm)
+                    call = _corrected
+                    forced_bypass = True
+            if call in self.valid_calls and not forced_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
                 if dec_type in ('primary', 'itila'):
