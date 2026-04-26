@@ -1217,7 +1217,11 @@ def _get_bmorse_lib():
 # libitila.so — Bayesian CW decoder (envelope in, callsigns out)
 # ---------------------------------------------------------------------------
 
-_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST', 'FD', 'SS', 'NA', 'UP'}
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'CWT', 'SST', 'MST', 'FD', 'SS', 'NA', 'UP'}
+# QRZ/QRL deliberately NOT runner anchors. After a QSO the runner sends
+# "TU CALL 5NN QRZ?" and the next decode chunk often starts with the next
+# caller — extracting after QRZ grabs the wrong station. CQ + contest tokens
+# uniquely identify runners; we lose nothing real by dropping QRZ here.
 # Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
 _BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,4}[A-Z]{1,6}$')
 # Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
@@ -1300,7 +1304,7 @@ def _itila_extract_cq_call(text):
     candidates = []
 
     # Fuzzy CQ trigger matching: allow 1-char substitution (FWT→CWT, TES→TEST, CWE→CWT)
-    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ', 'QRL', 'FD', 'SS', 'NA', 'UP'}
+    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'FD', 'SS', 'NA', 'UP'}
     def _is_cq_trigger(tok):
         if tok in _ITILA_CQ_WORDS:
             return True
@@ -4632,8 +4636,14 @@ class SpotTracker:
                 # seen_p1 prevents counting the same call twice in one process() call.
                 # Promotes to spot after scp_bypass_threshold consistent decode events.
                 # Noise won't produce the same non-SCP call N times at one frequency.
+                # Use 1 kHz bucket here (vs 500 Hz freq_bin above) so a single
+                # runner whose bins jitter across ±500 Hz can accumulate hits in
+                # one place. UK/EI 2026-04-25: W4H/W4I FQP runners decoded
+                # cleanly at 14025.5/.6/.9 but each bypass bucket only saw 1-2
+                # hits, never reaching threshold.
                 seen_p1.add(call)  # dedupe within this process() call
-                bkey = (call, freq_bin)
+                bypass_freq = int(round(freq_khz))
+                bkey = (call, bypass_freq)
                 self._bypass_counts[bkey] += 1
                 if self._bypass_counts[bkey] >= self.scp_bypass_threshold and \
                    bkey not in self._bypass_spotted:
