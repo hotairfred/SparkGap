@@ -89,6 +89,16 @@ def _get_hpsdr_fast():
             lib.hpsdr_set_decode.restype = None
             lib.hpsdr_set_decode.argtypes = [
                 _ct.c_void_p, _ct.c_void_p, _ct.c_int]
+            # Per-RX decode setup — used to selectively skip C decode for
+            # certain RX (e.g. PFB scanners with different struct layout
+            # and envelope rate from per-bin ITILA scanner).  Optional;
+            # falls back gracefully if libhpsdr_fast doesn't export it.
+            try:
+                lib.hpsdr_set_rx_decode.restype = None
+                lib.hpsdr_set_rx_decode.argtypes = [
+                    _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_int]
+            except AttributeError:
+                pass
             lib.hpsdr_start_worker.restype = None
             lib.hpsdr_start_worker.argtypes = [_ct.c_void_p]
             lib.hpsdr_stop_worker.restype = None
@@ -1857,6 +1867,145 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         return None
 
 
+# ---------------------------------------------------------------------------
+# PFB-backed scanner — alternative to libitila_scanner.so. Same Python wrapper
+# surface; replaces per-bin NCO+FIR with a shared polyphase channelizer.
+# Selected by config flag use_pfb_scanner.
+# ---------------------------------------------------------------------------
+PFB_NCHAN      = 2048   # must match PSC_PFB_NCHAN in pfb_scanner.c
+PFB_OVERSAMPLE = 2      # must match PSC_PFB_OVERSAMPLE in pfb_scanner.c
+
+def _pfb_output_rate(sample_rate):
+    """Envelope-sample rate produced by the PFB scanner. C-side uses the
+    same int math, so this stays consistent."""
+    return (sample_rate * PFB_OVERSAMPLE) // PFB_NCHAN
+
+
+class _PFBLibShim:
+    """Thin namespace that exposes pfb_sc_* symbols under itila_sc_* names.
+
+    Lets _ItilaSc and _ItilaScanner reach into the PFB backend without any
+    code changes: every call site that does ``self._sc._lib.itila_sc_xxx``
+    transparently dispatches to ``pfb_sc_xxx`` on libpfb_scanner.so."""
+    _aliases = {
+        'itila_sc_feed_iq':       'pfb_sc_feed_iq',
+        'itila_sc_ready_bins':    'pfb_sc_ready_bins',
+        'itila_sc_list_bins':     'pfb_sc_list_bins',
+        'itila_sc_drain_env':     'pfb_sc_drain_env',
+        'itila_sc_peek_env':      'pfb_sc_peek_env',
+        'itila_sc_env_n':         'pfb_sc_env_n',
+        'itila_sc_bin_count':     'pfb_sc_bin_count',
+        'itila_sc_mark_evidence': 'pfb_sc_mark_evidence',
+        'itila_sc_get_snr':       'pfb_sc_get_snr',
+        'itila_sc_set_decoder':   'pfb_sc_set_decoder',
+        'itila_sc_decode_ready':  'pfb_sc_decode_ready',
+        'itila_sc_env_drops':     'pfb_sc_env_drops',
+        'itila_sc_bins_peak':     'pfb_sc_bins_peak',
+        'itila_sc_free':          'pfb_sc_free',
+    }
+
+    def __init__(self, lib):
+        self._real = lib
+
+    def __getattr__(self, name):
+        return getattr(self._real, self._aliases.get(name, name))
+
+
+def _get_pfb_scanner(sample_rate, center_hz, max_bins, min_snr,
+                     window_samples, energy_win, grid_hz,
+                     band_min_hz, band_max_hz,
+                     sos100, sos200):
+    """Drop-in replacement for _get_itila_scanner that loads
+    libpfb_scanner.so and returns an _ItilaSc-compatible wrapper.
+    The PFB backend is selected when use_pfb_scanner=True."""
+    import ctypes as _ct
+    try:
+        lib = _ct.CDLL('./libpfb_scanner.so')
+        lib.pfb_sc_create.restype  = _ct.c_void_p
+        lib.pfb_sc_create.argtypes = [
+            _ct.c_int, _ct.c_double, _ct.c_int, _ct.c_double,
+            _ct.c_int, _ct.c_int, _ct.c_double,
+            _ct.c_double, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.c_int,
+            _ct.POINTER(_ct.c_double)]
+        lib.pfb_sc_free.restype    = None
+        lib.pfb_sc_free.argtypes   = [_ct.c_void_p]
+        lib.pfb_sc_feed_iq.restype  = None
+        lib.pfb_sc_feed_iq.argtypes = [
+            _ct.c_void_p,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_ready_bins.restype  = _ct.c_int
+        lib.pfb_sc_ready_bins.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_list_bins.restype  = _ct.c_int
+        lib.pfb_sc_list_bins.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_drain_env.restype  = _ct.c_int
+        lib.pfb_sc_drain_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_peek_env.restype  = _ct.c_int
+        lib.pfb_sc_peek_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_bin_count.restype  = _ct.c_int
+        lib.pfb_sc_bin_count.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_env_n.restype  = _ct.c_int
+        lib.pfb_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.pfb_sc_mark_evidence.restype  = None
+        lib.pfb_sc_mark_evidence.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.pfb_sc_get_snr.restype  = _ct.c_double
+        lib.pfb_sc_get_snr.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.pfb_sc_env_drops.restype  = _ct.c_ulonglong
+        lib.pfb_sc_env_drops.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_bins_peak.restype  = _ct.c_int
+        lib.pfb_sc_bins_peak.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_set_decoder.restype  = None
+        lib.pfb_sc_set_decoder.argtypes = [
+            _ct.c_void_p,
+            _ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
+            _ct.c_double]
+        lib.pfb_sc_decode_ready.restype  = _ct.c_int
+        lib.pfb_sc_decode_ready.argtypes = [
+            _ct.c_void_p, _ct.c_int,
+            _ct.c_void_p, _ct.c_int]
+        lib.pfb_sc_n_chan.restype       = _ct.c_int
+        lib.pfb_sc_n_chan.argtypes      = [_ct.c_void_p]
+        lib.pfb_sc_bin_spacing.restype  = _ct.c_double
+        lib.pfb_sc_bin_spacing.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_output_rate.restype  = _ct.c_int
+        lib.pfb_sc_output_rate.argtypes = [_ct.c_void_p]
+
+        n_sos = sos100.shape[0]
+        s100 = np.ascontiguousarray(sos100, dtype=np.float64)
+        s200 = np.ascontiguousarray(sos200, dtype=np.float64)
+        p100 = s100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = s200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        h = lib.pfb_sc_create(
+            _ct.c_int(sample_rate), _ct.c_double(center_hz),
+            _ct.c_int(max_bins),    _ct.c_double(min_snr),
+            _ct.c_int(window_samples), _ct.c_int(energy_win),
+            _ct.c_double(grid_hz),
+            _ct.c_double(band_min_hz), _ct.c_double(band_max_hz),
+            p100, _ct.c_int(n_sos), p200)
+        if not h:
+            log.warning("pfb_sc_create returned NULL")
+            return None
+        h_void  = _ct.c_void_p(h)
+        n_chan  = lib.pfb_sc_n_chan(h_void)
+        out_rt  = lib.pfb_sc_output_rate(h_void)
+        bsp     = lib.pfb_sc_bin_spacing(h_void)
+        log.info("Loaded libpfb_scanner.so (sr=%d center=%.0f Hz "
+                 "n_chan=%d bin_spacing=%.2f Hz output_rate=%d Hz max_bins=%d)",
+                 sample_rate, center_hz, n_chan, bsp, out_rt, max_bins)
+        sc = _ItilaSc(_PFBLibShim(lib), h_void)
+        sc.envelope_rate = out_rt
+        return sc
+    except OSError:
+        log.warning("libpfb_scanner.so not found")
+        return None
+
+
 class _ItilaChannel:
     """Streaming Bayesian CW decoder via libitila.so.
 
@@ -2028,11 +2177,18 @@ class _ItilaScanner:
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
-                 max_bins=80):
+                 max_bins=80, use_pfb=False):
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
-        self._window_samples = int(window_sec * 200)
         self._window_sec     = window_sec
+        self._use_pfb        = bool(use_pfb)
+
+        # Envelope rate: 200 Hz for the per-bin FIR scanner; PFB output rate
+        # otherwise (with current params: 192000*2/2048 = 187 Hz).  Window is
+        # always window_sec long in seconds, just sized in actual samples.
+        self._envelope_rate  = (_pfb_output_rate(sample_rate) if self._use_pfb
+                                else 200)
+        self._window_samples = int(window_sec * self._envelope_rate)
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
@@ -2041,10 +2197,15 @@ class _ItilaScanner:
         # f_hz -> {h100, h200, pending} — itila decoder handles per bin
         self._bins = {}
 
-        self._sc = _get_itila_scanner(
+        loader = _get_pfb_scanner if self._use_pfb else _get_itila_scanner
+        # Per-bin scanner keeps its 50 Hz grid.  PFB scanner uses 50 Hz too;
+        # the per-bin fine-tune NCO mix snaps the residual offset out, so
+        # we don't lose resolution by spawning at sub-bin frequencies.
+        grid_hz = 50.0
+        self._sc = loader(
             sample_rate, center_khz * 1000.0, max_bins, min_snr,
             self._window_samples, 4096,
-            50.0,                           # grid_hz (50 Hz for FIR selectivity)
+            grid_hz,
             band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
         )
@@ -2074,8 +2235,9 @@ class _ItilaScanner:
         lib = _get_itila_lib()
         h100 = h200 = None
         if lib:
-            h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
-            h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
+            rate = self._envelope_rate
+            h100 = _ct.c_void_p(lib.itila_create(rate, 100.0))
+            h200 = _ct.c_void_p(lib.itila_create(rate, 200.0))
         self._bins[f_hz] = {
             'h100': h100, 'h200': h200, 'pending': [], 'wpm': 0, 'snr': 0.0,
             'text_buf': '',       # rolling accumulated raw decode text
@@ -3792,6 +3954,7 @@ class InstanceManager:
                  use_pfb_dispatcher=False, use_itila=False,
                  itila_ev_thresh=2.0, itila_window_sec=120.0,
                  itila_min_snr=8.0, itila_max_bins=200,
+                 use_pfb_scanner=False,
                  cw_min_khz=0.0, cw_max_khz=99999.0):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -3806,6 +3969,7 @@ class InstanceManager:
         self.itila_window_sec = float(itila_window_sec)
         self.itila_min_snr = float(itila_min_snr)
         self.itila_max_bins = int(itila_max_bins)
+        self.use_pfb_scanner = bool(use_pfb_scanner)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
@@ -3881,7 +4045,8 @@ class InstanceManager:
                     min_snr=float(self.itila_min_snr),
                     band_min_khz=bmin,
                     band_max_khz=bmax,
-                    max_bins=int(self.itila_max_bins))
+                    max_bins=int(self.itila_max_bins),
+                    use_pfb=self.use_pfb_scanner)
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -4945,8 +5110,19 @@ class OpenSkimmer:
         # One InstanceManager per band
         # ----------------------------------------------------------------
         speeds_cfg = self.cfg.get('decoder_speeds', [0, 25, 30, 35])
+        # Per-band PFB enable.  Two ways to specify:
+        #   "use_pfb_scanner": true                — all bands on PFB
+        #   "pfb_scanner_bands": ["20m", 7090000]  — listed bands on PFB (A/B test)
+        # The list accepts band names ("20m") or center Hz ints (7090000).
+        pfb_global = bool(self.cfg.get('use_pfb_scanner', False))
+        pfb_bands_raw = self.cfg.get('pfb_scanner_bands', [])
+        pfb_band_names = {str(b) for b in pfb_bands_raw}
+        pfb_band_hz    = {int(b)  for b in pfb_bands_raw if isinstance(b, int)}
         self.managers = []
         for _name, _center_hz, _rx_idx in self._band_meta:
+            use_pfb_here = (pfb_global
+                            or _name in pfb_band_names
+                            or _center_hz in pfb_band_hz)
             mgr = InstanceManager(
                 sample_rate=rx_sample_rate,
                 decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
@@ -4966,6 +5142,7 @@ class OpenSkimmer:
                 itila_window_sec=float(self.cfg.get('itila_window_sec', 120.0)),
                 itila_min_snr=float(self.cfg.get('signal_min_snr', 8.0)),
                 itila_max_bins=int(self.cfg.get('itila_max_bins', 200)),
+                use_pfb_scanner=use_pfb_here,
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
                 cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
             )
@@ -5070,12 +5247,33 @@ class OpenSkimmer:
                                      if mgr._itila_scanner and mgr._itila_scanner._sc)
                 if scanners_ready == len(self.managers):
                     import ctypes as _ct
-                    # Set decode function pointer (itila_sc_decode_ready)
-                    sc_lib = self.managers[0]._itila_scanner._sc._lib
-                    decode_ptr = _ct.cast(sc_lib.itila_sc_decode_ready, _ct.c_void_p)
-                    window_samples = int(self.cfg.get('itila_window_sec', 60) * 200)
-                    self.receiver.lib.hpsdr_set_decode(
-                        self.receiver._h, decode_ptr, _ct.c_int(window_samples))
+                    # Per-RX decode setup.  Each scanner registers its native
+                    # decode entry point and envelope-sample window.  For PFB
+                    # scanners the lib shim transparently routes the
+                    # itila_sc_decode_ready name to pfb_sc_decode_ready —
+                    # both produce the byte-identical ScDecodeResult struct,
+                    # so the C worker writes them into the same result buffer
+                    # and Python's poll loop routes them the same way.
+                    have_per_rx = hasattr(self.receiver.lib, 'hpsdr_set_rx_decode')
+                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                        scanner = mgr._itila_scanner
+                        if not (scanner and scanner._sc):
+                            continue
+                        decode_ptr = _ct.cast(
+                            scanner._sc._lib.itila_sc_decode_ready,
+                            _ct.c_void_p)
+                        window_samples = scanner._window_samples
+                        if have_per_rx:
+                            self.receiver.lib.hpsdr_set_rx_decode(
+                                self.receiver._h, ri,
+                                decode_ptr, _ct.c_int(window_samples))
+                        else:
+                            # Old hpsdr_fast — single decode setter.
+                            # Safe only when all bands use the same backend.
+                            self.receiver.lib.hpsdr_set_decode(
+                                self.receiver._h, decode_ptr,
+                                _ct.c_int(window_samples))
+                    self._pfb_managers = []  # no Python decode poll needed
                     # Enable FT8 raw IQ accumulation per band (skipped if disabled)
                     if self.cfg.get('enable_ft8', True):
                         FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
@@ -5095,6 +5293,15 @@ class OpenSkimmer:
                     self._worker_started = True
                     log.info("C worker thread started (%d bands, CW+FT8)",
                              scanners_ready)
+            # PFB scanners' C worker only feeds; decode runs in Python.
+            # Drain ready windows and route through the scanner's normal
+            # _process_ready (Python decode + spotting path).
+            if use_c and getattr(self, '_worker_started', False):
+                for mgr in getattr(self, '_pfb_managers', []):
+                    sc = mgr._itila_scanner
+                    if sc:
+                        sc._process_ready()
+
             # Process decode results — poll from C worker's result buffer
             if use_c and getattr(self, '_worker_started', False):
                 import ctypes as _ct

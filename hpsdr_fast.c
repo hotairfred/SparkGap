@@ -98,14 +98,16 @@ typedef struct {
         pthread_mutex_t mu;
     } ft8_cap[MAX_RX];
 
-    /* Per-receiver scanner handles for worker thread */
-    void *scanners[MAX_RX];         /* ItilaSc* per enabled receiver */
-    sc_feed_iq_fn scanner_feed;     /* itila_sc_feed_iq function pointer */
+    /* Per-receiver scanner handles + function pointers + window for worker thread.
+     * Each RX may use a different scanner backend (per-bin ITILA or PFB), each
+     * with its own feed_iq + decode_ready entry points and envelope rate.
+     * scanner_feed[rx]/scanner_decode[rx] = NULL means "no scanner attached
+     * (or decode handled in Python)" — the worker skips that step for this RX. */
+    void *scanners[MAX_RX];         /* ItilaSc or PfbSc per enabled receiver */
+    sc_feed_iq_fn scanner_feed[MAX_RX];
+    int (*scanner_decode[MAX_RX])(void *sc, int window_samples, void *results, int max);
+    int window_samples_rx[MAX_RX];  /* envelope-samples per decode window, per RX */
     double iq_scale;                /* 8388608.0 */
-    int window_samples;             /* ITILA decode window size */
-
-    /* Decode function pointer (itila_sc_decode_ready) */
-    int (*scanner_decode)(void *sc, int window_samples, void *results, int max);
 
     /* Result ring buffer — worker writes, Python reads */
     #define RESULT_MAX 256
@@ -402,10 +404,21 @@ static void *scanner_worker(void *arg);
 void hpsdr_set_scanner(HpsdrFast *h, int rx_index, void *scanner_handle,
                         sc_feed_iq_fn feed_fn, double scale) {
     if (rx_index >= 0 && rx_index < MAX_RX) {
-        h->scanners[rx_index] = scanner_handle;
-        h->scanner_feed = feed_fn;
+        h->scanners[rx_index]     = scanner_handle;
+        h->scanner_feed[rx_index] = feed_fn;
         h->iq_scale = scale;
     }
+}
+
+/* Per-RX decode setup.  Lets one RX use the C decode loop (legacy ITILA path)
+ * while another uses Python decode (e.g. PFB scanner with a different envelope
+ * rate / struct layout).  Pass decode_fn=NULL to skip C decode for this RX. */
+void hpsdr_set_rx_decode(HpsdrFast *h, int rx_index,
+                         int (*decode_fn)(void *, int, void *, int),
+                         int window_samples) {
+    if (rx_index < 0 || rx_index >= MAX_RX) return;
+    h->scanner_decode[rx_index]  = decode_fn;
+    h->window_samples_rx[rx_index] = window_samples;
 }
 
 /* ---- FT8 setup and decode ---- */
@@ -565,8 +578,13 @@ static void ft8_check_decode(HpsdrFast *h) {
 void hpsdr_set_decode(HpsdrFast *h,
                        int (*decode_fn)(void*, int, void*, int),
                        int window_samples) {
-    h->scanner_decode = decode_fn;
-    h->window_samples = window_samples;
+    /* Legacy single-decode setter — fans out to every RX so existing
+     * callers stay working.  Use hpsdr_set_rx_decode for per-RX setup
+     * (e.g. PFB scanner needs decode handled in Python). */
+    for (int i = 0; i < MAX_RX; i++) {
+        h->scanner_decode[i]    = decode_fn;
+        h->window_samples_rx[i] = window_samples;
+    }
 }
 
 void hpsdr_start_worker(HpsdrFast *h) {
@@ -657,7 +675,7 @@ static void *scanner_worker(void *arg) {
     while (h->worker_running) {
         int did_work = 0;
 
-        if (h->rx_enabled[rx] && h->scanners[rx] && h->scanner_feed) {
+        if (h->rx_enabled[rx] && h->scanners[rx] && h->scanner_feed[rx]) {
             /* Drain ring buffer → feed scanner */
             RxRing *r = &h->rx[rx];
             int avail = ring_avail(r);
@@ -670,15 +688,16 @@ static void *scanner_worker(void *arg) {
                     rp = (rp + 1) % RING_SIZE;
                 }
                 r->read_pos = rp;
-                h->scanner_feed(h->scanners[rx], i_tmp, q_tmp, n);
+                h->scanner_feed[rx](h->scanners[rx], i_tmp, q_tmp, n);
                 did_work = 1;
                 avail = ring_avail(r);
             }
 
-            /* Decode ready windows */
-            if (h->scanner_decode && h->window_samples > 0) {
-                int n_dec = h->scanner_decode(h->scanners[rx],
-                                               h->window_samples,
+            /* Decode ready windows.  scanner_decode[rx] may be NULL if
+             * Python is handling decode for this RX (e.g. PFB scanner). */
+            if (h->scanner_decode[rx] && h->window_samples_rx[rx] > 0) {
+                int n_dec = h->scanner_decode[rx](h->scanners[rx],
+                                               h->window_samples_rx[rx],
                                                dec_buf, 64);
                 if (n_dec > 0) {
                     pthread_mutex_lock(&h->result_lock);
