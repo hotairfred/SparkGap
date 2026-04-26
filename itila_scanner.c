@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* ---- compile-time limits ---- */
 #define SC_MAX_BINS   512
@@ -93,6 +94,10 @@ struct ItilaSc {
     ScBin  bins[SC_MAX_BINS];
 
     pthread_mutex_t lock;  /* protects bins/envelope during concurrent feed+decode */
+
+    /* Diagnostic counters */
+    uint64_t env_drops;          /* per-bin envelope cap hits */
+    uint64_t bins_at_max;        /* peak active bin count */
 
     /* ITILA decoder function pointers — set via itila_sc_set_decoder */
     void *(*dec_create)(int sample_rate, double lpf_hz);
@@ -406,6 +411,8 @@ static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full
                 b->env100[b->env_n] = env_100;
                 b->env200[b->env_n] = env_200;
                 b->env_n++;
+            } else {
+                sc->env_drops++;
             }
         }
 
@@ -574,8 +581,12 @@ int itila_sc_peek_env(ItilaSc *sc, double f_hz,
 
 int itila_sc_bin_count(ItilaSc *sc)
 {
+    if (sc->n_bins > (int)sc->bins_at_max) sc->bins_at_max = sc->n_bins;
     return sc->n_bins;
 }
+
+unsigned long long itila_sc_env_drops(ItilaSc *sc) { return (unsigned long long)sc->env_drops; }
+int      itila_sc_bins_peak(ItilaSc *sc) { return (int)sc->bins_at_max; }
 
 int itila_sc_env_n(ItilaSc *sc, double f_hz)
 {

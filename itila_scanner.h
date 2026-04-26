@@ -67,6 +67,10 @@ void itila_sc_mark_evidence(ItilaSc *sc, double f_hz);
 /* Current number of active bins. */
 int itila_sc_bin_count(ItilaSc *sc);
 
+/* Diagnostic counters: env-cap drops since start, peak active bin count. */
+unsigned long long itila_sc_env_drops(ItilaSc *sc);
+int                itila_sc_bins_peak(ItilaSc *sc);
+
 /* Env samples buffered for a specific bin (0 if not found). */
 int itila_sc_env_n(ItilaSc *sc, double f_hz);
 

@@ -3791,6 +3791,7 @@ class InstanceManager:
                  ml_max_channels=20, use_dispatcher=False,
                  use_pfb_dispatcher=False, use_itila=False,
                  itila_ev_thresh=2.0, itila_window_sec=120.0,
+                 itila_min_snr=8.0, itila_max_bins=200,
                  cw_min_khz=0.0, cw_max_khz=99999.0):
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -3803,6 +3804,8 @@ class InstanceManager:
         self.use_itila = bool(use_itila)
         self.itila_ev_thresh = float(itila_ev_thresh)
         self.itila_window_sec = float(itila_window_sec)
+        self.itila_min_snr = float(itila_min_snr)
+        self.itila_max_bins = int(itila_max_bins)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
@@ -3875,9 +3878,10 @@ class InstanceManager:
                     self.sample_rate, center_khz,
                     ev_thresh=self.itila_ev_thresh,
                     window_sec=self.itila_window_sec,
-                    min_snr=12.0,
+                    min_snr=float(self.itila_min_snr),
                     band_min_khz=bmin,
-                    band_max_khz=bmax)
+                    band_max_khz=bmax,
+                    max_bins=int(self.itila_max_bins))
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -4960,6 +4964,8 @@ class OpenSkimmer:
                 use_itila=bool(self.cfg.get('use_itila', False)),
                 itila_ev_thresh=float(self.cfg.get('itila_ev_thresh', 2.0)),
                 itila_window_sec=float(self.cfg.get('itila_window_sec', 120.0)),
+                itila_min_snr=float(self.cfg.get('signal_min_snr', 8.0)),
+                itila_max_bins=int(self.cfg.get('itila_max_bins', 200)),
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
                 cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
             )
@@ -5070,18 +5076,21 @@ class OpenSkimmer:
                     window_samples = int(self.cfg.get('itila_window_sec', 60) * 200)
                     self.receiver.lib.hpsdr_set_decode(
                         self.receiver._h, decode_ptr, _ct.c_int(window_samples))
-                    # Enable FT8 raw IQ accumulation per band
-                    FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
-                                 21090: 21074, 28090: 28074}
-                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
-                        ck = ch / 1000
-                        ft8_khz = FT8_FREQS.get(int(ck))
-                        if ft8_khz:
-                            self.receiver.lib.hpsdr_enable_ft8(
-                                self.receiver._h, ri,
-                                _ct.c_double(ft8_khz * 1000.0),
-                                _ct.c_double(float(ch)))
-                            log.info("FT8 accumulator enabled rx%d: %.0f kHz", ri, ft8_khz)
+                    # Enable FT8 raw IQ accumulation per band (skipped if disabled)
+                    if self.cfg.get('enable_ft8', True):
+                        FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
+                                     21090: 21074, 28090: 28074}
+                        for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                            ck = ch / 1000
+                            ft8_khz = FT8_FREQS.get(int(ck))
+                            if ft8_khz:
+                                self.receiver.lib.hpsdr_enable_ft8(
+                                    self.receiver._h, ri,
+                                    _ct.c_double(ft8_khz * 1000.0),
+                                    _ct.c_double(float(ch)))
+                                log.info("FT8 accumulator enabled rx%d: %.0f kHz", ri, ft8_khz)
+                    else:
+                        log.info("FT8 disabled by config (enable_ft8=false)")
                     self.receiver.lib.hpsdr_start_worker(self.receiver._h)
                     self._worker_started = True
                     log.info("C worker thread started (%d bands, CW+FT8)",
@@ -5311,9 +5320,39 @@ class OpenSkimmer:
                          "%d chars, %.0fs",
                          self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
+                # Ring + env-cap drop telemetry (added 2026-04-26 to verify
+                # we're not silently losing samples in the C pipeline).
+                if use_c and self.receiver and self.receiver._h:
+                    try:
+                        rl = self.receiver.lib
+                        pkts  = rl.hpsdr_pkt_count(self.receiver._h)
+                        rdrop = rl.hpsdr_drop_count(self.receiver._h)
+                        env_drops_total = 0
+                        bins_total = 0
+                        bins_peak = 0
+                        for mgr in self.managers:
+                            wrapper = getattr(mgr, '_itila_scanner', None)
+                            sc = getattr(wrapper, '_sc', None) if wrapper else None
+                            if sc and sc._h:
+                                if hasattr(sc._lib, 'itila_sc_env_drops'):
+                                    sc._lib.itila_sc_env_drops.restype = _ct.c_ulonglong
+                                    sc._lib.itila_sc_env_drops.argtypes = [_ct.c_void_p]
+                                    sc._lib.itila_sc_bins_peak.restype = _ct.c_int
+                                    sc._lib.itila_sc_bins_peak.argtypes = [_ct.c_void_p]
+                                    sc._lib.itila_sc_bin_count.restype = _ct.c_int
+                                    sc._lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
+                                    env_drops_total += sc._lib.itila_sc_env_drops(sc._h)
+                                    bins_peak = max(bins_peak, sc._lib.itila_sc_bins_peak(sc._h))
+                                    bins_total += sc._lib.itila_sc_bin_count(sc._h)
+                        log.info("Health: ring_drops=%d/%d (%.4f%%) env_drops=%d bins=%d peak=%d",
+                                 rdrop, pkts, 100.0 * rdrop / max(pkts + rdrop, 1),
+                                 env_drops_total, bins_total, bins_peak)
+                    except Exception as e:
+                        log.warning("Health probe failed: %s", e)
 
             # FT8 decode — aligned to minute boundaries, runs in thread
-            if use_c and getattr(self, '_worker_started', False):
+            if use_c and getattr(self, '_worker_started', False) \
+                    and self.cfg.get('enable_ft8', True):
                 ft8_now = time.time()
                 ft8_sec = ft8_now % 60
                 ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
