@@ -4813,18 +4813,19 @@ class SpotTracker:
         distinct candidate calls in the last SIGHTING_WINDOW). With SCP
         bucketing in place, garbled variants (VM4FO, ITM4FO) collapse
         into their nearest SCP-valid bucket (KM4FO), so 'distinct' here
-        means distinct *real* calls, not decode variants. Floor of 3
-        because we want at least 3 sightings of a bucket before trusting
-        it — single hits are too easy to fabricate from noise around a
-        nearby real signal."""
+        means distinct *real* calls, not decode variants.
+          1 distinct → 2 sightings   (clean POTA/SST/casual op — fast)
+          2-3 distinct → 3 sightings (light competition)
+          4+ distinct → 5 sightings  (pile-up / contest / heavy spread)"""
         if not hasattr(self, '_freq_sighting_times'):
-            return 3
+            return 2
         cutoff = now - self.SIGHTING_WINDOW
         distinct = {c for t, c in self._freq_sighting_times.get(freq_bin, [])
                     if t >= cutoff}
         n = len(distinct)
-        if n <= 3: return 3   # clean to light: 3 votes for the bucket
-        return 5              # pile-up / contest / heavy bucket spread
+        if n <= 1: return 2   # clean — POTA/SST single op
+        if n <= 3: return 3   # light competition
+        return 5              # pile-up / contest / heavy spread
 
     def _committed_call_alive(self, call, freq_bin, now):
         """True iff committed call has been re-sighted within COMMIT_LOCK_SEC.
@@ -5235,7 +5236,7 @@ class SpotTracker:
                 if bypass_gate and not committed:
                     total_at_freq = self._count_freq_total(freq_bin, now)
                     base_thresh = self._adaptive_commit_threshold(freq_bin, now)
-                    floor = 3 if patt3ch_match == 'active' else 5
+                    floor = 2 if patt3ch_match == 'active' else 5
                     thresh = max(base_thresh, floor)
                     if total_at_freq < thresh:
                         bypass_gate = False
