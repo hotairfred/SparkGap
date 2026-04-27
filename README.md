@@ -7,14 +7,22 @@ spot output via telnet.
 > **Status:** alpha. Actively developed. Tested in production on a
 > Red Pitaya STEMlab 125-14 with a 5-band antenna.
 >
-> **Two reference comparisons:**
-> - **File replay** vs VE3NEA's SkimSrv (frozen / closed Windows
->   software) on a 15-min CW contest recording: caught 81% of
->   SkimSrv's spots PLUS 23 additional RBN-confirmed real calls
->   SkimSrv missed.
-> - **Live deployment** vs UT4LW's SDC Skimmer (actively-maintained
->   commercial competitor) on the same antenna split: 67% recall in
->   the first 17 minutes of operation.
+> **Reference comparisons (comparable, not claiming superiority):**
+>
+> - **File replay** against a 15-min CW contest recording (B1_seg2)
+>   with a SkimSrv-generated answer key: catches 81% of the keyed
+>   calls. Each catches some calls the other doesn't.
+>
+> - **Live deployment** alongside UT4LW's SDC Skimmer (actively-
+>   maintained commercial competitor) on a shared antenna split:
+>   matches 67% of SDC's spots in the first 17 minutes of operation.
+>   Each catches some calls the other doesn't — they hear different
+>   pieces of the same band.
+>
+> SDC has years of contest tuning we don't yet match. We have features
+> SDC doesn't (Linux native, open source, multi-mode in one process,
+> packet-loss telemetry). Comparable, complementary, not competing on
+> winning a single benchmark.
 >
 > Not yet feeding the live RBN — Aggregator-equivalent forwarder is
 > on the roadmap.
