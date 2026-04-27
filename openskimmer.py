@@ -4519,7 +4519,8 @@ class SpotTracker:
     """
 
     def __init__(self, valid_calls, blacklist, respot_interval=120,
-                 fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0):
+                 fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0,
+                 patt3ch_path='patt3ch.lst'):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
@@ -4527,6 +4528,15 @@ class SpotTracker:
         self.add_calls = add_calls or set()
         # 0 = naked (no SCP), None = SCP-only (no bypass), N>0 = promote after N decodes
         self.scp_bypass_threshold = scp_bypass_threshold
+        # patt3ch.lst: SkimSrv's structural-pattern allowlist used as the
+        # bypass-tier validation. Calls matching a pattern are
+        # "structurally legit" — relaxed gate. Calls NOT matching are
+        # likely noise (suffixes/fragments of real calls).
+        # Format: "<flag> <pattern>" where @=letter, #=digit, literal else.
+        # Roughly half are flagged "+" (common) vs unflagged (rare).
+        self._patt3ch_by_len_active = {}   # length -> [compiled regex, ...]
+        self._patt3ch_by_len_rare   = {}
+        self._load_patt3ch(patt3ch_path)
 
         # Exact match tracking
         self._tracking = defaultdict(lambda: {
@@ -4630,6 +4640,46 @@ class SpotTracker:
             return 4
         return 3
 
+    def _load_patt3ch(self, path):
+        """Load SkimSrv's patt3ch.lst structural-pattern allowlist.
+        Compiles each pattern to a regex and indexes by call length for
+        O(patterns_at_length) lookup. Patterns flagged "+" go in the
+        active bucket; unflagged go in rare. Both are valid; flag is
+        used to weight confidence."""
+        try:
+            with open(path) as fp:
+                for line in fp:
+                    line = line.rstrip()
+                    if len(line) < 2:
+                        continue
+                    flag = line[0]
+                    pat = line[2:].strip()
+                    if not pat:
+                        continue
+                    rx_str = '^' + pat.replace('@', '[A-Z]').replace('#', '[0-9]') + '$'
+                    rx = re.compile(rx_str)
+                    bucket = (self._patt3ch_by_len_active if flag == '+'
+                              else self._patt3ch_by_len_rare)
+                    bucket.setdefault(len(pat), []).append(rx)
+            n_active = sum(len(v) for v in self._patt3ch_by_len_active.values())
+            n_rare = sum(len(v) for v in self._patt3ch_by_len_rare.values())
+            log.info("Loaded patt3ch.lst: %d active + %d rare patterns",
+                     n_active, n_rare)
+        except FileNotFoundError:
+            log.warning("patt3ch.lst not found at %s — bypass-tier validation disabled", path)
+
+    def _matches_patt3ch(self, call):
+        """Return 'active' if call matches a "+"-flagged pattern,
+        'rare' if it matches an unflagged pattern, or None."""
+        n = len(call)
+        for rx in self._patt3ch_by_len_active.get(n, []):
+            if rx.match(call):
+                return 'active'
+        for rx in self._patt3ch_by_len_rare.get(n, []):
+            if rx.match(call):
+                return 'rare'
+        return None
+
     # Deferred consensus emission: a freq_bin must accumulate this many
     # sightings (across all candidate calls) before we commit to one call
     # and emit it. Suppresses the multiple-spots-from-one-real-signal
@@ -4640,16 +4690,99 @@ class SpotTracker:
     COMMIT_THRESHOLD = 5
     COMMIT_LOCK_SEC = 300
 
+    _BUCKET_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+    # Leading-noise trim characters: E (.), T (-), I (..), S (...) are the
+    # shortest Morse symbols and the most common decoder noise prefixes
+    # (the decoder hears noise crackle as a few short elements before the
+    # real signal starts). Trimming ≤2 of these from the front and
+    # re-checking SCP catches ITM4FO/EVM4FO/etc that edit-1 alone misses.
+    _BUCKET_NOISE_CHARS = 'ETIS'
+
+    def _scp_bucket(self, call):
+        """Map a call to its consensus bucket: nearest SCP-valid call within
+        edit distance 1 (substitution), or after trimming ≤2 leading
+        noise-prefix chars (E/T/I/S) plus another edit-1 substitution.
+        Returns the call itself if no unambiguous SCP neighbor exists.
+        Collapses garbled variants (VM4FO, ITM4FO, EVM4FO → KM4FO) into
+        one vote bucket while keeping distinct SCP-valid calls (K8MA vs
+        K8MR) separate. Cached per-call (deterministic mapping)."""
+        if not hasattr(self, '_bucket_cache'):
+            self._bucket_cache = {}
+        if call in self._bucket_cache:
+            return self._bucket_cache[call]
+        if call in self.valid_calls:
+            self._bucket_cache[call] = call
+            return call
+
+        def _edit1_unique_scp(s):
+            """Return the unique SCP-valid edit-1 substitution of s, or
+            None if zero or 2+ matches (ambiguous → no merge)."""
+            matches = set()
+            for i in range(len(s)):
+                for c in self._BUCKET_CHARS:
+                    if c == s[i]: continue
+                    cand = s[:i] + c + s[i+1:]
+                    if cand in self.valid_calls:
+                        matches.add(cand)
+                        if len(matches) > 1:
+                            return None
+            return matches.pop() if len(matches) == 1 else None
+
+        bucket = _edit1_unique_scp(call)
+        if bucket:
+            self._bucket_cache[call] = bucket
+            return bucket
+
+        # TEST<call> fusion split: when the runner sends "TEST <call>" with
+        # too little inter-word space, the decoder fuses them and emits
+        # "T<call>". The leading "T" is a single dah from the trailing K
+        # of "TEST" or just the gap collapse. If stripping a leading T
+        # yields a SCP-valid call, that's almost certainly what happened.
+        # Industry-known issue (RBN-OPS thread 2023-09-20, N4ZR's example).
+        # Only fires when call is 5+ chars (TN4ZR → N4ZR is the canonical
+        # case) and the stripped form is in SCP exactly.
+        if len(call) >= 5 and call[0] == 'T':
+            suffix = call[1:]
+            if suffix in self.valid_calls:
+                self._bucket_cache[call] = suffix
+                return suffix
+
+        # Try trimming ≤2 leading noise chars and re-checking. Bounded so
+        # IT9XYZ (real IT prefix) doesn't trim to 9XYZ and then bucket to
+        # K9XYZ — only trim if (a) the prefix is all noise-chars and (b)
+        # the original wasn't itself a SCP entry.
+        for trim_len in range(1, 3):
+            if len(call) - trim_len < 3: break
+            if not all(c in self._BUCKET_NOISE_CHARS for c in call[:trim_len]):
+                break
+            suffix = call[trim_len:]
+            if suffix in self.valid_calls:
+                self._bucket_cache[call] = suffix
+                return suffix
+            sub = _edit1_unique_scp(suffix)
+            if sub:
+                self._bucket_cache[call] = sub
+                return sub
+
+        # No SCP neighbor — vote for self (could be special event, club
+        # call, or noise; decisions about acceptance happen downstream)
+        self._bucket_cache[call] = call
+        return call
+
     def _record_sighting(self, call, freq_bin, now):
         """Record a timestamped sighting for time-windowed counting.
         Maintains both per-call and per-freq indices for fast lookup
-        from either side."""
+        from either side. Sightings are recorded under the SCP bucket
+        (garbled variants collapse to nearest SCP) so the consensus
+        winner counts votes from all decode variants."""
         if not hasattr(self, '_sighting_times'):
             self._sighting_times = defaultdict(list)
         if not hasattr(self, '_freq_sighting_times'):
             self._freq_sighting_times = defaultdict(list)
-        self._sighting_times[call].append((now, freq_bin))
-        self._freq_sighting_times[freq_bin].append((now, call))
+        bucket = self._scp_bucket(call)
+        self._sighting_times[bucket].append((now, freq_bin))
+        self._freq_sighting_times[freq_bin].append((now, bucket))
 
     def _count_freq_total(self, freq_bin, now):
         """Total sightings at freq_bin across ALL calls within SIGHTING_WINDOW."""
@@ -4677,21 +4810,21 @@ class SpotTracker:
 
     def _adaptive_commit_threshold(self, freq_bin, now):
         """Adapt the consensus threshold based on freq clutter (number of
-        distinct candidate calls in the last SIGHTING_WINDOW). Clean
-        frequencies (POTA, casual ops) only emit one or two distinct
-        calls — first sighting is the runner. Cluttered frequencies
-        (contests, pile-ups, weak-signal multi-variant decodes) need
-        full consensus. Avoids the blanket-5 latency penalty for the
-        easy cases while keeping protection where it's earned."""
+        distinct candidate calls in the last SIGHTING_WINDOW). With SCP
+        bucketing in place, garbled variants (VM4FO, ITM4FO) collapse
+        into their nearest SCP-valid bucket (KM4FO), so 'distinct' here
+        means distinct *real* calls, not decode variants. Floor of 3
+        because we want at least 3 sightings of a bucket before trusting
+        it — single hits are too easy to fabricate from noise around a
+        nearby real signal."""
         if not hasattr(self, '_freq_sighting_times'):
-            return 1
+            return 3
         cutoff = now - self.SIGHTING_WINDOW
         distinct = {c for t, c in self._freq_sighting_times.get(freq_bin, [])
                     if t >= cutoff}
         n = len(distinct)
-        if n <= 1: return 1   # clean — emit first sighting
-        if n <= 3: return 3   # light competition or weak-decoder variants
-        return 5              # pile-up / contest / heavy variant spread
+        if n <= 3: return 3   # clean to light: 3 votes for the bucket
+        return 5              # pile-up / contest / heavy bucket spread
 
     def _committed_call_alive(self, call, freq_bin, now):
         """True iff committed call has been re-sighted within COMMIT_LOCK_SEC.
@@ -4914,6 +5047,9 @@ class SpotTracker:
         has_context_global = bool(CQ_PATTERNS.search(recent_ctx_for_runner))
         cq_runner_call = (_itila_extract_cq_call(recent_ctx_for_runner, self.valid_calls)
                           if has_context_global else None)
+        # Collapse runner candidate to its SCP bucket too, so a garbled
+        # form in the text (VM4FO) matches a clean form (KM4FO) in the gate.
+        cq_runner_bucket = self._scp_bucket(cq_runner_call) if cq_runner_call else None
 
         # --- Path 1: Exact SCP match ---
         # 1a: regex scan (word-boundary aware)
@@ -4971,6 +5107,17 @@ class SpotTracker:
                     call = _corrected
                     forced_bypass = True
 
+            # SCP bucket: collapse single-edit garbled variants to nearest
+            # SCP-valid call. VM4FO/ITM4FO/EVM4FO → KM4FO. K8MA and K8MR
+            # stay distinct (both SCP-valid → no merge). When the bucket
+            # differs from the raw call, treat the bucketed form as the
+            # canonical decode. Skips bypass since bucket ∈ SCP.
+            if '/' not in call:
+                _bucket = self._scp_bucket(call)
+                if _bucket != call and _bucket in self.valid_calls:
+                    log.info("SCP bucket: %s → %s @ %.1f kHz", call, _bucket, freq_khz)
+                    call = _bucket
+
             # Global WPM sanity gate.  MAX_WPM=50 is defined as a constant
             # documenting "spots above this are almost certainly noise" but
             # was never actually enforced — wire it in here.  Contest CW
@@ -5003,8 +5150,8 @@ class SpotTracker:
                 # cross-check). When no runner could be identified despite
                 # has_context (CQ token garbled, no adjacent base call), fall
                 # back to original permissive behavior.
-                if has_context and cq_runner_call is not None:
-                    gate = (call == cq_runner_call) or (recent_count >= min_s)
+                if has_context and cq_runner_bucket is not None:
+                    gate = (call == cq_runner_bucket) or (recent_count >= min_s)
                 else:
                     gate = has_context or recent_count >= min_s
 
@@ -5052,20 +5199,30 @@ class SpotTracker:
                         })
             elif self.scp_bypass_threshold and CALL_RE.match(call) \
                     and call not in seen_p1:
-                # Non-SCP call that looks structurally valid — gate via the
-                # SAME per-freq consensus the SCP-valid path uses, plus a
-                # min-3 floor (bypass calls are inherently more suspect than
-                # SCP-validated ones, so they need more evidence). Records
-                # sightings into the unified freq tracker so SCP-valid and
-                # bypass calls compete for the same freq slot — kills the
-                # 6/9 hallucination rate the bypass path showed pre-fix
-                # (KC3RLZ/AC3A bleeding from KC3RLG @ 200 Hz; A1QV @ W3RJ).
+                # Non-SCP call that looks structurally valid. Layered
+                # confidence based on patt3ch.lst (SkimSrv's structural
+                # allowlist):
+                #   patt3ch active ("+") → bypass with normal min-3 thresh
+                #   patt3ch rare        → bypass with min-5 thresh
+                #   patt3ch no match    → drop (likely fragment/garbage)
+                # Plus the same per-freq consensus the SCP-valid path uses
+                # so SCP-valid and bypass calls compete for the same freq
+                # slot — kills the bleed-over pattern (KC3RLZ/AC3A from
+                # KC3RLG @ 200 Hz; A1QV @ W3RJ).
                 seen_p1.add(call)  # dedupe within this process() call
                 if wpm > self.MAX_WPM:
                     continue
+                patt3ch_match = self._matches_patt3ch(call)
+                if patt3ch_match is None:
+                    # Doesn't match any common callsign structure.
+                    # Probably noise (HA235R fragments: A235R, M5R; contest
+                    # exchange garbage: TT5CM; garbled prefixes: VM4FO).
+                    # Don't even record — drop quietly.
+                    continue
                 self._record_sighting(call, freq_bin, now)
 
-                # Adaptive consensus, bypass-strength: floor at 3
+                # Adaptive consensus, bypass-strength. patt3ch tier sets
+                # the floor: active ("+") = 3, rare = 5.
                 bypass_gate = True
                 committed = self._freq_committed.get(freq_bin)
                 if committed:
@@ -5077,7 +5234,9 @@ class SpotTracker:
                         bypass_gate = False
                 if bypass_gate and not committed:
                     total_at_freq = self._count_freq_total(freq_bin, now)
-                    thresh = max(self._adaptive_commit_threshold(freq_bin, now), 3)
+                    base_thresh = self._adaptive_commit_threshold(freq_bin, now)
+                    floor = 3 if patt3ch_match == 'active' else 5
+                    thresh = max(base_thresh, floor)
                     if total_at_freq < thresh:
                         bypass_gate = False
                     else:
@@ -5086,8 +5245,8 @@ class SpotTracker:
                             bypass_gate = False
                         else:
                             self._freq_committed[freq_bin] = (call, now)
-                            log.info("FREQ COMMIT (bypass): %s @ bin=%d (%d/%d sightings, thresh=%d)",
-                                     call, freq_bin, winner_n, total_at_freq, thresh)
+                            log.info("FREQ COMMIT (bypass/%s): %s @ bin=%d (%d/%d sightings, thresh=%d)",
+                                     patt3ch_match, call, freq_bin, winner_n, total_at_freq, thresh)
 
                 bkey = (call, int(round(freq_khz)))
                 if bypass_gate and bkey not in self._bypass_spotted \
