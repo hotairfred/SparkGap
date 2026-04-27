@@ -119,6 +119,14 @@ def _get_hpsdr_fast():
                 _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
                 _ct.c_int, _ct.POINTER(_ct.c_double)]
             try:
+                lib.hpsdr_iq_snapshot_read.restype = _ct.c_int
+                lib.hpsdr_iq_snapshot_read.argtypes = [
+                    _ct.c_void_p, _ct.c_int,
+                    _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
+                    _ct.c_int, _ct.POINTER(_ct.c_double)]
+            except AttributeError:
+                pass
+            try:
                 lib.hpsdr_pkt_lost.restype = _ct.c_uint64
                 lib.hpsdr_pkt_lost.argtypes = [_ct.c_void_p]
             except AttributeError:
@@ -1898,7 +1906,7 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
 # surface; replaces per-bin NCO+FIR with a shared polyphase channelizer.
 # Selected by config flag use_pfb_scanner.
 # ---------------------------------------------------------------------------
-PFB_NCHAN      = 2048   # must match PSC_PFB_NCHAN in pfb_scanner.c
+PFB_NCHAN      = 4096   # must match PSC_PFB_NCHAN in pfb_scanner.c
 PFB_OVERSAMPLE = 2      # must match PSC_PFB_OVERSAMPLE in pfb_scanner.c
 
 def _pfb_output_rate(sample_rate):
@@ -4546,6 +4554,8 @@ class SpotTracker:
         # signal (K2NV, K2YG, VE3GMZ, VE6RST, WB2FUE, WI5D). Tracked
         # as freq_bin -> (call, sighting_count).
         self._freq_leader = {}
+        self._freq_committed = {}      # freq_bin -> (call, commit_time)
+        self._freq_sighting_times = defaultdict(list)  # freq_bin -> [(t, call), ...]
 
         # Build SCP prefix index for fast fuzzy matching
         self._scp_by_len = defaultdict(list)
@@ -4620,11 +4630,79 @@ class SpotTracker:
             return 4
         return 3
 
+    # Deferred consensus emission: a freq_bin must accumulate this many
+    # sightings (across all candidate calls) before we commit to one call
+    # and emit it. Suppresses the multiple-spots-from-one-real-signal
+    # pattern (K4R / K4RU / K4RUM / K4RUMN / TT5CM / K5CM all from one
+    # K4RUM CQ). Once committed, other calls at this freq are silenced
+    # for COMMIT_LOCK_SEC. Reset when committed call hasn't been re-sighted
+    # in COMMIT_LOCK_SEC (runner abandoned/QSY).
+    COMMIT_THRESHOLD = 5
+    COMMIT_LOCK_SEC = 300
+
     def _record_sighting(self, call, freq_bin, now):
-        """Record a timestamped sighting for time-windowed counting."""
+        """Record a timestamped sighting for time-windowed counting.
+        Maintains both per-call and per-freq indices for fast lookup
+        from either side."""
         if not hasattr(self, '_sighting_times'):
             self._sighting_times = defaultdict(list)
+        if not hasattr(self, '_freq_sighting_times'):
+            self._freq_sighting_times = defaultdict(list)
         self._sighting_times[call].append((now, freq_bin))
+        self._freq_sighting_times[freq_bin].append((now, call))
+
+    def _count_freq_total(self, freq_bin, now):
+        """Total sightings at freq_bin across ALL calls within SIGHTING_WINDOW."""
+        if not hasattr(self, '_freq_sighting_times'):
+            return 0
+        cutoff = now - self.SIGHTING_WINDOW
+        fresh = [(t, c) for t, c in self._freq_sighting_times.get(freq_bin, [])
+                 if t >= cutoff]
+        self._freq_sighting_times[freq_bin] = fresh
+        return len(fresh)
+
+    def _freq_winner(self, freq_bin, now):
+        """Call with the most sightings at freq_bin within SIGHTING_WINDOW.
+        Returns (call, count) or (None, 0) if no sightings."""
+        if not hasattr(self, '_freq_sighting_times'):
+            return None, 0
+        cutoff = now - self.SIGHTING_WINDOW
+        from collections import Counter
+        counts = Counter(c for t, c in self._freq_sighting_times.get(freq_bin, [])
+                         if t >= cutoff)
+        if not counts:
+            return None, 0
+        call, n = counts.most_common(1)[0]
+        return call, n
+
+    def _adaptive_commit_threshold(self, freq_bin, now):
+        """Adapt the consensus threshold based on freq clutter (number of
+        distinct candidate calls in the last SIGHTING_WINDOW). Clean
+        frequencies (POTA, casual ops) only emit one or two distinct
+        calls — first sighting is the runner. Cluttered frequencies
+        (contests, pile-ups, weak-signal multi-variant decodes) need
+        full consensus. Avoids the blanket-5 latency penalty for the
+        easy cases while keeping protection where it's earned."""
+        if not hasattr(self, '_freq_sighting_times'):
+            return 1
+        cutoff = now - self.SIGHTING_WINDOW
+        distinct = {c for t, c in self._freq_sighting_times.get(freq_bin, [])
+                    if t >= cutoff}
+        n = len(distinct)
+        if n <= 1: return 1   # clean — emit first sighting
+        if n <= 3: return 3   # light competition or weak-decoder variants
+        return 5              # pile-up / contest / heavy variant spread
+
+    def _committed_call_alive(self, call, freq_bin, now):
+        """True iff committed call has been re-sighted within COMMIT_LOCK_SEC.
+        When false, the freq slot is released (runner QSY/abandoned)."""
+        if not hasattr(self, '_sighting_times'):
+            return False
+        cutoff = now - self.COMMIT_LOCK_SEC
+        for t, fb in self._sighting_times.get(call, []):
+            if fb == freq_bin and t >= cutoff:
+                return True
+        return False
 
     # Max distinct frequency bins within the sighting window before
     # suppressing a call as a noise hallucination. Real stations sit on
@@ -4825,6 +4903,18 @@ class SpotTracker:
         spots = []
         now = time.time()
 
+        # CQ-runner identification: when CQ context is present, the call
+        # adjacent to CQ is the runner; other SCP-valid calls in the same
+        # buffer (worked stations during exchanges) are not. RBN cross-check
+        # 2026-04-26: 59% of false-positive spots were wrong-call-of-real-
+        # signal — a SCP-valid call from the runner's QSO leaking through
+        # the has_context gate. Pre-compute the runner once per call to
+        # _decode_window so we can demote non-runner SCP matches below.
+        recent_ctx_for_runner = context_clean[-500:] if len(context_clean) > 500 else context_clean
+        has_context_global = bool(CQ_PATTERNS.search(recent_ctx_for_runner))
+        cq_runner_call = (_itila_extract_cq_call(recent_ctx_for_runner, self.valid_calls)
+                          if has_context_global else None)
+
         # --- Path 1: Exact SCP match ---
         # 1a: regex scan (word-boundary aware)
         seen_p1 = set()
@@ -4904,13 +4994,51 @@ class SpotTracker:
                 recent_ctx = context_clean[-500:] if len(context_clean) > 500 else context_clean
                 has_context = bool(CQ_PATTERNS.search(recent_ctx))
                 min_s = self._min_sightings(call, snr)
-                # ITILA used to single-shot here (gate=True) on the theory that
-                # its Bayesian ev_thresh was sufficient quality gate. Live UK/EI
-                # contest 2026-04-25 disproved that — 87 OpenSkimmer-only spots
-                # vs SDC's 70 in 20 min, many of them noise-decoded SCP-valid
-                # calls that didn't repeat. ITILA now uses the same multi-sighting
-                # gate as other decoders.
-                gate = has_context or recent_count >= min_s
+                # CQ-runner gate: when a CQ context exists AND we identified
+                # the runner adjacent to CQ, only THAT call passes via context.
+                # Other SCP-valid calls in the same buffer are likely worked
+                # stations from the runner's QSO and must satisfy
+                # multi-sighting on their own to be spotted. This kills the
+                # 59% wrong-call-of-real-signal failure mode (2026-04-26 RBN
+                # cross-check). When no runner could be identified despite
+                # has_context (CQ token garbled, no adjacent base call), fall
+                # back to original permissive behavior.
+                if has_context and cq_runner_call is not None:
+                    gate = (call == cq_runner_call) or (recent_count >= min_s)
+                else:
+                    gate = has_context or recent_count >= min_s
+
+                # Deferred consensus gate: emit at most one call per freq_bin,
+                # picked by majority sightings after COMMIT_THRESHOLD total
+                # sightings have accumulated at that freq across all calls.
+                # Suppresses the multiple-spots-from-one-real-signal pattern
+                # where K4R/K4RU/K4RUM/K4RUMN/TT5CM all get emitted from one
+                # K4RUM CQ. Once a freq commits to a call, other calls there
+                # are silenced for COMMIT_LOCK_SEC; reset when the committed
+                # call hasn't been re-sighted in COMMIT_LOCK_SEC.
+                if gate:
+                    committed = self._freq_committed.get(freq_bin)
+                    if committed:
+                        committed_call, _ = committed
+                        if not self._committed_call_alive(committed_call, freq_bin, now):
+                            del self._freq_committed[freq_bin]
+                            committed = None
+                        elif call != committed_call:
+                            gate = False  # suppress non-committed call at this freq
+                    if gate and not committed:
+                        total_at_freq = self._count_freq_total(freq_bin, now)
+                        thresh = self._adaptive_commit_threshold(freq_bin, now)
+                        if total_at_freq < thresh:
+                            gate = False  # not enough evidence yet — defer
+                        else:
+                            winner_call, winner_n = self._freq_winner(freq_bin, now)
+                            if winner_call != call:
+                                gate = False  # this call isn't the winner
+                            else:
+                                self._freq_committed[freq_bin] = (call, now)
+                                log.info("FREQ COMMIT: %s @ bin=%d (%d/%d sightings, thresh=%d)",
+                                         call, freq_bin, winner_n, total_at_freq, thresh)
+
                 if gate and self._can_respot(call, freq_khz, now) \
                         and self._is_freq_leader(call, freq_bin, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
@@ -4924,24 +5052,49 @@ class SpotTracker:
                         })
             elif self.scp_bypass_threshold and CALL_RE.match(call) \
                     and call not in seen_p1:
-                # Non-SCP call that looks structurally valid — track per (call, freq).
-                # seen_p1 prevents counting the same call twice in one process() call.
-                # Promotes to spot after scp_bypass_threshold consistent decode events.
-                # Noise won't produce the same non-SCP call N times at one frequency.
-                # Use 1 kHz bucket here (vs 500 Hz freq_bin above) so a single
-                # runner whose bins jitter across ±500 Hz can accumulate hits in
-                # one place. UK/EI 2026-04-25: W4H/W4I FQP runners decoded
-                # cleanly at 14025.5/.6/.9 but each bypass bucket only saw 1-2
-                # hits, never reaching threshold.
+                # Non-SCP call that looks structurally valid — gate via the
+                # SAME per-freq consensus the SCP-valid path uses, plus a
+                # min-3 floor (bypass calls are inherently more suspect than
+                # SCP-validated ones, so they need more evidence). Records
+                # sightings into the unified freq tracker so SCP-valid and
+                # bypass calls compete for the same freq slot — kills the
+                # 6/9 hallucination rate the bypass path showed pre-fix
+                # (KC3RLZ/AC3A bleeding from KC3RLG @ 200 Hz; A1QV @ W3RJ).
                 seen_p1.add(call)  # dedupe within this process() call
-                bypass_freq = int(round(freq_khz))
-                bkey = (call, bypass_freq)
-                self._bypass_counts[bkey] += 1
-                if self._bypass_counts[bkey] >= self.scp_bypass_threshold and \
-                   bkey not in self._bypass_spotted:
-                    self._bypass_spotted.add(bkey)  # emit once per (call, freq)
-                    log.info("SCP bypass: %s at %.1f kHz (count=%d)",
-                             call, freq_khz, self._bypass_counts[bkey])
+                if wpm > self.MAX_WPM:
+                    continue
+                self._record_sighting(call, freq_bin, now)
+
+                # Adaptive consensus, bypass-strength: floor at 3
+                bypass_gate = True
+                committed = self._freq_committed.get(freq_bin)
+                if committed:
+                    committed_call, _ = committed
+                    if not self._committed_call_alive(committed_call, freq_bin, now):
+                        del self._freq_committed[freq_bin]
+                        committed = None
+                    elif call != committed_call:
+                        bypass_gate = False
+                if bypass_gate and not committed:
+                    total_at_freq = self._count_freq_total(freq_bin, now)
+                    thresh = max(self._adaptive_commit_threshold(freq_bin, now), 3)
+                    if total_at_freq < thresh:
+                        bypass_gate = False
+                    else:
+                        winner_call, winner_n = self._freq_winner(freq_bin, now)
+                        if winner_call != call:
+                            bypass_gate = False
+                        else:
+                            self._freq_committed[freq_bin] = (call, now)
+                            log.info("FREQ COMMIT (bypass): %s @ bin=%d (%d/%d sightings, thresh=%d)",
+                                     call, freq_bin, winner_n, total_at_freq, thresh)
+
+                bkey = (call, int(round(freq_khz)))
+                if bypass_gate and bkey not in self._bypass_spotted \
+                        and self._can_respot(call, freq_khz, now):
+                    self._bypass_spotted.add(bkey)
+                    log.info("SCP bypass: %s at %.1f kHz", call, freq_khz)
+                    self._mark_spotted(call, freq_khz, now)
                     spots.append({
                         'call': call,
                         'freq_khz': freq_khz,
@@ -5290,7 +5443,77 @@ class OpenSkimmer:
             log.info("OpenSkimmer LIVE: %s (%.3f kHz) rx%d, telnet :%d",
                      name, cal_center / 1000, rx_idx,
                      self.cfg.get('telnet_port', 7300))
+
+        # SIGUSR1 → snapshot the current IQ buffer for every enabled band
+        # to /tmp/diag_<band>_<HHMMSS>.wav for live-vs-replay diagnostics.
+        # Reuses the FT8 capture buffer (must have enable_ft8=true).
+        if (getattr(self, '_use_c_receiver', False)
+                and self.cfg.get('enable_ft8', True)):
+            try:
+                signal.signal(signal.SIGUSR1, self._diag_iq_snapshot)
+                log.info("SIGUSR1 handler installed: kill -USR1 %d for IQ snapshot", os.getpid())
+            except Exception as e:
+                log.warning("Failed to install SIGUSR1 handler: %s", e)
+
         return True
+
+    def _diag_iq_snapshot(self, signum, frame):
+        """SIGUSR1 handler — non-destructive snapshot of FT8 capture buffer
+        for every band → /tmp/diag_<band-khz>_<HHMMSS>.wav (24-bit stereo
+        IQ at 192 kHz). Replay with:
+          openskimmer.py --file <wav> --center-khz <khz> --start-min 0 --end-min 1
+        FT8 buffer stores int24 values cast to float (range ±8388608) —
+        we write them straight back as 24-bit PCM so the file reader gets
+        the full Pitaya range. read_24bit_iq_chunk reads exactly this."""
+        try:
+            import ctypes as _ct
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime('%H%M%S')
+            n_max = 192000 * 65  # FT8_BUF_CAP
+            i_buf = (_ct.c_float * n_max)()
+            q_buf = (_ct.c_float * n_max)()
+            t_first = _ct.c_double(0)
+            for name, center_hz, rx_idx in self._band_meta:
+                n = self.receiver.lib.hpsdr_iq_snapshot_read(
+                    self.receiver._h, rx_idx, i_buf, q_buf, n_max, _ct.byref(t_first))
+                if n < 192000:
+                    log.warning("SIGUSR1 rx%d (%s): only %d samples — skipping",
+                                rx_idx, name, n)
+                    continue
+                khz = int(center_hz / 1000)
+                path = f"/tmp/diag_{khz}_{ts}.wav"
+                i_arr = np.frombuffer(i_buf, dtype=np.float32, count=n)
+                q_arr = np.frombuffer(q_buf, dtype=np.float32, count=n)
+                # Clip to int24 range, convert to int32 then pack as 3-byte LE
+                i32 = np.clip(i_arr, -8388608, 8388607).astype(np.int32)
+                q32 = np.clip(q_arr, -8388608, 8388607).astype(np.int32)
+                interleaved = np.empty(n * 2, dtype=np.int32)
+                interleaved[0::2] = i32
+                interleaved[1::2] = q32
+                # Take low 3 bytes of each int32 (little-endian)
+                raw_bytes = interleaved.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+                # Write 24-bit PCM WAV manually (Python wave module won't)
+                rate = 192000
+                channels = 2
+                byte_rate = rate * channels * 3
+                block_align = channels * 3
+                data_size = len(raw_bytes)
+                fmt_chunk = struct.pack('<HHIIHH', 1, channels, rate,
+                                        byte_rate, block_align, 24)
+                with open(path, 'wb') as f:
+                    f.write(b'RIFF')
+                    f.write(struct.pack('<I', 36 + data_size))
+                    f.write(b'WAVE')
+                    f.write(b'fmt ')
+                    f.write(struct.pack('<I', len(fmt_chunk)))
+                    f.write(fmt_chunk)
+                    f.write(b'data')
+                    f.write(struct.pack('<I', data_size))
+                    f.write(raw_bytes)
+                log.info("SIGUSR1: wrote %s (%d samples, %.1f sec, t_first=%.3f)",
+                         path, n, n / 192000.0, t_first.value)
+        except Exception as e:
+            log.error("SIGUSR1 snapshot failed: %s", e)
 
     async def stop(self):
         self.running = False
