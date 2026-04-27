@@ -16,10 +16,10 @@
     "sdr_ip": "192.168.1.54",
     "sdr_port": 1024,
     "sample_rate": 192000,
-    "cw_min_khz": 14000,
-    "cw_max_khz": 14070,
+    "cw_min_khz": 7000,
+    "cw_max_khz": 7070,
     "bands": [
-        14090000
+        7090000
     ],
     "telnet_port": 7300,
     "scp_bypass_threshold": 3,

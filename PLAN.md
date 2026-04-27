@@ -67,11 +67,17 @@ fix it. Each architecture re-runs into the same wall.
 
 1. **Channel filter too wide → adjacent strong signal saturation.**
    - Per-bin scanner Stage 2 LPF: 75 Hz (post FIR75 commit `1ce6feb`)
-   - PFB at n_chan=2048: 94 Hz (this session — *wider*, not narrower)
-   - SDC reportedly: 25-30 Hz
-   - We are 2.5-4x wider than SDC. Adjacent strong signals (K1LZ at
-     14010.6 +47 dB sitting 1.5 kHz from M7Z at +2 dB) bleed into the
-     weak bin's input.
+   - PFB at n_chan=2048: 94 Hz (this session)
+   - PFB at n_chan=4096: 47 Hz (later this session)
+   - **CORRECTION (2026-04-26 17:30 per Grayline's binary analysis):**
+     SkimSrv does NOT use narrow channels — they use 500 Hz PFB bins
+     PLUS a per-channel Goertzel at 600 Hz audio pitch for in-bin
+     frequency selection.  Earlier memory entries citing "SDC ~25-30 Hz"
+     were a wrong guess that propagated.  See
+     `feedback_envelope_decoder_arch.md` for the full corrected picture.
+   - For envelope-based decoding (us), narrower channels DO help avoid
+     summing co-channel signals — but the proper architectural fix is
+     adding fine-frequency selection per active bin.
 
 2. **AGC saturation by adjacent strong signals.** If AGC window is
    shared or wide, a strong signal sets the gain that suppresses weak

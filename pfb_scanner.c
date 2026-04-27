@@ -44,16 +44,58 @@
 #define PSC_ENV_CAP    15000    /* 75s at ~200 Hz — 1.25 decode windows */
 
 /* PFB parameters — power of 2, oversample=2.
- *   bin_spacing = 192000 / 2048 = 93.75 Hz
- *   output_rate = 192000 *  2 / 2048 = 187.5 Hz
- *   M (input samples per output step) = 2048 / 2 = 1024
+ *   n_chan = 4096:
+ *     bin_spacing = 192000 / 4096 = 46.875 Hz  (was 93.75 at n_chan=2048)
+ *     output_rate = 192000 *  2 / 4096 = 93.75 Hz
+ *     M (input samples per output step) = 4096 / 2 = 2048
  *
- * 2048 channels gives plenty of headroom — even spawning 500 bins per
- * scanner adds only the per-bin envelope cost, which is ~188 ops/sec/bin.
+ * Bumped from 2048 to 4096 (2026-04-26 ~17:00 UTC) after recognizing the
+ * "trash-in-the-bin" problem: at 94 Hz channel BW, contest CW spacing
+ * (~200 Hz) puts 1-2 adjacent stations partially inside each channel.
+ * Their envelopes sum non-coherently → garbage → decoder frenzy at
+ * WPM_MAX.  47 Hz channels keep adjacent stations out cleanly.
+ * See feedback_envelope_decoder_arch.md for the full architectural note.
  */
-#define PSC_PFB_NCHAN        2048
+#define PSC_PFB_NCHAN        4096
 #define PSC_PFB_OVERSAMPLE   2
 #define PSC_PFB_TAPS         12
+
+/* Per-bin narrow LPF on complex IQ (after fine-tune NCO mix, before |x|).
+ *
+ * This is the frequency-selective stage that envelope decoders need to
+ * discriminate co-channel signals.  Once the spawn-frequency station is
+ * mixed to DC, this LPF passes only ±25 Hz around DC and rejects other
+ * in-bin signals (which sit at ±30-47 Hz baseband after the same mix).
+ * SkimSrv's per-channel Goertzel does the equivalent thing in frequency
+ * domain.  Per-bin scanner does this with FIR_S2_100/200 (75 Hz LPF on
+ * complex IQ — too wide for contest, but the same architectural shape).
+ *
+ * 9-tap Hamming-windowed FIR LPF, fc=25 Hz at fs=93.75 Hz:
+ *    0 Hz:  0 dB    (DC carrier preserved)
+ *   10 Hz: -0.3 dB  (CW dot fundamentals 12-25 Hz — passed cleanly)
+ *   25 Hz: -6 dB    (cutoff)
+ *   30 Hz: -11 dB   (in-bin competitor rejection starts)
+ *   40 Hz: -31 dB   (strong rejection)
+ *   46 Hz: -58 dB   (PFB channel edge — fully gone)
+ * Has small negative coefs (Gibbs); applied to complex IQ which can be
+ * negative anyway, so no Bayesian decoder issue (envelope is taken AFTER).
+ */
+#define PSC_BIN_LPF_LEN 9
+static const double PSC_BIN_LPF[9] = {
+     2.570683646980142e-03,
+    -2.151220437994406e-02,
+    -1.773977117982848e-02,
+     2.719386220946657e-01,
+     5.294853396362532e-01,
+     2.719386220946657e-01,
+    -1.773977117982848e-02,
+    -2.151220437994406e-02,
+     2.570683646980142e-03,
+};
+
+/* Envelope smoothing — non-negative MA on |x|.  3-tap at 93.75 Hz output. */
+#define PSC_ENV_SMOOTH_LEN 3
+static const double PSC_ENV_SMOOTH[3] = { 1.0/3.0, 1.0/3.0, 1.0/3.0 };
 
 /* ---- per-bin state ---- */
 typedef struct {
@@ -68,6 +110,19 @@ typedef struct {
     double env100[PSC_ENV_CAP];
     double env200[PSC_ENV_CAP];
     int    env_n;
+
+    /* Per-bin narrow LPF delay line (complex IQ, after fine-tune mix). */
+    double bin_lpf_i[PSC_BIN_LPF_LEN];
+    double bin_lpf_q[PSC_BIN_LPF_LEN];
+    int    bin_lpf_pos;
+    int    bin_lpf_count;  /* primed once it reaches PSC_BIN_LPF_LEN */
+
+    /* Envelope smoother delay line.  Per-bin (one per active bin) circular
+     * buffer of last PSC_ENV_SMOOTH_LEN raw envelope samples.  See
+     * process_bin_row for use. */
+    double env_dl[PSC_ENV_SMOOTH_LEN];
+    int    env_dl_pos;
+    int    env_dl_count;  /* primed once it reaches PSC_ENV_SMOOTH_LEN */
 
     int    created_sample;   /* in PFB output-rate samples */
     int    last_evidence;    /* in PFB output-rate samples */
@@ -273,7 +328,15 @@ static void run_scan(PfbSc *sc, const double *seg_i, const double *seg_q)
     qsort(peaks, np, sizeof(PsPeak), cmp_peak_desc);
 
     /* Cluster within 150 Hz, keep strongest, spawn new bins. */
-    double cluster_hz = 150.0;
+    /* Cluster threshold: must be NARROWER than PFB bin spacing or signals
+     * land in adjacent PFB channels we never spawn into.  Per-bin scanner
+     * uses 150 Hz but its NCO mix can place a bin anywhere; PFB is locked
+     * to the 94 Hz channel grid.  Live RF (2026-04-26 14:55 UTC, NA QSO
+     * Party): W4H at 14036.82 +49 dB SDC was completely missed because
+     * scan spawned bin at 14036.7 → mapped to PFB bin 1480 (centered 14036.75)
+     * → the actual signal at 14036.82 was in bin 1481 (centered 14036.844),
+     * but that bin's spawn was blocked by 150 Hz cluster window. */
+    double cluster_hz = (double)sc->pfb_bin_spacing * 0.95;
     for (int i = 0; i < np; i++) {
         double f_hz = peaks[i].f_hz;
 
@@ -343,6 +406,10 @@ static void run_scan(PfbSc *sc, const double *seg_i, const double *seg_q)
 static void process_bin_row(PfbSc *sc, PsBin *b,
                              const float *bin_row, int n_steps)
 {
+    /* Shift the signal at +residual_hz baseband DOWN to DC.
+     * Code does y = (xi + j*xq) * (cp + j*sp) = z * exp(+j*phase).
+     * For freq shift -residual: need phase = -2π*residual*t,
+     *   i.e. dphi = -2π*residual/fs.  (This sign was right originally.) */
     double dphi = -2.0 * M_PI * b->residual_hz / (double)sc->pfb_output_rate;
     double cs   = cos(dphi);
     double sn   = sin(dphi);
@@ -353,7 +420,8 @@ static void process_bin_row(PfbSc *sc, PsBin *b,
         double xi = bin_row[2 * s + 0];
         double xq = bin_row[2 * s + 1];
 
-        /* mix by exp(-j*phase) — keep envelope, drop residual carrier */
+        /* Stage 1: fine-tune mix — shift spawn-frequency to DC.
+         * mix by exp(-j*phase) (per Eq 2.25 SDR4Engineers, see comment above) */
         double mi = xi * cp - xq * sp;
         double mq = xi * sp + xq * cp;
         /* advance phase */
@@ -361,7 +429,44 @@ static void process_bin_row(PfbSc *sc, PsBin *b,
         double sn2 = sp * cs + cp * sn;
         cp = cn; sp = sn2;
 
-        double env = sqrt(mi * mi + mq * mq);
+        /* Stage 2: per-bin narrow LPF on complex IQ for in-bin frequency
+         * selectivity.  Spawn-frequency carrier sits at DC after the mix
+         * above; this LPF passes ±25 Hz around DC and rejects co-channel
+         * competitors that landed at ±30+ Hz baseband.  Without this stage
+         * the envelope detector below sees |signal_A + signal_B| for
+         * any pair of in-bin signals (the trash-in-the-bin problem). */
+        b->bin_lpf_i[b->bin_lpf_pos] = mi;
+        b->bin_lpf_q[b->bin_lpf_pos] = mq;
+        b->bin_lpf_pos = (b->bin_lpf_pos + 1) % PSC_BIN_LPF_LEN;
+        if (b->bin_lpf_count < PSC_BIN_LPF_LEN) {
+            b->bin_lpf_count++;
+            continue;  /* prime delay line, skip output */
+        }
+        double fi = 0.0, fq = 0.0;
+        int p = b->bin_lpf_pos;  /* oldest sample */
+        for (int k = 0; k < PSC_BIN_LPF_LEN; k++) {
+            int idx = (p + k) % PSC_BIN_LPF_LEN;
+            fi += PSC_BIN_LPF[k] * b->bin_lpf_i[idx];
+            fq += PSC_BIN_LPF[k] * b->bin_lpf_q[idx];
+        }
+
+        /* Stage 3: envelope detect on filtered complex IQ */
+        double env_raw = sqrt(fi * fi + fq * fq);
+
+        /* Stage 4: envelope smoother (non-negative MA, kills residual noise) */
+        b->env_dl[b->env_dl_pos] = env_raw;
+        b->env_dl_pos = (b->env_dl_pos + 1) % PSC_ENV_SMOOTH_LEN;
+        if (b->env_dl_count < PSC_ENV_SMOOTH_LEN) {
+            b->env_dl_count++;
+            continue;
+        }
+        double env = 0.0;
+        int q = b->env_dl_pos;
+        for (int k = 0; k < PSC_ENV_SMOOTH_LEN; k++) {
+            int idx = (q + k) % PSC_ENV_SMOOTH_LEN;
+            env += PSC_ENV_SMOOTH[k] * b->env_dl[idx];
+        }
+
         if (b->env_n < PSC_ENV_CAP) {
             b->env100[b->env_n] = env;
             b->env200[b->env_n] = env;
