@@ -2211,8 +2211,10 @@ class _ItilaScanner:
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
-                 max_bins=80, use_pfb=False, valid_calls=None):
+                 max_bins=80, use_pfb=False, valid_calls=None,
+                 enable_caller_spotting=True):
         self.valid_calls = valid_calls or set()
+        self.enable_caller_spotting = bool(enable_caller_spotting)
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_sec     = window_sec
@@ -2362,27 +2364,34 @@ class _ItilaScanner:
                         self._sc._h, _ct.c_double(f_hz))
 
             # Path 2: context extraction — if CQ was seen on this bin
-            # recently, re-extract the RUNNER from the accumulated buffer.
-            # Originally this used _itila_extract_all_calls to ALSO capture
-            # QSO partners (commit c042491, "74% → 91% recall vs CW Skimmer")
-            # — that matched CW Skimmer's GUI behavior of showing every
-            # callsign heard. But for RBN runner-only spotting (which is
-            # our actual product, see /mnt/atlas/skimmer/docs/skimserv_comparison.md),
-            # callers in pile-ups are noise — they're not running the freq.
-            # Live UK/EI 14011.1 produced 6 spots (K1LZ + 5 callers calling
-            # K1LZ), where SDC reported only K1LZ. Switched to runner-only
-            # extraction on the accumulated buffer (the CQ token persists,
-            # so the same _itila_extract_cq_call function works across windows).
+            # recently, extract callsigns from the accumulated buffer.
+            # Two modes (controlled by enable_caller_spotting):
+            #   true  → c042491 behavior: extract callers AND runner
+            #           (74% → 91% recall vs CW Skimmer benchmark)
+            #   false → runner-only via _itila_extract_cq_call (precision-
+            #           focused; emits 1 spot per pile-up not N)
             elif now - st['last_cq_time'] < 120.0:
-                call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
-                if call and call not in st['spotted']:
-                    st['spotted'].add(call)
-                    st['pending'].append(f'CQ {call} ')
-                    log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
-                             f_khz, call, wpm, int(now - st['last_cq_time']))
-                    if self._sc:
-                        self._sc._lib.itila_sc_mark_evidence(
-                            self._sc._h, _ct.c_double(f_hz))
+                if self.enable_caller_spotting:
+                    calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                    for c in calls_in_raw:
+                        if c not in st['spotted']:
+                            st['spotted'].add(c)
+                            st['pending'].append(f'CQ {c} ')
+                            log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, all)",
+                                     f_khz, c, wpm, int(now - st['last_cq_time']))
+                            if self._sc:
+                                self._sc._lib.itila_sc_mark_evidence(
+                                    self._sc._h, _ct.c_double(f_hz))
+                else:
+                    call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
+                    if call and call not in st['spotted']:
+                        st['spotted'].add(call)
+                        st['pending'].append(f'CQ {call} ')
+                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
+                                 f_khz, call, wpm, int(now - st['last_cq_time']))
+                        if self._sc:
+                            self._sc._lib.itila_sc_mark_evidence(
+                                self._sc._h, _ct.c_double(f_hz))
 
     def _process_ready_c(self):
         """C decode loop — all bin iteration + decode happens in C."""
@@ -2436,17 +2445,30 @@ class _ItilaScanner:
                 if self._sc:
                     self._sc._lib.itila_sc_mark_evidence(
                         self._sc._h, _ct.c_double(f_hz))
-            # Path 2: context extraction — runner-only (see Python path above)
+            # Path 2: context extraction — see Python path above for the
+            # caller-vs-runner-only mode flag (enable_caller_spotting).
             elif now - st['last_cq_time'] < 120.0:
-                call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
-                if call and call not in st['spotted']:
-                    st['spotted'].add(call)
-                    st['pending'].append(f'CQ {call} ')
-                    log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
-                             f_khz, call, wpm, int(now - st['last_cq_time']))
-                    if self._sc:
-                        self._sc._lib.itila_sc_mark_evidence(
-                            self._sc._h, _ct.c_double(f_hz))
+                if self.enable_caller_spotting:
+                    calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                    for c in calls_in_raw:
+                        if c not in st['spotted']:
+                            st['spotted'].add(c)
+                            st['pending'].append(f'CQ {c} ')
+                            log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, all)",
+                                     f_khz, c, wpm, int(now - st['last_cq_time']))
+                            if self._sc:
+                                self._sc._lib.itila_sc_mark_evidence(
+                                    self._sc._h, _ct.c_double(f_hz))
+                else:
+                    call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
+                    if call and call not in st['spotted']:
+                        st['spotted'].add(call)
+                        st['pending'].append(f'CQ {call} ')
+                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
+                                 f_khz, call, wpm, int(now - st['last_cq_time']))
+                        if self._sc:
+                            self._sc._lib.itila_sc_mark_evidence(
+                                self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
         """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm)."""
@@ -3990,7 +4012,8 @@ class InstanceManager:
                  itila_ev_thresh=2.0, itila_window_sec=120.0,
                  itila_min_snr=8.0, itila_max_bins=200,
                  use_pfb_scanner=False, valid_calls=None,
-                 cw_min_khz=0.0, cw_max_khz=99999.0):
+                 cw_min_khz=0.0, cw_max_khz=99999.0,
+                 enable_caller_spotting=True):
         self.valid_calls = valid_calls or set()
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -4006,6 +4029,7 @@ class InstanceManager:
         self.itila_min_snr = float(itila_min_snr)
         self.itila_max_bins = int(itila_max_bins)
         self.use_pfb_scanner = bool(use_pfb_scanner)
+        self.enable_caller_spotting = bool(enable_caller_spotting)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
@@ -4083,7 +4107,8 @@ class InstanceManager:
                     band_max_khz=bmax,
                     max_bins=int(self.itila_max_bins),
                     use_pfb=self.use_pfb_scanner,
-                    valid_calls=getattr(self, 'valid_calls', None))
+                    valid_calls=getattr(self, 'valid_calls', None),
+                    enable_caller_spotting=self.enable_caller_spotting)
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -4518,14 +4543,34 @@ class SpotTracker:
     This is the streaming equivalent of the offline multi-sighting filter.
     """
 
+    # "Ship-it" defaults: all gates off, caller-spotting on, telemetry on.
+    # Per the 2026-04-27 plan (feedback_ship_it_plan.md), local gates were
+    # over-tuning precision and crashing recall. Default to permissive emit
+    # and let the cluster filter (VE7CC's 2+ skimmer rule). Each gate
+    # remains as a feature that can be re-enabled individually via config
+    # for users who want stricter local behavior.
+    GATE_DEFAULTS = {
+        'gate_cq_runner':              False,  # CQ-adjacency forces runner-only when CQ in buffer
+        'gate_freq_consensus':         False,  # per-freq commit + 5-min lock + adaptive thresh
+        'gate_patt3ch_filter':         False,  # drop bypass calls not matching patt3ch.lst
+        'gate_bypass_consensus':       False,  # bypass goes through freq consensus vs simple count
+        'gate_scp_bucket_substitute':  False,  # emit bucket form instead of raw call
+        'enable_caller_spotting':      True,   # extract callers AND runner from QSO buffer (c042491)
+        'gate_telemetry':              True,   # log "would-gate" decisions even when gate is off
+    }
+
     def __init__(self, valid_calls, blacklist, respot_interval=120,
                  fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0,
-                 patt3ch_path='patt3ch.lst'):
+                 patt3ch_path='patt3ch.lst', gate_config=None):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
         self.fuzzy_min_cycles = fuzzy_min_cycles
         self.add_calls = add_calls or set()
+        # Gate config — start with defaults, override anything in gate_config arg
+        self.gate_config = dict(self.GATE_DEFAULTS)
+        if gate_config:
+            self.gate_config.update(gate_config)
         # 0 = naked (no SCP), None = SCP-only (no bypass), N>0 = promote after N decodes
         self.scp_bypass_threshold = scp_bypass_threshold
         # patt3ch.lst: SkimSrv's structural-pattern allowlist used as the
@@ -5110,14 +5155,15 @@ class SpotTracker:
 
             # SCP bucket: collapse single-edit garbled variants to nearest
             # SCP-valid call. VM4FO/ITM4FO/EVM4FO → KM4FO. K8MA and K8MR
-            # stay distinct (both SCP-valid → no merge). When the bucket
-            # differs from the raw call, treat the bucketed form as the
-            # canonical decode. Skips bypass since bucket ∈ SCP.
+            # stay distinct (both SCP-valid → no merge). Bucketing always
+            # logs the mapping; whether to SUBSTITUTE the call (emit bucket
+            # form instead of raw) is controlled by gate_scp_bucket_substitute.
             if '/' not in call:
                 _bucket = self._scp_bucket(call)
                 if _bucket != call and _bucket in self.valid_calls:
                     log.info("SCP bucket: %s → %s @ %.1f kHz", call, _bucket, freq_khz)
-                    call = _bucket
+                    if self.gate_config['gate_scp_bucket_substitute']:
+                        call = _bucket
 
             # Global WPM sanity gate.  MAX_WPM=50 is defined as a constant
             # documenting "spots above this are almost certainly noise" but
@@ -5151,10 +5197,22 @@ class SpotTracker:
                 # cross-check). When no runner could be identified despite
                 # has_context (CQ token garbled, no adjacent base call), fall
                 # back to original permissive behavior.
-                if has_context and cq_runner_bucket is not None:
+                if (self.gate_config['gate_cq_runner']
+                        and has_context and cq_runner_bucket is not None):
                     gate = (call == cq_runner_bucket) or (recent_count >= min_s)
+                    if not gate and self.gate_config['gate_telemetry']:
+                        log.debug("WOULD-GATE cq_runner: %s @ %.1f kHz "
+                                  "(runner=%s, count=%d)",
+                                  call, freq_khz, cq_runner_bucket, recent_count)
                 else:
                     gate = has_context or recent_count >= min_s
+                    # Telemetry: log what cq_runner WOULD have done if enabled
+                    if (self.gate_config['gate_telemetry']
+                            and has_context and cq_runner_bucket is not None
+                            and call != cq_runner_bucket
+                            and recent_count < min_s):
+                        log.debug("PHANTOM cq_runner: %s @ %.1f kHz would suppress "
+                                  "(runner=%s)", call, freq_khz, cq_runner_bucket)
 
                 # Deferred consensus gate: emit at most one call per freq_bin,
                 # picked by majority sightings after COMMIT_THRESHOLD total
@@ -5164,7 +5222,7 @@ class SpotTracker:
                 # K4RUM CQ. Once a freq commits to a call, other calls there
                 # are silenced for COMMIT_LOCK_SEC; reset when the committed
                 # call hasn't been re-sighted in COMMIT_LOCK_SEC.
-                if gate:
+                if gate and self.gate_config['gate_freq_consensus']:
                     committed = self._freq_committed.get(freq_bin)
                     if committed:
                         committed_call, _ = committed
@@ -5200,60 +5258,70 @@ class SpotTracker:
                         })
             elif self.scp_bypass_threshold and CALL_RE.match(call) \
                     and call not in seen_p1:
-                # Non-SCP call that looks structurally valid. Layered
-                # confidence based on patt3ch.lst (SkimSrv's structural
-                # allowlist):
-                #   patt3ch active ("+") → bypass with normal min-3 thresh
-                #   patt3ch rare        → bypass with min-5 thresh
-                #   patt3ch no match    → drop (likely fragment/garbage)
-                # Plus the same per-freq consensus the SCP-valid path uses
-                # so SCP-valid and bypass calls compete for the same freq
-                # slot — kills the bleed-over pattern (KC3RLZ/AC3A from
-                # KC3RLG @ 200 Hz; A1QV @ W3RJ).
+                # Non-SCP structurally-valid call. Two layered behaviors,
+                # each flag-controlled:
+                #   gate_patt3ch_filter — drop calls not matching patt3ch.lst
+                #   gate_bypass_consensus — bypass goes through freq consensus
+                # When both off (ship-it default): emit on simple count
+                # threshold, tag with patt3ch result for downstream visibility.
                 seen_p1.add(call)  # dedupe within this process() call
                 if wpm > self.MAX_WPM:
                     continue
-                patt3ch_match = self._matches_patt3ch(call)
-                if patt3ch_match is None:
-                    # Doesn't match any common callsign structure.
-                    # Probably noise (HA235R fragments: A235R, M5R; contest
-                    # exchange garbage: TT5CM; garbled prefixes: VM4FO).
-                    # Don't even record — drop quietly.
+                patt3ch_match = self._matches_patt3ch(call)  # 'active' / 'rare' / None
+                if self.gate_config['gate_patt3ch_filter'] and patt3ch_match is None:
+                    # Drop bypass calls not matching any common pattern.
+                    # Likely noise — fragments / contest-exchange garbage.
                     continue
+                elif (patt3ch_match is None
+                      and self.gate_config['gate_telemetry']):
+                    log.debug("PHANTOM patt3ch_filter: %s @ %.1f kHz "
+                              "would suppress (no pattern match)",
+                              call, freq_khz)
                 self._record_sighting(call, freq_bin, now)
 
-                # Adaptive consensus, bypass-strength. patt3ch tier sets
-                # the floor: active ("+") = 3, rare = 5.
                 bypass_gate = True
-                committed = self._freq_committed.get(freq_bin)
-                if committed:
-                    committed_call, _ = committed
-                    if not self._committed_call_alive(committed_call, freq_bin, now):
-                        del self._freq_committed[freq_bin]
-                        committed = None
-                    elif call != committed_call:
-                        bypass_gate = False
-                if bypass_gate and not committed:
-                    total_at_freq = self._count_freq_total(freq_bin, now)
-                    base_thresh = self._adaptive_commit_threshold(freq_bin, now)
-                    floor = 2 if patt3ch_match == 'active' else 5
-                    thresh = max(base_thresh, floor)
-                    if total_at_freq < thresh:
-                        bypass_gate = False
-                    else:
-                        winner_call, winner_n = self._freq_winner(freq_bin, now)
-                        if winner_call != call:
+                if self.gate_config['gate_bypass_consensus']:
+                    # Per-freq consensus + lock for bypass. Tighter floor:
+                    # patt3ch active ("+") = 3 sightings, rare = 5.
+                    committed = self._freq_committed.get(freq_bin)
+                    if committed:
+                        committed_call, _ = committed
+                        if not self._committed_call_alive(committed_call, freq_bin, now):
+                            del self._freq_committed[freq_bin]
+                            committed = None
+                        elif call != committed_call:
+                            bypass_gate = False
+                    if bypass_gate and not committed:
+                        total_at_freq = self._count_freq_total(freq_bin, now)
+                        base_thresh = self._adaptive_commit_threshold(freq_bin, now)
+                        floor = 2 if patt3ch_match == 'active' else 5
+                        thresh = max(base_thresh, floor)
+                        if total_at_freq < thresh:
                             bypass_gate = False
                         else:
-                            self._freq_committed[freq_bin] = (call, now)
-                            log.info("FREQ COMMIT (bypass/%s): %s @ bin=%d (%d/%d sightings, thresh=%d)",
-                                     patt3ch_match, call, freq_bin, winner_n, total_at_freq, thresh)
+                            winner_call, winner_n = self._freq_winner(freq_bin, now)
+                            if winner_call != call:
+                                bypass_gate = False
+                            else:
+                                self._freq_committed[freq_bin] = (call, now)
+                                log.info("FREQ COMMIT (bypass/%s): %s @ bin=%d (%d/%d sightings, thresh=%d)",
+                                         patt3ch_match, call, freq_bin, winner_n, total_at_freq, thresh)
+                else:
+                    # Simple count-threshold path (pre-tonight behavior):
+                    # promote when same (call, freq_kHz_bucket) has been
+                    # decoded N times, where N = scp_bypass_threshold.
+                    bypass_freq = int(round(freq_khz))
+                    bkey_count = (call, bypass_freq)
+                    self._bypass_counts[bkey_count] += 1
+                    if self._bypass_counts[bkey_count] < self.scp_bypass_threshold:
+                        bypass_gate = False
 
                 bkey = (call, int(round(freq_khz)))
                 if bypass_gate and bkey not in self._bypass_spotted \
                         and self._can_respot(call, freq_khz, now):
                     self._bypass_spotted.add(bkey)
-                    log.info("SCP bypass: %s at %.1f kHz", call, freq_khz)
+                    log.info("SCP bypass: %s at %.1f kHz [patt3ch=%s]",
+                             call, freq_khz, patt3ch_match or 'none')
                     self._mark_spotted(call, freq_khz, now)
                     spots.append({
                         'call': call,
@@ -5465,10 +5533,16 @@ class OpenSkimmer:
         )
         self._add_calls_mtime = (os.path.getmtime(self._add_calls_path)
                                  if os.path.exists(self._add_calls_path) else 0)
+        # Build gate_config from any of the gate_* / enable_* keys in cfg.
+        # SpotTracker fills in any missing keys from GATE_DEFAULTS (ship-it
+        # mode = all gates off, caller-spotting on).
+        gate_config = {k: self.cfg[k] for k in SpotTracker.GATE_DEFAULTS
+                       if k in self.cfg}
         self.tracker = SpotTracker(calls, blacklist,
                                    self.cfg.get('respot_interval', 120),
                                    add_calls=add_calls,
-                                   scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)))
+                                   scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)),
+                                   gate_config=gate_config)
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
@@ -5590,6 +5664,7 @@ class OpenSkimmer:
                 valid_calls=calls,
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
                 cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
+                enable_caller_spotting=bool(self.cfg.get('enable_caller_spotting', True)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
@@ -6355,8 +6430,10 @@ def run_file_mode(args, config):
         config.get('add_calls', 'add_calls.txt'),
         config.get('blacklist', 'blacklist.txt'),
     )
+    gate_config = {k: config[k] for k in SpotTracker.GATE_DEFAULTS if k in config}
     tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls,
-                          scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)))
+                          scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)),
+                          gate_config=gate_config)
 
     # Determine file format and sample rate
     with open(args.file, 'rb') as f:
@@ -6400,6 +6477,7 @@ def run_file_mode(args, config):
         valid_calls=calls,  # required for the SCP-bias path in extractor
         cw_min_khz=float(config.get('cw_min_khz', 0)),
         cw_max_khz=float(config.get('cw_max_khz', 99999)),
+        enable_caller_spotting=bool(config.get('enable_caller_spotting', True)),
     )
 
     center_khz = args.center_khz
