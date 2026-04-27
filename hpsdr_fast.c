@@ -829,6 +829,30 @@ int hpsdr_ft8_swap_read(HpsdrFast *h, int rx,
     return n;
 }
 
+/* Diagnostic: non-destructive snapshot of the active FT8 capture buffer.
+ * Unlike hpsdr_ft8_swap_read this does NOT swap or reset, so the FT8
+ * minute thread's swap timing is unaffected. Use for ad-hoc IQ recording
+ * (e.g. to replay through openskimmer.py --file and isolate live-vs-
+ * recorded decoder behavior). Holds the per-RX FT8 mutex for the memcpy;
+ * recv_thread parks briefly during that window. */
+int hpsdr_iq_snapshot_read(HpsdrFast *h, int rx,
+                           float *i_out, float *q_out, int max_n,
+                           double *t_first_out) {
+    if (rx < 0 || rx >= MAX_RX || !h->ft8_cap[rx].enabled) return 0;
+    if (!h->ft8_cap[rx].bufs[0].i) return 0;
+    pthread_mutex_lock(&h->ft8_cap[rx].mu);
+    int active = h->ft8_cap[rx].active;
+    Ft8Buf *b = &h->ft8_cap[rx].bufs[active];
+    int n = b->n < max_n ? b->n : max_n;
+    if (n > 0) {
+        memcpy(i_out, b->i, n * sizeof(float));
+        memcpy(q_out, b->q, n * sizeof(float));
+    }
+    if (t_first_out) *t_first_out = b->t_first;
+    pthread_mutex_unlock(&h->ft8_cap[rx].mu);
+    return n;
+}
+
 uint64_t hpsdr_pkt_count(HpsdrFast *h) { return h->pkt_count; }
 uint64_t hpsdr_drop_count(HpsdrFast *h) { return h->drop_count; }
 uint64_t hpsdr_pkt_lost(HpsdrFast *h) { return h->pkt_lost; }
