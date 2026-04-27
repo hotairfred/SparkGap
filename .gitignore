@@ -46,3 +46,4 @@ test_c_recv.c
 .claude/
 .vscode/
 .idea/
+comms.md
