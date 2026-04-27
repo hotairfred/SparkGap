@@ -6390,6 +6390,13 @@ def run_file_mode(args, config):
         use_itila=bool(config.get('use_itila', False)),
         itila_ev_thresh=float(config.get('itila_ev_thresh', 2.0)),
         itila_window_sec=float(config.get('itila_window_sec', 120.0)),
+        # Match live mode: use config values for itila_min_snr / max_bins /
+        # use_pfb_scanner instead of letting the InstanceManager defaults
+        # (8.0, 200, False) silently apply. Pre-fix divergence documented
+        # in feedback_file_vs_live_config_divergence.md.
+        itila_min_snr=float(config.get('signal_min_snr', 12)),
+        itila_max_bins=int(config.get('itila_max_bins', 200)),
+        use_pfb_scanner=bool(config.get('use_pfb_scanner', False)),
         valid_calls=calls,  # required for the SCP-bias path in extractor
         cw_min_khz=float(config.get('cw_min_khz', 0)),
         cw_max_khz=float(config.get('cw_max_khz', 99999)),
