@@ -4874,11 +4874,13 @@ class SpotTracker:
 
     def _committed_call_alive(self, call, freq_bin, now):
         """True iff committed call has been re-sighted within COMMIT_LOCK_SEC.
-        When false, the freq slot is released (runner QSY/abandoned)."""
+        When false, the freq slot is released (runner QSY/abandoned).
+        Bucket-aware lookup (matches _record_sighting's storage key)."""
         if not hasattr(self, '_sighting_times'):
             return False
+        bucket = self._scp_bucket(call)
         cutoff = now - self.COMMIT_LOCK_SEC
-        for t, fb in self._sighting_times.get(call, []):
+        for t, fb in self._sighting_times.get(bucket, []):
             if fb == freq_bin and t >= cutoff:
                 return True
         return False
@@ -4894,13 +4896,21 @@ class SpotTracker:
 
     def _count_recent_sightings(self, call, freq_bin, now):
         """Count sightings within SIGHTING_WINDOW seconds at the same freq bin.
-        Suppresses calls seen at too many distinct frequencies (noise scatter)."""
+        Suppresses calls seen at too many distinct frequencies (noise scatter).
+
+        Bucket-aware: _record_sighting stores entries under the SCP bucket
+        (so VM4FO/ITM4FO/KM4FO all collapse to one KM4FO key). The lookup
+        here must use the same bucketing so garbled raw calls find the
+        accumulated count of their bucket family. Without this, garbled
+        forms returned 0 sightings even after their bucket had accumulated
+        many votes — silently killing the multi-sighting gate path."""
         if not hasattr(self, '_sighting_times'):
             return 0
-        entries = self._sighting_times.get(call, [])
+        bucket = self._scp_bucket(call)  # match _record_sighting's storage key
+        entries = self._sighting_times.get(bucket, [])
         cutoff = now - self.SIGHTING_WINDOW
         fresh = [(t, fb) for t, fb in entries if t >= cutoff]
-        self._sighting_times[call] = fresh
+        self._sighting_times[bucket] = fresh
 
         # Multi-frequency suppression: if this call appears at 3+ distinct
         # freq bins in the window, it's noise — real ops don't QSY 3x/min.
@@ -5197,9 +5207,15 @@ class SpotTracker:
                 # cross-check). When no runner could be identified despite
                 # has_context (CQ token garbled, no adjacent base call), fall
                 # back to original permissive behavior.
+                # Bucket-aware comparison: cq_runner_bucket is already a
+                # bucket form. Compare against this call's bucket so the
+                # gate works whether or not gate_scp_bucket_substitute
+                # is on (raw call vs bucket call shouldn't affect runner
+                # identification).
+                _call_bucket = self._scp_bucket(call)
                 if (self.gate_config['gate_cq_runner']
                         and has_context and cq_runner_bucket is not None):
-                    gate = (call == cq_runner_bucket) or (recent_count >= min_s)
+                    gate = (_call_bucket == cq_runner_bucket) or (recent_count >= min_s)
                     if not gate and self.gate_config['gate_telemetry']:
                         log.debug("WOULD-GATE cq_runner: %s @ %.1f kHz "
                                   "(runner=%s, count=%d)",
@@ -5209,7 +5225,7 @@ class SpotTracker:
                     # Telemetry: log what cq_runner WOULD have done if enabled
                     if (self.gate_config['gate_telemetry']
                             and has_context and cq_runner_bucket is not None
-                            and call != cq_runner_bucket
+                            and _call_bucket != cq_runner_bucket
                             and recent_count < min_s):
                         log.debug("PHANTOM cq_runner: %s @ %.1f kHz would suppress "
                                   "(runner=%s)", call, freq_khz, cq_runner_bucket)
