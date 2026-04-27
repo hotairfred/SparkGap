@@ -73,11 +73,16 @@ log = logging.getLogger('rbn_feeder')
 LOCAL_HOST = '127.0.0.1'
 LOCAL_PORT = 7300
 
-# Standard DX-cluster spot line format produced by openskimmer.py
-# Example: "DX de WF8Z-#:        14025.5  R2HE          15 dB  26 WPM  CQ           1313Z"
+# Standard DX-cluster spot line format produced by openskimmer.py.
+# Example: "DX de WF8Z-#:    14025.50  R2HE         CW   15 dB  26 WPM  CQ  OS  1313Z"
+# Mode column (CW/FT8/RTTY/...) lives between dx_call and dB.
 SPOT_RE = re.compile(
-    r'^DX de (\S+):\s+(\d+\.\d+)\s+(\S+)\s+(.*?)(\d{4}Z)?\s*$'
+    r'^DX de (\S+):\s+(\d+\.\d+)\s+(\S+)\s+(\S+)\s+(.*?)(\d{4}Z)?\s*$'
 )
+
+# Modes RBN accepts. RBN is a CW-and-RTTY network — FT8/FT4/digital spots
+# go to PSKReporter via a different protocol (not implemented here).
+RBN_MODES = {'CW', 'RTTY'}
 
 
 def stamp():
@@ -136,7 +141,7 @@ def connect_rbn(host, port, call):
 
 def parse_spot(line):
     """Parse an openskimmer telnet 'DX de ...' line into structured fields.
-    Returns dict with freq, call, snr, wpm, mode or None if not a spot."""
+    Returns dict with freq, call, mode, body, time or None if not a spot."""
     m = SPOT_RE.match(line.strip())
     if not m:
         return None
@@ -144,8 +149,9 @@ def parse_spot(line):
         'spotter': m.group(1),
         'freq':    float(m.group(2)),
         'call':    m.group(3).upper(),
-        'comment': m.group(4).strip(),
-        'time':    m.group(5) or '',
+        'mode':    m.group(4).upper(),
+        'body':    m.group(5).strip(),
+        'time':    m.group(6) or '',
     }
 
 
@@ -153,7 +159,8 @@ def forward_loop(local_sock, rbn_sock, blacklist, dry_run=False):
     """Read lines from local, parse, forward to RBN.  Blocks until either
     side disconnects.  Caller handles reconnect."""
     buf = b''
-    counts = {'forwarded': 0, 'blacklisted': 0, 'malformed': 0, 'non_spot': 0}
+    counts = {'forwarded': 0, 'blacklisted': 0, 'malformed': 0, 'non_spot': 0,
+              'wrong_mode': 0}
     last_status = time.time()
     while True:
         chunk = local_sock.recv(8192)
@@ -172,6 +179,13 @@ def forward_loop(local_sock, rbn_sock, blacklist, dry_run=False):
                 counts['malformed'] += 1
                 log.debug("malformed: %r", text)
                 continue
+            if spot['mode'] not in RBN_MODES:
+                # FT8/FT4/digital — wrong destination, drop quietly.
+                # PSKReporter would be the right home (separate feeder).
+                counts['wrong_mode'] += 1
+                log.debug("wrong mode for RBN: %s @ %.1f (%s)",
+                          spot['call'], spot['freq'], spot['mode'])
+                continue
             if spot['call'] in blacklist:
                 counts['blacklisted'] += 1
                 log.debug("blacklisted: %s @ %.1f", spot['call'], spot['freq'])
@@ -179,14 +193,15 @@ def forward_loop(local_sock, rbn_sock, blacklist, dry_run=False):
             # Forward — verbatim line is the safest, most-cluster-compatible form
             wire = (text + '\n').encode('ascii', errors='replace')
             if dry_run:
-                log.info("[DRY] would forward: %s @ %.1f kHz", spot['call'], spot['freq'])
+                log.info("[DRY] %s %s @ %.1f kHz", spot['mode'], spot['call'], spot['freq'])
             else:
                 try:
                     rbn_sock.sendall(wire)
                 except (BrokenPipeError, ConnectionResetError) as e:
                     log.warning("RBN socket dead (%s) — reconnecting", e)
                     return counts
-                log.info("→ %s @ %.1f kHz [%s]", spot['call'], spot['freq'], spot['comment'][:40])
+                log.info("→ %s %s @ %.1f kHz [%s]", spot['mode'], spot['call'],
+                         spot['freq'], spot['body'][:40])
             counts['forwarded'] += 1
         # Periodic status line
         now = time.time()

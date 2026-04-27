@@ -34,11 +34,22 @@ class SpotTelnetServer:
     """Async TCP telnet server that broadcasts CW spots to connected clients."""
 
     def __init__(self, host: str = '0.0.0.0', port: int = 7300,
-                 callsign: str = 'WF8Z-2', node_call: str = 'SPARK-2'):
+                 callsign: str = 'WF8Z', node_call: str = 'SPARK-2',
+                 skimmer_suffix: str = '-#', source_tag: str = 'OS'):
         self.host = host
         self.port = port
-        self.callsign = callsign  # Spotter callsign (appears in DX de)
+        self.callsign = callsign  # Operator's callsign (without suffix)
         self.node_call = node_call
+        # RBN convention: skimmer-source spots use a "-#" suffix on the
+        # spotter call to mark them as machine-generated, distinguishing
+        # them from human-submitted DX spots. SkimSrv, SDC Skimmer, and
+        # all RBN-feeder skimmers use this. The suffix is what the
+        # central RBN server expects when parsing skimmer spots.
+        self.skimmer_suffix = skimmer_suffix
+        # Trailing tag identifying the spot source (SDC, SkimSrv, OS for
+        # OpenSkimmer). Optional but useful for cluster filter rules
+        # (e.g. CT1BOH's SKIMVALID can preference specific sources).
+        self.source_tag = source_tag
         self._clients: Dict[asyncio.StreamWriter, dict] = {}
         self._server = None
         self._spot_count = 0
@@ -154,15 +165,31 @@ class SpotTelnetServer:
     def broadcast_spot(self, freq_khz: float, dx_call: str,
                        snr: int = 0, wpm: int = 0,
                        mode: str = 'CW', comment: str = '') -> None:
-        """Send a spot to all connected clients.
+        """Send a spot to all connected clients in canonical RBN-skimmer
+        wire format:
+
+          DX de WF8Z-#:   14033.42  N5TOO          CW   1 dB 27 WPM  CQ  OS  1337Z
+                  ^^^^                              ^^^                   ^^
+                  spotter+'#' suffix                explicit mode         source tag
+
+        Format matches what SkimSrv, SDC Skimmer, and other RBN-feeder
+        skimmers emit. The mode column (CW/FT8/FT4/RTTY/etc) is required
+        for RBN-server parsing; it lives between the dx_call and the dB
+        figure. The trailing tag (OS = OpenSkimmer) distinguishes our
+        source from SkimSrv (no tag) / SDC Skimmer (SDC tag) etc., useful
+        for cluster filters that preference by source.
+
+        For non-CW modes, WPM is omitted from the line. For FT8 the
+        comment slot carries the decoded message ("CQ AG3I JN18", etc.);
+        for CW the slot is "CQ" or "BEACON" or empty.
 
         Args:
             freq_khz: Frequency in kHz (e.g., 14023.5)
             dx_call: Spotted callsign
             snr: Signal-to-noise ratio in dB
-            wpm: CW speed in words per minute
-            mode: Mode string (CW, RTTY, FT8, etc.)
-            comment: Spot comment
+            wpm: CW/RTTY speed in words per minute (ignored for FT8/digital)
+            mode: Mode string (CW, RTTY, FT8, FT4, etc.)
+            comment: Spot comment / message body (e.g. "CQ" or FT8 message)
         """
         if not self._clients:
             return
@@ -171,27 +198,41 @@ class SpotTelnetServer:
         now = datetime.now(timezone.utc)
         time_str = now.strftime('%H%M')
 
-        # Build comment with SNR and WPM
-        if not comment:
-            parts = []
-            if snr:
-                parts.append(f'{int(snr)} dB')
-            if wpm:
-                parts.append(f'{wpm} WPM')
-            if mode and mode != 'CW':
-                parts.append(mode)
-            parts.append('CQ')
-            comment = '  '.join(parts)
+        # Spotter call always carries the skimmer suffix
+        spotter = self.callsign + self.skimmer_suffix  # e.g. "WF8Z-#"
 
-        # Standard DX Spider format
-        spotter = (self.callsign + ':')[:10]
-        std_line = (f"DX de {spotter:<10s}{freq_khz:10.1f}  "
-                    f"{dx_call:<12s} {comment:<28s}{time_str}Z\a\r\n")
+        # SNR portion: WPM included only for CW/RTTY (modes that have a
+        # speed); skipped for FT8/FT4/digital. Sign on dB preserved when
+        # present (FT8 spots have +12, -3, etc.; CW skimmer dB is
+        # always positive but always-positive formatting still parses).
+        # No leading "+" for positive dB (matches SDC/SkimSrv convention).
+        # Negative dB (FT8 weak signals) prints with "-" naturally.
+        snr_str = f"{int(snr):>3d} dB" if snr else "  0 dB"
+        if wpm and mode in ('CW', 'RTTY'):
+            snr_str = f"{snr_str}  {int(wpm):>2d} WPM"
 
-        # VE7CC CC11 format
+        # Body — what was decoded ("CQ" or message). Default to "CQ" if
+        # the caller didn't pass a comment.
+        body = (comment or 'CQ').strip() or 'CQ'
+
+        # Mode field: 4-char column.
+        mode_col = (mode or 'CW').upper()[:5]
+
+        # Standard DX Spider / skimmer-source format
+        std_line = (f"DX de {spotter+':':<10s}"
+                    f"{freq_khz:9.2f}  "
+                    f"{dx_call:<12s}"
+                    f" {mode_col:<4s}"
+                    f"{snr_str:<14s}"
+                    f"  {body:<20s}"
+                    f"{self.source_tag:<4s}"
+                    f"{time_str}Z\a\r\n")
+
+        # VE7CC CC11 format — caret-separated structured form
         date_str = now.strftime('%d-%b-%Y')
+        cc11_comment = f"{snr_str}  {body}"
         cc11_line = (f"CC11^{freq_khz:.1f}^{dx_call}^{date_str}^{time_str}Z^"
-                     f"{comment}^{self.callsign}^^^0^\a\r\n")
+                     f"{cc11_comment}^{spotter}^^^{mode_col}^\a\r\n")
 
         dead = []
         for writer, state in self._clients.items():

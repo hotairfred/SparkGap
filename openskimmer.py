@@ -5546,8 +5546,10 @@ class OpenSkimmer:
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
-            callsign=self.cfg.get('callsign', 'WF8Z-2'),
+            callsign=self.cfg.get('callsign', 'WF8Z'),
             node_call=self.cfg.get('node_call', 'SPARK-2'),
+            skimmer_suffix=self.cfg.get('skimmer_suffix', '-#'),
+            source_tag=self.cfg.get('source_tag', 'OS'),
         )
         await self.telnet.start()
 
