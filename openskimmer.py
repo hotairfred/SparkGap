@@ -4793,10 +4793,15 @@ class SpotTracker:
                 self._bucket_cache[call] = suffix
                 return suffix
 
-        # Try trimming ≤2 leading noise chars and re-checking. Bounded so
-        # IT9XYZ (real IT prefix) doesn't trim to 9XYZ and then bucket to
-        # K9XYZ — only trim if (a) the prefix is all noise-chars and (b)
-        # the original wasn't itself a SCP entry.
+        # Try trimming ≤2 leading noise chars (E/T/I/S) and looking for
+        # an EXACT SCP match.  We do NOT chain edit-1 after trim: that
+        # combination was too aggressive and produced country-prefix
+        # collapses (IT9DV→R9DV, IR3OR→R3OR — Italian prefixes turning
+        # into Russian via "trim I, sub T→R").  Many real DX prefixes
+        # start with E or T (EA/EI/ES Spain/Ireland/Estonia, IT/IR/IS/
+        # IZ Italy, TF/TI/TG Iceland/CR/Guatemala).  Trim+exact preserves
+        # the legitimate "leading-noise prefix on a real call" recovery
+        # while preventing the country flip damage.
         for trim_len in range(1, 3):
             if len(call) - trim_len < 3: break
             if not all(c in self._BUCKET_NOISE_CHARS for c in call[:trim_len]):
@@ -4805,10 +4810,6 @@ class SpotTracker:
             if suffix in self.valid_calls:
                 self._bucket_cache[call] = suffix
                 return suffix
-            sub = _edit1_unique_scp(suffix)
-            if sub:
-                self._bucket_cache[call] = sub
-                return sub
 
         # No SCP neighbor — vote for self (could be special event, club
         # call, or noise; decisions about acceptance happen downstream)

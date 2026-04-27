@@ -36,6 +36,6 @@
     "gate_freq_consensus":         false,
     "gate_patt3ch_filter":         false,
     "gate_bypass_consensus":       false,
-    "gate_scp_bucket_substitute":  false,
+    "gate_scp_bucket_substitute":  true,
     "gate_telemetry":              true
 }
