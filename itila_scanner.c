@@ -31,6 +31,18 @@
 #define SC_DEC3       10      /* 2 kHz → 200 Hz    (FIR stage 3) */
 #define SC_ENV_CAP    15000   /* 75s at 200 Hz — 1.25 decode windows */
 
+/* Lazy bin spawn: a peak must be detected by ≥SC_CAND_HITS_REQUIRED scans
+ * before a bin is allocated for it. Filters single-scan noise crossings
+ * that otherwise burn per-RX worker decode cycles on garbage. Candidates
+ * within SC_CAND_CLUSTER_HZ of an existing one are merged. Stale ones
+ * (last_seen older than SC_CAND_EXPIRY_SCANS scans) are recycled. At
+ * 4096-sample scans / 192k SPS = ~21 ms cadence, 3 hits ≈ 63 ms latency
+ * to spawn — negligible vs CW callsign duration. */
+#define SC_MAX_CANDIDATES      512
+#define SC_CAND_HITS_REQUIRED  3
+#define SC_CAND_EXPIRY_SCANS   10
+#define SC_CAND_CLUSTER_HZ     150.0
+
 #include "itila_fir_coeffs.h"
 
 /* ---- per-bin state ---- */
@@ -98,6 +110,17 @@ struct ItilaSc {
     /* Diagnostic counters */
     uint64_t env_drops;          /* per-bin envelope cap hits */
     uint64_t bins_at_max;        /* peak active bin count */
+    uint64_t spawn_gated;        /* candidates rejected (insufficient hits) */
+    uint64_t spawn_promoted;     /* candidates that became bins */
+
+    /* Lazy spawn candidate ring — see SC_MAX_CANDIDATES comment block */
+    int      scan_counter;
+    struct {
+        double f_hz;
+        int    hits;
+        int    last_seen_scan;
+        int    in_use;
+    } cand[SC_MAX_CANDIDATES];
 
     /* ITILA decoder function pointers — set via itila_sc_set_decoder */
     void *(*dec_create)(int sample_rate, double lpf_hz);
@@ -256,6 +279,17 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 
     qsort(peaks, np, sizeof(ScPeak), cmp_peak_desc);
 
+    /* Bump scan counter and expire stale candidates (haven't been seen in
+     * SC_CAND_EXPIRY_SCANS scans). Recycled slots fall to the allocator. */
+    sc->scan_counter++;
+    int expiry_cutoff = sc->scan_counter - SC_CAND_EXPIRY_SCANS;
+    for (int c = 0; c < SC_MAX_CANDIDATES; c++) {
+        if (sc->cand[c].in_use &&
+            sc->cand[c].last_seen_scan < expiry_cutoff) {
+            sc->cand[c].in_use = 0;
+        }
+    }
+
     /* Cluster (150 Hz), keep strongest per cluster, spawn new bins.
      * Tightened from 300 Hz to match 50 Hz grid + FIR selectivity. */
     double cluster_hz = 150.0;
@@ -282,6 +316,44 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
                 fprintf(stderr, "PEAK %.1f Hz (%.1f dB) NEW\n", f_hz, peaks[i].snr);
         }
         if (found) continue;
+
+        /* Lazy spawn gate: require SC_CAND_HITS_REQUIRED scans at this
+         * frequency before allocating a real bin. Find existing candidate
+         * within SC_CAND_CLUSTER_HZ; otherwise allocate a new candidate
+         * slot (preferring expired/unused slots). */
+        int cand_idx = -1;
+        for (int c = 0; c < SC_MAX_CANDIDATES; c++) {
+            if (sc->cand[c].in_use &&
+                fabs(sc->cand[c].f_hz - f_hz) < SC_CAND_CLUSTER_HZ) {
+                cand_idx = c;
+                break;
+            }
+        }
+        if (cand_idx < 0) {
+            /* Allocate a slot — first try unused, else oldest in_use */
+            int oldest_seen = sc->scan_counter + 1;
+            int oldest_idx  = -1;
+            for (int c = 0; c < SC_MAX_CANDIDATES; c++) {
+                if (!sc->cand[c].in_use) { cand_idx = c; break; }
+                if (sc->cand[c].last_seen_scan < oldest_seen) {
+                    oldest_seen = sc->cand[c].last_seen_scan;
+                    oldest_idx  = c;
+                }
+            }
+            if (cand_idx < 0) cand_idx = oldest_idx;
+            sc->cand[cand_idx].f_hz   = f_hz;
+            sc->cand[cand_idx].hits   = 0;
+            sc->cand[cand_idx].in_use = 1;
+        }
+        sc->cand[cand_idx].hits++;
+        sc->cand[cand_idx].last_seen_scan = sc->scan_counter;
+        if (sc->cand[cand_idx].hits < SC_CAND_HITS_REQUIRED) {
+            sc->spawn_gated++;
+            continue;  /* not enough hits yet — defer spawn */
+        }
+        /* Threshold met: spawn the bin and recycle the candidate slot */
+        sc->cand[cand_idx].in_use = 0;
+        sc->spawn_promoted++;
 
         /* Evict stale bins if at capacity: bins that never produced evidence
          * after 120s, or produced evidence but went silent for 300s */
