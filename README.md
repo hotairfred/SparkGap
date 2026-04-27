@@ -1,0 +1,169 @@
+# OpenSkimmer
+
+Open-source, Linux-native, multi-mode amateur radio skimmer.
+**CW + FT8 + RTTY** on multiple bands simultaneously, feeding RBN-style
+spot output via telnet.
+
+> **Status:** alpha. Actively developed. Tested in production on a
+> Red Pitaya STEMlab 125-14 with a 5-band antenna. Decoder accuracy
+> on a 15-minute CW contest hour (RBN-validated): catches 41% of
+> RBN-confirmed real signals, beating SkimSrv's 33% on the same
+> recording. Not yet feeding the live RBN — under active development.
+
+## Why this exists
+
+Every other CW/multi-mode skimmer in the amateur radio ecosystem is
+**Windows-only and closed-source.**  CW Skimmer, Skimmer Server, and
+Aggregator (all by VE3NEA) have been frozen since their author moved
+on; even bug fixes aren't possible because the original development
+toolchain is obsolete.  UT4LW's SDC Skimmer is actively maintained
+but commercial and forbidden by its author from feeding the RBN.
+
+So Linux/FreeBSD radio operators, headless server users, and anyone
+wanting auditable software have had no alternative.  This project is
+the alternative.
+
+## What works today
+
+- **Multi-band CW skimming** via Red Pitaya (HPSDR Protocol 1).
+  5 bands simultaneously on a stock Pitaya 125-14, sustained.
+- **FT8 decoding** on each band's WSPR/FT8 sub-band, minute-aligned.
+- **RTTY skimming** (currently runs alongside FT8; auto-disabled
+  outside RTTY contests).
+- **Modern Bayesian CW decoder (ITILA)** with thread-safe per-handle
+  state, lazy bin-spawn (filters noise-driven candidates before
+  burning decoder cycles on garbage), and per-bin envelope smoothing.
+- **Adaptive consensus gates** controlled by config flags — every
+  precision/recall trade-off is a knob the operator can turn for
+  their use case.  Default ("ship-it") mode is permissive emit;
+  cluster filters (VE7CC's 2+ skimmer rule) handle the noise downstream.
+- **Telnet spot output** in standard DX cluster format, ready for an
+  Aggregator-equivalent feeder (TODO).
+- **Diagnostic infrastructure** for validating against SDC and RBN
+  reference streams (`sdc_tee.py`, `rbn_tee.py`).
+
+## What's not yet there
+
+- **Hardware abstraction** beyond Red Pitaya HPSDR.  RX-888, SDRPlay,
+  Hermes Lite 2 backends would each require a plugin author who owns
+  that hardware.  See the IqSource discussion in the project docs.
+- **Direct RBN feed.**  We emit telnet locally; piping that to the
+  RBN's central servers requires the Aggregator-equivalent forwarder.
+- **Documentation polish.**  This README is the start; expect rough
+  edges in install, config, and operations until the project matures.
+- **Validated multi-recording test suite.**  We have one rigorous
+  comparison run; need many more across band conditions and contest
+  formats before publishing reliability claims.
+
+## Quick start (Linux, Pitaya 125-14)
+
+Dependencies (Debian/Ubuntu):
+
+```
+apt install build-essential gcc python3 python3-numpy python3-scipy \
+            libfftw3-dev pkg-config
+```
+
+Build the C libraries:
+
+```
+make libpfb_scanner.so libcw_dispatcher.so
+gcc -O3 -march=native -shared -fPIC -pthread -o libhpsdr_fast.so hpsdr_fast.c -lm
+gcc -O3 -march=native -ffast-math -shared -fPIC -o libitila_scanner.so itila_scanner.c -lm
+```
+
+(See `Makefile` for the full list.  ITILA decoder library `libitila.so`
+build is currently in `bayes-skimmer3.cpp` / Makefile.)
+
+Pitaya: install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/) firmware
+and ensure it's reachable on your LAN.  Update `sdr_ip` in your config.
+
+Configure: copy `sk_5band.json` and edit:
+
+```json
+{
+  "callsign": "YOUR_CALL",
+  "grid": "YOUR_GRID",
+  "sdr_ip": "192.168.X.X",
+  "bands": [3590000, 7090000, 14090000, 21090000, 28090000],
+  "enable_ft8": true,
+  ...
+}
+```
+
+Run:
+
+```
+python3 openskimmer.py --config sk_5band.json
+```
+
+Connect to the spot stream:
+
+```
+telnet localhost 7300
+```
+
+## Configuration: gate flags
+
+The decoder behavior is fully configurable.  Defaults are "ship-it"
+mode (permissive emit, trust cluster filtering).  Each gate can be
+re-enabled individually for stricter local behavior:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `enable_caller_spotting` | `true`  | Extract callers AND runner from QSO context (high-recall mode) |
+| `gate_cq_runner` | `false` | Forces runner-only when CQ is in buffer (lower recall, higher precision) |
+| `gate_freq_consensus` | `false` | Per-freq adaptive consensus + 5-min commit lock |
+| `gate_patt3ch_filter` | `false` | Reject bypass calls not matching SkimSrv's `patt3ch.lst` patterns |
+| `gate_bypass_consensus` | `false` | Bypass calls go through freq consensus vs simple count threshold |
+| `gate_scp_bucket_substitute` | `false` | Emit nearest-SCP bucket form instead of raw decoded call |
+| `gate_telemetry` | `true`  | Log "would-gate" decisions even when gate is off (diagnostic) |
+
+Plus the standard knobs:
+
+- `signal_min_snr` — bin spawn threshold (default 12 dB; lower = more weak DX, more CPU)
+- `itila_max_bins` — concurrent bin ceiling per band (default 200; 400 is comfortable on 125-14)
+- `scp_bypass_threshold` — sightings required for non-SCP-validated calls
+- `enable_ft8` — runs FT8 + RTTY pipelines (RTTY currently piggy-backs)
+
+## File-mode replay
+
+Useful for offline analysis and gate-flag tuning:
+
+```
+python3 openskimmer.py --file recording.wav --center-khz 7090 \
+                       --start-min 0 --end-min 15 --config sk_5band.json
+```
+
+Accepts 16-bit and 24-bit stereo IQ WAV files at 192 kHz.
+
+## Diagnostic tools
+
+- `sdc_tee.py` — connects to a local SDC/SkimSrv telnet server and
+  appends timestamped spots to `/tmp/sdc_stream.log`.
+- `rbn_tee.py` — same for the worldwide RBN at
+  `telnet.reversebeacon.net:7000`.
+- `SIGUSR1` to a running `openskimmer.py` instance dumps the current
+  per-band IQ buffer to `/tmp/diag_<band>_<HHMMSS>.wav` for offline
+  replay (requires `enable_ft8: true` — taps the FT8 capture buffer).
+
+## License
+
+GPLv3.  See `LICENSE`.
+
+## Status of this README
+
+This is a working README.  Expect it to evolve as the project matures.
+Bug reports and pull requests welcome.
+
+## Acknowledgments
+
+- VE3NEA for CW Skimmer, Skimmer Server, and decades of contributions
+  to amateur radio decoder software.
+- ITILA decoder authors for the open-source Bayesian CW decoder.
+- Pavel Demin for the Red Pitaya HPSDR firmware.
+- The RBN-OPS community for their thoughtful discussion of skimmer
+  validation, callsign correction, and multi-skimmer consensus.
+- N2WQ for the spotter-reliability analysis methodology.
+- Everyone who's run a CW skimmer for the last 15 years and kept the
+  RBN ecosystem alive.

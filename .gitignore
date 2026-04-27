@@ -27,3 +27,22 @@ ml_merged.txt
 
 # Binary databases
 MASTER.DTA
+
+# FT8 capture binaries (debugging)
+*.c2
+
+# Operational data — generated, not source
+contest_logs/
+rbn_data/
+research/
+
+# Local debugging / one-off tools
+c_record.py
+debug_recv.py
+quick_record.py
+test_c_recv.c
+
+# Agent / IDE state
+.claude/
+.vscode/
+.idea/
