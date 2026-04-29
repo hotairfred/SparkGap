@@ -30,10 +30,10 @@ spot output via telnet.
 ## Why this exists
 
 Every other CW/multi-mode skimmer in the amateur radio ecosystem is
-**Windows-only and closed-source.**  CW Skimmer, Skimmer Server, and
-Aggregator (all by VE3NEA) have been frozen since their author moved
-on; even bug fixes aren't possible because the original development
-toolchain is obsolete.  UT4LW's **SDC Skimmer** is actively maintained
+**Windows-only and closed-source.**  CW Skimmer and Skimmer Server
+have been frozen for years; even bug fixes aren't possible because
+the original development toolchain is obsolete.  Aggregator (the
+RBN's Windows spot forwarder) is also closed-source and Windows-only.  UT4LW's **SDC Skimmer** is actively maintained
 and decodes well, but is commercial closed-source and its author
 forbids RBN-feeder use.
 
@@ -165,10 +165,10 @@ python3 rbn_feeder.py --call YOUR_CALL --grid YOUR_GRID6 \
                       --local-host 127.0.0.1 --local-port 7300
 ```
 
-`rbn_feeder.py` is a native Linux replacement for VE3NEA's
-Aggregator. It posts spots directly to RBN's ingest endpoint using
-the same JSON HTTP protocol Aggregator uses ... no Wine, no .NET,
-no closed-source binaries in the path. Use `--dry-run` to verify
+`rbn_feeder.py` is a native Linux replacement for Aggregator. It
+posts spots directly to RBN's ingest endpoint using the same JSON
+HTTP protocol Aggregator uses ... no Wine, no .NET, no closed-source
+binaries in the path. Use `--dry-run` to verify
 parsing without actually forwarding upstream.
 
 > Coordinate with the RBN admins (rbn-ops@groups.io is a good place
@@ -248,10 +248,6 @@ regardless.
 
 ### Software the live pipeline depends on
 
-- **VE3NEA (Alex Shovkoplyas)** — CW Skimmer, Skimmer Server,
-  Aggregator, and the CWSL plugin ecosystem. The reference for what a
-  good CW skimmer looks like, and decades of contributions to amateur
-  decoder software.
 - **Pavel Demin** — Red Pitaya HPSDR firmware (`sdr_receiver_hpsdr`)
   and the `ft8d` standalone FT8 decoder.
 
