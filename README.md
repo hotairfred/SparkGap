@@ -190,14 +190,60 @@ Bug reports and pull requests welcome.
 
 ## Acknowledgments
 
-- VE3NEA for CW Skimmer, Skimmer Server, and decades of contributions
-  to amateur radio decoder software.
-- David MacKay for *Information Theory, Inference, and Learning
-  Algorithms* (the textbook the decoder is named after — the Bayesian
-  framework comes from there; the decoder itself is original).
-- Pavel Demin for the Red Pitaya HPSDR firmware.
-- The RBN-OPS community for their thoughtful discussion of skimmer
+This project stands on a lot of prior work — both software and theory.
+Where source files are derived from another project, the original
+copyright headers and license remain in those files; the list below is
+the high-level acknowledgment.
+
+The current production pipeline uses the **ITILA** decoder (original to
+this project, named after MacKay's textbook). Several other decoders
+ship in this tree as alternative paths and as research baselines —
+they are not currently in the live spotting pipeline, but they are
+included in the source distribution and their authors deserve credit
+regardless.
+
+### Software the live pipeline depends on
+
+- **VE3NEA (Alex Shovkoplyas)** — CW Skimmer, Skimmer Server,
+  Aggregator, and the CWSL plugin ecosystem. The reference for what a
+  good CW skimmer looks like, and decades of contributions to amateur
+  decoder software.
+- **Pavel Demin** — Red Pitaya HPSDR firmware (`sdr_receiver_hpsdr`)
+  and the `ft8d` standalone FT8 decoder.
+
+### Decoders shipped as alternative paths / research
+
+These are present in the tree but not in the active pipeline. Each
+file retains its original headers and license.
+
+- **AG1LE (Mauri Niininen)** — *bmorse*, a Bayesian Morse decoder
+  (`bmorse-skimmer.cpp`, `bmorse_lib.cxx`, `bmorse_src/`,
+  `libbmorse.so`). Original copyright 2012–2014, GPL-3.0. Used during
+  decoder research.
+- **TF3LJ (Loftur E. Jonasson)** and the **UHSDR Firmware Project** —
+  the in-process UHSDR CW decoder (`uhsdr_cw_lib.cpp`, `uhsdr_cw.cpp`,
+  `libuhsdr_cw.so`). Original copyright 2016, GPL-3.0.
+- **W1HKJ (Dave Freese)**, **AG1LE (Mauri Niininen)**, **OH2BNS
+  (Tomi Manninen)**, **VE7IT (Lawrence Glaister)** — the *fldigi* CW
+  decoder. `fldigi_cw.cpp` is a standalone port of fldigi's `cw.cxx`,
+  GPL-3.0.
+- **HA7ILM (Andras Retzler)** and **Marat Fayzullin (luarvique)** —
+  *libcsdr* / *csdr-cwskimmer*. `libcsdr_cw.cpp` derives from this
+  work, BSD-licensed.
+- **Erik de Castro Lopo** — *sndfile-spectrogram*, code referenced by
+  bmorse.
+
+### Theory and framework
+
+- **David MacKay** — *Information Theory, Inference, and Learning
+  Algorithms* (Cambridge University Press, 2003). The Bayesian
+  framework behind the ITILA decoder comes from there; the decoder
+  itself is original to this project.
+
+### Community
+
+- **The RBN-OPS community** — thoughtful discussion of skimmer
   validation, callsign correction, and multi-skimmer consensus.
-- N2WQ for the spotter-reliability analysis methodology.
+- **N2WQ** — spotter-reliability analysis methodology.
 - Everyone who's run a CW skimmer for the last 15 years and kept the
   RBN ecosystem alive.
