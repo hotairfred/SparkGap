@@ -1,7 +1,10 @@
 #!/bin/bash
-# Mount NAS if not already mounted
+# Mount NAS if not already mounted.
+# Credentials live in ~/.smbcredentials (mode 600), format:
+#     username=<user>
+#     password=<pass>
 mountpoint -q /mnt/atlas/nas || sudo mount -t cifs //192.168.1.200/share /mnt/atlas/nas \
-    -o username=claude,password=***REDACTED***,uid=1000,gid=1000
+    -o credentials="$HOME/.smbcredentials",uid=1000,gid=1000
 
 pkill -f openskimmer.py
 sleep 2
