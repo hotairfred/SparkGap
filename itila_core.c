@@ -41,6 +41,24 @@ void fb_core(const double* log_B, const double* log_T, int T,
              double* log_alpha, double* log_beta, double* log_Z_out);
 
 /* -------------------------------------------------------------------------
+ * Scratch buffer types (moved here from function-local definitions for
+ * use as per-handle fields in itila_state_t below).  Live mode runs
+ * multiple per-RX worker threads concurrently in itila_feed; the
+ * function-local statics that previously held these were shared across
+ * threads and corrupted each other's beam/extraction state.  Storing
+ * them per-handle eliminates that contention.
+ * ---------------------------------------------------------------------- */
+typedef struct { int is_mark; int dur; } run_t;
+
+typedef struct {
+    double score;
+    char   sym[MAX_SYM];
+    char   txt[MAX_TEXT];
+} beam_state_t;
+
+typedef struct { char call[MAX_CALL]; int count; } callsign_t;
+
+/* -------------------------------------------------------------------------
  * Internal state
  * ---------------------------------------------------------------------- */
 typedef struct {
@@ -55,6 +73,19 @@ typedef struct {
     double *gamma_marg;  /* [MAX_ENV * 2] marginalized posteriors */
     double *env_norm;    /* [MAX_ENV]     normalized envelope */
     int8_t *marks;       /* [MAX_ENV]     binary mark/space */
+
+    /* Per-handle scratch — moved out of function-local statics for
+     * thread-safety (root cause found 2026-04-26).  Used by
+     * decode_runs_beam, extract_callsigns, itila_feed, itila_feed_online. */
+    run_t        *sc_runs;          /* MAX_ENV */
+    beam_state_t *sc_beamA;         /* MAX_BEAM */
+    beam_state_t *sc_beamB;         /* MAX_BEAM */
+    beam_state_t *sc_dedup;         /* MAX_BEAM */
+    char         *sc_up;            /* MAX_TEXT  — uppercase copy in extract_callsigns */
+    char         (*sc_tokens)[MAX_CALL+4];  /* 256 entries — tokens in extract_callsigns */
+    callsign_t   *sc_calls;         /* MAX_CALLS */
+    char         (*sc_out_texts)[MAX_TEXT]; /* MAX_TEXTS entries */
+    char         *sc_primary;       /* MAX_TEXT — primary_text */
 
     /* Speed bins */
     double speed_bins[N_SPEED_BINS];
@@ -86,6 +117,7 @@ typedef struct {
 
     /* Output */
     char result_buf[RESULT_BUF];
+    double last_wpm;       /* WPM from most recent successful decode */
 } itila_state_t;
 
 /* -------------------------------------------------------------------------
@@ -605,21 +637,19 @@ static int fit_mark_wpm_components(
 
 /* -------------------------------------------------------------------------
  * decode_runs_beam — M7b score-guided beam search
+ * (beam_state_t typedef hoisted to top of file — see itila_state_t)
  * ---------------------------------------------------------------------- */
-typedef struct {
-    double score;
-    char   sym[MAX_SYM];
-    char   txt[MAX_TEXT];
-} beam_state_t;
-
 static int beam_score_cmp(const void *a, const void *b) {
     double sa = ((const beam_state_t*)a)->score;
     double sb = ((const beam_state_t*)b)->score;
     return (sa < sb) - (sa > sb);  /* descending */
 }
 
-/* Returns number of texts written into out_texts (each MAX_TEXT chars) */
+/* Returns number of texts written into out_texts (each MAX_TEXT chars).
+ * st provides per-handle scratch buffers (sc_runs, sc_beamA, sc_beamB,
+ * sc_dedup) that used to be function-local statics. */
 static int decode_runs_beam(
+    itila_state_t *st,
     const int8_t *marks, int T,
     double wpm,
     char out_texts[][MAX_TEXT], int max_out)
@@ -629,9 +659,8 @@ static int decode_runs_beam(
     double zone_hi  = boundary * 1.25;
     double unit     = unit_samples(wpm);
 
-    /* Build run list */
-    typedef struct { int is_mark; int dur; } run_t;
-    static run_t runs[MAX_ENV];
+    /* Build run list — uses st->sc_runs (per-handle, was function-local static) */
+    run_t *runs = st->sc_runs;
     int n_runs = 0;
     int val = marks[0], cnt = 1;
     for (int i = 1; i < T; i++) {
@@ -648,9 +677,8 @@ static int decode_runs_beam(
     #define GEOM_LOG_PMF(d, mean) \
         ((d-1) * log1p(-(1.0/((mean)<1.0?1.0:(mean)))) + log(1.0/((mean)<1.0?1.0:(mean))))
 
-    /* Beam: working array (double buffer) */
-    static beam_state_t beamA[MAX_BEAM], beamB[MAX_BEAM];
-    beam_state_t *beam = beamA, *next = beamB;
+    /* Beam: working array (double buffer) — per-handle scratch. */
+    beam_state_t *beam = st->sc_beamA, *next = st->sc_beamB;
     int beam_sz = 1;
     beam[0].score = 0.0; beam[0].sym[0] = '\0'; beam[0].txt[0] = '\0';
 
@@ -686,7 +714,7 @@ static int decode_runs_beam(
                 if (next_sz > MAX_TEXTS) next_sz = MAX_TEXTS;
                 /* Deduplicate by (sym,txt) keeping highest score (already sorted) */
                 int dedup_sz = 0;
-                static beam_state_t dedup_buf[MAX_BEAM];
+                beam_state_t *dedup_buf = st->sc_dedup;  /* per-handle scratch */
                 for (int i = 0; i < next_sz; i++) {
                     int dup = 0;
                     for (int j = 0; j < dedup_sz; j++)
@@ -778,7 +806,7 @@ static int is_callsign(const char *s) {
     return 0;
 }
 
-typedef struct { char call[MAX_CALL]; int count; } callsign_t;
+/* callsign_t typedef hoisted to top of file */
 
 static int add_callsign(const char *tok, callsign_t *calls, int *n_calls) {
     if (!is_callsign(tok)) return 0;
@@ -794,18 +822,19 @@ static int add_callsign(const char *tok, callsign_t *calls, int *n_calls) {
 }
 
 static int extract_callsigns(
+    itila_state_t *st,
     const char *text,
     callsign_t *calls, int *n_calls)
 {
-    /* Uppercase copy */
-    static char up[MAX_TEXT];
+    /* Uppercase copy — per-handle scratch (was function-local static). */
+    char *up = st->sc_up;
     int tlen = (int)strlen(text);
     if (tlen >= MAX_TEXT) tlen = MAX_TEXT-1;
     for (int i = 0; i < tlen; i++) up[i] = toupper((unsigned char)text[i]);
     up[tlen] = '\0';
 
-    /* Tokenize into alphanumeric runs */
-    static char tokens[256][MAX_CALL+4]; /* up to 256 tokens, len up to 10 */
+    /* Tokenize into alphanumeric runs — per-handle scratch. */
+    char (*tokens)[MAX_CALL+4] = st->sc_tokens;
     int tok_lens[256];
     int n_toks = 0;
     int i = 0;
@@ -890,8 +919,22 @@ itila_t itila_create(int sample_rate, double lpf_hz) {
     st->env_norm   = (double*)malloc(MAX_ENV     * sizeof(double));
     st->marks      = (int8_t*)malloc(MAX_ENV     * sizeof(int8_t));
 
+    /* Per-handle scratch — replaces function-local statics for thread safety. */
+    st->sc_runs      = (run_t*)       malloc(MAX_ENV * sizeof(run_t));
+    st->sc_beamA     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    st->sc_beamB     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    st->sc_dedup     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    st->sc_up        = (char*)        malloc(MAX_TEXT * sizeof(char));
+    st->sc_tokens    = malloc(256 * (MAX_CALL + 4));
+    st->sc_calls     = (callsign_t*)  malloc(MAX_CALLS * sizeof(callsign_t));
+    st->sc_out_texts = malloc(MAX_TEXTS * MAX_TEXT);
+    st->sc_primary   = (char*)        malloc(MAX_TEXT * sizeof(char));
+
     if (!st->log_B || !st->log_alpha || !st->log_beta ||
-        !st->gamma || !st->gamma_marg || !st->env_norm || !st->marks) {
+        !st->gamma || !st->gamma_marg || !st->env_norm || !st->marks ||
+        !st->sc_runs || !st->sc_beamA || !st->sc_beamB || !st->sc_dedup ||
+        !st->sc_up || !st->sc_tokens || !st->sc_calls ||
+        !st->sc_out_texts || !st->sc_primary) {
         itila_free(st); return NULL;
     }
 
@@ -925,22 +968,25 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     double wpm_cands[2]; int n_cands;
     n_cands = fit_mark_wpm_components(st->marks, n, wpm_em, wpm_cands, 2);
 
-    static callsign_t calls[MAX_CALLS];
+    /* Per-handle scratch — was function-local static; live mode races. */
+    callsign_t *calls = st->sc_calls;
     int n_calls = 0;
-    static char out_texts[MAX_TEXTS][MAX_TEXT];
-    static char primary_text[MAX_TEXT];
+    char (*out_texts)[MAX_TEXT] = st->sc_out_texts;
+    char *primary_text = st->sc_primary;
     primary_text[0] = '\0';
 
     for (int ci = 0; ci < n_cands; ci++) {
-        int n_texts = decode_runs_beam(st->marks, n, wpm_cands[ci],
+        int n_texts = decode_runs_beam(st, st->marks, n, wpm_cands[ci],
                                        out_texts, MAX_TEXTS);
         if (ci == 0 && n_texts > 0)
             strncpy(primary_text, out_texts[0], MAX_TEXT-1);
         for (int ti = 0; ti < n_texts; ti++)
-            extract_callsigns(out_texts[ti], calls, &n_calls);
+            extract_callsigns(st, out_texts[ti], calls, &n_calls);
     }
 
     if (n_calls == 0) return st->result_buf;
+
+    st->last_wpm = wpm_cands[0];
 
     if (primary_text[0]) {
         strncpy(st->result_buf, primary_text, RESULT_BUF-1);
@@ -1090,19 +1136,23 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
     double wpm_cands[2]; int n_cands;
     n_cands = fit_mark_wpm_components(st->marks, n, wpm2, wpm_cands, 2);
 
-    static callsign_t calls_ol[MAX_CALLS];
+    /* Per-handle scratch — was function-local static; live mode races.
+     * itila_feed and itila_feed_online both call decode_runs_beam +
+     * extract_callsigns; sharing the same per-handle scratch is fine
+     * (a single handle is never used concurrently).  */
+    callsign_t *calls_ol = st->sc_calls;
     int n_calls = 0;
-    static char out_texts_ol[MAX_TEXTS][MAX_TEXT];
-    static char primary_ol[MAX_TEXT];
+    char (*out_texts_ol)[MAX_TEXT] = st->sc_out_texts;
+    char *primary_ol = st->sc_primary;
     primary_ol[0] = '\0';
 
     for (int ci = 0; ci < n_cands; ci++) {
-        int n_texts = decode_runs_beam(st->marks, n, wpm_cands[ci],
+        int n_texts = decode_runs_beam(st, st->marks, n, wpm_cands[ci],
                                        out_texts_ol, MAX_TEXTS);
         if (ci == 0 && n_texts > 0)
             strncpy(primary_ol, out_texts_ol[0], MAX_TEXT - 1);
         for (int ti = 0; ti < n_texts; ti++)
-            extract_callsigns(out_texts_ol[ti], calls_ol, &n_calls);
+            extract_callsigns(st, out_texts_ol[ti], calls_ol, &n_calls);
     }
 
     if (n_calls == 0) return st->result_buf;
@@ -1138,7 +1188,16 @@ void itila_free(itila_t h) {
     itila_state_t *st = (itila_state_t*)h;
     free(st->log_B); free(st->log_alpha); free(st->log_beta);
     free(st->gamma); free(st->gamma_marg); free(st->env_norm); free(st->marks);
+    free(st->sc_runs);
+    free(st->sc_beamA); free(st->sc_beamB); free(st->sc_dedup);
+    free(st->sc_up); free(st->sc_tokens);
+    free(st->sc_calls); free(st->sc_out_texts); free(st->sc_primary);
     free(st);
+}
+
+double itila_get_wpm(itila_t h) {
+    if (!h) return 0.0;
+    return ((itila_state_t*)h)->last_wpm;
 }
 
 /* Debug: expose EM estimate for testing */

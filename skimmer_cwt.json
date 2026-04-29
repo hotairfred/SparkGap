@@ -1,0 +1,29 @@
+{
+    "callsign": "WF8Z-ARC",
+    "grid": "EM79sm",
+    "master_scp": "MASTER.SCP",
+    "add_calls": "add_calls.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "decoder_speeds": [
+        0,
+        15,
+        20,
+        25,
+        30,
+        35,
+        40
+    ],
+    "ml_model": null,
+    "signal_min_snr": 6,
+    "max_instances": 150,
+    "max_channels": 30,
+    "respot_interval": 0,
+    "telnet_port": 7303,
+    "sdr_ip": "192.168.1.54",
+    "bands": [
+        14040000
+    ],
+    "sample_rate": 192000,
+    "spot_log": "/mnt/atlas/nas/skimmer/cwt_live_spots.csv",
+    "record_wav": "/mnt/atlas/nas/skimmer/recordings/cwt_{ts}_{band}kHz.wav"
+}

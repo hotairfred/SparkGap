@@ -1,0 +1,17 @@
+{
+  "callsign": "WF8Z",
+  "grid": "EM79",
+  "master_scp": "MASTER.SCP",
+  "add_calls": "add_calls.txt",
+  "decoder_bin": "./uhsdr_cw",
+  "decoder_speeds": [0, 15, 20, 25, 30, 35, 40],
+  "max_channels": 50,
+  "signal_min_snr": 12,
+  "rescan_interval_sec": 30,
+  "use_itila": true,
+  "itila_ev_thresh": 2.0,
+  "itila_window_sec": 120,
+  "use_cpp_dispatcher": false,
+  "use_cpp_pfb": false,
+  "telnet_port": 7305
+}

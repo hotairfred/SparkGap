@@ -1,0 +1,32 @@
+{
+    "callsign": "WF8Z-2",
+    "grid": "EM79sm",
+    "node_call": "SPARK-2",
+    "sdr_ip": "127.0.0.1",
+    "sdr_port": 1024,
+    "hpsdr_listen_port": 1025,
+    "lna_gain": 40,
+    "sample_rate": 192000,
+    "max_receivers": 1,
+    "bands": [
+        7090000
+    ],
+    "buffer_seconds": 120,
+    "cw_min_khz": 7000,
+    "cw_max_khz": 7074,
+    "signal_min_snr": 15,
+    "signal_timeout": 120,
+    "max_channels": 8,
+    "master_scp": "MASTER.SCP",
+    "add_calls": "add_calls.txt",
+    "blacklist": "blacklist.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "decoder_speeds": [
+        0
+    ],
+    "min_sightings": 1,
+    "respot_interval": 120,
+    "telnet_port": 7300,
+    "status_interval": 30,
+    "max_instances": 20
+}

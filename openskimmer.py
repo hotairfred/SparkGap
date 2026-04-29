@@ -45,6 +45,169 @@ from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('openskimmer')
 
+# ---------------------------------------------------------------------------
+# Fast C receiver for HPSDR Protocol 1 (multi-band)
+# ---------------------------------------------------------------------------
+_hpsdr_fast_lib = None
+def _get_hpsdr_fast():
+    global _hpsdr_fast_lib
+    if _hpsdr_fast_lib is None:
+        import ctypes as _ct
+        try:
+            lib = _ct.CDLL('./libhpsdr_fast.so')
+            lib.hpsdr_create.restype = _ct.c_void_p
+            lib.hpsdr_create.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_int,
+                                          _ct.c_int, _ct.c_int]
+            lib.hpsdr_set_freq.restype = None
+            lib.hpsdr_set_freq.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_uint32]
+            lib.hpsdr_start.restype = None
+            lib.hpsdr_start.argtypes = [_ct.c_void_p]
+            lib.hpsdr_stop.restype = None
+            lib.hpsdr_stop.argtypes = [_ct.c_void_p]
+            lib.hpsdr_destroy.restype = None
+            lib.hpsdr_destroy.argtypes = [_ct.c_void_p]
+            lib.hpsdr_drain.restype = _ct.c_int
+            lib.hpsdr_drain.argtypes = [_ct.c_void_p, _ct.c_int,
+                                         _ct.POINTER(_ct.c_double),
+                                         _ct.POINTER(_ct.c_double), _ct.c_int]
+            lib.hpsdr_available.restype = _ct.c_int
+            lib.hpsdr_available.argtypes = [_ct.c_void_p, _ct.c_int]
+            lib.hpsdr_pkt_count.restype = _ct.c_uint64
+            lib.hpsdr_pkt_count.argtypes = [_ct.c_void_p]
+            lib.hpsdr_drop_count.restype = _ct.c_uint64
+            lib.hpsdr_drop_count.argtypes = [_ct.c_void_p]
+            lib.hpsdr_n_receivers.restype = _ct.c_int
+            lib.hpsdr_n_receivers.argtypes = [_ct.c_void_p]
+            lib.hpsdr_drain_to_scanner.restype = _ct.c_int
+            lib.hpsdr_drain_to_scanner.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_double,
+                _ct.c_void_p]  # feed_fn pointer
+            lib.hpsdr_set_scanner.restype = None
+            lib.hpsdr_set_scanner.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_void_p,
+                _ct.c_void_p, _ct.c_double]
+            lib.hpsdr_set_decode.restype = None
+            lib.hpsdr_set_decode.argtypes = [
+                _ct.c_void_p, _ct.c_void_p, _ct.c_int]
+            # Per-RX decode setup — used to selectively skip C decode for
+            # certain RX (e.g. PFB scanners with different struct layout
+            # and envelope rate from per-bin ITILA scanner).  Optional;
+            # falls back gracefully if libhpsdr_fast doesn't export it.
+            try:
+                lib.hpsdr_set_rx_decode.restype = None
+                lib.hpsdr_set_rx_decode.argtypes = [
+                    _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_int]
+            except AttributeError:
+                pass
+            lib.hpsdr_start_worker.restype = None
+            lib.hpsdr_start_worker.argtypes = [_ct.c_void_p]
+            lib.hpsdr_stop_worker.restype = None
+            lib.hpsdr_stop_worker.argtypes = [_ct.c_void_p]
+            lib.hpsdr_set_ft8.restype = None
+            lib.hpsdr_set_ft8.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_double,
+                _ct.c_double, _ct.c_char_p]
+            lib.hpsdr_poll_results.restype = _ct.c_int
+            lib.hpsdr_poll_results.argtypes = [
+                _ct.c_void_p, _ct.c_void_p, _ct.c_int]
+            lib.hpsdr_enable_ft8.restype = None
+            lib.hpsdr_enable_ft8.argtypes = [
+                _ct.c_void_p, _ct.c_int, _ct.c_double, _ct.c_double]
+            lib.hpsdr_ft8_swap_read.restype = _ct.c_int
+            lib.hpsdr_ft8_swap_read.argtypes = [
+                _ct.c_void_p, _ct.c_int,
+                _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
+                _ct.c_int, _ct.POINTER(_ct.c_double)]
+            try:
+                lib.hpsdr_iq_snapshot_read.restype = _ct.c_int
+                lib.hpsdr_iq_snapshot_read.argtypes = [
+                    _ct.c_void_p, _ct.c_int,
+                    _ct.POINTER(_ct.c_float), _ct.POINTER(_ct.c_float),
+                    _ct.c_int, _ct.POINTER(_ct.c_double)]
+            except AttributeError:
+                pass
+            try:
+                lib.hpsdr_pkt_lost.restype = _ct.c_uint64
+                lib.hpsdr_pkt_lost.argtypes = [_ct.c_void_p]
+            except AttributeError:
+                pass
+            _hpsdr_fast_lib = lib
+            log.info("Loaded libhpsdr_fast.so (C receiver)")
+        except OSError:
+            log.warning("libhpsdr_fast.so not found — falling back to Python receiver")
+            _hpsdr_fast_lib = False
+    return _hpsdr_fast_lib if _hpsdr_fast_lib else None
+
+
+class _CReceiver:
+    """Drop-in replacement for HPSDRReceiver using C receive thread."""
+
+    def __init__(self, ip, port, n_receivers, sample_rate, lna_gain=20):
+        import ctypes as _ct
+        self.lib = _get_hpsdr_fast()
+        self.n_receivers = n_receivers
+        self.sample_rate = sample_rate
+        self._h = None
+        if self.lib:
+            self._h = _ct.c_void_p(self.lib.hpsdr_create(
+                ip.encode(), port, n_receivers, sample_rate, lna_gain))
+            if not self._h:
+                log.error("hpsdr_create failed")
+
+    def set_frequency(self, rx_index, freq_hz):
+        if self._h and self.lib:
+            self.lib.hpsdr_set_freq(self._h, rx_index, int(freq_hz))
+
+    def start(self):
+        if self._h and self.lib:
+            self.lib.hpsdr_start(self._h)
+            log.info("C receiver started: %d receivers at %d Hz",
+                     self.n_receivers, self.sample_rate)
+
+    def stop(self):
+        if self._h and self.lib:
+            self.lib.hpsdr_stop(self._h)
+            log.info("C receiver stopped (pkts=%d drops=%d)",
+                     self.lib.hpsdr_pkt_count(self._h),
+                     self.lib.hpsdr_drop_count(self._h))
+
+    def drain(self, rx_index, max_n):
+        """Drain up to max_n IQ samples for receiver rx_index.
+        Returns (i_array, q_array) as numpy float64."""
+        import ctypes as _ct
+        if not self._h or not self.lib:
+            return np.zeros(0), np.zeros(0)
+        i_buf = np.empty(max_n, dtype=np.float64)
+        q_buf = np.empty(max_n, dtype=np.float64)
+        n = self.lib.hpsdr_drain(self._h, rx_index,
+                                  i_buf.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                  q_buf.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                  max_n)
+        return i_buf[:n], q_buf[:n]
+
+    def available(self, rx_index):
+        if not self._h or not self.lib:
+            return 0
+        return self.lib.hpsdr_available(self._h, rx_index)
+
+    def drain_to_scanner(self, rx_index, scanner_sc):
+        """Drain IQ and feed directly to ITILA scanner in C — zero Python overhead."""
+        if not self._h or not self.lib or not scanner_sc or not scanner_sc._h:
+            return 0
+        import ctypes as _ct
+        # Get raw function pointer from the SAME library Python loaded
+        feed_ptr = _ct.cast(scanner_sc._lib.itila_sc_feed_iq,
+                            _ct.c_void_p)
+        return self.lib.hpsdr_drain_to_scanner(
+            self._h, rx_index,
+            scanner_sc._h, _ct.c_double(8388608.0),
+            feed_ptr)
+
+    def destroy(self):
+        if self._h and self.lib:
+            self.lib.hpsdr_destroy(self._h)
+            self._h = None
+
 CALL_RE = re.compile(
     r'(?<![A-Z0-9])'
     r'('
@@ -59,7 +222,7 @@ FALSE_POSITIVES = {
     'QSL', 'QTH', 'QRL', 'CFM', 'PSE', 'TNX', 'TKS',
     'BT', 'AR', 'SK', 'KN', 'AS', 'EE5E', 'TT5T',
 }
-CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|QRL|CWT|SST|MST|TU|UP|DE)\b', re.IGNORECASE)
+CQ_PATTERNS = re.compile(r'\b(CQ|TEST|QRZ|QRL|CWT|SST|MST|FD|SS|NA|UP)\b', re.IGNORECASE)
 
 BANDS = {
     '160m': 1891000, '80m': 3591000, '40m': 7100000, '30m': 10191000,
@@ -1072,25 +1235,73 @@ def _get_bmorse_lib():
 # libitila.so — Bayesian CW decoder (envelope in, callsigns out)
 # ---------------------------------------------------------------------------
 
-_ITILA_CQ_WORDS = {'CQ', 'TEST', 'QRZ', 'QRL', 'CWT', 'SST', 'MST'}
+_ITILA_CQ_WORDS = {'CQ', 'TEST', 'CWT', 'SST', 'MST', 'FD', 'SS', 'NA', 'UP'}
+# QRZ/QRL deliberately NOT runner anchors. After a QSO the runner sends
+# "TU CALL 5NN QRZ?" and the next decode chunk often starts with the next
+# caller — extracting after QRZ grabs the wrong station. CQ + contest tokens
+# uniquely identify runners; we lose nothing real by dropping QRZ here.
 # Base callsign: 1-2 prefix letters, 1-2 digits, 1-4 suffix letters
-_BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]{1,4}$')
+_BASE_CALL_PAT = re.compile(r'^[A-Z]{1,2}[0-9]{1,4}[A-Z]{1,6}$')
 # Slash suffixes that don't make it a new full callsign: /P /M /MM /QRP /0-9
 _SLASH_SUFFIX_PAT = re.compile(r'^([0-9]|P|M|MM|QRP|A|B)$')
 
 def _is_base_call(tok):
-    return bool(_BASE_CALL_PAT.match(tok)) and len(tok) >= 4
+    # 99%+ of real base callsigns are 4-7 chars; 8+ are almost all slash calls
+    # which Case 1 in _itila_extract_cq_call handles separately.  An 8+ char
+    # match here is almost always trailing decoder garbage glommed onto a real
+    # call (e.g. HB9AMO → "HB9AMOHBM").
+    #
+    # 3-char minimum — 205 SCP calls are 3 chars (M7Z, M3A, G6M, M2G, M0X,
+    # G3X, G8X — common UK/EU contest 1x1 calls).  Live RF (2026-04-26 07:00)
+    # caught M7Z calling CQ at 7018.6 with raw text containing "M7Z" 4+ times
+    # across windows, but the previous 4-char floor blocked extraction.
+    return bool(_BASE_CALL_PAT.match(tok)) and 3 <= len(tok) <= 7
 
-def _itila_extract_cq_call(text):
+def _itila_extract_all_calls(text, min_count=2):
+    """Extract callsigns that appear at least min_count times in raw decoded text.
+
+    Used for context extraction when a CQ was seen on this bin recently.
+    Requires repetition to filter noise — real calls get repeated in QSOs.
+    Returns list of unique callsign strings, most-repeated first.
+    """
+    tokens = re.findall(r'[A-Z0-9]{4,10}', text.upper())
+    from collections import Counter
+    counts = Counter()
+    for tok in tokens:
+        if _is_base_call(tok) and tok not in FALSE_POSITIVES:
+            counts[tok] += 1
+    return [call for call, cnt in counts.most_common() if cnt >= min_count]
+
+
+def _itila_extract_cq_call(text, valid_calls=None):
     """Extract callsign adjacent to CQ/TEST in decoded Morse text.
 
     Handles full slash callsigns in all forms:
       CALL/SUFFIX  — W1AW/0, K9MA/P, K9MA/MM, K9MA/QRP
       PREFIX/CALL  — PJ2/AG3I, VE3/WF8Z
       Split tokens — slash decoded as space: ['PJ2', 'AG3I'] → PJ2/AG3I
+
+    `valid_calls` (set of SCP callsigns) is optional but strongly recommended
+    for 3-char-extraction correctness: when both M7Z (real) and M7G (noise)
+    appear as candidates, picking the SCP-valid one beats picking by recency.
+
     Returns callsign string (with slash) or None.
     """
     tokens = re.findall(r'[A-Z0-9]+(?:/[A-Z0-9]+)*', text.upper())
+
+    # Split on DE boundary: "EC7RDE" → "EC7R", "DE"; "EC7RDEN1MX" → "EC7R", "DE", "N1MX"
+    # Only split when the part before DE looks like a callsign (letter+digit pattern)
+    split_de = []
+    for tok in tokens:
+        m = re.match(r'^([A-Z]{1,2}\d[A-Z0-9]*?)DE([A-Z0-9].*)?$', tok)
+        if m and m.group(1) and len(m.group(1)) >= 4:
+            split_de.append(m.group(1))
+            split_de.append('DE')
+            if m.group(2):
+                split_de.append(m.group(2))
+        else:
+            split_de.append(tok)
+    tokens = split_de
 
     # Split merged CQ+callsign tokens (e.g. "CQCWTWJ9B" → "CQ", "CWT", "WJ9B")
     _SPLIT_PREFIXES = ('CWT', 'CQ', 'TEST', 'MST', 'SST', 'QRZ')
@@ -1125,7 +1336,7 @@ def _itila_extract_cq_call(text):
     candidates = []
 
     # Fuzzy CQ trigger matching: allow 1-char substitution (FWT→CWT, TES→TEST, CWE→CWT)
-    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'QRZ', 'QRL'}
+    _FUZZY_CQ = {'CQ', 'CWT', 'TEST', 'SST', 'MST', 'FD', 'SS', 'NA', 'UP'}
     def _is_cq_trigger(tok):
         if tok in _ITILA_CQ_WORDS:
             return True
@@ -1184,9 +1395,21 @@ def _itila_extract_cq_call(text):
     if not candidates:
         return None
 
-    # Return most frequent candidate; break ties by last occurrence
-    # (later occurrences of a repeated callsign tend to be cleaner)
+    # If we have a callsign DB, strongly prefer SCP-valid candidates over
+    # noise candidates of the same shape.  Necessary now that 3-char calls
+    # are allowed: real call M7Z and noise call M7G both pass the regex,
+    # and old recency-based tie-break was picking M7G half the time.
     from collections import Counter
+    if valid_calls is not None:
+        scp_cands = [c for c in candidates if c in valid_calls]
+        if scp_cands:
+            counts = Counter(scp_cands)
+            max_count = max(counts.values())
+            for c in reversed(scp_cands):
+                if counts[c] == max_count:
+                    return c
+
+    # Fallback: most frequent candidate; break ties by last occurrence.
     counts = Counter(candidates)
     max_count = max(counts.values())
     for c in reversed(candidates):
@@ -1212,11 +1435,263 @@ def _get_itila_lib():
                                                _ct.c_double, _ct.c_double]
             _itila_lib.itila_free.restype  = None
             _itila_lib.itila_free.argtypes = [_ct.c_void_p]
+            _itila_lib.itila_get_wpm.restype  = _ct.c_double
+            _itila_lib.itila_get_wpm.argtypes = [_ct.c_void_p]
             log.info("Loaded libitila.so")
         except OSError:
             log.warning("libitila.so not found — ITILA decoder unavailable")
             _itila_lib = False  # sentinel: tried and failed
     return _itila_lib if _itila_lib else None
+
+
+_rtty_lib = None
+
+def _get_rtty_lib():
+    global _rtty_lib
+    if _rtty_lib is None:
+        import ctypes as _ct
+        try:
+            _rtty_lib = _ct.CDLL('./librtty.so')
+            _rtty_lib.rtty_create.restype = _ct.c_void_p
+            _rtty_lib.rtty_create.argtypes = [_ct.c_int, _ct.c_double]
+            _rtty_lib.rtty_feed.restype  = _ct.c_char_p
+            _rtty_lib.rtty_feed.argtypes = [_ct.c_void_p,
+                                             _ct.POINTER(_ct.c_double),
+                                             _ct.c_int,
+                                             _ct.POINTER(_ct.c_double)]
+            _rtty_lib.rtty_free.restype  = None
+            _rtty_lib.rtty_free.argtypes = [_ct.c_void_p]
+            log.info("Loaded librtty.so")
+        except OSError:
+            log.warning("librtty.so not found — RTTY decoder unavailable")
+            _rtty_lib = False
+    return _rtty_lib if _rtty_lib else None
+
+
+def _rtty_calls_match(a, b):
+    """Two RTTY-decoded callsigns are likely the same station if either
+    is a substring of the other (catches truncations like KD7N ⊂ KD7ND
+    and prefix garbage like K0MK ⊂ ITK0MK), OR they differ by at most
+    one edit (catches single-bit-error substitutions like KD7ND ↔ KD7NB).
+    Used by RTTY confirmation to collapse decoder bit-error variants."""
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) <= 1
+    # len(b) == len(a) + 1: try removing each char from b
+    for i in range(len(b)):
+        if a == b[:i] + b[i+1:]:
+            return True
+    return False
+
+
+# RTTY contest sub-bands per band, as offset (Hz) from band center.
+# Centers in our config are 3590/7090/14090/21090/28090 kHz.
+RTTY_RANGES = {
+    3590:  (-10000,  +10000),  # 80m: 3580-3600
+    7090:  (-55000,  -35000),  # 40m: 7035-7055 (RTTY contest portion)
+    14090: (-10000,  +10000),  # 20m: 14080-14100
+    21090: (-10000,  +10000),  # 15m: 21080-21100
+    28090: (-10000,  +10000),  # 10m: 28080-28100
+}
+
+
+def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
+    """Scan one band's IQ snapshot for RTTY signals; broadcast spots.
+
+    MVP piggyback on the FT8 minute snapshot. Detects pairs of spectral
+    peaks ~170 Hz apart (the RTTY shift) within the band's RTTY sub-range,
+    demodulates each candidate to USB audio at 12 kHz with the signal
+    centered at +1000 Hz, and feeds librtty's decoder. Returns spot count.
+    """
+    import ctypes as _ct
+    from scipy.signal import resample_poly, find_peaks
+    from numpy.fft import fft, ifft
+
+    rng = RTTY_RANGES.get(int(band_center_khz))
+    if rng is None:
+        return 0
+    rtty_lo, rtty_hi = rng
+
+    band_center_hz = band_center_khz * 1000.0
+    iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
+
+    # Peak detection: 2-second FFT → 0.5 Hz bins
+    fft_n = 2 * 192000
+    if len(iq) < fft_n:
+        return 0
+    spec = np.abs(fft(iq[:fft_n]))
+    freqs = np.fft.fftfreq(fft_n, 1.0 / 192000)
+    order = np.argsort(freqs)
+    freqs_s = freqs[order]
+    spec_s = spec[order]
+
+    sel = (freqs_s >= rtty_lo) & (freqs_s <= rtty_hi)
+    sub_freqs = freqs_s[sel]
+    sub_spec = spec_s[sel]
+    if len(sub_spec) < 200:
+        return 0
+
+    # Smooth (~5 Hz) and find peaks above 4× median
+    smoothed = np.convolve(sub_spec, np.ones(11) / 11, mode='same')
+    noise = float(np.median(smoothed))
+    if noise <= 0:
+        return 0
+    bin_hz = float(sub_freqs[1] - sub_freqs[0])
+    peaks_idx, _ = find_peaks(smoothed, height=noise * 4,
+                              distance=max(1, int(60 / bin_hz)))
+    if len(peaks_idx) < 2:
+        return 0
+
+    # Pair peaks ~170 Hz apart (within ±20 Hz)
+    candidates = []  # (rf_hz, snr_db)
+    seen_keys = set()
+    for ii, pi in enumerate(peaks_idx):
+        for pj in peaks_idx[ii + 1:]:
+            d = float(sub_freqs[pj] - sub_freqs[pi])
+            if d > 200:  # past the shift; subsequent js are further
+                break
+            if abs(d - 170.0) <= 20.0:
+                center_off = float(sub_freqs[pi] + sub_freqs[pj]) / 2.0
+                rf_hz = band_center_hz + center_off
+                key = int(round(rf_hz / 100)) * 100
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                amp = float(smoothed[pi] + smoothed[pj]) / 2.0
+                snr_db = 20.0 * np.log10(amp / noise)
+                candidates.append((rf_hz, snr_db))
+                break
+
+    n_peaks = len(peaks_idx)
+    if not candidates:
+        log.info("RTTY %s scan: %d peaks, 0 paired (noise=%.0f, range %d..%d Hz)",
+                 bn, n_peaks, noise, int(rtty_lo), int(rtty_hi))
+        return 0
+    candidates.sort(key=lambda x: -x[1])
+    candidates = candidates[:10]
+    log.info("RTTY %s scan: %d peaks → %d paired candidates (top SNR %.0f dB)",
+             bn, n_peaks, len(candidates), candidates[0][1])
+
+    # Decode each candidate
+    n_spots = 0
+    seen_calls = set()
+    audio_center = 1000.0
+    t = np.arange(n_samples) / 192000.0
+    for rf_hz, snr_db in candidates:
+        offset_hz = (rf_hz - band_center_hz) - audio_center
+        mixed = iq * np.exp(-1j * 2.0 * np.pi * offset_hz * t)
+        dec12 = resample_poly(mixed, 1, 16)
+        sp = fft(dec12)
+        sp[len(sp) // 2:] = 0
+        audio = ifft(sp).real * 2.0
+        peak = float(np.max(np.abs(audio)))
+        if peak <= 0:
+            continue
+        audio = (audio / peak * 0.7).astype(np.float64)
+
+        h = rtty_lib.rtty_create(_ct.c_int(12000), _ct.c_double(audio_center))
+        if not h:
+            continue
+        confidence = _ct.c_double(0.0)
+        try:
+            txt_ptr = rtty_lib.rtty_feed(
+                h,
+                audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                _ct.c_int(len(audio)),
+                _ct.byref(confidence))
+            text = txt_ptr.decode('latin-1', errors='replace') if txt_ptr else ''
+        finally:
+            rtty_lib.rtty_free(h)
+
+        text = text.strip()
+        if not text:
+            log.info("RTTY %s @ %.1f kHz (%.0f dB): no text", bn, rf_hz/1000.0, snr_db)
+            continue
+        log.info("RTTY %s @ %.1f kHz (%.0f dB): %s",
+                 bn, rf_hz / 1000.0, snr_db, text[:80])
+
+        # Letter-first prefix: kills "33W"-style garbage from bit errors,
+        # keeps 1x1 special event calls (K0M, K1Y, W2B). Allows 3-8 chars.
+        for call in re.findall(r'\b[A-Z][A-Z0-9]{0,2}[0-9][A-Z]{1,4}\b', text):
+            if not (3 <= len(call) <= 7):
+                continue
+            if call in seen_calls:
+                continue
+            seen_calls.add(call)
+
+            # Multi-cycle confirmation: only spot when same call decoded
+            # ≥2 times within 5 min at the same freq (200 Hz bucket).
+            # Suppress re-emit for 10 min after spotting. Decoder bit errors
+            # produce different garbled spellings each cycle — real stations
+            # repeat themselves on the same freq.
+            #
+            # Fuzzy matching: a new call merges with an existing pending
+            # entry in the same freq bucket if they're substring-related
+            # or within edit-distance 1 (KD7ND/KD7NB/KD7N/KD7NDR all
+            # collapse to whichever was seen first). Catches the
+            # "ITK0MK / K0MK" smushed-call false positive too.
+            now = time.time()
+            if not hasattr(skimmer, '_rtty_pending'):
+                skimmer._rtty_pending = {}   # key -> [timestamps]
+                skimmer._rtty_emitted = {}   # key -> last_emit_ts
+            freq_bucket = round(rf_hz / 200.0) * 200.0
+
+            # Look for an existing variant of this call in the same bucket
+            canonical = call
+            for (existing_call, existing_bucket) in list(skimmer._rtty_pending.keys()):
+                if existing_bucket == freq_bucket and \
+                        _rtty_calls_match(call, existing_call):
+                    canonical = existing_call
+                    break
+            # Also check emitted (recently spotted) — same-bucket variant
+            # debounce should suppress this even under a different spelling
+            for (existing_call, existing_bucket) in list(skimmer._rtty_emitted.keys()):
+                if existing_bucket == freq_bucket and \
+                        _rtty_calls_match(call, existing_call):
+                    canonical = existing_call
+                    break
+            key = (canonical, freq_bucket)
+
+            last_emit = skimmer._rtty_emitted.get(key, 0)
+            if now - last_emit < 600:
+                continue  # debounce: already spotted recently (any variant)
+
+            sightings = [t for t in skimmer._rtty_pending.get(key, [])
+                         if now - t < 300]
+            sightings.append(now)
+            skimmer._rtty_pending[key] = sightings
+
+            # High-SNR shortcut: skip 2-cycle confirmation if signal is
+            # strong (≥25 dB). Real loud signals very rarely produce
+            # bit-error garbage that just happens to match a callsign
+            # regex; weak signals are where the false positives come from.
+            strong = snr_db >= 25.0
+
+            if not strong and len(sightings) < 2:
+                log.info("RTTY pending: %s @ %.1f kHz (%d/2 sightings)",
+                         call, rf_hz / 1000.0, len(sightings))
+                continue
+
+            skimmer._rtty_emitted[key] = now
+            log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
+                     rf_hz / 1000.0, call, int(snr_db), text[:50])
+            skimmer.telnet.broadcast_spot(
+                freq_khz=rf_hz / 1000.0,
+                dx_call=call,
+                snr=int(snr_db),
+                mode='RTTY',
+                comment=text[:60])
+            skimmer.spot_count += 1
+            n_spots += 1
+
+    return n_spots
 
 
 class _ItilaDsp:
@@ -1339,6 +1814,13 @@ class _ItilaSc:
         return self._lib.itila_sc_drain_env(
             self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
 
+    def peek_env(self, f_hz, env100, env200, max_n):
+        import ctypes as _ct
+        p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = env200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        return self._lib.itila_sc_peek_env(
+            self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
+
     def free(self):
         self._lib.itila_sc_free(self._h)
         self._h = None
@@ -1380,6 +1862,21 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
         lib.itila_sc_mark_evidence.restype  = None
         lib.itila_sc_mark_evidence.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_get_snr.restype  = _ct.c_double
+        lib.itila_sc_get_snr.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.itila_sc_peek_env.restype  = _ct.c_int
+        lib.itila_sc_peek_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.itila_sc_set_decoder.restype  = None
+        lib.itila_sc_set_decoder.argtypes = [
+            _ct.c_void_p,
+            _ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
+            _ct.c_double]
+        lib.itila_sc_decode_ready.restype  = _ct.c_int
+        lib.itila_sc_decode_ready.argtypes = [
+            _ct.c_void_p, _ct.c_int,
+            _ct.c_void_p, _ct.c_int]
 
         n_sos = sos100.shape[0]
         s100  = np.ascontiguousarray(sos100, dtype=np.float64)
@@ -1401,6 +1898,145 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         return _ItilaSc(lib, _ct.c_void_p(h))
     except OSError:
         log.warning("libitila_scanner.so not found")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# PFB-backed scanner — alternative to libitila_scanner.so. Same Python wrapper
+# surface; replaces per-bin NCO+FIR with a shared polyphase channelizer.
+# Selected by config flag use_pfb_scanner.
+# ---------------------------------------------------------------------------
+PFB_NCHAN      = 4096   # must match PSC_PFB_NCHAN in pfb_scanner.c
+PFB_OVERSAMPLE = 2      # must match PSC_PFB_OVERSAMPLE in pfb_scanner.c
+
+def _pfb_output_rate(sample_rate):
+    """Envelope-sample rate produced by the PFB scanner. C-side uses the
+    same int math, so this stays consistent."""
+    return (sample_rate * PFB_OVERSAMPLE) // PFB_NCHAN
+
+
+class _PFBLibShim:
+    """Thin namespace that exposes pfb_sc_* symbols under itila_sc_* names.
+
+    Lets _ItilaSc and _ItilaScanner reach into the PFB backend without any
+    code changes: every call site that does ``self._sc._lib.itila_sc_xxx``
+    transparently dispatches to ``pfb_sc_xxx`` on libpfb_scanner.so."""
+    _aliases = {
+        'itila_sc_feed_iq':       'pfb_sc_feed_iq',
+        'itila_sc_ready_bins':    'pfb_sc_ready_bins',
+        'itila_sc_list_bins':     'pfb_sc_list_bins',
+        'itila_sc_drain_env':     'pfb_sc_drain_env',
+        'itila_sc_peek_env':      'pfb_sc_peek_env',
+        'itila_sc_env_n':         'pfb_sc_env_n',
+        'itila_sc_bin_count':     'pfb_sc_bin_count',
+        'itila_sc_mark_evidence': 'pfb_sc_mark_evidence',
+        'itila_sc_get_snr':       'pfb_sc_get_snr',
+        'itila_sc_set_decoder':   'pfb_sc_set_decoder',
+        'itila_sc_decode_ready':  'pfb_sc_decode_ready',
+        'itila_sc_env_drops':     'pfb_sc_env_drops',
+        'itila_sc_bins_peak':     'pfb_sc_bins_peak',
+        'itila_sc_free':          'pfb_sc_free',
+    }
+
+    def __init__(self, lib):
+        self._real = lib
+
+    def __getattr__(self, name):
+        return getattr(self._real, self._aliases.get(name, name))
+
+
+def _get_pfb_scanner(sample_rate, center_hz, max_bins, min_snr,
+                     window_samples, energy_win, grid_hz,
+                     band_min_hz, band_max_hz,
+                     sos100, sos200):
+    """Drop-in replacement for _get_itila_scanner that loads
+    libpfb_scanner.so and returns an _ItilaSc-compatible wrapper.
+    The PFB backend is selected when use_pfb_scanner=True."""
+    import ctypes as _ct
+    try:
+        lib = _ct.CDLL('./libpfb_scanner.so')
+        lib.pfb_sc_create.restype  = _ct.c_void_p
+        lib.pfb_sc_create.argtypes = [
+            _ct.c_int, _ct.c_double, _ct.c_int, _ct.c_double,
+            _ct.c_int, _ct.c_int, _ct.c_double,
+            _ct.c_double, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.c_int,
+            _ct.POINTER(_ct.c_double)]
+        lib.pfb_sc_free.restype    = None
+        lib.pfb_sc_free.argtypes   = [_ct.c_void_p]
+        lib.pfb_sc_feed_iq.restype  = None
+        lib.pfb_sc_feed_iq.argtypes = [
+            _ct.c_void_p,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_ready_bins.restype  = _ct.c_int
+        lib.pfb_sc_ready_bins.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_list_bins.restype  = _ct.c_int
+        lib.pfb_sc_list_bins.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_drain_env.restype  = _ct.c_int
+        lib.pfb_sc_drain_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_peek_env.restype  = _ct.c_int
+        lib.pfb_sc_peek_env.argtypes = [
+            _ct.c_void_p, _ct.c_double,
+            _ct.POINTER(_ct.c_double), _ct.POINTER(_ct.c_double), _ct.c_int]
+        lib.pfb_sc_bin_count.restype  = _ct.c_int
+        lib.pfb_sc_bin_count.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_env_n.restype  = _ct.c_int
+        lib.pfb_sc_env_n.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.pfb_sc_mark_evidence.restype  = None
+        lib.pfb_sc_mark_evidence.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.pfb_sc_get_snr.restype  = _ct.c_double
+        lib.pfb_sc_get_snr.argtypes = [_ct.c_void_p, _ct.c_double]
+        lib.pfb_sc_env_drops.restype  = _ct.c_ulonglong
+        lib.pfb_sc_env_drops.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_bins_peak.restype  = _ct.c_int
+        lib.pfb_sc_bins_peak.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_set_decoder.restype  = None
+        lib.pfb_sc_set_decoder.argtypes = [
+            _ct.c_void_p,
+            _ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
+            _ct.c_double]
+        lib.pfb_sc_decode_ready.restype  = _ct.c_int
+        lib.pfb_sc_decode_ready.argtypes = [
+            _ct.c_void_p, _ct.c_int,
+            _ct.c_void_p, _ct.c_int]
+        lib.pfb_sc_n_chan.restype       = _ct.c_int
+        lib.pfb_sc_n_chan.argtypes      = [_ct.c_void_p]
+        lib.pfb_sc_bin_spacing.restype  = _ct.c_double
+        lib.pfb_sc_bin_spacing.argtypes = [_ct.c_void_p]
+        lib.pfb_sc_output_rate.restype  = _ct.c_int
+        lib.pfb_sc_output_rate.argtypes = [_ct.c_void_p]
+
+        n_sos = sos100.shape[0]
+        s100 = np.ascontiguousarray(sos100, dtype=np.float64)
+        s200 = np.ascontiguousarray(sos200, dtype=np.float64)
+        p100 = s100.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        p200 = s200.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        h = lib.pfb_sc_create(
+            _ct.c_int(sample_rate), _ct.c_double(center_hz),
+            _ct.c_int(max_bins),    _ct.c_double(min_snr),
+            _ct.c_int(window_samples), _ct.c_int(energy_win),
+            _ct.c_double(grid_hz),
+            _ct.c_double(band_min_hz), _ct.c_double(band_max_hz),
+            p100, _ct.c_int(n_sos), p200)
+        if not h:
+            log.warning("pfb_sc_create returned NULL")
+            return None
+        h_void  = _ct.c_void_p(h)
+        n_chan  = lib.pfb_sc_n_chan(h_void)
+        out_rt  = lib.pfb_sc_output_rate(h_void)
+        bsp     = lib.pfb_sc_bin_spacing(h_void)
+        log.info("Loaded libpfb_scanner.so (sr=%d center=%.0f Hz "
+                 "n_chan=%d bin_spacing=%.2f Hz output_rate=%d Hz max_bins=%d)",
+                 sample_rate, center_hz, n_chan, bsp, out_rt, max_bins)
+        sc = _ItilaSc(_PFBLibShim(lib), h_void)
+        sc.envelope_rate = out_rt
+        return sc
+    except OSError:
+        log.warning("libpfb_scanner.so not found")
         return None
 
 
@@ -1527,11 +2163,14 @@ class _ItilaChannel:
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             log.debug("ITILA window %.1f kHz: thresh=%.1f raw=%r", self.rf_khz, self._ev_thresh, raw[:80])
             if raw:
+                wpm = int(round(lib.itila_get_wpm(h)))
                 call = _itila_extract_cq_call(raw)
                 if call and call not in seen:
                     seen.add(call)
                     self._pending.append(f'CQ {call} ')
-                    log.info("ITILA %.1f kHz: %s (from: %s)", self.rf_khz, call, raw[:60])
+                    if wpm > 0:
+                        self.detected_wpm = wpm
+                    log.info("ITILA %.1f kHz: %s %d WPM (from: %s)", self.rf_khz, call, wpm, raw[:60])
 
     def read(self):
         if not self._pending:
@@ -1572,11 +2211,21 @@ class _ItilaScanner:
     def __init__(self, sample_rate, center_khz, ev_thresh=2.0,
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
-                 max_bins=80):
+                 max_bins=80, use_pfb=False, valid_calls=None,
+                 enable_caller_spotting=True):
+        self.valid_calls = valid_calls or set()
+        self.enable_caller_spotting = bool(enable_caller_spotting)
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
-        self._window_samples = int(window_sec * 200)
         self._window_sec     = window_sec
+        self._use_pfb        = bool(use_pfb)
+
+        # Envelope rate: 200 Hz for the per-bin FIR scanner; PFB output rate
+        # otherwise (with current params: 192000*2/2048 = 187 Hz).  Window is
+        # always window_sec long in seconds, just sized in actual samples.
+        self._envelope_rate  = (_pfb_output_rate(sample_rate) if self._use_pfb
+                                else 200)
+        self._window_samples = int(window_sec * self._envelope_rate)
 
         fs_pcm = DECODER_RATE  # 12000 Hz
         sos_100 = butter(6, 100.0 / (fs_pcm / 2.0), btype='low', output='sos')
@@ -1585,13 +2234,35 @@ class _ItilaScanner:
         # f_hz -> {h100, h200, pending} — itila decoder handles per bin
         self._bins = {}
 
-        self._sc = _get_itila_scanner(
+        loader = _get_pfb_scanner if self._use_pfb else _get_itila_scanner
+        # Per-bin scanner keeps its 50 Hz grid.  PFB scanner uses 50 Hz too;
+        # the per-bin fine-tune NCO mix snaps the residual offset out, so
+        # we don't lose resolution by spawning at sub-bin frequencies.
+        grid_hz = 50.0
+        self._sc = loader(
             sample_rate, center_khz * 1000.0, max_bins, min_snr,
             self._window_samples, 4096,
-            50.0,                           # grid_hz (50 Hz for FIR selectivity)
+            grid_hz,
             band_min_khz * 1000.0, band_max_khz * 1000.0,
             sos_100.astype(np.float64), sos_200.astype(np.float64),
         )
+
+        # Set up C decode loop — decoder handles managed by scanner
+        import ctypes as _ct
+        itila_lib = _get_itila_lib()
+        if self._sc and itila_lib:
+            self._sc._lib.itila_sc_set_decoder(
+                self._sc._h,
+                _ct.cast(itila_lib.itila_create, _ct.c_void_p),
+                _ct.cast(itila_lib.itila_feed, _ct.c_void_p),
+                _ct.cast(itila_lib.itila_free, _ct.c_void_p),
+                _ct.cast(itila_lib.itila_get_wpm, _ct.c_void_p),
+                _ct.c_double(ev_thresh))
+            self._c_decode = True
+            # Pre-allocate result buffer for C decode loop
+            self._decode_results = (_ct.c_char * (280 * 128))()
+        else:
+            self._c_decode = False
 
     def _ensure_bin_handles(self, f_hz):
         """Create itila decoder handles for a C-spawned bin if not yet tracked."""
@@ -1601,9 +2272,15 @@ class _ItilaScanner:
         lib = _get_itila_lib()
         h100 = h200 = None
         if lib:
-            h100 = _ct.c_void_p(lib.itila_create(200, 100.0))
-            h200 = _ct.c_void_p(lib.itila_create(200, 200.0))
-        self._bins[f_hz] = {'h100': h100, 'h200': h200, 'pending': []}
+            rate = self._envelope_rate
+            h100 = _ct.c_void_p(lib.itila_create(rate, 100.0))
+            h200 = _ct.c_void_p(lib.itila_create(rate, 200.0))
+        self._bins[f_hz] = {
+            'h100': h100, 'h200': h200, 'pending': [], 'wpm': 0, 'snr': 0.0,
+            'text_buf': '',       # rolling accumulated raw decode text
+            'spotted': set(),     # calls already spotted on this bin
+            'last_cq_time': 0.0,  # wall time of last CQ trigger on this bin
+        }
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
     def feed_iq(self, i_arr, q_arr):
@@ -1612,28 +2289,26 @@ class _ItilaScanner:
         i_c = np.ascontiguousarray(i_arr, dtype=np.float64)
         q_c = np.ascontiguousarray(q_arr, dtype=np.float64)
         self._sc.feed_iq(i_c, q_c)
+        self._process_ready()
 
-        # Sync Python bin handles with C-spawned bins
+    def _process_ready(self):
+        """Sync bin handles with C scanner and decode any ready windows."""
+        if not self._sc:
+            return
         active_hz = self._sc.list_bins()
         for f_hz in active_hz:
             self._ensure_bin_handles(f_hz)
-        # Drop handles for bins the C scanner has evicted
         for f_hz in list(self._bins):
             if f_hz not in active_hz:
                 self._free_bin_handles(f_hz)
 
-        # Fire decode on any ready windows
         ready = self._sc.ready_bins()
         for f_hz in ready:
             st = self._bins.get(f_hz)
             if st is None:
                 continue
             n_env = self._sc.env_n(f_hz)
-            if n_env > 0 and n_env % 1000 < 8:
-                log.info("ITILA env %.1f kHz: %d/%d",
-                         f_hz/1000.0, n_env, self._window_samples)
             while n_env >= self._window_samples:
-                log.info("ITILA decode firing %.1f kHz env=%d", f_hz/1000.0, n_env)
                 self._decode_bin(f_hz, st)
                 n_env = self._sc.env_n(f_hz)
 
@@ -1650,7 +2325,11 @@ class _ItilaScanner:
             return
 
         f_khz = f_hz / 1000.0
-        seen = set()
+        snr = self._sc._lib.itila_sc_get_snr(self._sc._h, _ct.c_double(f_hz))
+        if snr > 0:
+            st['snr'] = snr
+        now = time.time()
+
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
@@ -1660,28 +2339,145 @@ class _ItilaScanner:
                                     _ct.c_double(f_khz),
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
-            if raw:
-                log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
-            else:
-                log.debug("ITILA scan %.1f kHz: (empty)", f_khz)
-            if raw:
-                call = _itila_extract_cq_call(raw)
-                if call and call not in seen:
-                    seen.add(call)
-                    st['pending'].append(f'CQ {call} ')
-                    log.info("ITILA scan %.1f kHz: %s (raw: %s)", f_khz, call, raw[:60])
-                    if self._sc:
-                        self._sc._lib.itila_sc_mark_evidence(
-                            self._sc._h, _ct.c_double(f_hz))
+            if not raw:
+                continue
+            log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+            wpm = int(round(lib.itila_get_wpm(h)))
+            if wpm > 0:
+                st['wpm'] = wpm
+
+            # Accumulate raw text in rolling buffer (last 512 chars)
+            st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
+
+            # Check for CQ trigger in this window's raw text
+            if CQ_PATTERNS.search(raw):
+                st['last_cq_time'] = now
+
+            # Path 1: direct extraction from this window (standard)
+            call = _itila_extract_cq_call(raw, self.valid_calls)
+            if call and call not in st['spotted']:
+                st['spotted'].add(call)
+                st['pending'].append(f'CQ {call} ')
+                log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
+                if self._sc:
+                    self._sc._lib.itila_sc_mark_evidence(
+                        self._sc._h, _ct.c_double(f_hz))
+
+            # Path 2: context extraction — if CQ was seen on this bin
+            # recently, extract callsigns from the accumulated buffer.
+            # Two modes (controlled by enable_caller_spotting):
+            #   true  → c042491 behavior: extract callers AND runner
+            #           (74% → 91% recall vs CW Skimmer benchmark)
+            #   false → runner-only via _itila_extract_cq_call (precision-
+            #           focused; emits 1 spot per pile-up not N)
+            elif now - st['last_cq_time'] < 120.0:
+                if self.enable_caller_spotting:
+                    calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                    for c in calls_in_raw:
+                        if c not in st['spotted']:
+                            st['spotted'].add(c)
+                            st['pending'].append(f'CQ {c} ')
+                            log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, all)",
+                                     f_khz, c, wpm, int(now - st['last_cq_time']))
+                            if self._sc:
+                                self._sc._lib.itila_sc_mark_evidence(
+                                    self._sc._h, _ct.c_double(f_hz))
+                else:
+                    call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
+                    if call and call not in st['spotted']:
+                        st['spotted'].add(call)
+                        st['pending'].append(f'CQ {call} ')
+                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
+                                 f_khz, call, wpm, int(now - st['last_cq_time']))
+                        if self._sc:
+                            self._sc._lib.itila_sc_mark_evidence(
+                                self._sc._h, _ct.c_double(f_hz))
+
+    def _process_ready_c(self):
+        """C decode loop — all bin iteration + decode happens in C."""
+        import ctypes as _ct
+        if not self._sc or not getattr(self, '_c_decode', False):
+            return
+        # ScDecodeResult: {double f_hz(8), double snr(8), int wpm(4), pad(4), char text[256]}
+        # Total: 280 bytes per result (with padding)
+        max_results = 128
+        result_size = 8 + 8 + 4 + 4 + 256  # 280 bytes
+        buf = _ct.create_string_buffer(result_size * max_results)
+        n = self._sc._lib.itila_sc_decode_ready(
+            self._sc._h, _ct.c_int(self._window_samples),
+            buf, _ct.c_int(max_results))
+
+        now = time.time()
+        for i in range(n):
+            offset = i * result_size
+            f_hz = _ct.c_double.from_buffer(buf, offset).value
+            snr = _ct.c_double.from_buffer(buf, offset + 8).value
+            wpm = _ct.c_int.from_buffer(buf, offset + 16).value
+            raw = buf[offset + 24:offset + result_size].split(b'\0')[0].decode('ascii', errors='replace')
+
+            if not raw:
+                continue
+            f_khz = f_hz / 1000.0
+            log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+
+            # Ensure Python bin state exists for ticker tape
+            if f_hz not in self._bins:
+                self._bins[f_hz] = {
+                    'h100': None, 'h200': None, 'pending': [], 'wpm': 0, 'snr': 0.0,
+                    'text_buf': '', 'spotted': set(), 'last_cq_time': 0.0,
+                }
+            st = self._bins[f_hz]
+            st['snr'] = snr
+            if wpm > 0:
+                st['wpm'] = wpm
+
+            # Ticker tape: accumulate text
+            st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
+            if CQ_PATTERNS.search(raw):
+                st['last_cq_time'] = now
+
+            # Path 1: direct CQ extraction
+            call = _itila_extract_cq_call(raw, self.valid_calls)
+            if call and call not in st['spotted']:
+                st['spotted'].add(call)
+                st['pending'].append(f'CQ {call} ')
+                log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
+                if self._sc:
+                    self._sc._lib.itila_sc_mark_evidence(
+                        self._sc._h, _ct.c_double(f_hz))
+            # Path 2: context extraction — see Python path above for the
+            # caller-vs-runner-only mode flag (enable_caller_spotting).
+            elif now - st['last_cq_time'] < 120.0:
+                if self.enable_caller_spotting:
+                    calls_in_raw = _itila_extract_all_calls(st['text_buf'])
+                    for c in calls_in_raw:
+                        if c not in st['spotted']:
+                            st['spotted'].add(c)
+                            st['pending'].append(f'CQ {c} ')
+                            log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, all)",
+                                     f_khz, c, wpm, int(now - st['last_cq_time']))
+                            if self._sc:
+                                self._sc._lib.itila_sc_mark_evidence(
+                                    self._sc._h, _ct.c_double(f_hz))
+                else:
+                    call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
+                    if call and call not in st['spotted']:
+                        st['spotted'].add(call)
+                        st['pending'].append(f'CQ {call} ')
+                        log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
+                                 f_khz, call, wpm, int(now - st['last_cq_time']))
+                        if self._sc:
+                            self._sc._lib.itila_sc_mark_evidence(
+                                self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
-        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', 0)."""
+        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm)."""
         results = []
         for f_hz, st in self._bins.items():
             if st['pending']:
                 text = ''.join(st['pending'])
                 st['pending'] = []
-                results.append((f_hz/1000.0, 0.0, text, text, id(st), 'itila', 0))
+                results.append((f_hz/1000.0, st['snr'], text, text, id(st), 'itila', st['wpm']))
         return results
 
     def _free_bin_handles(self, f_hz):
@@ -3214,7 +4010,11 @@ class InstanceManager:
                  ml_max_channels=20, use_dispatcher=False,
                  use_pfb_dispatcher=False, use_itila=False,
                  itila_ev_thresh=2.0, itila_window_sec=120.0,
-                 cw_min_khz=0.0, cw_max_khz=99999.0):
+                 itila_min_snr=8.0, itila_max_bins=200,
+                 use_pfb_scanner=False, valid_calls=None,
+                 cw_min_khz=0.0, cw_max_khz=99999.0,
+                 enable_caller_spotting=True):
+        self.valid_calls = valid_calls or set()
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
         self.bmorse_bin = bmorse_bin      # None = no bmorse
@@ -3226,6 +4026,10 @@ class InstanceManager:
         self.use_itila = bool(use_itila)
         self.itila_ev_thresh = float(itila_ev_thresh)
         self.itila_window_sec = float(itila_window_sec)
+        self.itila_min_snr = float(itila_min_snr)
+        self.itila_max_bins = int(itila_max_bins)
+        self.use_pfb_scanner = bool(use_pfb_scanner)
+        self.enable_caller_spotting = bool(enable_caller_spotting)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
@@ -3288,13 +4092,23 @@ class InstanceManager:
         # Lazily create or re-center the ITILA scanner when center_khz is known.
         if self.use_itila:
             if self._itila_scanner is None:
+                # Derive per-band CW limits from center frequency if global limits
+                # don't make sense for this band (multi-band operation)
+                bmin, bmax = self.cw_min_khz, self.cw_max_khz
+                if bmin == 0 or center_khz < bmin - 100 or center_khz > bmax + 100:
+                    bmin = center_khz - 100
+                    bmax = center_khz - 20
                 self._itila_scanner = _ItilaScanner(
                     self.sample_rate, center_khz,
                     ev_thresh=self.itila_ev_thresh,
                     window_sec=self.itila_window_sec,
-                    min_snr=12.0,
-                    band_min_khz=self.cw_min_khz,
-                    band_max_khz=self.cw_max_khz)
+                    min_snr=float(self.itila_min_snr),
+                    band_min_khz=bmin,
+                    band_max_khz=bmax,
+                    max_bins=int(self.itila_max_bins),
+                    use_pfb=self.use_pfb_scanner,
+                    valid_calls=getattr(self, 'valid_calls', None),
+                    enable_caller_spotting=self.enable_caller_spotting)
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -3729,15 +4543,45 @@ class SpotTracker:
     This is the streaming equivalent of the offline multi-sighting filter.
     """
 
+    # "Ship-it" defaults: all gates off, caller-spotting on, telemetry on.
+    # Per the 2026-04-27 plan (feedback_ship_it_plan.md), local gates were
+    # over-tuning precision and crashing recall. Default to permissive emit
+    # and let the cluster filter (VE7CC's 2+ skimmer rule). Each gate
+    # remains as a feature that can be re-enabled individually via config
+    # for users who want stricter local behavior.
+    GATE_DEFAULTS = {
+        'gate_cq_runner':              False,  # CQ-adjacency forces runner-only when CQ in buffer
+        'gate_freq_consensus':         False,  # per-freq commit + 5-min lock + adaptive thresh
+        'gate_patt3ch_filter':         False,  # drop bypass calls not matching patt3ch.lst
+        'gate_bypass_consensus':       False,  # bypass goes through freq consensus vs simple count
+        'gate_scp_bucket_substitute':  False,  # emit bucket form instead of raw call
+        'enable_caller_spotting':      True,   # extract callers AND runner from QSO buffer (c042491)
+        'gate_telemetry':              True,   # log "would-gate" decisions even when gate is off
+    }
+
     def __init__(self, valid_calls, blacklist, respot_interval=120,
-                 fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0):
+                 fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0,
+                 patt3ch_path='patt3ch.lst', gate_config=None):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
         self.fuzzy_min_cycles = fuzzy_min_cycles
         self.add_calls = add_calls or set()
+        # Gate config — start with defaults, override anything in gate_config arg
+        self.gate_config = dict(self.GATE_DEFAULTS)
+        if gate_config:
+            self.gate_config.update(gate_config)
         # 0 = naked (no SCP), None = SCP-only (no bypass), N>0 = promote after N decodes
         self.scp_bypass_threshold = scp_bypass_threshold
+        # patt3ch.lst: SkimSrv's structural-pattern allowlist used as the
+        # bypass-tier validation. Calls matching a pattern are
+        # "structurally legit" — relaxed gate. Calls NOT matching are
+        # likely noise (suffixes/fragments of real calls).
+        # Format: "<flag> <pattern>" where @=letter, #=digit, literal else.
+        # Roughly half are flagged "+" (common) vs unflagged (rare).
+        self._patt3ch_by_len_active = {}   # length -> [compiled regex, ...]
+        self._patt3ch_by_len_rare   = {}
+        self._load_patt3ch(patt3ch_path)
 
         # Exact match tracking
         self._tracking = defaultdict(lambda: {
@@ -3758,10 +4602,40 @@ class SpotTracker:
         # Cross-channel hallucination filter
         self._cycle_calls = defaultdict(set)
 
+        # Per-freq-bin sighting leader. Only the leader may emit a spot
+        # at a given freq_bin within the recent-sightings window. Closes
+        # the multi-call-per-freq FP pattern Grayline measured 2026-04-25:
+        # 14038.8 was producing 6 different SCP-valid spots from 1 real
+        # signal (K2NV, K2YG, VE3GMZ, VE6RST, WB2FUE, WI5D). Tracked
+        # as freq_bin -> (call, sighting_count).
+        self._freq_leader = {}
+        self._freq_committed = {}      # freq_bin -> (call, commit_time)
+        self._freq_sighting_times = defaultdict(list)  # freq_bin -> [(t, call), ...]
+
         # Build SCP prefix index for fast fuzzy matching
         self._scp_by_len = defaultdict(list)
         for call in valid_calls:
             self._scp_by_len[len(call)].append(call)
+
+        # Suffix index for leading-letter substitution recovery.
+        # The Bayesian decoder routinely garbles the first character of weak
+        # signals (K→T, G→D, H→S, F→E, etc. — they're 1-2 dits apart in Morse).
+        # Indexing valid_calls by call[1:] lets us recover the right SCP call
+        # in O(1) when there's exactly one match: e.g. "T1LZ" → suffix "1LZ" →
+        # uniquely "K1LZ".  Skipped when ambiguous to avoid false rewrites.
+        self._scp_by_suffix = defaultdict(list)
+        # Prefix index for trailing-letter truncation recovery.
+        # The decoder also drops the trailing character routinely (EI5KF→EI5K,
+        # DF7TV→DF7T).  When exactly one SCP call extends our candidate by one
+        # letter, recover it.  Extensions are usually ambiguous (EI5K → EI5KF
+        # / EI5KG / EI5KI / ...), so this fires less often than leading-letter
+        # but the same force-bypass gate keeps wrong recoveries safe.
+        self._scp_by_prefix = defaultdict(list)
+        for call in valid_calls:
+            if 4 <= len(call) <= 7 and '/' not in call:
+                self._scp_by_suffix[call[1:]].append(call)
+            if 5 <= len(call) <= 7 and '/' not in call:
+                self._scp_by_prefix[call[:-1]].append(call)
 
     # Window for time-gated sighting counts (seconds). A call must be
     # seen N times within this window to pass the sightings threshold.
@@ -3794,25 +4668,223 @@ class SpotTracker:
     def _min_sightings(self, call, snr=0):
         """Morse-weight-based sighting threshold.
         Low-weight calls (short Morse elements) require more sightings —
-        they're generated by noise far more often than high-weight calls."""
+        they're generated by noise far more often than high-weight calls.
+        Bumped 2026-04-25 after live UK/EI contest produced 87 FPs vs SDC's
+        70 unique spots in 20 min — the prior thresholds (6/4/3/2) let too
+        many noise-decoded SCP-valid calls through."""
         if call in self.add_calls:
             return 1  # pre-validated rare calls: one clean decode is enough
         # Strip slash suffix for weight calculation
         base = call.split('/')[0]
         w = self._morse_weight(base)
         if w <= 9:    # R3ER=8, N5ER=9, MM2T=9, SE5E=9
-            return 6
+            return 7
         elif w <= 12: # K3WW=11, N4BA=11, W4SPR=12
-            return 4
+            return 5
         elif w <= 15: # W6AYC=14, KG9X=13, WB2AA=15
-            return 3
-        return 2
+            return 4
+        return 3
+
+    def _load_patt3ch(self, path):
+        """Load SkimSrv's patt3ch.lst structural-pattern allowlist.
+        Compiles each pattern to a regex and indexes by call length for
+        O(patterns_at_length) lookup. Patterns flagged "+" go in the
+        active bucket; unflagged go in rare. Both are valid; flag is
+        used to weight confidence."""
+        try:
+            with open(path) as fp:
+                for line in fp:
+                    line = line.rstrip()
+                    if len(line) < 2:
+                        continue
+                    flag = line[0]
+                    pat = line[2:].strip()
+                    if not pat:
+                        continue
+                    rx_str = '^' + pat.replace('@', '[A-Z]').replace('#', '[0-9]') + '$'
+                    rx = re.compile(rx_str)
+                    bucket = (self._patt3ch_by_len_active if flag == '+'
+                              else self._patt3ch_by_len_rare)
+                    bucket.setdefault(len(pat), []).append(rx)
+            n_active = sum(len(v) for v in self._patt3ch_by_len_active.values())
+            n_rare = sum(len(v) for v in self._patt3ch_by_len_rare.values())
+            log.info("Loaded patt3ch.lst: %d active + %d rare patterns",
+                     n_active, n_rare)
+        except FileNotFoundError:
+            log.warning("patt3ch.lst not found at %s — bypass-tier validation disabled", path)
+
+    def _matches_patt3ch(self, call):
+        """Return 'active' if call matches a "+"-flagged pattern,
+        'rare' if it matches an unflagged pattern, or None."""
+        n = len(call)
+        for rx in self._patt3ch_by_len_active.get(n, []):
+            if rx.match(call):
+                return 'active'
+        for rx in self._patt3ch_by_len_rare.get(n, []):
+            if rx.match(call):
+                return 'rare'
+        return None
+
+    # Deferred consensus emission: a freq_bin must accumulate this many
+    # sightings (across all candidate calls) before we commit to one call
+    # and emit it. Suppresses the multiple-spots-from-one-real-signal
+    # pattern (K4R / K4RU / K4RUM / K4RUMN / TT5CM / K5CM all from one
+    # K4RUM CQ). Once committed, other calls at this freq are silenced
+    # for COMMIT_LOCK_SEC. Reset when committed call hasn't been re-sighted
+    # in COMMIT_LOCK_SEC (runner abandoned/QSY).
+    COMMIT_THRESHOLD = 5
+    COMMIT_LOCK_SEC = 300
+
+    _BUCKET_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+    # Leading-noise trim characters: E (.), T (-), I (..), S (...) are the
+    # shortest Morse symbols and the most common decoder noise prefixes
+    # (the decoder hears noise crackle as a few short elements before the
+    # real signal starts). Trimming ≤2 of these from the front and
+    # re-checking SCP catches ITM4FO/EVM4FO/etc that edit-1 alone misses.
+    _BUCKET_NOISE_CHARS = 'ETIS'
+
+    def _scp_bucket(self, call):
+        """Map a call to its consensus bucket: nearest SCP-valid call within
+        edit distance 1 (substitution), or after trimming ≤2 leading
+        noise-prefix chars (E/T/I/S) plus another edit-1 substitution.
+        Returns the call itself if no unambiguous SCP neighbor exists.
+        Collapses garbled variants (VM4FO, ITM4FO, EVM4FO → KM4FO) into
+        one vote bucket while keeping distinct SCP-valid calls (K8MA vs
+        K8MR) separate. Cached per-call (deterministic mapping)."""
+        if not hasattr(self, '_bucket_cache'):
+            self._bucket_cache = {}
+        if call in self._bucket_cache:
+            return self._bucket_cache[call]
+        if call in self.valid_calls:
+            self._bucket_cache[call] = call
+            return call
+
+        def _edit1_unique_scp(s):
+            """Return the unique SCP-valid edit-1 substitution of s, or
+            None if zero or 2+ matches (ambiguous → no merge)."""
+            matches = set()
+            for i in range(len(s)):
+                for c in self._BUCKET_CHARS:
+                    if c == s[i]: continue
+                    cand = s[:i] + c + s[i+1:]
+                    if cand in self.valid_calls:
+                        matches.add(cand)
+                        if len(matches) > 1:
+                            return None
+            return matches.pop() if len(matches) == 1 else None
+
+        bucket = _edit1_unique_scp(call)
+        if bucket:
+            self._bucket_cache[call] = bucket
+            return bucket
+
+        # TEST<call> fusion split: when the runner sends "TEST <call>" with
+        # too little inter-word space, the decoder fuses them and emits
+        # "T<call>". The leading "T" is a single dah from the trailing K
+        # of "TEST" or just the gap collapse. If stripping a leading T
+        # yields a SCP-valid call, that's almost certainly what happened.
+        # Industry-known issue (RBN-OPS thread 2023-09-20, N4ZR's example).
+        # Only fires when call is 5+ chars (TN4ZR → N4ZR is the canonical
+        # case) and the stripped form is in SCP exactly.
+        if len(call) >= 5 and call[0] == 'T':
+            suffix = call[1:]
+            if suffix in self.valid_calls:
+                self._bucket_cache[call] = suffix
+                return suffix
+
+        # Try trimming ≤2 leading noise chars (E/T/I/S) and looking for
+        # an EXACT SCP match.  We do NOT chain edit-1 after trim: that
+        # combination was too aggressive and produced country-prefix
+        # collapses (IT9DV→R9DV, IR3OR→R3OR — Italian prefixes turning
+        # into Russian via "trim I, sub T→R").  Many real DX prefixes
+        # start with E or T (EA/EI/ES Spain/Ireland/Estonia, IT/IR/IS/
+        # IZ Italy, TF/TI/TG Iceland/CR/Guatemala).  Trim+exact preserves
+        # the legitimate "leading-noise prefix on a real call" recovery
+        # while preventing the country flip damage.
+        for trim_len in range(1, 3):
+            if len(call) - trim_len < 3: break
+            if not all(c in self._BUCKET_NOISE_CHARS for c in call[:trim_len]):
+                break
+            suffix = call[trim_len:]
+            if suffix in self.valid_calls:
+                self._bucket_cache[call] = suffix
+                return suffix
+
+        # No SCP neighbor — vote for self (could be special event, club
+        # call, or noise; decisions about acceptance happen downstream)
+        self._bucket_cache[call] = call
+        return call
 
     def _record_sighting(self, call, freq_bin, now):
-        """Record a timestamped sighting for time-windowed counting."""
+        """Record a timestamped sighting for time-windowed counting.
+        Maintains both per-call and per-freq indices for fast lookup
+        from either side. Sightings are recorded under the SCP bucket
+        (garbled variants collapse to nearest SCP) so the consensus
+        winner counts votes from all decode variants."""
         if not hasattr(self, '_sighting_times'):
             self._sighting_times = defaultdict(list)
-        self._sighting_times[call].append((now, freq_bin))
+        if not hasattr(self, '_freq_sighting_times'):
+            self._freq_sighting_times = defaultdict(list)
+        bucket = self._scp_bucket(call)
+        self._sighting_times[bucket].append((now, freq_bin))
+        self._freq_sighting_times[freq_bin].append((now, bucket))
+
+    def _count_freq_total(self, freq_bin, now):
+        """Total sightings at freq_bin across ALL calls within SIGHTING_WINDOW."""
+        if not hasattr(self, '_freq_sighting_times'):
+            return 0
+        cutoff = now - self.SIGHTING_WINDOW
+        fresh = [(t, c) for t, c in self._freq_sighting_times.get(freq_bin, [])
+                 if t >= cutoff]
+        self._freq_sighting_times[freq_bin] = fresh
+        return len(fresh)
+
+    def _freq_winner(self, freq_bin, now):
+        """Call with the most sightings at freq_bin within SIGHTING_WINDOW.
+        Returns (call, count) or (None, 0) if no sightings."""
+        if not hasattr(self, '_freq_sighting_times'):
+            return None, 0
+        cutoff = now - self.SIGHTING_WINDOW
+        from collections import Counter
+        counts = Counter(c for t, c in self._freq_sighting_times.get(freq_bin, [])
+                         if t >= cutoff)
+        if not counts:
+            return None, 0
+        call, n = counts.most_common(1)[0]
+        return call, n
+
+    def _adaptive_commit_threshold(self, freq_bin, now):
+        """Adapt the consensus threshold based on freq clutter (number of
+        distinct candidate calls in the last SIGHTING_WINDOW). With SCP
+        bucketing in place, garbled variants (VM4FO, ITM4FO) collapse
+        into their nearest SCP-valid bucket (KM4FO), so 'distinct' here
+        means distinct *real* calls, not decode variants.
+          1 distinct → 2 sightings   (clean POTA/SST/casual op — fast)
+          2-3 distinct → 3 sightings (light competition)
+          4+ distinct → 5 sightings  (pile-up / contest / heavy spread)"""
+        if not hasattr(self, '_freq_sighting_times'):
+            return 2
+        cutoff = now - self.SIGHTING_WINDOW
+        distinct = {c for t, c in self._freq_sighting_times.get(freq_bin, [])
+                    if t >= cutoff}
+        n = len(distinct)
+        if n <= 1: return 2   # clean — POTA/SST single op
+        if n <= 3: return 3   # light competition
+        return 5              # pile-up / contest / heavy spread
+
+    def _committed_call_alive(self, call, freq_bin, now):
+        """True iff committed call has been re-sighted within COMMIT_LOCK_SEC.
+        When false, the freq slot is released (runner QSY/abandoned).
+        Bucket-aware lookup (matches _record_sighting's storage key)."""
+        if not hasattr(self, '_sighting_times'):
+            return False
+        bucket = self._scp_bucket(call)
+        cutoff = now - self.COMMIT_LOCK_SEC
+        for t, fb in self._sighting_times.get(bucket, []):
+            if fb == freq_bin and t >= cutoff:
+                return True
+        return False
 
     # Max distinct frequency bins within the sighting window before
     # suppressing a call as a noise hallucination. Real stations sit on
@@ -3825,13 +4897,21 @@ class SpotTracker:
 
     def _count_recent_sightings(self, call, freq_bin, now):
         """Count sightings within SIGHTING_WINDOW seconds at the same freq bin.
-        Suppresses calls seen at too many distinct frequencies (noise scatter)."""
+        Suppresses calls seen at too many distinct frequencies (noise scatter).
+
+        Bucket-aware: _record_sighting stores entries under the SCP bucket
+        (so VM4FO/ITM4FO/KM4FO all collapse to one KM4FO key). The lookup
+        here must use the same bucketing so garbled raw calls find the
+        accumulated count of their bucket family. Without this, garbled
+        forms returned 0 sightings even after their bucket had accumulated
+        many votes — silently killing the multi-sighting gate path."""
         if not hasattr(self, '_sighting_times'):
             return 0
-        entries = self._sighting_times.get(call, [])
+        bucket = self._scp_bucket(call)  # match _record_sighting's storage key
+        entries = self._sighting_times.get(bucket, [])
         cutoff = now - self.SIGHTING_WINDOW
         fresh = [(t, fb) for t, fb in entries if t >= cutoff]
-        self._sighting_times[call] = fresh
+        self._sighting_times[bucket] = fresh
 
         # Multi-frequency suppression: if this call appears at 3+ distinct
         # freq bins in the window, it's noise — real ops don't QSY 3x/min.
@@ -3840,6 +4920,34 @@ class SpotTracker:
             return 0
 
         return sum(1 for _, fb in fresh if fb == freq_bin)
+
+    def _is_freq_leader(self, call, freq_bin, now):
+        """Returns True iff `call` has the most recent sightings at
+        `freq_bin` within SIGHTING_WINDOW. Suppresses non-leader calls
+        so each freq_bin emits at most one spot per window — closes the
+        multi-call-per-freq FP pattern (one real signal producing 5+
+        SCP-valid spots from regex matches inside noise-decoded text).
+
+        Updates the per-bin leader cache when this call is or becomes
+        the leader. A stale leader (window expired → 0 sightings) is
+        replaced by any call with sightings >0."""
+        my_count = self._count_recent_sightings(call, freq_bin, now)
+        leader = self._freq_leader.get(freq_bin)
+        if leader is None:
+            self._freq_leader[freq_bin] = (call, my_count)
+            return True
+        leader_call, _leader_cached = leader
+        if leader_call == call:
+            self._freq_leader[freq_bin] = (call, my_count)
+            return True
+        # Different call leads — recompute their current count (cached
+        # value can be stale if their sightings have aged out).
+        fresh_leader_count = self._count_recent_sightings(
+            leader_call, freq_bin, now)
+        if fresh_leader_count == 0 or my_count > fresh_leader_count:
+            self._freq_leader[freq_bin] = (call, my_count)
+            return True
+        return False
 
     def _can_respot(self, call, freq_khz, now):
         """Per-(call,freq) respot check. QSY >1kHz = immediate spot."""
@@ -3854,6 +4962,50 @@ class SpotTracker:
             self._respot_times = {}
         key = (call, round(freq_khz))
         self._respot_times[key] = now
+
+    def _extend_truncated_call(self, call):
+        """If `call` looks like a real SCP call with the last letter dropped,
+        return the SCP version when uniquely determined.
+
+        Bayesian decoder also routinely drops the trailing character on weak
+        signals or when the operator's WPM ramps mid-word.  Live RF (2026-04-26
+        05:31 UTC) showed EI5KF being decoded as EI5K and DF7TV as DF7T."""
+        if call in self.valid_calls:
+            return None
+        if len(call) < 4 or len(call) > 6:
+            return None
+        candidates = self._scp_by_prefix.get(call)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _correct_leading_letter(self, call):
+        """If `call` looks like a leading-letter substitution of a single SCP
+        call, return that SCP call.  Returns None if `call` is already in SCP,
+        if no SCP variant matches, or if multiple variants match (ambiguous).
+
+        Diagnoses the Bayesian decoder's most common failure on weak signals:
+        the first character lands on a Morse-confusable letter.  Examples
+        from live SDC diff (2026-04-26 05:04-05:09 UTC):
+            T1LZ  → K1LZ    SB9BUN → HB9BUN    E5IN → F5IN
+            MM8U  → GM8U    E4HRM  → DL4HRM (2-edit, not handled here)
+        """
+        if call in self.valid_calls:
+            return None
+        if len(call) < 4 or len(call) > 7:
+            return None
+        suffix = call[1:]
+        candidates = self._scp_by_suffix.get(suffix)
+        if not candidates:
+            return None
+        # Single-match policy: only correct when unambiguous.  Many SCP suffixes
+        # (e.g. "1AW") have dozens of valid prefixes — substituting the first
+        # one would be wrong as often as right.
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def _fuzzy_match(self, fragment, max_dist=1):
         """Find SCP callsigns within edit distance max_dist of fragment.
@@ -3941,36 +5093,96 @@ class SpotTracker:
         spots = []
         now = time.time()
 
+        # CQ-runner identification: when CQ context is present, the call
+        # adjacent to CQ is the runner; other SCP-valid calls in the same
+        # buffer (worked stations during exchanges) are not. RBN cross-check
+        # 2026-04-26: 59% of false-positive spots were wrong-call-of-real-
+        # signal — a SCP-valid call from the runner's QSO leaking through
+        # the has_context gate. Pre-compute the runner once per call to
+        # _decode_window so we can demote non-runner SCP matches below.
+        recent_ctx_for_runner = context_clean[-500:] if len(context_clean) > 500 else context_clean
+        has_context_global = bool(CQ_PATTERNS.search(recent_ctx_for_runner))
+        cq_runner_call = (_itila_extract_cq_call(recent_ctx_for_runner, self.valid_calls)
+                          if has_context_global else None)
+        # Collapse runner candidate to its SCP bucket too, so a garbled
+        # form in the text (VM4FO) matches a clean form (KM4FO) in the gate.
+        cq_runner_bucket = self._scp_bucket(cq_runner_call) if cq_runner_call else None
+
         # --- Path 1: Exact SCP match ---
         # 1a: regex scan (word-boundary aware)
         seen_p1 = set()
         for m in CALL_RE.finditer(clean):
             call = m.group(1)
-            if len(call) < 4 or call in FALSE_POSITIVES:
+            # 3-char minimum: M7Z, M3A, G6M etc. are real contest calls in SCP.
+            if len(call) < 3 or call in FALSE_POSITIVES:
                 continue
             if call in self.blacklist:
                 continue
 
-            _slash_base = None
+            # Strip slash suffix and spot the BASE call only (RBN convention).
+            # Live SDC comparison 2026-04-25: SDC's spots have ZERO slashes;
+            # they all strip to base. RBN aggregator filters slash spots
+            # against MASTER.SCP (base-only) so they're dropped upstream
+            # anyway — emitting them is wasted work plus it inflates our
+            # FP count with garbled suffixes (N8KH/B, K8MR/HPT, W4DXM/IDR
+            # etc., all from decoder bit errors after the base call).
+            #
+            # Either side of the slash that's a base call in SCP wins.
+            # If BOTH sides are SCP base calls (e.g. W4/N1ABC = N1ABC
+            # operating from W4 area), prefer the longer one (the actual
+            # operator's call, not the regional prefix).
             if '/' in call:
                 _parts = call.split('/', 1)
+                _candidates = []
                 if _is_base_call(_parts[0]) and _parts[0] in self.valid_calls:
-                    _slash_base = _parts[0]
-                elif _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
-                    _slash_base = _parts[1]
-            # SCP bypass was disabled 2026-04-21. Originally added because
-            # ITILA's noisy raw text produced garbled callsigns that needed
-            # ev_thresh as the only quality gate. After GMM WPM estimation +
-            # fuzzy extraction + recursive token splitting, extraction quality
-            # improved enough that SCP validation catches ~84 false spots per
-            # 15-min eval without losing real calls. If a future decoder change
-            # degrades extraction quality, re-enable bypass by uncommenting:
-            # _itila_bypass = (dec_type == 'itila' and _is_base_call(call))
-            # Fuzzy SCP reverted 2026-04-22: corrected correct calls into wrong
-            # ones (NY3J→NY3B). Using scp_bypass_threshold instead — requires
-            # N consistent decodes of the same non-SCP call before spotting.
-            _itila_bypass = False
-            if call in self.valid_calls or _slash_base is not None or _itila_bypass:
+                    _candidates.append(_parts[0])
+                if _is_base_call(_parts[1]) and _parts[1] in self.valid_calls:
+                    _candidates.append(_parts[1])
+                if _candidates:
+                    call = max(_candidates, key=len)
+                # else: leave call as-is, will fail SCP check below
+            # Track whether `call` came from a decoder-error correction.
+            # Force corrected calls through bypass (multi-sighting) instead
+            # of exact (single-shot with context): SCP membership of the
+            # corrected call doesn't prove the decoder heard it correctly.
+            # Live-RF data (2026-04-26 05:17 UTC) showed Bayesian hallucinating
+            # N4UL from a clean DF7TV signal; treating that as "exact" plus
+            # context-gated would spot N4UL.  Multi-sighting catches the drift.
+            #
+            # Two correction modes, both only attempted at sane WPM (decoder
+            # output above 45 WPM is almost always noise hallucination):
+            #   leading-letter — first char garbled (T1LZ → K1LZ)
+            #   prefix-extend  — trailing char dropped (EI5K → EI5KF)
+            # Each requires an unambiguous single SCP match, else stay quiet.
+            forced_bypass = False
+            if '/' not in call and 0 < wpm <= 45:
+                _corrected = self._correct_leading_letter(call) \
+                          or self._extend_truncated_call(call)
+                if _corrected:
+                    log.info("SCP correct: %s → %s @ %.1f kHz wpm=%d",
+                             call, _corrected, freq_khz, wpm)
+                    call = _corrected
+                    forced_bypass = True
+
+            # SCP bucket: collapse single-edit garbled variants to nearest
+            # SCP-valid call. VM4FO/ITM4FO/EVM4FO → KM4FO. K8MA and K8MR
+            # stay distinct (both SCP-valid → no merge). Bucketing always
+            # logs the mapping; whether to SUBSTITUTE the call (emit bucket
+            # form instead of raw) is controlled by gate_scp_bucket_substitute.
+            if '/' not in call:
+                _bucket = self._scp_bucket(call)
+                if _bucket != call and _bucket in self.valid_calls:
+                    log.info("SCP bucket: %s → %s @ %.1f kHz", call, _bucket, freq_khz)
+                    if self.gate_config['gate_scp_bucket_substitute']:
+                        call = _bucket
+
+            # Global WPM sanity gate.  MAX_WPM=50 is defined as a constant
+            # documenting "spots above this are almost certainly noise" but
+            # was never actually enforced — wire it in here.  Contest CW
+            # tops out around 40-45 WPM in practice; 50+ is decoder frenzy.
+            if wpm > self.MAX_WPM:
+                continue
+            if call in self.valid_calls and not forced_bypass:
                 seen_p1.add(call)
                 # Primary decoder exact match — suppress secondary decoders here
                 if dec_type in ('primary', 'itila'):
@@ -3982,19 +5194,76 @@ class SpotTracker:
                 info['snr'] = max(info['snr'], snr)
                 self._record_sighting(call, freq_bin, now)
                 recent_count = self._count_recent_sightings(call, freq_bin, now)
-                if dec_type == 'itila':
-                    # ITILA's Bayesian ev_thresh is the quality gate — one clean
-                    # window decode is sufficient. CW engine FPs are now gated
-                    # at source (decoder_speeds=[]).
-                    gate = True
+                # Context check: only look at RECENT text (last ~500 chars)
+                # to avoid "CQ" appearing by chance in hours of noise output.
+                recent_ctx = context_clean[-500:] if len(context_clean) > 500 else context_clean
+                has_context = bool(CQ_PATTERNS.search(recent_ctx))
+                min_s = self._min_sightings(call, snr)
+                # CQ-runner gate: when a CQ context exists AND we identified
+                # the runner adjacent to CQ, only THAT call passes via context.
+                # Other SCP-valid calls in the same buffer are likely worked
+                # stations from the runner's QSO and must satisfy
+                # multi-sighting on their own to be spotted. This kills the
+                # 59% wrong-call-of-real-signal failure mode (2026-04-26 RBN
+                # cross-check). When no runner could be identified despite
+                # has_context (CQ token garbled, no adjacent base call), fall
+                # back to original permissive behavior.
+                # Bucket-aware comparison: cq_runner_bucket is already a
+                # bucket form. Compare against this call's bucket so the
+                # gate works whether or not gate_scp_bucket_substitute
+                # is on (raw call vs bucket call shouldn't affect runner
+                # identification).
+                _call_bucket = self._scp_bucket(call)
+                if (self.gate_config['gate_cq_runner']
+                        and has_context and cq_runner_bucket is not None):
+                    gate = (_call_bucket == cq_runner_bucket) or (recent_count >= min_s)
+                    if not gate and self.gate_config['gate_telemetry']:
+                        log.debug("WOULD-GATE cq_runner: %s @ %.1f kHz "
+                                  "(runner=%s, count=%d)",
+                                  call, freq_khz, cq_runner_bucket, recent_count)
                 else:
-                    # Context check: only look at RECENT text (last ~500 chars)
-                    # to avoid "CQ" appearing by chance in hours of noise output.
-                    recent_ctx = context_clean[-500:] if len(context_clean) > 500 else context_clean
-                    has_context = bool(CQ_PATTERNS.search(recent_ctx))
-                    min_s = self._min_sightings(call, snr)
                     gate = has_context or recent_count >= min_s
-                if gate and self._can_respot(call, freq_khz, now):
+                    # Telemetry: log what cq_runner WOULD have done if enabled
+                    if (self.gate_config['gate_telemetry']
+                            and has_context and cq_runner_bucket is not None
+                            and _call_bucket != cq_runner_bucket
+                            and recent_count < min_s):
+                        log.debug("PHANTOM cq_runner: %s @ %.1f kHz would suppress "
+                                  "(runner=%s)", call, freq_khz, cq_runner_bucket)
+
+                # Deferred consensus gate: emit at most one call per freq_bin,
+                # picked by majority sightings after COMMIT_THRESHOLD total
+                # sightings have accumulated at that freq across all calls.
+                # Suppresses the multiple-spots-from-one-real-signal pattern
+                # where K4R/K4RU/K4RUM/K4RUMN/TT5CM all get emitted from one
+                # K4RUM CQ. Once a freq commits to a call, other calls there
+                # are silenced for COMMIT_LOCK_SEC; reset when the committed
+                # call hasn't been re-sighted in COMMIT_LOCK_SEC.
+                if gate and self.gate_config['gate_freq_consensus']:
+                    committed = self._freq_committed.get(freq_bin)
+                    if committed:
+                        committed_call, _ = committed
+                        if not self._committed_call_alive(committed_call, freq_bin, now):
+                            del self._freq_committed[freq_bin]
+                            committed = None
+                        elif call != committed_call:
+                            gate = False  # suppress non-committed call at this freq
+                    if gate and not committed:
+                        total_at_freq = self._count_freq_total(freq_bin, now)
+                        thresh = self._adaptive_commit_threshold(freq_bin, now)
+                        if total_at_freq < thresh:
+                            gate = False  # not enough evidence yet — defer
+                        else:
+                            winner_call, winner_n = self._freq_winner(freq_bin, now)
+                            if winner_call != call:
+                                gate = False  # this call isn't the winner
+                            else:
+                                self._freq_committed[freq_bin] = (call, now)
+                                log.info("FREQ COMMIT: %s @ bin=%d (%d/%d sightings, thresh=%d)",
+                                         call, freq_bin, winner_n, total_at_freq, thresh)
+
+                if gate and self._can_respot(call, freq_khz, now) \
+                        and self._is_freq_leader(call, freq_bin, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
                         self._mark_spotted(call, freq_khz, now)
                         spots.append({
@@ -4006,18 +5275,71 @@ class SpotTracker:
                         })
             elif self.scp_bypass_threshold and CALL_RE.match(call) \
                     and call not in seen_p1:
-                # Non-SCP call that looks structurally valid — track per (call, freq).
-                # seen_p1 prevents counting the same call twice in one process() call.
-                # Promotes to spot after scp_bypass_threshold consistent decode events.
-                # Noise won't produce the same non-SCP call N times at one frequency.
+                # Non-SCP structurally-valid call. Two layered behaviors,
+                # each flag-controlled:
+                #   gate_patt3ch_filter — drop calls not matching patt3ch.lst
+                #   gate_bypass_consensus — bypass goes through freq consensus
+                # When both off (ship-it default): emit on simple count
+                # threshold, tag with patt3ch result for downstream visibility.
                 seen_p1.add(call)  # dedupe within this process() call
-                bkey = (call, freq_bin)
-                self._bypass_counts[bkey] += 1
-                if self._bypass_counts[bkey] >= self.scp_bypass_threshold and \
-                   bkey not in self._bypass_spotted:
-                    self._bypass_spotted.add(bkey)  # emit once per (call, freq)
-                    log.info("SCP bypass: %s at %.1f kHz (count=%d)",
-                             call, freq_khz, self._bypass_counts[bkey])
+                if wpm > self.MAX_WPM:
+                    continue
+                patt3ch_match = self._matches_patt3ch(call)  # 'active' / 'rare' / None
+                if self.gate_config['gate_patt3ch_filter'] and patt3ch_match is None:
+                    # Drop bypass calls not matching any common pattern.
+                    # Likely noise — fragments / contest-exchange garbage.
+                    continue
+                elif (patt3ch_match is None
+                      and self.gate_config['gate_telemetry']):
+                    log.debug("PHANTOM patt3ch_filter: %s @ %.1f kHz "
+                              "would suppress (no pattern match)",
+                              call, freq_khz)
+                self._record_sighting(call, freq_bin, now)
+
+                bypass_gate = True
+                if self.gate_config['gate_bypass_consensus']:
+                    # Per-freq consensus + lock for bypass. Tighter floor:
+                    # patt3ch active ("+") = 3 sightings, rare = 5.
+                    committed = self._freq_committed.get(freq_bin)
+                    if committed:
+                        committed_call, _ = committed
+                        if not self._committed_call_alive(committed_call, freq_bin, now):
+                            del self._freq_committed[freq_bin]
+                            committed = None
+                        elif call != committed_call:
+                            bypass_gate = False
+                    if bypass_gate and not committed:
+                        total_at_freq = self._count_freq_total(freq_bin, now)
+                        base_thresh = self._adaptive_commit_threshold(freq_bin, now)
+                        floor = 2 if patt3ch_match == 'active' else 5
+                        thresh = max(base_thresh, floor)
+                        if total_at_freq < thresh:
+                            bypass_gate = False
+                        else:
+                            winner_call, winner_n = self._freq_winner(freq_bin, now)
+                            if winner_call != call:
+                                bypass_gate = False
+                            else:
+                                self._freq_committed[freq_bin] = (call, now)
+                                log.info("FREQ COMMIT (bypass/%s): %s @ bin=%d (%d/%d sightings, thresh=%d)",
+                                         patt3ch_match, call, freq_bin, winner_n, total_at_freq, thresh)
+                else:
+                    # Simple count-threshold path (pre-tonight behavior):
+                    # promote when same (call, freq_kHz_bucket) has been
+                    # decoded N times, where N = scp_bypass_threshold.
+                    bypass_freq = int(round(freq_khz))
+                    bkey_count = (call, bypass_freq)
+                    self._bypass_counts[bkey_count] += 1
+                    if self._bypass_counts[bkey_count] < self.scp_bypass_threshold:
+                        bypass_gate = False
+
+                bkey = (call, int(round(freq_khz)))
+                if bypass_gate and bkey not in self._bypass_spotted \
+                        and self._can_respot(call, freq_khz, now):
+                    self._bypass_spotted.add(bkey)
+                    log.info("SCP bypass: %s at %.1f kHz [patt3ch=%s]",
+                             call, freq_khz, patt3ch_match or 'none')
+                    self._mark_spotted(call, freq_khz, now)
                     spots.append({
                         'call': call,
                         'freq_khz': freq_khz,
@@ -4026,38 +5348,16 @@ class SpotTracker:
                         'method': 'unverified',
                     })
 
-        # 1b: sliding window on collapsed text — catches calls embedded in
-        # noise like "TUCY0S" where the regex word-boundary check misses them
-        collapsed_new = re.sub(r'[^A-Z0-9]', '', clean)
-        for wlen in range(4, 8):
-            for i in range(len(collapsed_new) - wlen + 1):
-                frag = collapsed_new[i:i+wlen]
-                if frag in seen_p1 or frag in FALSE_POSITIVES or frag in self.blacklist:
-                    continue
-                if frag not in self.valid_calls:
-                    continue
-                seen_p1.add(frag)
-                if dec_type == 'primary':
-                    self._cycle_calls[frag].add(freq_bin)
-                info = self._tracking[frag]
-                info['count'] += 1
-                info['freq'] = freq_khz
-                info['snr'] = max(info['snr'], snr)
-                self._record_sighting(frag, freq_bin, now)
-
-                min_s = self._min_sightings(frag, snr)
-                recent_count = self._count_recent_sightings(frag, freq_bin, now)
-                if recent_count >= min_s and \
-                   self._can_respot(frag, freq_khz, now):
-                    if len(self._cycle_calls[frag]) < 3:
-                        self._mark_spotted(frag, freq_khz, now)
-                        spots.append({
-                            'call': frag,
-                            'freq_khz': freq_khz,
-                            'snr': snr,
-                            'wpm': wpm,
-                            'method': 'exact_window',
-                        })
+        # Path 1b (sliding window on collapsed text) DISABLED 2026-04-25.
+        # It scanned every 4-7 char window across the no-spaces decoded text
+        # and snap-matched against the ~50K SCP entries. With that many calls
+        # in the database, random 4-5 char substrings inside noisy decoder
+        # output match valid SCP calls often enough to slip past the
+        # sightings gate. Live UK/EI DX 17:30 UTC: 14038.8 kHz produced
+        # 5 different SCP-valid spots (N0HJZ, N5KW, VE7ZO, W0PI, WF3T) from
+        # ONE real signal — Path 1b was the source. Path 1a (regex with
+        # word boundaries) catches real calls fine; the "embedded in noise"
+        # recall recovery isn't worth the precision cost.
 
         # --- Path 2: Fragment accumulation + fuzzy match ---
         # Secondary decoders (bmorse) skip fragment accumulation — their noise
@@ -4123,7 +5423,8 @@ class SpotTracker:
                 # Check consensus against SCP — exact first, then fuzzy
                 if consensus_str in self.valid_calls:
                     info = self._tracking[consensus_str]
-                    if self._can_respot(consensus_str, freq_khz, now):
+                    if self._can_respot(consensus_str, freq_khz, now) \
+                            and self._is_freq_leader(consensus_str, freq_bin, now):
                         if consensus_str not in self.blacklist:
                             self._mark_spotted(consensus_str, freq_khz, now)
                             info['freq'] = freq_khz
@@ -4146,7 +5447,8 @@ class SpotTracker:
                     if fuzzy and avg_confidence >= 0.90:
                         best_call, best_dist = min(fuzzy, key=lambda x: x[1])
                         info = self._tracking[best_call]
-                        if self._can_respot(best_call, freq_khz, now):
+                        if self._can_respot(best_call, freq_khz, now) \
+                                and self._is_freq_leader(best_call, freq_bin, now):
                             if best_call not in self.blacklist:
                                 self._mark_spotted(best_call, freq_khz, now)
                                 info['freq'] = freq_khz
@@ -4248,15 +5550,28 @@ class OpenSkimmer:
         )
         self._add_calls_mtime = (os.path.getmtime(self._add_calls_path)
                                  if os.path.exists(self._add_calls_path) else 0)
+        # Build gate_config from any of the gate_* / enable_* keys in cfg.
+        # SpotTracker fills in any missing keys from GATE_DEFAULTS (ship-it
+        # mode = all gates off, caller-spotting on).
+        gate_config = {k: self.cfg[k] for k in SpotTracker.GATE_DEFAULTS
+                       if k in self.cfg}
         self.tracker = SpotTracker(calls, blacklist,
                                    self.cfg.get('respot_interval', 120),
                                    add_calls=add_calls,
-                                   scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)))
+                                   scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)),
+                                   gate_config=gate_config)
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
-            callsign=self.cfg.get('callsign', 'WF8Z-2'),
+            callsign=self.cfg.get('callsign', 'WF8Z'),
             node_call=self.cfg.get('node_call', 'SPARK-2'),
+            skimmer_suffix=self.cfg.get('skimmer_suffix', '-#'),
+            source_tag=self.cfg.get('source_tag', 'OS'),
+            op_name=self.cfg.get('op_name', ''),
+            qth=self.cfg.get('qth', ''),
+            grid=self.cfg.get('grid', ''),
+            validation_level=self.cfg.get('validation_level', 'Normal'),
+            skimsrv_version=self.cfg.get('skimsrv_version', '1.6.0.145'),
         )
         await self.telnet.start()
 
@@ -4276,6 +5591,15 @@ class OpenSkimmer:
                 'i': [],
                 'q': [],
             }
+
+        # Advertise band ranges in SETT response so Aggregator knows
+        # what we cover. Range = center ± half scan bandwidth (kHz).
+        half_bw_khz = float(self.cfg.get('skim_bandwidth_khz', 96)) / 2.0
+        self.telnet.bands = [
+            (round(center_hz / 1000.0 - half_bw_khz, 1),
+             round(center_hz / 1000.0 + half_bw_khz, 1))
+            for _, center_hz, _ in self._band_meta
+        ]
 
         rx_sample_rate = self.cfg.get('sample_rate', 48000)
         sdr_port = self.cfg.get('sdr_port', 1024)
@@ -4309,20 +5633,47 @@ class OpenSkimmer:
             passive = self.cfg.get('passive', False)
             rx_filter = self.cfg.get('rx_filter', None)
             n_rx = max(self.cfg.get('max_receivers', 1), n_bands)
-            self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
-                                          n_receivers=n_rx, sample_rate=rx_sample_rate,
-                                          listen_port=listen_port,
-                                          passive=passive, rx_filter=rx_filter)
+            lna_gain = self.cfg.get('lna_gain', 20)
+
+            # Use C receiver for multi-band (handles 9600+ pkt/s)
+            self._use_c_receiver = (n_bands > 1 and _get_hpsdr_fast() is not None)
+            if self._use_c_receiver:
+                self.receiver = _CReceiver(device_ip, sdr_port,
+                                            n_rx, rx_sample_rate, lna_gain)
+            else:
+                self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
+                                              n_receivers=n_rx, sample_rate=rx_sample_rate,
+                                              listen_port=listen_port,
+                                              passive=passive, rx_filter=rx_filter)
+                self.receiver.lna_gain = lna_gain
             for _name, center_hz, rx_idx in self._band_meta:
                 self.receiver.set_frequency(rx_idx, center_hz)
-            self.receiver.lna_gain = self.cfg.get('lna_gain', 20)
 
         # ----------------------------------------------------------------
         # One InstanceManager per band
         # ----------------------------------------------------------------
         speeds_cfg = self.cfg.get('decoder_speeds', [0, 25, 30, 35])
+        # Per-band PFB enable.  Two ways to specify:
+        #   "use_pfb_scanner": true                — all bands on PFB
+        #   "pfb_scanner_bands": ["20m", 7090000]  — listed bands on PFB (A/B test)
+        # The list accepts band names ("20m") or center Hz ints (7090000).
+        pfb_global = bool(self.cfg.get('use_pfb_scanner', False))
+        pfb_bands_raw = self.cfg.get('pfb_scanner_bands', [])
+        pfb_band_names = {str(b) for b in pfb_bands_raw}
+        pfb_band_hz    = {int(b)  for b in pfb_bands_raw if isinstance(b, int)}
+        # Per-band signal_min_snr override for PFB-using bands.  PFB has fixed
+        # channelization cost regardless of bin count — we can run lower SNR
+        # without the per-RX worker drowning the way per-bin scanners do.
+        # Falls back to the global signal_min_snr when not set.
+        pfb_min_snr = self.cfg.get('pfb_min_snr')
+        global_min_snr = float(self.cfg.get('signal_min_snr', 8.0))
         self.managers = []
         for _name, _center_hz, _rx_idx in self._band_meta:
+            use_pfb_here = (pfb_global
+                            or _name in pfb_band_names
+                            or _center_hz in pfb_band_hz)
+            min_snr_here = (float(pfb_min_snr) if (use_pfb_here and pfb_min_snr is not None)
+                            else global_min_snr)
             mgr = InstanceManager(
                 sample_rate=rx_sample_rate,
                 decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
@@ -4340,8 +5691,13 @@ class OpenSkimmer:
                 use_itila=bool(self.cfg.get('use_itila', False)),
                 itila_ev_thresh=float(self.cfg.get('itila_ev_thresh', 2.0)),
                 itila_window_sec=float(self.cfg.get('itila_window_sec', 120.0)),
+                itila_min_snr=min_snr_here,
+                itila_max_bins=int(self.cfg.get('itila_max_bins', 200)),
+                use_pfb_scanner=use_pfb_here,
+                valid_calls=calls,
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
                 cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
+                enable_caller_spotting=bool(self.cfg.get('enable_caller_spotting', True)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
@@ -4355,12 +5711,86 @@ class OpenSkimmer:
             log.info("OpenSkimmer LIVE: %s (%.3f kHz) rx%d, telnet :%d",
                      name, cal_center / 1000, rx_idx,
                      self.cfg.get('telnet_port', 7300))
+
+        # SIGUSR1 → snapshot the current IQ buffer for every enabled band
+        # to /tmp/diag_<band>_<HHMMSS>.wav for live-vs-replay diagnostics.
+        # Reuses the FT8 capture buffer (must have enable_ft8=true).
+        if (getattr(self, '_use_c_receiver', False)
+                and self.cfg.get('enable_ft8', True)):
+            try:
+                signal.signal(signal.SIGUSR1, self._diag_iq_snapshot)
+                log.info("SIGUSR1 handler installed: kill -USR1 %d for IQ snapshot", os.getpid())
+            except Exception as e:
+                log.warning("Failed to install SIGUSR1 handler: %s", e)
+
         return True
+
+    def _diag_iq_snapshot(self, signum, frame):
+        """SIGUSR1 handler — non-destructive snapshot of FT8 capture buffer
+        for every band → /tmp/diag_<band-khz>_<HHMMSS>.wav (24-bit stereo
+        IQ at 192 kHz). Replay with:
+          openskimmer.py --file <wav> --center-khz <khz> --start-min 0 --end-min 1
+        FT8 buffer stores int24 values cast to float (range ±8388608) —
+        we write them straight back as 24-bit PCM so the file reader gets
+        the full Pitaya range. read_24bit_iq_chunk reads exactly this."""
+        try:
+            import ctypes as _ct
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime('%H%M%S')
+            n_max = 192000 * 65  # FT8_BUF_CAP
+            i_buf = (_ct.c_float * n_max)()
+            q_buf = (_ct.c_float * n_max)()
+            t_first = _ct.c_double(0)
+            for name, center_hz, rx_idx in self._band_meta:
+                n = self.receiver.lib.hpsdr_iq_snapshot_read(
+                    self.receiver._h, rx_idx, i_buf, q_buf, n_max, _ct.byref(t_first))
+                if n < 192000:
+                    log.warning("SIGUSR1 rx%d (%s): only %d samples — skipping",
+                                rx_idx, name, n)
+                    continue
+                khz = int(center_hz / 1000)
+                path = f"/tmp/diag_{khz}_{ts}.wav"
+                i_arr = np.frombuffer(i_buf, dtype=np.float32, count=n)
+                q_arr = np.frombuffer(q_buf, dtype=np.float32, count=n)
+                # Clip to int24 range, convert to int32 then pack as 3-byte LE
+                i32 = np.clip(i_arr, -8388608, 8388607).astype(np.int32)
+                q32 = np.clip(q_arr, -8388608, 8388607).astype(np.int32)
+                interleaved = np.empty(n * 2, dtype=np.int32)
+                interleaved[0::2] = i32
+                interleaved[1::2] = q32
+                # Take low 3 bytes of each int32 (little-endian)
+                raw_bytes = interleaved.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+                # Write 24-bit PCM WAV manually (Python wave module won't)
+                rate = 192000
+                channels = 2
+                byte_rate = rate * channels * 3
+                block_align = channels * 3
+                data_size = len(raw_bytes)
+                fmt_chunk = struct.pack('<HHIIHH', 1, channels, rate,
+                                        byte_rate, block_align, 24)
+                with open(path, 'wb') as f:
+                    f.write(b'RIFF')
+                    f.write(struct.pack('<I', 36 + data_size))
+                    f.write(b'WAVE')
+                    f.write(b'fmt ')
+                    f.write(struct.pack('<I', len(fmt_chunk)))
+                    f.write(fmt_chunk)
+                    f.write(b'data')
+                    f.write(struct.pack('<I', data_size))
+                    f.write(raw_bytes)
+                log.info("SIGUSR1: wrote %s (%d samples, %.1f sec, t_first=%.3f)",
+                         path, n, n / 192000.0, t_first.value)
+        except Exception as e:
+            log.error("SIGUSR1 snapshot failed: %s", e)
 
     async def stop(self):
         self.running = False
         if self.receiver:
-            self.receiver.close()
+            if getattr(self, '_use_c_receiver', False):
+                self.receiver.stop()
+                self.receiver.destroy()
+            else:
+                self.receiver.close()
         for mgr in self.managers:
             mgr.kill_all()
         if self.telnet:
@@ -4397,12 +5827,16 @@ class OpenSkimmer:
             pass  # Don't let errors kill the receiver thread
 
     async def run(self):
-        rx_thread = threading.Thread(
-            target=self.receiver.receive,
-            args=(self._iq_callback,),
-            daemon=True,
-        )
-        rx_thread.start()
+        use_c = getattr(self, '_use_c_receiver', False)
+        if use_c:
+            self.receiver.start()
+        else:
+            rx_thread = threading.Thread(
+                target=self.receiver.receive,
+                args=(self._iq_callback,),
+                daemon=True,
+            )
+            rx_thread.start()
         log.info("IQ stream started")
 
         scan_interval = self.cfg.get('scan_interval', 5)
@@ -4414,37 +5848,165 @@ class OpenSkimmer:
             now = time.time()
             live_rate = self.cfg.get('sample_rate', 48000)
             # ----------------------------------------------------------------
-            # Per-band: drain feed buffers and push IQ to decoders
-            # 200ms cap per band to stay real-time even under backlog.
+            # Per-band: drain IQ and push to decoders
             # ----------------------------------------------------------------
             for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
-                with self._iq_lock:
-                    buf = self._band_bufs[rx_idx]
-                    raw_chunks = buf['raw']
-                    buf['raw'] = []
-                if raw_chunks:
-                    # Convert raw iq_samples lists → numpy in the main thread.
-                    # Cap to ~200ms of backlog before feeding decoders.
-                    chunk_size = len(raw_chunks[0])
-                    max_chunks = max(1, live_rate // 5 // chunk_size)
-                    if len(raw_chunks) > max_chunks:
-                        raw_chunks = raw_chunks[-max_chunks:]
-                    feed_i = []
-                    feed_q = []
-                    for chunk in raw_chunks:
-                        iq_arr = np.asarray(chunk, dtype=np.float64)
-                        feed_i.append(iq_arr[:, 0] * 8388608.0)
-                        feed_q.append(iq_arr[:, 1] * 8388608.0)
-                    # Maintain FFT deque for the periodic scan
-                    max_iq_buf = live_rate * 10
-                    iq_deq = buf['iq']
-                    for chunk in raw_chunks:
-                        iq_deq.extend(chunk)
-                    while len(iq_deq) > max_iq_buf:
-                        iq_deq.popleft()
-                    i_cat = np.concatenate(feed_i)
-                    q_cat = np.concatenate(feed_q)
-                    mgr.feed_all_iq(i_cat, q_cat)
+                if use_c:
+                    # C worker thread handles drain → scanner feed
+                    # Just ensure scanners are created and registered
+                    if mgr._itila_scanner is None and mgr.use_itila:
+                        center_khz = center_hz / 1000
+                        mgr.update_signals([], center_khz)
+                    scanner = mgr._itila_scanner
+                    if scanner and scanner._sc and not getattr(self, '_worker_started', False):
+                        import ctypes as _ct
+                        feed_ptr = _ct.cast(scanner._sc._lib.itila_sc_feed_iq, _ct.c_void_p)
+                        self.receiver.lib.hpsdr_set_scanner(
+                            self.receiver._h, rx_idx, scanner._sc._h,
+                            feed_ptr, _ct.c_double(8388608.0))
+            # Start worker thread once all scanners are registered
+            if use_c and not getattr(self, '_worker_started', False):
+                scanners_ready = sum(1 for mgr in self.managers
+                                     if mgr._itila_scanner and mgr._itila_scanner._sc)
+                if scanners_ready == len(self.managers):
+                    import ctypes as _ct
+                    # Per-RX decode setup.  Each scanner registers its native
+                    # decode entry point and envelope-sample window.  For PFB
+                    # scanners the lib shim transparently routes the
+                    # itila_sc_decode_ready name to pfb_sc_decode_ready —
+                    # both produce the byte-identical ScDecodeResult struct,
+                    # so the C worker writes them into the same result buffer
+                    # and Python's poll loop routes them the same way.
+                    have_per_rx = hasattr(self.receiver.lib, 'hpsdr_set_rx_decode')
+                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                        scanner = mgr._itila_scanner
+                        if not (scanner and scanner._sc):
+                            continue
+                        decode_ptr = _ct.cast(
+                            scanner._sc._lib.itila_sc_decode_ready,
+                            _ct.c_void_p)
+                        window_samples = scanner._window_samples
+                        if have_per_rx:
+                            self.receiver.lib.hpsdr_set_rx_decode(
+                                self.receiver._h, ri,
+                                decode_ptr, _ct.c_int(window_samples))
+                        else:
+                            # Old hpsdr_fast — single decode setter.
+                            # Safe only when all bands use the same backend.
+                            self.receiver.lib.hpsdr_set_decode(
+                                self.receiver._h, decode_ptr,
+                                _ct.c_int(window_samples))
+                    self._pfb_managers = []  # no Python decode poll needed
+                    # Enable FT8 raw IQ accumulation per band (skipped if disabled)
+                    if self.cfg.get('enable_ft8', True):
+                        FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
+                                     21090: 21074, 28090: 28074}
+                        for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                            ck = ch / 1000
+                            ft8_khz = FT8_FREQS.get(int(ck))
+                            if ft8_khz:
+                                self.receiver.lib.hpsdr_enable_ft8(
+                                    self.receiver._h, ri,
+                                    _ct.c_double(ft8_khz * 1000.0),
+                                    _ct.c_double(float(ch)))
+                                log.info("FT8 accumulator enabled rx%d: %.0f kHz", ri, ft8_khz)
+                    else:
+                        log.info("FT8 disabled by config (enable_ft8=false)")
+                    self.receiver.lib.hpsdr_start_worker(self.receiver._h)
+                    self._worker_started = True
+                    log.info("C worker thread started (%d bands, CW+FT8)",
+                             scanners_ready)
+            # PFB scanners' C worker only feeds; decode runs in Python.
+            # Drain ready windows and route through the scanner's normal
+            # _process_ready (Python decode + spotting path).
+            if use_c and getattr(self, '_worker_started', False):
+                for mgr in getattr(self, '_pfb_managers', []):
+                    sc = mgr._itila_scanner
+                    if sc:
+                        sc._process_ready()
+
+            # Process decode results — poll from C worker's result buffer
+            if use_c and getattr(self, '_worker_started', False):
+                import ctypes as _ct
+                result_size = 280
+                max_poll = 128
+                if not hasattr(self, '_poll_buf'):
+                    self._poll_buf = _ct.create_string_buffer(result_size * max_poll)
+                poll_buf = self._poll_buf
+                n = self.receiver.lib.hpsdr_poll_results(
+                    self.receiver._h, poll_buf, _ct.c_int(max_poll))
+                now = time.time()
+                for i in range(n):
+                    off = i * result_size
+                    f_hz = _ct.c_double.from_buffer(poll_buf, off).value
+                    snr = _ct.c_double.from_buffer(poll_buf, off + 8).value
+                    wpm = _ct.c_int.from_buffer(poll_buf, off + 16).value
+                    raw = poll_buf[off+24:off+result_size].split(b'\0')[0].decode('ascii', errors='replace')
+                    if not raw:
+                        continue
+                    f_khz = f_hz / 1000.0
+                    log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+                    # Find or create bin state for ticker tape
+                    scanner = None
+                    for mgr in self.managers:
+                        if mgr._itila_scanner:
+                            scanner = mgr._itila_scanner
+                            break
+                    if not scanner:
+                        continue
+                    if f_hz not in scanner._bins:
+                        scanner._bins[f_hz] = {
+                            'h100': None, 'h200': None, 'pending': [],
+                            'wpm': 0, 'snr': 0.0, 'text_buf': '',
+                            'spotted': set(), 'last_cq_time': 0.0,
+                        }
+                    st = scanner._bins[f_hz]
+                    st['snr'] = snr
+                    if wpm > 0:
+                        st['wpm'] = wpm
+                    st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
+                    if CQ_PATTERNS.search(raw):
+                        st['last_cq_time'] = now
+                    call = _itila_extract_cq_call(raw, self.tracker.valid_calls)
+                    if call and call not in st['spotted']:
+                        st['spotted'].add(call)
+                        st['pending'].append(f'CQ {call} ')
+                        log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)",
+                                 f_khz, call, wpm, raw[:60])
+                    elif now - st['last_cq_time'] < 120.0:
+                        # runner-only context extraction (see _process_ready)
+                        call = _itila_extract_cq_call(st['text_buf'], self.tracker.valid_calls)
+                        if call and call not in st['spotted']:
+                            st['spotted'].add(call)
+                            st['pending'].append(f'CQ {call} ')
+                            log.info("ITILA context %.1f kHz: %s %d WPM",
+                                     f_khz, call, wpm)
+                else:
+                    # Python receiver path: drain from callback buffers
+                    with self._iq_lock:
+                        buf = self._band_bufs[rx_idx]
+                        raw_chunks = buf['raw']
+                        buf['raw'] = []
+                    if raw_chunks:
+                        chunk_size = len(raw_chunks[0])
+                        max_chunks = max(1, live_rate // 5 // chunk_size)
+                        if len(raw_chunks) > max_chunks:
+                            raw_chunks = raw_chunks[-max_chunks:]
+                        feed_i = []
+                        feed_q = []
+                        for chunk in raw_chunks:
+                            iq_arr = np.asarray(chunk, dtype=np.float64)
+                            feed_i.append(iq_arr[:, 0] * 8388608.0)
+                            feed_q.append(iq_arr[:, 1] * 8388608.0)
+                        max_iq_buf = live_rate * 10
+                        iq_deq = buf['iq']
+                        for chunk in raw_chunks:
+                            iq_deq.extend(chunk)
+                        while len(iq_deq) > max_iq_buf:
+                            iq_deq.popleft()
+                        i_cat = np.concatenate(feed_i)
+                        q_cat = np.concatenate(feed_q)
+                        mgr.feed_all_iq(i_cat, q_cat)
 
             # ----------------------------------------------------------------
             # Periodic signal scan — one FFT per band
@@ -4473,65 +6035,66 @@ class OpenSkimmer:
                         if added or removed:
                             log.info("add_calls reloaded: +%d -%d calls", len(added), len(removed))
 
-                fft_size = 8192
-                min_snr = self.cfg.get('signal_min_snr', 12)
-                cw_min  = self.cfg.get('cw_min_khz', 0)
-                cw_max  = self.cfg.get('cw_max_khz', 99999)
+                # In C receiver mode, scanner has its own FFT scan — skip Python FFT
+                if not use_c:
+                    fft_size = 8192
+                    min_snr = self.cfg.get('signal_min_snr', 12)
+                    cw_min  = self.cfg.get('cw_min_khz', 0)
+                    cw_max  = self.cfg.get('cw_max_khz', 99999)
 
-                for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
-                    center_khz = center_hz / 1000
-                    with self._iq_lock:
-                        iq_deque = self._band_bufs[rx_idx]['iq']
-                        if len(iq_deque) >= fft_size:
-                            raw = list(itertools.islice(iq_deque,
-                                                        len(iq_deque) - fft_size,
-                                                        None))
-                        else:
-                            raw = None
+                    for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
+                        center_khz = center_hz / 1000
+                        with self._iq_lock:
+                            iq_deque = self._band_bufs[rx_idx]['iq']
+                            if len(iq_deque) >= fft_size:
+                                raw = list(itertools.islice(iq_deque,
+                                                            len(iq_deque) - fft_size,
+                                                            None))
+                            else:
+                                raw = None
 
-                    if raw is None:
-                        continue
+                        if raw is None:
+                            continue
 
-                    iq_arr = np.array([complex(i, q) for i, q in raw])
-                    window  = np.blackman(fft_size)
-                    psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
-                    psd_db  = 10 * np.log10(psd + 1e-20)
-                    noise   = np.median(psd_db)
+                        iq_arr = np.array([complex(i, q) for i, q in raw])
+                        window  = np.blackman(fft_size)
+                        psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
+                        psd_db  = 10 * np.log10(psd + 1e-20)
+                        noise   = np.median(psd_db)
 
-                    signals = []
-                    N = fft_size
-                    for i in range(1, N - 1):
-                        if psd_db[i] > noise + min_snr and \
-                           psd_db[i] > psd_db[i - 1] and psd_db[i] > psd_db[i + 1]:
-                            delta = 0.5 * (psd_db[i-1] - psd_db[i+1]) / \
-                                    (psd_db[i-1] - 2*psd_db[i] + psd_db[i+1])
-                            exact = i + delta
-                            if exact >= N / 2:
-                                exact -= N
-                            f = exact * live_rate / N
-                            signals.append((f, psd_db[i] - noise))
+                        signals = []
+                        N = fft_size
+                        for i in range(1, N - 1):
+                            if psd_db[i] > noise + min_snr and \
+                               psd_db[i] > psd_db[i - 1] and psd_db[i] > psd_db[i + 1]:
+                                delta = 0.5 * (psd_db[i-1] - psd_db[i+1]) / \
+                                        (psd_db[i-1] - 2*psd_db[i] + psd_db[i+1])
+                                exact = i + delta
+                                if exact >= N / 2:
+                                    exact -= N
+                                f = exact * live_rate / N
+                                signals.append((f, psd_db[i] - noise))
 
-                    # Cluster peaks within 100 Hz
-                    clustered = []
-                    for freq, snr in sorted(signals):
-                        if not clustered or abs(freq - clustered[-1][0]) > 100:
-                            clustered.append((freq, snr))
-                        elif snr > clustered[-1][1]:
-                            clustered[-1] = (freq, snr)
+                        clustered = []
+                        for freq, snr in sorted(signals):
+                            if not clustered or abs(freq - clustered[-1][0]) > 100:
+                                clustered.append((freq, snr))
+                            elif snr > clustered[-1][1]:
+                                clustered[-1] = (freq, snr)
 
-                    log.info("[%s] noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
-                             band_name, noise, noise + min_snr, len(iq_deque))
-                    top = sorted(signals, key=lambda x: -x[1])[:10]
-                    for f, s in top:
-                        log.info("  [%s] PEAK %.3f kHz %.1f dB",
-                                 band_name, center_khz + f/1000, s)
-                    if not top:
-                        log.info("  [%s] (no peaks above threshold)", band_name)
+                        log.info("[%s] noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
+                                 band_name, noise, noise + min_snr, len(iq_deque))
+                        top = sorted(signals, key=lambda x: -x[1])[:10]
+                        for f, s in top:
+                            log.info("  [%s] PEAK %.3f kHz %.1f dB",
+                                     band_name, center_khz + f/1000, s)
+                        if not top:
+                            log.info("  [%s] (no peaks above threshold)", band_name)
 
-                    if cw_min or cw_max < 99999:
-                        clustered = [(f, s) for f, s in clustered
-                                     if cw_min <= center_khz + f/1000 <= cw_max]
-                    mgr.update_signals(clustered, center_khz)
+                        if cw_min or cw_max < 99999:
+                            clustered = [(f, s) for f, s in clustered
+                                         if cw_min <= center_khz + f/1000 <= cw_max]
+                        mgr.update_signals(clustered, center_khz)
 
             # ----------------------------------------------------------------
             # Collect decoder output from every band — spots to shared telnet
@@ -4587,8 +6150,213 @@ class OpenSkimmer:
                          "%d chars, %.0fs",
                          self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
+                # Ring + env-cap drop telemetry (added 2026-04-26 to verify
+                # we're not silently losing samples in the C pipeline).
+                if use_c and self.receiver and self.receiver._h:
+                    try:
+                        rl = self.receiver.lib
+                        pkts  = rl.hpsdr_pkt_count(self.receiver._h)
+                        rdrop = rl.hpsdr_drop_count(self.receiver._h)
+                        env_drops_total = 0
+                        bins_total = 0
+                        bins_peak = 0
+                        for mgr in self.managers:
+                            wrapper = getattr(mgr, '_itila_scanner', None)
+                            sc = getattr(wrapper, '_sc', None) if wrapper else None
+                            if sc and sc._h:
+                                if hasattr(sc._lib, 'itila_sc_env_drops'):
+                                    sc._lib.itila_sc_env_drops.restype = _ct.c_ulonglong
+                                    sc._lib.itila_sc_env_drops.argtypes = [_ct.c_void_p]
+                                    sc._lib.itila_sc_bins_peak.restype = _ct.c_int
+                                    sc._lib.itila_sc_bins_peak.argtypes = [_ct.c_void_p]
+                                    sc._lib.itila_sc_bin_count.restype = _ct.c_int
+                                    sc._lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
+                                    env_drops_total += sc._lib.itila_sc_env_drops(sc._h)
+                                    bins_peak = max(bins_peak, sc._lib.itila_sc_bins_peak(sc._h))
+                                    bins_total += sc._lib.itila_sc_bin_count(sc._h)
+                        log.info("Health: ring_drops=%d/%d (%.4f%%) env_drops=%d bins=%d peak=%d",
+                                 rdrop, pkts, 100.0 * rdrop / max(pkts + rdrop, 1),
+                                 env_drops_total, bins_total, bins_peak)
+                    except Exception as e:
+                        log.warning("Health probe failed: %s", e)
 
-            await asyncio.sleep(0.025)
+            # FT8 decode — aligned to minute boundaries, runs in thread
+            if use_c and getattr(self, '_worker_started', False) \
+                    and self.cfg.get('enable_ft8', True):
+                ft8_now = time.time()
+                ft8_sec = ft8_now % 60
+                ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
+                if ft8_sec < 5 and ft8_prev_sec >= 55 and \
+                        not getattr(self, '_ft8_running', False):
+                    self._ft8_running = True
+                    import ctypes as _ct, struct
+                    FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
+                                 21090: 21074, 28090: 28074}
+                    ft8_jobs = []
+                    n60 = 192000 * 60
+                    buf_cap = 192000 * 65
+                    pkt_lost = 0
+                    if hasattr(self.receiver.lib, 'hpsdr_pkt_lost'):
+                        try:
+                            pkt_lost = self.receiver.lib.hpsdr_pkt_lost(self.receiver._h)
+                        except Exception:
+                            pass
+                    pkts = self.receiver.lib.hpsdr_pkt_count(self.receiver._h)
+                    log.info("FT8 trigger: sec=%.2f pkts=%d lost=%d (%.2f%%)",
+                             ft8_sec, pkts, pkt_lost,
+                             100.0*pkt_lost/max(pkts+pkt_lost, 1))
+                    # Snapshot all bands first (one swap each — fast, atomic).
+                    # Each snapshot is the previous minute's data filling the
+                    # active buffer between the prior swap and this one.
+                    for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+                        ck = ch / 1000
+                        ft8_khz = FT8_FREQS.get(int(ck))
+                        if not ft8_khz:
+                            continue
+                        fi = np.empty(buf_cap, dtype=np.float32)
+                        fq = np.empty(buf_cap, dtype=np.float32)
+                        t_first = _ct.c_double(0.0)
+                        n = self.receiver.lib.hpsdr_ft8_swap_read(
+                            self.receiver._h, ri,
+                            fi.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+                            fq.ctypes.data_as(_ct.POINTER(_ct.c_float)),
+                            buf_cap, _ct.byref(t_first))
+                        log.info("FT8 %s rx%d: swap n=%d (%.2f s) t_first=%.3f",
+                                 bn, ri, n, n / 192000.0, t_first.value)
+                        # Allow up to 1 sec slack — swap-to-swap timing can
+                        # land the snapshot just under 60 sec depending on
+                        # where Python triggers within the second.
+                        if n < n60 - 192000:
+                            log.info("FT8 %s rx%d: short snapshot, skip", bn, ri)
+                            continue
+                        # Take the last min(n, n60) samples — the active buffer
+                        # was reset by the prior swap so this is automatically
+                        # minute-aligned (within ~50 ms).
+                        take = min(n, n60)
+                        fi_60 = fi[n - take:n].copy()
+                        fq_60 = fq[n - take:n].copy()
+                        ft8_jobs.append((bn, ri, ck, ft8_khz,
+                                         fi_60, fq_60, take))
+                    if ft8_jobs:
+                        def _ft8_decode(jobs, skimmer):
+                            import subprocess, wave
+                            from scipy.signal import resample_poly
+                            from numpy.fft import fft, ifft
+                            ft8_bin = '/home/sparkgap/decode_ft8'
+                            total = 0
+                            seen_msgs = set()  # dedupe across sliding windows
+                            for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
+                                iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
+                                offset_hz = (ft8_khz - ck) * 1000
+                                t = np.arange(n) / 192000
+                                mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
+                                # 192k → 12k complex via polyphase
+                                dec12 = resample_poly(mixed, 1, 16)
+                                slot_n = 15 * 12000
+                                # SLIDING window — slot start every 1 second.
+                                # Fixed sub-periods miss decodes due to FT8 transmission
+                                # offset (~0.5s past minute boundary) — we sweep 0–45s
+                                # in 1s steps to align with whatever the actual TX boundary is.
+                                for start in range(0, len(dec12) - slot_n + 1, 12000):
+                                    chunk = dec12[start:start+slot_n]
+                                    if len(chunk) < slot_n:
+                                        continue
+                                    # USB demodulation: zero negative freqs, take real
+                                    spec = fft(chunk)
+                                    spec[len(spec)//2:] = 0
+                                    audio = ifft(spec).real * 2
+                                    peak = np.max(np.abs(audio))
+                                    if peak > 0:
+                                        audio = audio / peak * 0.9
+                                    i16 = (audio * 32767).astype(np.int16)
+                                    part = start // 12000  # used in WAV filename
+                                    wav_fn = f'/tmp/ft8_{bn}_p{part}.wav'
+                                    with wave.open(wav_fn, 'wb') as wf:
+                                        wf.setnchannels(1); wf.setsampwidth(2)
+                                        wf.setframerate(12000)
+                                        wf.writeframes(i16.tobytes())
+                                    try:
+                                        r = subprocess.run([ft8_bin, wav_fn],
+                                            capture_output=True, text=True, timeout=20)
+                                    except Exception as e:
+                                        log.debug("decode_ft8 err %s p%d: %s", bn, part, e)
+                                        continue
+                                    for line in (r.stdout or '').strip().split('\n'):
+                                        line = line.strip()
+                                        if not line:
+                                            continue
+                                        # Format: "000000 +05.0 +1.12 1803 ~  CQ N4DWD EM86"
+                                        parts_o = line.split(maxsplit=5)
+                                        if len(parts_o) < 6:
+                                            continue
+                                        try:
+                                            snr = int(float(parts_o[1]))
+                                            audio_hz = int(parts_o[3])
+                                            msg = parts_o[5]
+                                        except (ValueError, IndexError):
+                                            continue
+                                        # RF freq = dial + audio offset
+                                        rf_khz = ft8_khz + audio_hz / 1000.0
+                                        # Extract caller from message
+                                        # CQ X Y → X is calling
+                                        # X Y Z → Y is responding to X (spot Y)
+                                        # X Y RR73/grid → spot Y
+                                        msg_parts = msg.split()
+                                        ft8_call = None
+                                        if msg_parts and msg_parts[0] == 'CQ':
+                                            # CQ [DX] CALL GRID — call is at index 1 or 2
+                                            if len(msg_parts) >= 2 and re.match(
+                                                    r'^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}$',
+                                                    msg_parts[1]):
+                                                ft8_call = msg_parts[1]
+                                            elif len(msg_parts) >= 3:
+                                                ft8_call = msg_parts[2]
+                                        elif len(msg_parts) >= 2:
+                                            # Standard QSO: X Y ... — Y is the spotted station
+                                            ft8_call = msg_parts[1]
+                                        if not ft8_call or not re.match(
+                                                r'^[A-Z0-9/]{3,11}$', ft8_call):
+                                            continue
+                                        # Dedupe: same band + msg = duplicate from
+                                        # sliding window catching same TX twice
+                                        dedup_key = (bn, msg)
+                                        if dedup_key in seen_msgs:
+                                            continue
+                                        seen_msgs.add(dedup_key)
+                                        log.info("FT8 %s p%d: %s", bn, part, line)
+                                        total += 1
+                                        skimmer.spot_count += 1
+                                        skimmer.telnet.broadcast_spot(
+                                            freq_khz=rf_khz, dx_call=ft8_call,
+                                            snr=snr, mode='FT8',
+                                            comment=msg)
+                                        log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
+                                                 rf_khz, ft8_call, snr, msg)
+                            log.info("FT8 cycle done: %d spots across %d bands",
+                                     total, len(jobs))
+                            # RTTY scan piggybacks on the same minute snapshot.
+                            # Run after FT8 so the FT8 spots flow first.
+                            rtty_lib = _get_rtty_lib()
+                            if rtty_lib is not None:
+                                rtty_total = 0
+                                for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
+                                    try:
+                                        rtty_total += _rtty_scan_band(
+                                            skimmer, rtty_lib, bn, ck, fi, fq, n)
+                                    except Exception as e:
+                                        log.warning("RTTY scan %s: %s", bn, e)
+                                log.info("RTTY cycle done: %d spots across %d bands",
+                                         rtty_total, len(jobs))
+                            skimmer._ft8_running = False
+                        import threading
+                        threading.Thread(target=_ft8_decode,
+                                         args=(ft8_jobs, self),
+                                         daemon=True).start()
+                    else:
+                        self._ft8_running = False
+                self._ft8_prev_sec = ft8_sec
+
+            await asyncio.sleep(0.1 if use_c else 0.025)
 
 
 def load_config(path):
@@ -4695,8 +6463,10 @@ def run_file_mode(args, config):
         config.get('add_calls', 'add_calls.txt'),
         config.get('blacklist', 'blacklist.txt'),
     )
+    gate_config = {k: config[k] for k in SpotTracker.GATE_DEFAULTS if k in config}
     tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls,
-                          scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)))
+                          scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)),
+                          gate_config=gate_config)
 
     # Determine file format and sample rate
     with open(args.file, 'rb') as f:
@@ -4730,11 +6500,31 @@ def run_file_mode(args, config):
         use_itila=bool(config.get('use_itila', False)),
         itila_ev_thresh=float(config.get('itila_ev_thresh', 2.0)),
         itila_window_sec=float(config.get('itila_window_sec', 120.0)),
+        # Match live mode: use config values for itila_min_snr / max_bins /
+        # use_pfb_scanner instead of letting the InstanceManager defaults
+        # (8.0, 200, False) silently apply. Pre-fix divergence documented
+        # in feedback_file_vs_live_config_divergence.md.
+        itila_min_snr=float(config.get('signal_min_snr', 12)),
+        itila_max_bins=int(config.get('itila_max_bins', 200)),
+        use_pfb_scanner=bool(config.get('use_pfb_scanner', False)),
+        valid_calls=calls,  # required for the SCP-bias path in extractor
         cw_min_khz=float(config.get('cw_min_khz', 0)),
         cw_max_khz=float(config.get('cw_max_khz', 99999)),
+        enable_caller_spotting=bool(config.get('enable_caller_spotting', True)),
     )
 
     center_khz = args.center_khz
+    cw_min = float(config.get('cw_min_khz', 0))
+    cw_max = float(config.get('cw_max_khz', 99999))
+    if cw_min > 0 and (center_khz < cw_min - 100 or center_khz > cw_max + 100):
+        log.warning("Center freq %.0f kHz is outside config band limits %.0f-%.0f kHz — "
+                    "overriding to center ±100 kHz", center_khz, cw_min, cw_max)
+        cw_min = center_khz - 100
+        cw_max = center_khz - 20
+        config['cw_min_khz'] = cw_min
+        config['cw_max_khz'] = cw_max
+        manager.cw_min_khz = cw_min
+        manager.cw_max_khz = cw_max
     all_spots = []
     chunk_sec = 300  # 5-minute chunks
 

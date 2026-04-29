@@ -1,0 +1,83 @@
+csdr-skimmer (1.11) stable; urgency=low
+
+  * Fixed RTTY baud step computation.
+  * Fixed RTTY frequency display.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 2 Mar 2026 12:18:02 -0000
+
+csdr-skimmer (1.10) stable; urgency=low
+
+  * Fixed sample rate limit.
+  * Fixed CW frequency computation.
+  * Improved help text (-h).
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 23 Feb 2026 12:18:02 -0000
+
+csdr-skimmer (1.9) stable; urgency=low
+
+  * Much better RTTY skimmer.
+  * Made RTTY require minimum signal level.
+  * Made RTTY use 2x7 bits to sync.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 16 Feb 2026 12:18:02 -0000
+
+csdr-skimmer (1.8) stable; urgency=low
+
+  * Fixed frequencies reported for CW and RTTY.
+  * Fixed SnR computation for RTTY.
+  * Improved SnR computation for CW.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Tue, 3 Feb 2026 12:18:02 -0000
+
+csdr-skimmer (1.7) stable; urgency=low
+
+  * Added SnR computation and reporting.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 19 Jan 2026 12:18:02 -0000
+
+csdr-skimmer (1.6) stable; urgency=low
+
+  * Greatly improved RTTY skimmer.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 5 Jan 2026 12:18:02 -0000
+
+csdr-skimmer (1.5) stable; urgency=low
+
+  * Renamed package to csdr-skimmer.
+  * Added RTTY skimmer.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 10 Nov 2025 12:18:02 -0000
+
+csdr-cwskimmer (1.4) stable; urgency=low
+
+  * Optimized and simplified the code.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 13 Oct 2025 12:18:02 -0000
+
+csdr-cwskimmer (1.3) stable; urgency=low
+
+  * Using exponential scale to sort magnitudes.
+  * Applying Hamming window to the FFT input.
+  * Improved errors removal again.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 17 Feb 2025 12:18:02 -0000
+
+csdr-cwskimmer (1.2) stable; urgency=low
+
+  * Converting inputs to 1/0 before feeding to CW decoders.
+  * Picking the most common magnitude as the base for 0.
+  * Improved errors removal (repeating I/E/Ts).
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 3 Feb 2025 12:18:02 -0000
+
+csdr-cwskimmer (1.1) stable; urgency=low
+
+  * Improved sensitivity.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Mon, 20 Jan 2025 12:18:02 -0000
+
+csdr-cwskimmer (1.0) stable; urgency=low
+
+  * First packaged release.
+
+ -- Marat Fayzullin <luarvique@gmail.com>  Fri, 22 Nov 2024 12:18:02 -0000

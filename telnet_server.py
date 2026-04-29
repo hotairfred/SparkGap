@@ -34,11 +34,41 @@ class SpotTelnetServer:
     """Async TCP telnet server that broadcasts CW spots to connected clients."""
 
     def __init__(self, host: str = '0.0.0.0', port: int = 7300,
-                 callsign: str = 'WF8Z-2', node_call: str = 'SPARK-2'):
+                 callsign: str = 'WF8Z', node_call: str = 'SPARK-2',
+                 skimmer_suffix: str = '-#', source_tag: str = 'OS',
+                 op_name: str = '', qth: str = '', grid: str = '',
+                 validation_level: str = 'Normal',
+                 skimsrv_version: str = '1.6.0.145'):
         self.host = host
         self.port = port
-        self.callsign = callsign  # Spotter callsign (appears in DX de)
+        self.callsign = callsign  # Operator's callsign (without suffix)
         self.node_call = node_call
+        # RBN convention: skimmer-source spots use a "-#" suffix on the
+        # spotter call to mark them as machine-generated, distinguishing
+        # them from human-submitted DX spots. SkimSrv, SDC Skimmer, and
+        # all RBN-feeder skimmers use this. The suffix is what the
+        # central RBN server expects when parsing skimmer spots.
+        self.skimmer_suffix = skimmer_suffix
+        # Trailing tag identifying the spot source (SDC, SkimSrv, OS for
+        # OpenSkimmer). Optional but useful for cluster filter rules
+        # (e.g. CT1BOH's SKIMVALID can preference specific sources).
+        self.source_tag = source_tag
+        # SkimSrv impersonation fields. Aggregator's primary-skimmer
+        # connection rejects sources that don't match SkimSrv's banner /
+        # SETT response shape (it parses "Skimmer Server v.X.Y.Z >= 1.3"
+        # from the pre-login banner and expects "SETT: vl<Level> <ranges>"
+        # in response to a SKIMMER/SETT query). Spoofing v.1.6.0.145
+        # passes the version gate; identifying as OpenSkimmer in the
+        # operator slot keeps it honest to a human reading the banner.
+        self.op_name = op_name
+        self.qth = qth
+        self.grid = grid
+        self.validation_level = validation_level
+        self.skimsrv_version = skimsrv_version
+        # Band ranges advertised in SETT response. List of (low_khz,
+        # high_khz) tuples. Populated by the daemon after band-meta is
+        # built; left empty here so construction order doesn't matter.
+        self.bands = []
         self._clients: Dict[asyncio.StreamWriter, dict] = {}
         self._server = None
         self._spot_count = 0
@@ -74,8 +104,25 @@ class SpotTelnetServer:
         log.info("Client connected: %s", addr)
 
         try:
-            # DX Spider login prompt
-            writer.write(b"login: Please enter your call: ")
+            # SkimSrv-shape pre-login banner. Aggregator parses these
+            # lines for operator/version metadata. The "Skimmer Server
+            # v.X.Y.Z" string must satisfy Aggregator's >=1.3 version
+            # check, so we spoof a known-good SkimSrv version verbatim.
+            # OpenSkimmer identifies itself in the operator-name slot
+            # so a human reading the banner sees what we actually are.
+            op_label = self.op_name or 'OpenSkimmer'
+            # Banner order is "operated by <NAME>, <CALL>" — Aggregator's
+            # parser maps the first field to skimName and the second to
+            # skimCall. Reversing this trips the grid-format check
+            # because Aggregator then thinks our callsign is the name.
+            banner = (
+                f"Welcome to the Skimmer Server Telnet cluster port!\r\n"
+                f"Skimmer Server v.{self.skimsrv_version} is operated by "
+                f"{op_label}, {self.callsign}\r\n"
+                f"in {self.qth} ({self.grid})\r\n"
+                f"Please enter your callsign:\r\n"
+            )
+            writer.write(banner.encode())
             await writer.drain()
 
             try:
@@ -90,18 +137,17 @@ class SpotTelnetServer:
             if not login_call:
                 login_call = "UNKNOWN"
 
-            # Welcome
-            writer.write(
-                f"Hello {login_call}, this is {self.node_call} running OpenSkimmer\r\n"
-                f"Spotter: {self.callsign}\r\n"
-                f"Spots delivered: {self._spot_count}\r\n"
-                f"{login_call} de {self.node_call} >\r\n".encode()
-            )
+            # SkimSrv-style post-login prompt: "<CALL> de SKIMMER
+            # YYYY-MM-DD HH:MMZ CwSkimmer >". Aggregator uses the
+            # "CwSkimmer" tail to identify the source kind.
+            now = datetime.now(timezone.utc)
+            ts = now.strftime('%Y-%m-%d %H:%M')
+            prompt = f"{login_call} de SKIMMER {ts}Z CwSkimmer >\r\n"
+            writer.write(prompt.encode())
             await writer.drain()
             log.info("Client logged in: %s (%s)", login_call, addr)
 
             self._clients[writer] = {'ve7cc': False, 'call': login_call}
-            prompt = f"{login_call} de {self.node_call} >\r\n"
 
             try:
                 while True:
@@ -116,7 +162,23 @@ class SpotTelnetServer:
                     verb = parts[0].lower() if parts else ''
 
                     try:
-                        if verb == 'set/ve7cc':
+                        if verb == 'skimmer/sett' or verb == 'sett':
+                            # SkimSrv response shape:
+                            #   SETT: vlNormal 7000.0-7035.0,14000.0-14045.5,...
+                            # Aggregator uses this to learn validation
+                            # level + scanned bands; if it doesn't get
+                            # this back it refuses to forward our spots.
+                            if self.bands:
+                                ranges = ','.join(
+                                    f"{lo:.1f}-{hi:.1f}" for lo, hi in self.bands
+                                )
+                            else:
+                                ranges = '7000.0-7300.0'
+                            writer.write(
+                                f"SETT: vl{self.validation_level} {ranges}\r\n"
+                                f"{prompt}".encode()
+                            )
+                        elif verb == 'set/ve7cc':
                             self._clients[writer]['ve7cc'] = True
                             writer.write(
                                 f"VE7CC gateway mode enabled\r\n{prompt}".encode()
@@ -128,7 +190,7 @@ class SpotTelnetServer:
                         elif verb == 'echo' and len(parts) > 1:
                             writer.write((parts[1] + "\r\n" + prompt).encode())
                         elif verb == 'bye' or verb == 'quit':
-                            writer.write(b"73 de OpenSkimmer\r\n")
+                            writer.write(b"CU AGN!\r\n")
                             await writer.drain()
                             break
                         elif verb.startswith('sh/'):
@@ -154,15 +216,31 @@ class SpotTelnetServer:
     def broadcast_spot(self, freq_khz: float, dx_call: str,
                        snr: int = 0, wpm: int = 0,
                        mode: str = 'CW', comment: str = '') -> None:
-        """Send a spot to all connected clients.
+        """Send a spot to all connected clients in canonical RBN-skimmer
+        wire format:
+
+          DX de WF8Z-#:   14033.42  N5TOO          CW   1 dB 27 WPM  CQ  OS  1337Z
+                  ^^^^                              ^^^                   ^^
+                  spotter+'#' suffix                explicit mode         source tag
+
+        Format matches what SkimSrv, SDC Skimmer, and other RBN-feeder
+        skimmers emit. The mode column (CW/FT8/FT4/RTTY/etc) is required
+        for RBN-server parsing; it lives between the dx_call and the dB
+        figure. The trailing tag (OS = OpenSkimmer) distinguishes our
+        source from SkimSrv (no tag) / SDC Skimmer (SDC tag) etc., useful
+        for cluster filters that preference by source.
+
+        For non-CW modes, WPM is omitted from the line. For FT8 the
+        comment slot carries the decoded message ("CQ AG3I JN18", etc.);
+        for CW the slot is "CQ" or "BEACON" or empty.
 
         Args:
             freq_khz: Frequency in kHz (e.g., 14023.5)
             dx_call: Spotted callsign
             snr: Signal-to-noise ratio in dB
-            wpm: CW speed in words per minute
-            mode: Mode string (CW, RTTY, FT8, etc.)
-            comment: Spot comment
+            wpm: CW/RTTY speed in words per minute (ignored for FT8/digital)
+            mode: Mode string (CW, RTTY, FT8, FT4, etc.)
+            comment: Spot comment / message body (e.g. "CQ" or FT8 message)
         """
         if not self._clients:
             return
@@ -171,27 +249,44 @@ class SpotTelnetServer:
         now = datetime.now(timezone.utc)
         time_str = now.strftime('%H%M')
 
-        # Build comment with SNR and WPM
-        if not comment:
-            parts = []
-            if snr:
-                parts.append(f'{int(snr)} dB')
-            if wpm:
-                parts.append(f'{wpm} WPM')
-            if mode and mode != 'CW':
-                parts.append(mode)
-            parts.append('CQ')
-            comment = '  '.join(parts)
+        # Spotter call always carries the skimmer suffix
+        spotter = self.callsign + self.skimmer_suffix  # e.g. "WF8Z-#"
 
-        # Standard DX Spider format
-        spotter = (self.callsign + ':')[:10]
-        std_line = (f"DX de {spotter:<10s}{freq_khz:10.1f}  "
-                    f"{dx_call:<12s} {comment:<28s}{time_str}Z\a\r\n")
+        # SNR portion: WPM included only for CW/RTTY (modes that have a
+        # speed); skipped for FT8/FT4/digital. Sign on dB preserved when
+        # present (FT8 spots have +12, -3, etc.; CW skimmer dB is
+        # always positive but always-positive formatting still parses).
+        # No leading "+" for positive dB (matches SDC/SkimSrv convention).
+        # Negative dB (FT8 weak signals) prints with "-" naturally.
+        snr_str = f"{int(snr):>3d} dB" if snr else "  0 dB"
+        if wpm and mode in ('CW', 'RTTY'):
+            # Single space between dB and WPM number — Aggregator's
+            # parser is rigid here. Two spaces causes it to drop both
+            # SNR and WPM (every spot uploaded as 0 dB / 18 WPM).
+            snr_str = f"{snr_str} {int(wpm):>2d} WPM"
 
-        # VE7CC CC11 format
+        # Body — what was decoded ("CQ" or message). Default to "CQ" if
+        # the caller didn't pass a comment.
+        body = (comment or 'CQ').strip() or 'CQ'
+
+        # Mode field: 4-char column.
+        mode_col = (mode or 'CW').upper()[:5]
+
+        # Standard DX Spider / skimmer-source format
+        std_line = (f"DX de {spotter+':':<10s}"
+                    f"{freq_khz:9.2f}  "
+                    f"{dx_call:<12s}"
+                    f" {mode_col:<4s}"
+                    f"{snr_str:<14s}"
+                    f"  {body:<20s}"
+                    f"{self.source_tag:<4s}"
+                    f"{time_str}Z\a\r\n")
+
+        # VE7CC CC11 format — caret-separated structured form
         date_str = now.strftime('%d-%b-%Y')
+        cc11_comment = f"{snr_str}  {body}"
         cc11_line = (f"CC11^{freq_khz:.1f}^{dx_call}^{date_str}^{time_str}Z^"
-                     f"{comment}^{self.callsign}^^^0^\a\r\n")
+                     f"{cc11_comment}^{spotter}^^^{mode_col}^\a\r\n")
 
         dead = []
         for writer, state in self._clients.items():

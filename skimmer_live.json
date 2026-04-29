@@ -1,0 +1,45 @@
+{
+    "callsign": "WF8Z-2",
+    "grid": "EM79sm",
+    "node_call": "SPARK-2",
+    "sdr_ip": "192.168.1.54",
+    "sdr_port": 1024,
+    "sample_rate": 192000,
+    "max_receivers": 1,
+    "bands": [
+        14070000
+    ],
+    "record_wav": "/mnt/atlas/skimmer/recordings/cwt_{ts}_{band}kHz.wav",
+    "buffer_seconds": 120,
+    "bmorse_speeds": [
+        25
+    ],
+    "cw_min_khz": 14000,
+    "cw_max_khz": 14070,
+    "signal_min_snr": 12,
+    "signal_timeout": 90,
+    "max_channels": 50,
+    "master_scp": "MASTER.SCP",
+    "add_calls": "add_calls.txt",
+    "blacklist": "blacklist.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "bmorse_bin": "/home/fred/morse-wip/src/bmorse",
+    "hamfist_bin": null,
+    "hamfist_scp": null,
+    "decoder_speeds": [
+        0,
+        15,
+        20,
+        25,
+        30,
+        35,
+        40
+    ],
+    "max_spot_wpm": 50,
+    "min_sightings": 3,
+    "respot_interval": 600,
+    "telnet_port": 7300,
+    "status_interval": 30,
+    "max_instances": 250,
+    "ml_model": null
+}

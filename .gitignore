@@ -1,29 +1,49 @@
-# Built artifacts
+# Build artifacts
 *.o
-*.so
-*.a
-csdr-cwskimmer*
+csdr-cwskimmer
+csdr-cwskimmer-40
+csdr-cwskimmer-tmp
+csdr-cwskimmer-multi
 csdr-rttyskimmer
 threshold-cwskimmer
-bayes-cwskimmer*
-uhsdr_cw
-cw_dispatcher_test
-cw_dispatcher_pfb_test
-fldigi_cw
-
-# Recordings and logs
-*.wav
-*.log
-*.csv
-
-# Python
+bayes-cwskimmer
+bayes-cwskimmer2
+bayes-cwskimmer3
 __pycache__/
-*.pyc
 
-# Model checkpoints
+# Audio recordings (large)
+*.wav
+
+# Model checkpoints (large)
 *.pth
+
+# Training data (large)
 training_data/
 training.log
 
+# ML eval results
+ml_bw*.txt
+ml_merged.txt
+
 # Binary databases
 MASTER.DTA
+
+# FT8 capture binaries (debugging)
+*.c2
+
+# Operational data — generated, not source
+contest_logs/
+rbn_data/
+research/
+
+# Local debugging / one-off tools
+c_record.py
+debug_recv.py
+quick_record.py
+test_c_recv.c
+
+# Agent / IDE state
+.claude/
+.vscode/
+.idea/
+comms.md

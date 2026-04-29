@@ -11,7 +11,7 @@ Stretch:    --wav replays a recorded WAV as fake Protocol 1 UDP frames,
 
 Usage:
     # Live proxy (pitaya → SkimSrv + OpenSkimmer)
-    python3 hpsdr_proxy.py --pitaya 192.168.1.X
+    python3 hpsdr_proxy.py --pitaya 192.168.1.54
 
     # WAV replay (regression / A-B without hardware)
     python3 hpsdr_proxy.py --wav B1_20260319_030000_7090kHz.wav
@@ -280,7 +280,7 @@ def main():
     signal.signal(signal.SIGTERM, _sighandler)
 
     ap = argparse.ArgumentParser(description='HPSDR Protocol 1 proxy / multiplexer')
-    ap.add_argument('--pitaya',      default='192.168.1.1', help='Pitaya IP (live mode)')
+    ap.add_argument('--pitaya',      default='192.168.1.54', help='Pitaya IP (live mode)')
     ap.add_argument('--port',  type=int, default=HPSDR_PORT, help='Listen port')
     ap.add_argument('--wav',         help='WAV file to replay (instead of live pitaya)')
     ap.add_argument('--no-realtime', action='store_true',    help='Replay as fast as possible')

@@ -1,0 +1,27 @@
+{
+    "callsign": "WF8Z",
+    "grid": "EM79",
+    "master_scp": "MASTER.SCP",
+    "add_calls": "add_calls.txt",
+    "decoder_bin": "./uhsdr_cw",
+    "decoder_speeds": [],
+    "max_channels": 300,
+    "signal_min_snr": 12,
+    "rescan_interval_sec": 30,
+    "use_itila": true,
+    "itila_window_sec": 60,
+    "itila_ev_thresh": 1.5,
+    "use_cpp_dispatcher": false,
+    "use_cpp_pfb": false,
+    "sdr_ip": "192.168.1.54",
+    "sdr_port": 1024,
+    "sample_rate": 192000,
+    "cw_min_khz": 7000,
+    "cw_max_khz": 7070,
+    "bands": [
+        7090000
+    ],
+    "telnet_port": 7300,
+    "scp_bypass_threshold": 3,
+    "max_bins": 300
+}
