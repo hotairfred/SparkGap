@@ -1,0 +1,52 @@
+# High-confidence blacklist candidates ... 1x1 calls emitted by us repeatedly,
+# never seen by SDC or worldwide RBN. Very likely decode noise hitting random
+# SCP entries by chance. Generated 2026-04-29 from 18+ hour score-log soak.
+#
+# Format: one CALL per line. Lines starting with # are ignored.
+# To deploy: append to blacklist.txt and restart skimmer.
+#
+# call  emissions  hours
+M7N    # 19 emissions across 7 hours
+M1T    # 17 emissions across 9 hours
+G4R    # 17 emissions across 6 hours
+C5R    # 10 emissions across 9 hours
+B4S    # 10 emissions across 7 hours
+M7T    # 10 emissions across 6 hours
+G9W    # 10 emissions across 4 hours
+N8A    # 10 emissions across 3 hours
+M2T    # 8 emissions across 7 hours
+M9T    # 8 emissions across 7 hours
+G2P    # 8 emissions across 6 hours
+E2A    # 8 emissions across 4 hours
+C7A    # 8 emissions across 4 hours
+G1W    # 8 emissions across 3 hours
+G6A    # 7 emissions across 5 hours
+M2J    # 7 emissions across 3 hours
+G6P    # 7 emissions across 2 hours
+M7R    # 6 emissions across 6 hours
+G5K    # 6 emissions across 6 hours
+M5G    # 6 emissions across 5 hours
+G1M    # 6 emissions across 4 hours
+G3G    # 6 emissions across 4 hours
+G3B    # 6 emissions across 3 hours
+V6D    # 5 emissions across 5 hours
+M3D    # 5 emissions across 4 hours
+M7V    # 5 emissions across 4 hours
+P3C    # 5 emissions across 3 hours
+M5P    # 4 emissions across 4 hours
+M6W    # 4 emissions across 3 hours
+W1E    # 4 emissions across 3 hours
+G5V    # 4 emissions across 3 hours
+G0W    # 4 emissions across 3 hours
+M9M    # 4 emissions across 2 hours
+M1X    # 4 emissions across 2 hours
+G5Q    # 4 emissions across 2 hours
+B1Z    # 3 emissions across 3 hours
+G8D    # 3 emissions across 3 hours
+S0S    # 3 emissions across 3 hours
+F5I    # 3 emissions across 3 hours
+B0A    # 3 emissions across 3 hours
+M3M    # 3 emissions across 2 hours
+M9A    # 3 emissions across 2 hours
+G3Q    # 3 emissions across 2 hours
+M1V    # 3 emissions across 2 hours

@@ -1,0 +1,51 @@
+# Suspect blacklist candidates ... 4+ char calls we emitted >=3 times across
+# >=2 hours, never confirmed by SDC or worldwide RBN. Could be:
+#  (a) genuinely real regional-only signals (don't blacklist!)
+#  (b) mangled forms of real adjacent calls (DO blacklist)
+# Spot-check before adding to real blacklist.
+#
+# call          emissions  hours  pattern
+N2WK           #  16     3   @#@@
+K4KYN          #  14     2   @#@@@
+N1AU           #  10     2   @#@@
+W4PF           #   9     2   @#@@
+K9CW           #   8     3   @#@@
+F5KAR          #   8     3   @#@@@
+VA3SP          #   8     2   @@#@@
+W8EWH          #   8     2   @#@@@
+K4GM           #   7     2   @#@@
+EE5A           #   6     6   @@#@
+NF8M           #   6     2   @@#@
+KK4E           #   6     2   @@#@
+VA3FN          #   6     2   @@#@@
+UR5EN          #   5     5   @@#@@
+W1AAE          #   5     4   @#@@@
+NN5NN          #   5     3   @@#@@
+SE5E           #   5     3   @@#@
+WA2JQK         #   5     2   @@#@@@
+N4DT           #   5     2   @#@@
+N4FP           #   5     2   @#@@
+F5CT           #   5     2   @#@@
+IO5I           #   4     4   @@#@
+PE6E           #   4     3   @@#@
+EA2EJO         #   4     3   @@#@@@
+OG6F           #   4     2   @@#@
+WA3NZA         #   4     2   @@#@@@
+N3ST           #   4     2   @#@@
+WA9LEY         #   4     2   @@#@@@
+W1EE           #   4     2   @#@@
+SM7CIL         #   4     2   @@#@@@
+N5TER          #   3     3   @#@@@
+TM6T           #   3     3   @@#@
+EE5SP          #   3     3   @@#@@
+RT2D           #   3     2   @@#@
+W4ER           #   3     2   @#@@
+WF3T           #   3     2   @@#@
+K7MOA          #   3     2   @#@@@
+W3AT           #   3     2   @#@@
+K3GG           #   3     2   @#@@
+K5LET          #   3     2   @#@@@
+K3WA           #   3     2   @#@@
+KM4F           #   3     2   @@#@
+TA3DE          #   3     2   @@#@@
+EA5EL          #   3     2   @@#@@

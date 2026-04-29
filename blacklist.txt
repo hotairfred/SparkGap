@@ -1,0 +1,53 @@
+# OpenSkimmer blacklist ... CALLs that should never be emitted.
+# Format: one CALL per line, # for comments.
+# Generated 2026-04-29 from 18+ hour 3-way score-log mining.
+#
+# All entries below are 1x1 calls our decoder repeatedly emitted
+# but neither SDC nor worldwide RBN ever heard. Decode noise
+# hitting random SCP entries by chance.
+#
+# 1x1 noise (high confidence)
+B0A
+B1Z
+B4S
+C5R
+C7A
+E2A
+F5I
+G0W
+G1M
+G1W
+G2P
+G3B
+G3G
+G3Q
+G4R
+G5K
+G5Q
+G5V
+G6A
+G6P
+G8D
+G9W
+M1T
+M1V
+M1X
+M2J
+M2T
+M3D
+M3M
+M5G
+M5P
+M6W
+M7N
+M7R
+M7T
+M7V
+M9A
+M9M
+M9T
+N8A
+P3C
+S0S
+V6D
+W1E
