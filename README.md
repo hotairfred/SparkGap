@@ -131,6 +131,50 @@ Connect to the spot stream:
 telnet localhost 7300
 ```
 
+## Quick start (macOS)
+
+Should work with light Makefile tweaks ... `-shared` produces `.dylib`
+not `.so` on macOS, and `ctypes` needs to know to look for the dylib
+extension. Apple Silicon also handles `-march=native` differently
+(`-mcpu=apple-m1` or just omit the flag and let clang pick).
+
+Dependencies via Homebrew:
+
+```
+brew install python@3 numpy scipy fftw pkg-config
+```
+
+Then either build with `gmake` (substituting `.so` → `.dylib` in the
+build commands above) or run from source after a one-time port pass.
+PRs welcome ... we test on Linux primarily, so Mac users get to be
+the porting authors.
+
+## Quick start (Windows)
+
+WSL2 with Ubuntu, then follow the Linux instructions verbatim. The
+HPSDR firmware on the Pitaya is reachable from WSL2 the same way it
+is from native Linux.
+
+## Feeding the RBN
+
+OpenSkimmer emits standard DX-cluster spots locally on telnet :7300.
+To forward them upstream to the Reverse Beacon Network:
+
+```
+python3 rbn_feeder.py --call YOUR_CALL --grid YOUR_GRID6 \
+                      --local-host 127.0.0.1 --local-port 7300
+```
+
+`rbn_feeder.py` is a native Linux replacement for VE3NEA's
+Aggregator. It posts spots directly to RBN's ingest endpoint using
+the same JSON HTTP protocol Aggregator uses ... no Wine, no .NET,
+no closed-source binaries in the path. Use `--dry-run` to verify
+parsing without actually forwarding upstream.
+
+> Coordinate with the RBN admins (rbn-ops@groups.io is a good place
+> to start) before pointing this at production. Don't surprise the
+> database with an unproven node.
+
 ## Configuration: gate flags
 
 The decoder behavior is fully configurable.  Defaults are "ship-it"
@@ -144,13 +188,13 @@ re-enabled individually for stricter local behavior:
 | `gate_freq_consensus` | `false` | Per-freq adaptive consensus + 5-min commit lock |
 | `gate_patt3ch_filter` | `false` | Reject bypass calls not matching SkimSrv's `patt3ch.lst` patterns |
 | `gate_bypass_consensus` | `false` | Bypass calls go through freq consensus vs simple count threshold |
-| `gate_scp_bucket_substitute` | `false` | Emit nearest-SCP bucket form instead of raw decoded call |
+| `gate_scp_bucket_substitute` | `true`  | Emit nearest-SCP bucket form instead of raw decoded call |
 | `gate_telemetry` | `true`  | Log "would-gate" decisions even when gate is off (diagnostic) |
 
 Plus the standard knobs:
 
 - `signal_min_snr` — bin spawn threshold (default 12 dB; lower = more weak DX, more CPU)
-- `itila_max_bins` — concurrent bin ceiling per band (default 200; 400 is comfortable on 125-14)
+- `itila_max_bins` — concurrent bin ceiling per band (`sk_5band.json` ships at 400; 200 is conservative)
 - `scp_bypass_threshold` — sightings required for non-SCP-validated calls
 - `enable_ft8` — runs FT8 + RTTY pipelines (RTTY currently piggy-backs)
 
