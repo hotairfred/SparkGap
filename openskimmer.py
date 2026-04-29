@@ -27,6 +27,7 @@ import os
 import re
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -4555,13 +4556,15 @@ class SpotTracker:
         'gate_patt3ch_filter':         False,  # drop bypass calls not matching patt3ch.lst
         'gate_bypass_consensus':       False,  # bypass goes through freq consensus vs simple count
         'gate_scp_bucket_substitute':  False,  # emit bucket form instead of raw call
+        'gate_recent_band_floor':      False,  # anchor solo decode if peers saw it recently (S-floor)
         'enable_caller_spotting':      True,   # extract callers AND runner from QSO buffer (c042491)
         'gate_telemetry':              True,   # log "would-gate" decisions even when gate is off
     }
 
     def __init__(self, valid_calls, blacklist, respot_interval=120,
                  fuzzy_min_cycles=3, add_calls=None, scp_bypass_threshold=0,
-                 patt3ch_path='patt3ch.lst', gate_config=None):
+                 patt3ch_path='patt3ch.lst', gate_config=None,
+                 recent_band_config=None):
         self.valid_calls = valid_calls
         self.blacklist = blacklist
         self.respot_interval = respot_interval
@@ -4571,6 +4574,23 @@ class SpotTracker:
         self.gate_config = dict(self.GATE_DEFAULTS)
         if gate_config:
             self.gate_config.update(gate_config)
+        # Recent-on-band support floor (S-floor, ported from N2WQ's
+        # GoCluster). When peer DX clusters spot a call on a band, we
+        # remember it for `window_sec`. If our own decoder later sees
+        # the same call on the same band — even on a single sighting
+        # — we trust it because peer skimmers already corroborated.
+        # Closes the solo-precision gap by anchoring confidence in
+        # what other RBN-feeder skimmers are also hearing.
+        rbc = recent_band_config or {}
+        self._rb_window_sec = float(rbc.get('window_sec', 3600))
+        self._rb_min_spotters = int(rbc.get('min_spotters', 2))
+        # _rb_support: {(call_bucket, band_id): {spotter_id: last_seen_ts}}
+        self._rb_support = defaultdict(dict)
+        self._rb_lock = threading.Lock()
+        self._rb_peers_cfg = list(rbc.get('peers', []))
+        # Tee threads start lazily on first peer-required call (or via
+        # explicit start_recent_band_tees()) so unit-test paths don't
+        # spawn networking.
         # 0 = naked (no SCP), None = SCP-only (no bypass), N>0 = promote after N decodes
         self.scp_bypass_threshold = scp_bypass_threshold
         # patt3ch.lst: SkimSrv's structural-pattern allowlist used as the
@@ -4684,6 +4704,123 @@ class SpotTracker:
         elif w <= 15: # W6AYC=14, KG9X=13, WB2AA=15
             return 4
         return 3
+
+    # ----------------------------------------------------------------
+    # Recent-on-band support floor (S-floor) — N2WQ GoCluster port
+    # ----------------------------------------------------------------
+
+    # ham bands keyed by lower-edge kHz; value is the band integer label
+    _BAND_EDGES = (
+        (1800,  160), (3500,   80), (7000,   40), (10100,  30),
+        (14000, 20),  (18068,  17), (21000,  15), (24890,  12),
+        (28000, 10),  (50000,   6),
+    )
+
+    @classmethod
+    def _band_id_for_freq(cls, freq_khz):
+        """Return the meter-band integer for a frequency. None if out of band."""
+        for edge_khz, band in reversed(cls._BAND_EDGES):
+            if freq_khz >= edge_khz:
+                return band
+        return None
+
+    def _ingest_support(self, call, freq_khz, spotter, ts):
+        """Record that `spotter` saw `call` on the band of `freq_khz` at `ts`.
+        Thread-safe; called from peer-tee threads and from the main loop's
+        self-anchor on every confirmed spot."""
+        bucket = self._scp_bucket(call)
+        band = self._band_id_for_freq(freq_khz)
+        if band is None:
+            return
+        with self._rb_lock:
+            self._rb_support[(bucket, band)][spotter] = ts
+
+    def _has_recent_band_support(self, call, freq_khz, now):
+        """True if `call` has been seen by >= min_spotters distinct spotters
+        on this band within `_rb_window_sec`. Self ('OS:self') counts as a
+        spotter, so once we've confirmed the call once it's anchored for
+        the window."""
+        band = self._band_id_for_freq(freq_khz)
+        if band is None:
+            return False
+        bucket = self._scp_bucket(call)
+        cutoff = now - self._rb_window_sec
+        with self._rb_lock:
+            spotters = self._rb_support.get((bucket, band), {})
+            live = sum(1 for ts in spotters.values() if ts >= cutoff)
+        return live >= self._rb_min_spotters
+
+    def _effective_min_sightings(self, call, freq_khz, snr=0, now=None):
+        """min_sightings, lowered to 1 when the call is anchored by recent
+        peer support on this band and the gate flag is on. Otherwise
+        identical to _min_sightings(call, snr)."""
+        base = self._min_sightings(call, snr)
+        if not self.gate_config.get('gate_recent_band_floor'):
+            return base
+        if now is None:
+            now = time.time()
+        if self._has_recent_band_support(call, freq_khz, now):
+            return 1
+        return base
+
+    # Peer-spot wire format. Matches "DX de SPOTTER-#: 14025.50 CALL ..."
+    # both with and without our os_tee timestamp prefix.
+    _PEER_SPOT_RE = re.compile(
+        r'^(?:\d{2}:\d{2}:\d{2}\s+)?DX de (\S+):\s+(\d+\.\d+)\s+([A-Z0-9/]{3,15})\s+'
+    )
+
+    def _peer_connect_loop(self, host, port, label, login_call='WF8Z'):
+        """Connect to a peer DX cluster, parse DX lines, ingest as S-floor
+        support evidence. Reconnects on disconnect. Runs as daemon thread."""
+        while True:
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(120)
+                s.connect((host, port))
+                time.sleep(0.5)
+                try: s.recv(8192)  # banner
+                except Exception: pass
+                s.sendall(f'{login_call}\n'.encode('ascii'))
+                log.info('S-floor: connected to %s peer %s:%d', label, host, port)
+                buf = b''
+                while True:
+                    chunk = s.recv(8192)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b'\n' in buf:
+                        line, buf = buf.split(b'\n', 1)
+                        text = line.decode('latin-1', errors='replace').rstrip('\r\x07 \t')
+                        m = self._PEER_SPOT_RE.match(text)
+                        if not m:
+                            continue
+                        spotter, freq, call = m.groups()
+                        self._ingest_support(
+                            call.upper(), float(freq),
+                            f'{label}:{spotter}', time.time()
+                        )
+            except (socket.error, OSError) as e:
+                log.debug('S-floor %s peer error: %s', label, e)
+            finally:
+                if s:
+                    try: s.close()
+                    except Exception: pass
+            time.sleep(5)
+
+    def start_recent_band_tees(self):
+        """Spawn one daemon thread per configured peer. Idempotent."""
+        if getattr(self, '_rb_peer_threads_started', False):
+            return
+        self._rb_peer_threads_started = True
+        for peer in self._rb_peers_cfg:
+            t = threading.Thread(
+                target=self._peer_connect_loop,
+                args=(peer['host'], peer['port'], peer.get('label', 'PEER')),
+                name=f"rb_peer_{peer.get('label','peer')}",
+                daemon=True,
+            )
+            t.start()
 
     def _load_patt3ch(self, path):
         """Load SkimSrv's patt3ch.lst structural-pattern allowlist.
@@ -5198,7 +5335,7 @@ class SpotTracker:
                 # to avoid "CQ" appearing by chance in hours of noise output.
                 recent_ctx = context_clean[-500:] if len(context_clean) > 500 else context_clean
                 has_context = bool(CQ_PATTERNS.search(recent_ctx))
-                min_s = self._min_sightings(call, snr)
+                min_s = self._effective_min_sightings(call, freq_khz, snr, now)
                 # CQ-runner gate: when a CQ context exists AND we identified
                 # the runner adjacent to CQ, only THAT call passes via context.
                 # Other SCP-valid calls in the same buffer are likely worked
@@ -5273,6 +5410,7 @@ class SpotTracker:
                             'wpm': wpm,
                             'method': 'exact',
                         })
+                        self._ingest_support(call, freq_khz, 'OS:self', now)
             elif self.scp_bypass_threshold and CALL_RE.match(call) \
                     and call not in seen_p1:
                 # Non-SCP structurally-valid call. Two layered behaviors,
@@ -5347,6 +5485,7 @@ class SpotTracker:
                         'wpm': wpm,
                         'method': 'unverified',
                     })
+                    self._ingest_support(call, freq_khz, 'OS:self', now)
 
         # Path 1b (sliding window on collapsed text) DISABLED 2026-04-25.
         # It scanned every 4-7 char window across the no-spaces decoded text
@@ -5436,6 +5575,7 @@ class SpotTracker:
                                 'wpm': wpm,
                                 'method': f'consensus(n={len(frag_list)},conf={avg_confidence:.0%})',
                             })
+                            self._ingest_support(consensus_str, freq_khz, 'OS:self', now)
                             log.info("Consensus: %s (n=%d, %.0f%% conf) @ %.1f kHz",
                                      consensus_str, len(frag_list),
                                      avg_confidence * 100, freq_khz)
@@ -5460,6 +5600,7 @@ class SpotTracker:
                                     'wpm': wpm,
                                     'method': f'fuzzy_consensus(d={best_dist},n={len(frag_list)},conf={avg_confidence:.0%})',
                                 })
+                                self._ingest_support(best_call, freq_khz, 'OS:self', now)
                                 log.info("Fuzzy consensus: '%s' → %s (d=%d, n=%d, %.0f%%)",
                                          consensus_str, best_call, best_dist,
                                          len(frag_list), avg_confidence * 100)
@@ -5559,7 +5700,14 @@ class OpenSkimmer:
                                    self.cfg.get('respot_interval', 120),
                                    add_calls=add_calls,
                                    scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)),
-                                   gate_config=gate_config)
+                                   gate_config=gate_config,
+                                   recent_band_config=self.cfg.get('recent_band_floor'))
+        # If the gate is configured (peers listed), start the peer-tee
+        # threads regardless of whether the gate is currently on. The
+        # support map is cheap to maintain and we want it warm if the
+        # gate is flipped on at runtime via config reload.
+        if self.cfg.get('recent_band_floor', {}).get('peers'):
+            self.tracker.start_recent_band_tees()
 
         self.telnet = SpotTelnetServer(
             port=self.cfg.get('telnet_port', 7300),
