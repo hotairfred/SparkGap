@@ -192,7 +192,9 @@ Bug reports and pull requests welcome.
 
 - VE3NEA for CW Skimmer, Skimmer Server, and decades of contributions
   to amateur radio decoder software.
-- ITILA decoder authors for the open-source Bayesian CW decoder.
+- David MacKay for *Information Theory, Inference, and Learning
+  Algorithms* (the textbook the decoder is named after — the Bayesian
+  framework comes from there; the decoder itself is original).
 - Pavel Demin for the Red Pitaya HPSDR firmware.
 - The RBN-OPS community for their thoughtful discussion of skimmer
   validation, callsign correction, and multi-skimmer consensus.
