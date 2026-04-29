@@ -40,6 +40,7 @@
     "gate_bypass_consensus":       false,
     "gate_scp_bucket_substitute":  true,
     "gate_recent_band_floor":      false,
+    "gate_harmonic_filter":        false,
     "gate_telemetry":              true,
 
     "_comment_recent_band": "S-floor: peer-skimmer support cache (ported from N2WQ GoCluster). When peers spot a call on a band recently, our solo decode of the same call is anchored to a 1-sighting threshold. Peer threads start when peers list is non-empty regardless of gate flag — keeps the cache warm so we can flip the gate at runtime.",

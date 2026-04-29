@@ -187,6 +187,7 @@ re-enabled individually for stricter local behavior:
 | `gate_bypass_consensus` | `false` | Bypass calls go through freq consensus vs simple count threshold |
 | `gate_scp_bucket_substitute` | `true`  | Emit nearest-SCP bucket form instead of raw decoded call |
 | `gate_recent_band_floor` | `false` | S-floor: anchor solo decode if peer skimmers spotted the same call on the same band recently |
+| `gate_harmonic_filter` | `false` | Drop apparent 2x-5x harmonic spurs of recent same-call spots (RX intermod artifacts) |
 | `gate_telemetry` | `true`  | Log "would-gate" decisions even when gate is off (diagnostic) |
 
 Plus the standard knobs:

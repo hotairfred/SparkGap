@@ -4557,6 +4557,7 @@ class SpotTracker:
         'gate_bypass_consensus':       False,  # bypass goes through freq consensus vs simple count
         'gate_scp_bucket_substitute':  False,  # emit bucket form instead of raw call
         'gate_recent_band_floor':      False,  # anchor solo decode if peers saw it recently (S-floor)
+        'gate_harmonic_filter':        False,  # drop 2x-5x harmonic spurs of same-call recent spots
         'enable_caller_spotting':      True,   # extract callers AND runner from QSO buffer (c042491)
         'gate_telemetry':              True,   # log "would-gate" decisions even when gate is off
     }
@@ -4591,6 +4592,20 @@ class SpotTracker:
         # Tee threads start lazily on first peer-required call (or via
         # explicit start_recent_band_tees()) so unit-test paths don't
         # spawn networking.
+
+        # Harmonic suppression history. {call_bucket: [(freq_khz, snr, ts), ...]}.
+        # Receiver intermod / mixer products generate apparent "spots" at
+        # 2x-5x integer multiples of strong fundamentals. The spurs decode
+        # to the same callsign as the fundamental (because they are the
+        # same audio signal, just at the wrong RF frequency). Filter by
+        # checking whether each new emit is a recent same-call spot's
+        # harmonic at appropriately weaker SNR.
+        self._harm_history = defaultdict(list)
+        self._harm_window_sec    = 300    # remember fundamentals for 5 min
+        self._harm_max_multiple  = 5      # check 2x-5x harmonics
+        self._harm_freq_tol_hz   = 100    # tolerance for the multiple match
+        self._harm_min_delta     = 6      # 2nd harmonic must be ≥6 dB weaker
+        self._harm_delta_step    = 2      # +2 dB margin per multiple beyond 2
         # 0 = naked (no SCP), None = SCP-only (no bypass), N>0 = promote after N decodes
         self.scp_bypass_threshold = scp_bypass_threshold
         # patt3ch.lst: SkimSrv's structural-pattern allowlist used as the
@@ -4826,6 +4841,66 @@ class SpotTracker:
                 daemon=True,
             )
             t.start()
+
+    # ----------------------------------------------------------------
+    # Harmonic suppression — N2WQ GoCluster port (technique 2 of 4)
+    # ----------------------------------------------------------------
+
+    def _is_harmonic_of_recent(self, call, freq_khz, snr, now):
+        """True if (call, freq) looks like a 2x-5x harmonic of a recent
+        same-call spot at appropriately weaker SNR. Match criteria:
+
+          - Same call (compared by SCP bucket so noise variants align)
+          - Fundamental seen within `_harm_window_sec`
+          - freq_khz / fund_freq within `_harm_freq_tol_hz` of an
+            integer 2..max_multiple
+          - This spot's SNR weaker than fundamental by at least
+            `_harm_min_delta + (n-2)*_harm_delta_step` dB
+            (so 2nd harmonic must be ≥6 dB weaker, 3rd ≥8 dB, etc.)
+        """
+        bucket = self._scp_bucket(call)
+        history = self._harm_history.get(bucket)
+        if not history:
+            return False
+        cutoff = now - self._harm_window_sec
+        # Prune in place — cheap and keeps storage bounded.
+        history[:] = [h for h in history if h[2] >= cutoff]
+        for fund_freq, fund_snr, _ts in history:
+            if fund_freq <= 0 or freq_khz <= fund_freq:
+                continue
+            ratio = freq_khz / fund_freq
+            tol_khz = self._harm_freq_tol_hz / 1000.0
+            for n in range(2, self._harm_max_multiple + 1):
+                if abs(freq_khz - n * fund_freq) <= tol_khz:
+                    required = self._harm_min_delta + (n - 2) * self._harm_delta_step
+                    if (fund_snr - snr) >= required:
+                        return True
+                    # Found the multiple but SNR delta wasn't enough — could
+                    # legitimately be a different real station. Don't mark.
+                    return False
+        return False
+
+    def _record_fundamental(self, call, freq_khz, snr, now):
+        """Add this spot to the call's harmonic-history list.
+        Only call AFTER confirming it is NOT itself a harmonic
+        (otherwise we'd record a harmonic as a fundamental, which
+        could chain-suppress real spots later)."""
+        bucket = self._scp_bucket(call)
+        self._harm_history[bucket].append((freq_khz, snr, now))
+
+    def _harmonic_check(self, call, freq_khz, snr, now):
+        """Combined check + telemetry. Returns True if the spot
+        should be suppressed as a harmonic (caller should `continue`)."""
+        if not self._is_harmonic_of_recent(call, freq_khz, snr, now):
+            return False
+        if self.gate_config.get('gate_harmonic_filter'):
+            log.info("HARMONIC suppressed: %s @ %.1f kHz snr=%d",
+                     call, freq_khz, snr)
+            return True
+        elif self.gate_config.get('gate_telemetry'):
+            log.info("PHANTOM harmonic: %s @ %.1f kHz snr=%d would suppress",
+                     call, freq_khz, snr)
+        return False
 
     def _load_patt3ch(self, path):
         """Load SkimSrv's patt3ch.lst structural-pattern allowlist.
@@ -5407,6 +5482,8 @@ class SpotTracker:
                 if gate and self._can_respot(call, freq_khz, now) \
                         and self._is_freq_leader(call, freq_bin, now):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
+                        if self._harmonic_check(call, freq_khz, snr, now):
+                            continue
                         self._mark_spotted(call, freq_khz, now)
                         spots.append({
                             'call': call,
@@ -5416,6 +5493,7 @@ class SpotTracker:
                             'method': 'exact',
                         })
                         self._ingest_support(call, freq_khz, 'OS:self', now)
+                        self._record_fundamental(call, freq_khz, snr, now)
             elif self.scp_bypass_threshold and CALL_RE.match(call) \
                     and call not in seen_p1:
                 # Non-SCP structurally-valid call. Two layered behaviors,
@@ -5479,6 +5557,8 @@ class SpotTracker:
                 bkey = (call, int(round(freq_khz)))
                 if bypass_gate and bkey not in self._bypass_spotted \
                         and self._can_respot(call, freq_khz, now):
+                    if self._harmonic_check(call, freq_khz, snr, now):
+                        continue
                     self._bypass_spotted.add(bkey)
                     log.info("SCP bypass: %s at %.1f kHz [patt3ch=%s]",
                              call, freq_khz, patt3ch_match or 'none')
@@ -5491,6 +5571,7 @@ class SpotTracker:
                         'method': 'unverified',
                     })
                     self._ingest_support(call, freq_khz, 'OS:self', now)
+                    self._record_fundamental(call, freq_khz, snr, now)
 
         # Path 1b (sliding window on collapsed text) DISABLED 2026-04-25.
         # It scanned every 4-7 char window across the no-spaces decoded text
@@ -5573,6 +5654,9 @@ class SpotTracker:
                             self._mark_spotted(consensus_str, freq_khz, now)
                             info['freq'] = freq_khz
                             info['snr'] = snr
+                            if self._harmonic_check(consensus_str, freq_khz, snr, now):
+                                frags_at_freq.clear()
+                                continue
                             spots.append({
                                 'call': consensus_str,
                                 'freq_khz': freq_khz,
@@ -5581,6 +5665,7 @@ class SpotTracker:
                                 'method': f'consensus(n={len(frag_list)},conf={avg_confidence:.0%})',
                             })
                             self._ingest_support(consensus_str, freq_khz, 'OS:self', now)
+                            self._record_fundamental(consensus_str, freq_khz, snr, now)
                             log.info("Consensus: %s (n=%d, %.0f%% conf) @ %.1f kHz",
                                      consensus_str, len(frag_list),
                                      avg_confidence * 100, freq_khz)
@@ -5598,6 +5683,9 @@ class SpotTracker:
                                 self._mark_spotted(best_call, freq_khz, now)
                                 info['freq'] = freq_khz
                                 info['snr'] = snr
+                                if self._harmonic_check(best_call, freq_khz, snr, now):
+                                    frags_at_freq.clear()
+                                    continue
                                 spots.append({
                                     'call': best_call,
                                     'freq_khz': freq_khz,
@@ -5606,6 +5694,7 @@ class SpotTracker:
                                     'method': f'fuzzy_consensus(d={best_dist},n={len(frag_list)},conf={avg_confidence:.0%})',
                                 })
                                 self._ingest_support(best_call, freq_khz, 'OS:self', now)
+                                self._record_fundamental(best_call, freq_khz, snr, now)
                                 log.info("Fuzzy consensus: '%s' → %s (d=%d, n=%d, %.0f%%)",
                                          consensus_str, best_call, best_dist,
                                          len(frag_list), avg_confidence * 100)
