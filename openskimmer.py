@@ -4771,12 +4771,17 @@ class SpotTracker:
 
     def _peer_connect_loop(self, host, port, label, login_call='WF8Z'):
         """Connect to a peer DX cluster, parse DX lines, ingest as S-floor
-        support evidence. Reconnects on disconnect. Runs as daemon thread."""
+        support evidence. Reconnects on disconnect. Runs as daemon thread.
+
+        Recv timeout is generous (10 min) because peer DX clusters can go
+        silent for several minutes during quiet hours. SDC in particular
+        has a consistent ~126s gap pattern; a 120s recv timeout would
+        churn-disconnect every few minutes."""
         while True:
             s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(120)
+                s.settimeout(600)
                 s.connect((host, port))
                 time.sleep(0.5)
                 try: s.recv(8192)  # banner

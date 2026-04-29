@@ -23,7 +23,9 @@ def run():
     while True:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(120)
+            # SDC has consistent ~126s silent gaps during quiet hours; 120s
+            # timeout was churn-disconnecting. 600s rides through them.
+            s.settimeout(600)
             s.connect((HOST, PORT))
             time.sleep(0.5)
             try: s.recv(8192)  # banner
