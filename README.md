@@ -179,6 +179,10 @@ Accepts 16-bit and 24-bit stereo IQ WAV files at 192 kHz.
 
 GPLv3.  See `LICENSE`.
 
+## Author
+
+Fred Krause, **WF8Z** (EM79SM).  Contact info is on QRZ.
+
 ## Status of this README
 
 This is a working README.  Expect it to evolve as the project matures.

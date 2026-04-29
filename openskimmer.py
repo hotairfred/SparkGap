@@ -5567,6 +5567,11 @@ class OpenSkimmer:
             node_call=self.cfg.get('node_call', 'SPARK-2'),
             skimmer_suffix=self.cfg.get('skimmer_suffix', '-#'),
             source_tag=self.cfg.get('source_tag', 'OS'),
+            op_name=self.cfg.get('op_name', ''),
+            qth=self.cfg.get('qth', ''),
+            grid=self.cfg.get('grid', ''),
+            validation_level=self.cfg.get('validation_level', 'Normal'),
+            skimsrv_version=self.cfg.get('skimsrv_version', '1.6.0.145'),
         )
         await self.telnet.start()
 
@@ -5586,6 +5591,15 @@ class OpenSkimmer:
                 'i': [],
                 'q': [],
             }
+
+        # Advertise band ranges in SETT response so Aggregator knows
+        # what we cover. Range = center ± half scan bandwidth (kHz).
+        half_bw_khz = float(self.cfg.get('skim_bandwidth_khz', 96)) / 2.0
+        self.telnet.bands = [
+            (round(center_hz / 1000.0 - half_bw_khz, 1),
+             round(center_hz / 1000.0 + half_bw_khz, 1))
+            for _, center_hz, _ in self._band_meta
+        ]
 
         rx_sample_rate = self.cfg.get('sample_rate', 48000)
         sdr_port = self.cfg.get('sdr_port', 1024)

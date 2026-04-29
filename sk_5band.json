@@ -1,6 +1,8 @@
 {
     "callsign": "WF8Z",
-    "grid": "EM79",
+    "grid": "EM79SM",
+    "op_name": "OpenSkimmer",
+    "qth": "",
     "master_scp": "MASTER.SCP",
     "add_calls": "add_calls.txt",
     "decoder_speeds": [],

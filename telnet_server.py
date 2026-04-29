@@ -35,7 +35,10 @@ class SpotTelnetServer:
 
     def __init__(self, host: str = '0.0.0.0', port: int = 7300,
                  callsign: str = 'WF8Z', node_call: str = 'SPARK-2',
-                 skimmer_suffix: str = '-#', source_tag: str = 'OS'):
+                 skimmer_suffix: str = '-#', source_tag: str = 'OS',
+                 op_name: str = '', qth: str = '', grid: str = '',
+                 validation_level: str = 'Normal',
+                 skimsrv_version: str = '1.6.0.145'):
         self.host = host
         self.port = port
         self.callsign = callsign  # Operator's callsign (without suffix)
@@ -50,6 +53,22 @@ class SpotTelnetServer:
         # OpenSkimmer). Optional but useful for cluster filter rules
         # (e.g. CT1BOH's SKIMVALID can preference specific sources).
         self.source_tag = source_tag
+        # SkimSrv impersonation fields. Aggregator's primary-skimmer
+        # connection rejects sources that don't match SkimSrv's banner /
+        # SETT response shape (it parses "Skimmer Server v.X.Y.Z >= 1.3"
+        # from the pre-login banner and expects "SETT: vl<Level> <ranges>"
+        # in response to a SKIMMER/SETT query). Spoofing v.1.6.0.145
+        # passes the version gate; identifying as OpenSkimmer in the
+        # operator slot keeps it honest to a human reading the banner.
+        self.op_name = op_name
+        self.qth = qth
+        self.grid = grid
+        self.validation_level = validation_level
+        self.skimsrv_version = skimsrv_version
+        # Band ranges advertised in SETT response. List of (low_khz,
+        # high_khz) tuples. Populated by the daemon after band-meta is
+        # built; left empty here so construction order doesn't matter.
+        self.bands = []
         self._clients: Dict[asyncio.StreamWriter, dict] = {}
         self._server = None
         self._spot_count = 0
@@ -85,8 +104,25 @@ class SpotTelnetServer:
         log.info("Client connected: %s", addr)
 
         try:
-            # DX Spider login prompt
-            writer.write(b"login: Please enter your call: ")
+            # SkimSrv-shape pre-login banner. Aggregator parses these
+            # lines for operator/version metadata. The "Skimmer Server
+            # v.X.Y.Z" string must satisfy Aggregator's >=1.3 version
+            # check, so we spoof a known-good SkimSrv version verbatim.
+            # OpenSkimmer identifies itself in the operator-name slot
+            # so a human reading the banner sees what we actually are.
+            op_label = self.op_name or 'OpenSkimmer'
+            # Banner order is "operated by <NAME>, <CALL>" — Aggregator's
+            # parser maps the first field to skimName and the second to
+            # skimCall. Reversing this trips the grid-format check
+            # because Aggregator then thinks our callsign is the name.
+            banner = (
+                f"Welcome to the Skimmer Server Telnet cluster port!\r\n"
+                f"Skimmer Server v.{self.skimsrv_version} is operated by "
+                f"{op_label}, {self.callsign}\r\n"
+                f"in {self.qth} ({self.grid})\r\n"
+                f"Please enter your callsign:\r\n"
+            )
+            writer.write(banner.encode())
             await writer.drain()
 
             try:
@@ -101,18 +137,17 @@ class SpotTelnetServer:
             if not login_call:
                 login_call = "UNKNOWN"
 
-            # Welcome
-            writer.write(
-                f"Hello {login_call}, this is {self.node_call} running OpenSkimmer\r\n"
-                f"Spotter: {self.callsign}\r\n"
-                f"Spots delivered: {self._spot_count}\r\n"
-                f"{login_call} de {self.node_call} >\r\n".encode()
-            )
+            # SkimSrv-style post-login prompt: "<CALL> de SKIMMER
+            # YYYY-MM-DD HH:MMZ CwSkimmer >". Aggregator uses the
+            # "CwSkimmer" tail to identify the source kind.
+            now = datetime.now(timezone.utc)
+            ts = now.strftime('%Y-%m-%d %H:%M')
+            prompt = f"{login_call} de SKIMMER {ts}Z CwSkimmer >\r\n"
+            writer.write(prompt.encode())
             await writer.drain()
             log.info("Client logged in: %s (%s)", login_call, addr)
 
             self._clients[writer] = {'ve7cc': False, 'call': login_call}
-            prompt = f"{login_call} de {self.node_call} >\r\n"
 
             try:
                 while True:
@@ -127,7 +162,23 @@ class SpotTelnetServer:
                     verb = parts[0].lower() if parts else ''
 
                     try:
-                        if verb == 'set/ve7cc':
+                        if verb == 'skimmer/sett' or verb == 'sett':
+                            # SkimSrv response shape:
+                            #   SETT: vlNormal 7000.0-7035.0,14000.0-14045.5,...
+                            # Aggregator uses this to learn validation
+                            # level + scanned bands; if it doesn't get
+                            # this back it refuses to forward our spots.
+                            if self.bands:
+                                ranges = ','.join(
+                                    f"{lo:.1f}-{hi:.1f}" for lo, hi in self.bands
+                                )
+                            else:
+                                ranges = '7000.0-7300.0'
+                            writer.write(
+                                f"SETT: vl{self.validation_level} {ranges}\r\n"
+                                f"{prompt}".encode()
+                            )
+                        elif verb == 'set/ve7cc':
                             self._clients[writer]['ve7cc'] = True
                             writer.write(
                                 f"VE7CC gateway mode enabled\r\n{prompt}".encode()
@@ -139,7 +190,7 @@ class SpotTelnetServer:
                         elif verb == 'echo' and len(parts) > 1:
                             writer.write((parts[1] + "\r\n" + prompt).encode())
                         elif verb == 'bye' or verb == 'quit':
-                            writer.write(b"73 de OpenSkimmer\r\n")
+                            writer.write(b"CU AGN!\r\n")
                             await writer.drain()
                             break
                         elif verb.startswith('sh/'):
@@ -209,7 +260,10 @@ class SpotTelnetServer:
         # Negative dB (FT8 weak signals) prints with "-" naturally.
         snr_str = f"{int(snr):>3d} dB" if snr else "  0 dB"
         if wpm and mode in ('CW', 'RTTY'):
-            snr_str = f"{snr_str}  {int(wpm):>2d} WPM"
+            # Single space between dB and WPM number — Aggregator's
+            # parser is rigid here. Two spaces causes it to drop both
+            # SNR and WPM (every spot uploaded as 0 dB / 18 WPM).
+            snr_str = f"{snr_str} {int(wpm):>2d} WPM"
 
         # Body — what was decoded ("CQ" or message). Default to "CQ" if
         # the caller didn't pass a comment.
