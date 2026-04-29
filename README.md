@@ -282,8 +282,5 @@ file retains its original headers and license.
 
 ### Community
 
-- **The RBN-OPS community** — thoughtful discussion of skimmer
-  validation, callsign correction, and multi-skimmer consensus.
-- **N2WQ** — spotter-reliability analysis methodology.
 - Everyone who's run a CW skimmer for the last 15 years and kept the
   RBN ecosystem alive.
