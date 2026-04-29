@@ -290,6 +290,30 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         }
     }
 
+    /* Sweep: evict stale bins regardless of capacity. The capacity-only
+     * eviction below was a leak — under typical operation each band's
+     * scanner stays well below max_bins, so the eviction path never ran
+     * and bins accumulated forever. After ~1-2 hours bin count drifts
+     * up to a few hundred, FFT cost climbs, decoder starves, ring
+     * drops climb past 50%. Sweeping unconditionally per scan keeps
+     * the active set bounded by what the band actually produces. */
+    {
+        int rate_12k = sc->sample_rate / SC_DEC1;
+        for (int b = 0; b < SC_MAX_BINS; b++) {
+            if (!sc->bins[b].active) continue;
+            int age      = sc->total_samples - sc->bins[b].created_sample;
+            int since_ev = sc->total_samples - sc->bins[b].last_evidence;
+            int stale    = 0;
+            if (sc->bins[b].last_evidence == 0 && age > 300 * rate_12k) stale = 1;
+            else if (sc->bins[b].last_evidence > 0 && since_ev > 300 * rate_12k) stale = 1;
+            if (stale) {
+                bin_free_decoders(sc, &sc->bins[b]);
+                sc->bins[b].active = 0;
+                sc->n_bins--;
+            }
+        }
+    }
+
     /* Cluster (150 Hz), keep strongest per cluster, spawn new bins.
      * Tightened from 300 Hz to match 50 Hz grid + FIR selectivity. */
     double cluster_hz = 150.0;
