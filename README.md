@@ -249,6 +249,10 @@ regardless.
 
 - **Pavel Demin** — Red Pitaya HPSDR firmware (`sdr_receiver_hpsdr`)
   and the `ft8d` standalone FT8 decoder.
+- **Rudy Bakalov (N2WQ)** — *GoCluster*, BSD-licensed cluster server.
+  Cross-source validation techniques (recent-on-band support floor,
+  harmonic suppression) in this project's spot pipeline are adapted
+  from GoCluster's design.
 
 ### Decoders shipped as alternative paths / research
 

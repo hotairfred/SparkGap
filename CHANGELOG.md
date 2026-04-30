@@ -31,8 +31,8 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 ## 2026-04-29
 
 ### Added
-- **Native RBN feeder (`rbn_feeder.py`)** — replaces Aggregator on
-  Linux. Reverse-engineered the protocol from a Wireshark capture:
+- **Native RBN feeder (`rbn_feeder.py`)** — Aggregator-equivalent on
+  Linux. Wire format derived from a local capture:
   plain HTTP on `x.reversebeacon.net:88`, JSON POSTs to `/rx/6/id.php`
   (registration heartbeat every 50s) and `/rx/6/s.php` (spot batch
   every ~10s). About 340 lines, three threads (local read / heartbeat
@@ -47,16 +47,15 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 - **`score_diff.py` A/B comparison tool** — takes two HH:MM[:SS]
   windows, prints metric deltas (precision, goldkey, recall) plus
   optional per-call movers (promoted / demoted / new solo).
-- **Recent-on-band support floor (S-floor)** — port of the first
-  technique from N2WQ's GoCluster. New `gate_recent_band_floor`
+- **Recent-on-band support floor (S-floor)** — adapted from N2WQ's
+  GoCluster cross-source validation work. New `gate_recent_band_floor`
   (off by default), per-(call_bucket, band) cache populated by
   background daemon threads tailing peer DX-cluster telnets (SDC
   on .205:7373, worldwide RBN on telnet.reversebeacon.net:7000).
   When gate is on AND a call has ≥ min_spotters distinct peer
   spotters within window_sec on the same band, threshold drops
   to 1 sighting. Cache warms regardless of gate flag.
-- **Harmonic suppression** — port of the second technique from
-  N2WQ's GoCluster. New `gate_harmonic_filter` (off by default).
+- **Harmonic suppression** — adapted from N2WQ's GoCluster. New `gate_harmonic_filter` (off by default).
   Per-call recent-fundamental history; on each emit checks whether
   the spot is a 2x-5x integer multiple of a recent same-call spot
   at appropriately weaker SNR. Phantom-mode telemetry counts
