@@ -253,7 +253,9 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
     if blacklist_path and os.path.exists(blacklist_path):
         with open(blacklist_path) as f:
             for line in f:
-                line = line.strip().upper()
+                # Strip end-of-line comments and surrounding whitespace,
+                # then skip empty lines and full-line comments.
+                line = line.split('#', 1)[0].strip().upper()
                 if line:
                     blacklist.add(line)
     log.info("Database: %d calls (%d add_calls) + %d blacklisted",
@@ -5392,6 +5394,14 @@ class SpotTracker:
                     log.info("SCP bucket: %s → %s @ %.1f kHz", call, _bucket, freq_khz)
                     if self.gate_config['gate_scp_bucket_substitute']:
                         call = _bucket
+
+            # Re-check blacklist after slash-strip / bucket substitution.
+            # Decoder noise can map to a blacklisted call via edit-1
+            # bucket substitute (e.g. "K7A" → "C7A", "K0A" → "B0A").
+            # Without this re-check the blacklist is bypassed for any
+            # call our decoder produces a typo'd version of.
+            if call in self.blacklist:
+                continue
 
             # Global WPM sanity gate.  MAX_WPM=50 is defined as a constant
             # documenting "spots above this are almost certainly noise" but
