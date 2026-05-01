@@ -43,7 +43,14 @@ def calls_in_window(path, start_hms, end_hms, mode_filter='CW'):
             if not m:
                 continue
             hms, call, mode = m.groups()
-            if hms < start_hms or hms >= end_hms:
+            # Wrap-aware window match — handles midnight-crossing windows
+            # (end_hms <= start_hms). Without this, `score_diff 23:00 01:00`
+            # would return zero because every HH:MM:SS >= '00:00:00'.
+            if start_hms <= end_hms:
+                in_window = start_hms <= hms < end_hms
+            else:
+                in_window = hms >= start_hms or hms < end_hms
+            if not in_window:
                 continue
             if mode_filter and mode.upper() != mode_filter:
                 continue
