@@ -24,8 +24,9 @@ spot output via telnet.
 > in one process, packet-loss telemetry). Comparable, complementary,
 > not competing on winning a single benchmark.
 >
-> Not yet feeding the live RBN — Aggregator-equivalent forwarder is
-> on the roadmap.
+> Native RBN feeder (`rbn_feeder.py`) is built and verified end-to-end
+> in dry-run.  Coordinating with the RBN admins before flipping live —
+> see *Feeding the RBN* below.
 
 ## Why this exists
 
@@ -62,18 +63,24 @@ For benchmarking we compare two ways:
   precision/recall trade-off is a knob the operator can turn for
   their use case.  Default ("ship-it") mode is permissive emit;
   cluster filters (VE7CC's 2+ skimmer rule) handle the noise downstream.
-- **Telnet spot output** in standard DX cluster format, ready for an
-  Aggregator-equivalent feeder (TODO).
+- **Telnet spot output** in standard DX cluster format, locally on
+  port 7300.
+- **Native RBN feeder** (`rbn_feeder.py`) — Aggregator-equivalent on
+  Linux.  Posts CW + RTTY spots directly to RBN's ingest endpoint
+  via JSON HTTP.  No Wine, no .NET, no closed-source binaries.
 - **Diagnostic infrastructure** for validating against SDC and RBN
-  reference streams (`sdc_tee.py`, `rbn_tee.py`).
+  reference streams (`sdc_tee.py`, `rbn_tee.py`, `score_loop.py`,
+  `score_diff.py`).
 
 ## What's not yet there
 
 - **Hardware abstraction** beyond Red Pitaya HPSDR.  RX-888, SDRPlay,
   Hermes Lite 2 backends would each require a plugin author who owns
   that hardware.  See the IqSource discussion in the project docs.
-- **Direct RBN feed.**  We emit telnet locally; piping that to the
-  RBN's central servers requires the Aggregator-equivalent forwarder.
+- **PSKReporter feeder for FT8 / FT4.**  RBN's ingest pipe is
+  CW + RTTY only; FT8/FT4 spots reach the wider community via
+  PSKReporter, which is a separate protocol entirely.  A
+  `pskr_feeder.py` would close that gap.
 - **Documentation polish.**  This README is the start; expect rough
   edges in install, config, and operations until the project matures.
 - **Validated multi-recording test suite.**  We have one rigorous
