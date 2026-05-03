@@ -155,10 +155,10 @@ class RBNSession:
 
     def _post(self, path, body):
         if self.dry_run:
-            log.info('[DRY] POST %s %s', path, json.dumps(body)[:200])
+            log.info('[DRY] POST %s %s', path, json.dumps(body, separators=(',', ':'))[:200])
             return None
         url = f'{self.url}/{path}'
-        data = json.dumps(body).encode('utf-8')
+        data = json.dumps(body, separators=(',', ':')).encode('utf-8')
         req = urlreq.Request(
             url, data=data, method='POST',
             headers={
@@ -220,17 +220,34 @@ class RBNSession:
         """Upload a batch of spot dicts (from parse_spot)."""
         if not spots:
             return None
+        # Spot tuple positions per RBN's current parser (verified
+        # 2026-05-03 via wire probing — Aggregator's documented format
+        # in the v6.7 binary disassembly is misaligned with what RBN
+        # currently expects, which is why Aggregator-bridged spots
+        # render as "OTHER 0 dB" instead of proper CW SNR WPM):
+        #   [0] freq
+        #   [1] call
+        #   [2] type code:  1=CQ, 2=DX, 3=BEACON
+        #   [3] SNR (numeric string)
+        #   [4] WPM (numeric string)
+        #   [5] "dB"      (literal, doesn't render)
+        #   [6] mode code: 1=CW, 2=PHONE, 5=FM, 10=PSK31, 15=SSTV,
+        #                  20=EME, 30=PSK63
+        #   [7] cq-flag string ("CQ" / "DE" / "BCN") — informational
+        #   [8] "D:"      (literal, doesn't render)
+        _MODE_TO_CODE = {'CW': '1'}  # extend when other modes are wired up
+        _CQ_TO_CODE   = {'CQ': '1', 'DX': '2', 'BCN': '3', 'BEACON': '3'}
         s_array = [
             [
                 f'{sp["freq"]:.2f}',
                 sp['call'],
-                '1',                 # source index — Aggregator always 1
-                sp['mode'],
-                'dB',                # literal unit token
+                _CQ_TO_CODE.get(sp['cq_flag'], '1'),
                 str(sp['snr']),
                 str(sp['wpm']),
+                'dB',
+                _MODE_TO_CODE.get(sp['mode'], '1'),  # CW default
                 sp['cq_flag'],
-                'D:',                # literal trailer token
+                'D:',
             ]
             for sp in spots
         ]
