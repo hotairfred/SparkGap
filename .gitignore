@@ -47,3 +47,11 @@ test_c_recv.c
 .vscode/
 .idea/
 comms.md
+
+# Private RBN auth module (Aggregator-equivalent shortHash / h algorithms).
+# Not shipped publicly — Aggregator's shortHash gates RBN abuse and
+# publishing the algorithm defeats that protection for everyone, not just
+# us.  Operators who want a Linux-native feeder currently bridge through
+# Aggregator on a Win box; the sanctioned Linux path is an open
+# conversation with RBN admins.
+rbn_auth.py

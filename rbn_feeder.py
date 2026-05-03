@@ -42,6 +42,31 @@ from urllib import request as urlreq, error as urlerror
 
 log = logging.getLogger('rbn_feeder')
 
+# RBN's id.php and s.php endpoints validate two short hash fields
+# (`shortHash` on id.php, `h` on s.php) computed by Aggregator before
+# upload.  Those algorithms gate spam against the RBN ingest endpoint;
+# without them, RBN accepts the POST (HTTP 200) but silently drops
+# the payload — spots never reach the worldwide telnet broadcast.
+#
+# This module ships WITHOUT those algorithms.  Operators wanting a
+# Linux-native feeder currently bridge through Aggregator on a
+# Windows box; the sanctioned Linux path is an open conversation
+# with the RBN administrators.  If you're testing locally, ignore
+# this — `--dry-run` doesn't POST upstream and works fine.
+#
+# If a private `rbn_auth` module is present at import time we use
+# it.  Otherwise we fall back to random hex, which RBN treats as
+# unauthenticated and silently drops.
+try:
+    from rbn_auth import id_php_short_hash, s_php_h
+    HAVE_RBN_AUTH = True
+except ImportError:
+    HAVE_RBN_AUTH = False
+    def id_php_short_hash(skim_sign_in):
+        return secrets.token_hex(4)
+    def s_php_h(callsigns):
+        return secrets.token_hex(4)
+
 # Skimmer telnet line format produced by openskimmer.py and SkimSrv:
 #   DX de WF8Z-#:    14025.50  R2HE         CW  15 dB 26 WPM  CQ  OS  1313Z
 SPOT_RE = re.compile(
@@ -125,9 +150,6 @@ class RBNSession:
         # spotWindows. Populated lazily.
         self.server_policy = {}
 
-    def _short_hash(self):
-        return secrets.token_hex(4)  # 8 hex chars per request
-
     def _band_limits_str(self):
         return ','.join(f'{lo:.1f}-{hi:.1f}' for lo, hi in self.bands)
 
@@ -170,18 +192,20 @@ class RBNSession:
             'mIXEDBandLimits': '',
             'masterSCPFilter': '0',
             'rTTYBandLimits': '',
-            'shortHash':     self._short_hash(),
             'showIP':        '1',
             'skimCall':      self.skim_call,
             'skimGrid':      self.skim_grid,
             'skimName':      self.skim_name,
             'skimQth':       self.skim_qth,
-            'skimSignIn':    f'Skimmer Server {SKIM_VERSION} '
-                             f'is operated by {self.skim_name}, {self.skim_call}',
             'skimValLevel':  self.skim_validation,
             'skimVersion':   SKIM_VERSION,
             't':             'id',
         }
+        # skimSignIn is part of the shortHash input; build it once and
+        # use the same string for both the body field and the hash.
+        body['skimSignIn'] = (f'Skimmer Server {SKIM_VERSION} '
+                              f'is operated by {self.skim_name}, {self.skim_call}')
+        body['shortHash']  = id_php_short_hash(body['skimSignIn'])
         resp = self._post('id.php', body)
         if isinstance(resp, dict) and resp:
             self.server_policy = resp
@@ -214,7 +238,7 @@ class RBNSession:
             'agg':   AGG_VERSION,
             'e':     self.skim_call,
             'fp':    self.fingerprint,
-            'h':     self._short_hash(),
+            'h':     s_php_h(sp['call'] for sp in spots),
             'nTP':   True,
             'tm':    time.time(),
             's':     s_array,
