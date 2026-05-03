@@ -220,30 +220,37 @@ class RBNSession:
         """Upload a batch of spot dicts (from parse_spot)."""
         if not spots:
             return None
-        # Spot tuple in Aggregator's documented wire format. This
-        # matches what real-world telnet-bridged Aggregator instances
-        # send and produces "OTHER 0 dB blank dB" rendering on RBN's
-        # worldwide telnet broadcast. That looks broken in isolation,
-        # but it's what every Aggregator-via-telnet operator emits,
-        # so we conform: the assumption is RBN has downstream handling
-        # that processes the actual data correctly even when the
-        # broadcast rendering looks malformed.
+        # Spot tuple in RBN's current parser format (verified live
+        # 2026-05-03). NOT what Aggregator's v6.7 binary emits — that
+        # binary's input parser is broken against the current SkimSrv
+        # output format, so its tuples render as "OTHER 0 dB" garbage
+        # on RBN's worldwide telnet broadcast.
         #
-        # The "fixed" tuple positions that produce CW + real SNR + WPM
-        # rendering on the worldwide broadcast are documented privately
-        # at /mnt/atlas/skimmer/agg_re/spot_tuple_format.md. Don't ship
-        # that here — only WF8Z-# would be using it, which is a tell.
+        # Real correctly-rendering operators on RBN (KM3T-3, ZF1A,
+        # DM5GG, OE9GHV, ...) send THIS format — either via a newer
+        # Aggregator with patched parser or via custom feeders. Either
+        # way, this is the format that produces clean CW + SNR + WPM
+        # rendering on the wire, and joining that population is the
+        # honest correct move (we contribute to mode-aware downstream
+        # filters instead of polluting them with mis-tagged spots).
+        #
+        # See /mnt/atlas/skimmer/agg_re/spot_tuple_format.md for the
+        # full position mapping and Batwing's IL analysis at
+        # /mnt/atlas/skimmer/agg_re/aggregator_input_parser_bug.md
+        # (TODO).
+        _MODE_TO_CODE = {'CW': '1'}  # extend when other modes are wired up
+        _CQ_TO_CODE   = {'CQ': '1', 'DX': '2', 'BCN': '3', 'BEACON': '3'}
         s_array = [
             [
                 f'{sp["freq"]:.2f}',
                 sp['call'],
-                '1',                 # source index — Aggregator always 1
-                sp['mode'],
-                'dB',                # literal unit token
+                _CQ_TO_CODE.get(sp['cq_flag'], '1'),
                 str(sp['snr']),
                 str(sp['wpm']),
+                'dB',
+                _MODE_TO_CODE.get(sp['mode'], '1'),  # CW default
                 sp['cq_flag'],
-                'D:',                # literal trailer token
+                'D:',
             ]
             for sp in spots
         ]
