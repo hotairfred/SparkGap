@@ -20,12 +20,14 @@ spot output via telnet.
 >   different pieces of the same band.
 >
 > SDC-Connectors has years of contest tuning we don't yet match. We
-> have features it doesn't (open source, native RBN feeder, multi-mode
-> in one process, packet-loss telemetry). Comparable, complementary,
-> not competing on winning a single benchmark.
+> have features it doesn't (open source, multi-mode in one process,
+> packet-loss telemetry). Comparable, complementary, not competing on
+> winning a single benchmark.
 >
-> Native RBN feeder (`rbn_feeder.py`) is built and verified end-to-end
-> in dry-run.  Coordinating with the RBN admins before flipping live —
+> A Linux-native RBN feeder is in development.  Until that path is
+> coordinated with the RBN admins and ready for general use,
+> operators wanting to feed RBN should bridge through Aggregator on
+> a Windows box pointed at openskimmer's `:7300` telnet output —
 > see *Feeding the RBN* below.
 
 ## Why this exists
@@ -64,10 +66,8 @@ For benchmarking we compare two ways:
   their use case.  Default ("ship-it") mode is permissive emit;
   cluster filters (VE7CC's 2+ skimmer rule) handle the noise downstream.
 - **Telnet spot output** in standard DX cluster format, locally on
-  port 7300.
-- **Native RBN feeder** (`rbn_feeder.py`) — Aggregator-equivalent on
-  Linux.  Posts CW + RTTY spots directly to RBN's ingest endpoint
-  via JSON HTTP.  No Wine, no .NET, no closed-source binaries.
+  port 7300.  This is what Aggregator consumes when bridging from
+  openskimmer to RBN.
 - **Diagnostic infrastructure** for validating against SDC and RBN
   reference streams (`sdc_tee.py`, `rbn_tee.py`, `score_loop.py`,
   `score_diff.py`).
@@ -161,23 +161,24 @@ is from native Linux.
 
 ## Feeding the RBN
 
-OpenSkimmer emits standard DX-cluster spots locally on telnet :7300.
-To forward them upstream to the Reverse Beacon Network:
+OpenSkimmer emits standard DX-cluster spots locally on telnet :7300
+in SkimSrv-compatible wire format.
 
-```
-python3 rbn_feeder.py --call YOUR_CALL --grid YOUR_GRID6 \
-                      --local-host 127.0.0.1 --local-port 7300
-```
+**Recommended path today:** bridge through Aggregator on a Windows
+box pointed at openskimmer's `:7300` telnet. Aggregator handles
+upstream registration and authentication with RBN; openskimmer
+provides the decoder + multi-band scanning.
 
-`rbn_feeder.py` is a native Linux replacement for Aggregator. It
-posts spots directly to RBN's ingest endpoint using the same JSON
-HTTP protocol Aggregator uses ... no Wine, no .NET, no closed-source
-binaries in the path. Use `--dry-run` to verify
-parsing without actually forwarding upstream.
+A `rbn_feeder.py` exists as a placeholder for an eventual fully
+Linux-native path, but the auth/handshake side requires
+coordination with RBN admins before it's appropriate to recommend
+for general use. Until then, the Aggregator-bridged setup is the
+correct way to contribute. If you're interested in beta-testing the
+Linux-native path, get in touch.
 
 > Coordinate with the RBN admins (rbn-ops@groups.io is a good place
-> to start) before pointing this at production. Don't surprise the
-> database with an unproven node.
+> to start) before pointing any new node at production. Don't
+> surprise the database with an unproven feeder.
 
 ## Configuration: gate flags
 
