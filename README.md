@@ -24,11 +24,10 @@ spot output via telnet.
 > packet-loss telemetry). Comparable, complementary, not competing on
 > winning a single benchmark.
 >
-> A Linux-native RBN feeder is in development.  Until that path is
-> coordinated with the RBN admins and ready for general use,
-> operators wanting to feed RBN should bridge through Aggregator on
-> a Windows box pointed at openskimmer's `:7300` telnet output —
-> see *Feeding the RBN* below.
+> A Linux-native RBN feeder is in development.  In the meantime,
+> openskimmer's `:7300` telnet is SkimSrv-format-compatible and
+> bridges cleanly through Aggregator on a Windows box — see
+> *Feeding the RBN* below.
 
 ## Why this exists
 
@@ -169,16 +168,9 @@ box pointed at openskimmer's `:7300` telnet. Aggregator handles
 upstream registration and authentication with RBN; openskimmer
 provides the decoder + multi-band scanning.
 
-A `rbn_feeder.py` exists as a placeholder for an eventual fully
-Linux-native path, but the auth/handshake side requires
-coordination with RBN admins before it's appropriate to recommend
-for general use. Until then, the Aggregator-bridged setup is the
-correct way to contribute. If you're interested in beta-testing the
-Linux-native path, get in touch.
-
-> Coordinate with the RBN admins (rbn-ops@groups.io is a good place
-> to start) before pointing any new node at production. Don't
-> surprise the database with an unproven feeder.
+A `rbn_feeder.py` exists as a placeholder for an eventual
+fully-Linux-native path. It's not ready for general use yet — if
+you're interested in beta-testing it, get in touch.
 
 ## Configuration: gate flags
 
