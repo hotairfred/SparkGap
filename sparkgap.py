@@ -46,6 +46,34 @@ from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('sparkgap')
 
+
+# ---------------------------------------------------------------------------
+# MQTT publisher for FT8 spots → pskr_feeder.py (best-effort, fail-silent).
+# Spots also flow via telnet :7300 — broker outage doesn't break that path.
+# ---------------------------------------------------------------------------
+_mqtt_pub = None
+_mqtt_pub_init_failed = False
+_GRID_RE = re.compile(r'^[A-R]{2}[0-9]{2}([a-x]{2})?$')
+
+def _get_mqtt_publisher():
+    global _mqtt_pub, _mqtt_pub_init_failed
+    if _mqtt_pub is not None or _mqtt_pub_init_failed:
+        return _mqtt_pub
+    try:
+        import paho.mqtt.client as mqtt
+        c = mqtt.Client(client_id='sparkgap-ft8-pub')
+        c.username_pw_set('mqttuser', 'mqttpass')
+        c.connect('192.168.1.14', 1883, keepalive=60)
+        c.loop_start()
+        _mqtt_pub = c
+        log.info("FT8 MQTT publisher connected: 192.168.1.14:1883 → skimmer/ft8/raw")
+        return c
+    except Exception as e:
+        log.warning("FT8 MQTT publisher init failed (will not retry): %s", e)
+        _mqtt_pub_init_failed = True
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Fast C receiver for HPSDR Protocol 1 (multi-band)
 # ---------------------------------------------------------------------------
@@ -6582,6 +6610,25 @@ class SparkGap:
                                             freq_khz=rf_khz, dx_call=ft8_call,
                                             snr=snr, mode='FT8',
                                             comment=msg)
+                                        # Best-effort publish to skimmer/ft8/raw for pskr_feeder.
+                                        # Grid is the last 4/6-char token if it matches Maidenhead.
+                                        ft8_grid = ''
+                                        if msg_parts and _GRID_RE.match(msg_parts[-1]):
+                                            ft8_grid = msg_parts[-1]
+                                        _pub = _get_mqtt_publisher()
+                                        if _pub is not None:
+                                            try:
+                                                _pub.publish('skimmer/ft8/raw', json.dumps({
+                                                    'call':    ft8_call,
+                                                    'grid':    ft8_grid,
+                                                    'freq_hz': int(rf_khz * 1000),
+                                                    'snr':     int(snr),
+                                                    'mode':    'FT8',
+                                                    'msg':     msg,
+                                                    'ts':      int(time.time()),
+                                                }), qos=0)
+                                            except Exception:
+                                                pass
                                         log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
                                                  rf_khz, ft8_call, snr, msg)
                             log.info("FT8 cycle done: %d spots across %d bands",
