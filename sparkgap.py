@@ -6185,8 +6185,10 @@ class SparkGap:
                     self._pfb_managers = []  # no Python decode poll needed
                     # Enable FT8 raw IQ accumulation per band (skipped if disabled)
                     if self.cfg.get('enable_ft8', True):
-                        FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
-                                     21090: 21074, 28090: 28074}
+                        FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
+                                     14090: 14074, 18083: 18100,
+                                     21090: 21074, 24902: 24915,
+                                     28090: 28074}
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
                             ft8_khz = FT8_FREQS.get(int(ck))
@@ -6476,8 +6478,10 @@ class SparkGap:
                         not getattr(self, '_ft8_running', False):
                     self._ft8_running = True
                     import ctypes as _ct, struct
-                    FT8_FREQS = {3590: 3573, 7090: 7074, 14090: 14074,
-                                 21090: 21074, 28090: 28074}
+                    FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
+                                 14090: 14074, 18083: 18100,
+                                 21090: 21074, 24902: 24915,
+                                 28090: 28074}
                     ft8_jobs = []
                     n60 = 192000 * 60
                     buf_cap = 192000 * 65
