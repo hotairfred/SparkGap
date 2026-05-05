@@ -235,15 +235,28 @@ class PSKReporterFeeder:
         if not self.spot_queue and self.session_start_count == 0:
             self.last_send_ts = now
             return
-        # Drain queue (cap per packet to stay under MAX_PAYLOAD_LENGTH)
-        spots = []
-        while self.spot_queue and len(spots) < 100:
-            spots.append(self.spot_queue.popleft())
-        # Templates: 3× at session start, then hourly
+        # 30 spots/packet keeps us under 1500-byte MTU. Bigger packets fragment
+        # at the IP layer and PSKReporter's reassembly drops fragmented IPFIX
+        # silently. WSJT-X's MAX_PAYLOAD_LENGTH=10000 works for them because
+        # they only emit 1-2 spots/cycle; we emit 50-100 from a 5-band skimmer.
+        SPOTS_PER_PACKET = 30
+        # Whether to include templates this tick — once per send window, not
+        # per packet (templates only need to land once per session-start /
+        # hourly refresh).
         include_templates = (self.session_start_count > 0
                              or now - self.last_template_ts > DESCRIPTOR_RESEND_INTERVAL)
+        first_packet = True
         try:
-            self._send_packet(spots, include_templates=include_templates)
+            while self.spot_queue or (first_packet and include_templates):
+                spots = []
+                while self.spot_queue and len(spots) < SPOTS_PER_PACKET:
+                    spots.append(self.spot_queue.popleft())
+                # Only include templates on the FIRST packet of this tick
+                templates_this_packet = include_templates and first_packet
+                self._send_packet(spots, include_templates=templates_this_packet)
+                first_packet = False
+                if not self.spot_queue:
+                    break
             if include_templates:
                 self.last_template_ts = now
                 if self.session_start_count > 0:
@@ -255,8 +268,6 @@ class PSKReporterFeeder:
         except Exception as e:
             self.log.error('send failed: %s', e)
             self.totals['send_errors'] += 1
-            for s in reversed(spots):
-                self.spot_queue.appendleft(s)
 
     def run(self):
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
