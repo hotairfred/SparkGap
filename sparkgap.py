@@ -61,7 +61,8 @@ def _get_mqtt_publisher():
         return _mqtt_pub
     try:
         import paho.mqtt.client as mqtt
-        c = mqtt.Client(client_id='sparkgap-ft8-pub')
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                        client_id='sparkgap-ft8-pub')
         c.username_pw_set('mqttuser', 'mqttpass')
         c.connect('192.168.1.14', 1883, keepalive=60)
         c.loop_start()

@@ -188,7 +188,7 @@ class PSKReporterFeeder:
         self.totals = {'queued': 0, 'sent_spots': 0, 'deduped': 0,
                        'packets_sent': 0, 'send_errors': 0}
 
-    def on_mqtt_msg(self, client, userdata, msg):
+    def on_mqtt_msg(self, client, userdata, msg, properties=None):
         try:
             spot = json.loads(msg.payload.decode('utf-8'))
         except Exception as e:
@@ -258,7 +258,8 @@ class PSKReporterFeeder:
                 self.spot_queue.appendleft(s)
 
     def run(self):
-        client = mqtt.Client(client_id='pskr_feeder')
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                             client_id='pskr_feeder')
         if self.args.mqtt_user:
             client.username_pw_set(self.args.mqtt_user, self.args.mqtt_pass or '')
         client.on_message = self.on_mqtt_msg
