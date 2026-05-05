@@ -61,13 +61,18 @@ def _get_mqtt_publisher():
         return _mqtt_pub
     try:
         import paho.mqtt.client as mqtt
+        host = os.environ.get('MQTT_HOST', 'localhost')
+        port = int(os.environ.get('MQTT_PORT', '1883'))
+        user = os.environ.get('MQTT_USER', '')
+        password = os.environ.get('MQTT_PASS', '')
         c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                         client_id='sparkgap-ft8-pub')
-        c.username_pw_set('mqttuser', 'mqttpass')
-        c.connect('192.168.1.14', 1883, keepalive=60)
+        if user:
+            c.username_pw_set(user, password)
+        c.connect(host, port, keepalive=60)
         c.loop_start()
         _mqtt_pub = c
-        log.info("FT8 MQTT publisher connected: 192.168.1.14:1883 → skimmer/ft8/raw")
+        log.info("FT8 MQTT publisher connected: %s:%d → skimmer/ft8/raw", host, port)
         return c
     except Exception as e:
         log.warning("FT8 MQTT publisher init failed (will not retry): %s", e)

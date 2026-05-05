@@ -28,6 +28,7 @@ Run:
 import argparse
 import json
 import logging
+import os
 import random
 import socket
 import struct
@@ -301,11 +302,17 @@ def main():
     # PSKReporter endpoint
     p.add_argument('--host', default=PSKR_HOST, help='PSKReporter host')
     p.add_argument('--port', type=int, default=PSKR_PORT, help='PSKReporter UDP port')
-    # MQTT broker (matches comms_lib defaults)
-    p.add_argument('--mqtt-host', default='192.168.1.14', help='MQTT broker host')
-    p.add_argument('--mqtt-port', type=int, default=1883, help='MQTT broker port')
-    p.add_argument('--mqtt-user', default='mqttuser', help='MQTT username')
-    p.add_argument('--mqtt-pass', default='mqttpass', help='MQTT password')
+    # MQTT broker — defaults read from environment so credentials stay out of source.
+    # Set MQTT_HOST / MQTT_PORT / MQTT_USER / MQTT_PASS in the systemd unit or shell env.
+    p.add_argument('--mqtt-host', default=os.environ.get('MQTT_HOST', 'localhost'),
+                   help='MQTT broker host (env: MQTT_HOST)')
+    p.add_argument('--mqtt-port', type=int,
+                   default=int(os.environ.get('MQTT_PORT', '1883')),
+                   help='MQTT broker port (env: MQTT_PORT)')
+    p.add_argument('--mqtt-user', default=os.environ.get('MQTT_USER', ''),
+                   help='MQTT username (env: MQTT_USER; empty = anonymous)')
+    p.add_argument('--mqtt-pass', default=os.environ.get('MQTT_PASS', ''),
+                   help='MQTT password (env: MQTT_PASS)')
     p.add_argument('--topic', default='skimmer/ft8/raw',
                    help='MQTT topic to subscribe')
     # Modes
