@@ -29,7 +29,7 @@
     "scp_bypass_threshold": 2,
     "max_bins": 300,
     "lna_gain": 20,
-    "enable_ft8": false,
+    "enable_ft8": true,
     "itila_max_bins": 400,
     "use_pfb_scanner": false,
 
