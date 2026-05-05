@@ -114,8 +114,10 @@ class IPFIXEncoder:
         ]:
             body.extend(struct.pack('>HHI', ie | 0x8000, length, ENTERPRISE_NUMBER))
         body.extend(struct.pack('>HH', IE_DATE_TIME_SECONDS, 4))
+        # RFC 5101: set length INCLUDES padding. Pad first, then write length.
+        pad4(body)
         struct.pack_into('>H', body, 2, len(body))
-        return bytes(pad4(body))
+        return bytes(body)
 
     def _receiver_template_set(self) -> bytes:
         body = bytearray()
@@ -124,8 +126,9 @@ class IPFIXEncoder:
         for ie in [IE_RECEIVER_CALL, IE_RECEIVER_LOCATOR,
                    IE_DECODING_SW, IE_ANTENNA_INFO, IE_RIG_INFO]:
             body.extend(struct.pack('>HHI', ie | 0x8000, 0xffff, ENTERPRISE_NUMBER))
+        pad4(body)
         struct.pack_into('>H', body, 2, len(body))
-        return bytes(pad4(body))
+        return bytes(body)
 
     def _receiver_data_set(self) -> bytes:
         body = bytearray()
@@ -133,8 +136,9 @@ class IPFIXEncoder:
         for s in [self.rx_call, self.rx_grid, self.decoding_sw,
                   self.antenna, self.rig]:
             write_utf_string(body, s)
+        pad4(body)
         struct.pack_into('>H', body, 2, len(body))
-        return bytes(pad4(body))
+        return bytes(body)
 
     def _sender_data_set(self, spots: list) -> bytes:
         body = bytearray()
@@ -147,8 +151,9 @@ class IPFIXEncoder:
             write_utf_string(body, spot.get('grid', '') or '')
             body.append(1)                            # informationSource = 1 (automatic)
             body.extend(struct.pack('>I', int(spot['ts'])))
+        pad4(body)
         struct.pack_into('>H', body, 2, len(body))
-        return bytes(pad4(body))
+        return bytes(body)
 
     def build_packet(self, spots: list, include_templates: bool = False) -> bytes:
         self.sequence_number += 1
