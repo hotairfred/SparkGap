@@ -1,4 +1,4 @@
-# OpenSkimmer plan
+# SparkGap plan
 
 _Current as of 2026-04-29._
 
@@ -26,7 +26,7 @@ Goldkey is the trustworthy number. Solo precision is the open work item.
 ## Active priorities
 
 1. **Multi-day data collection** via the 3-way scoring loop
-   (`os_tee.py`, `sdc_tee.py`, `rbn_tee.py`, `score_loop.py`). Hourly
+   (`sg_tee.py`, `sdc_tee.py`, `rbn_tee.py`, `score_loop.py`). Hourly
    rollup to `/tmp/score_loop.log`.
 2. **Build empirical blacklist** from calls that consistently appear
    solo (not on SDC, not on RBN) across many hours. Append to

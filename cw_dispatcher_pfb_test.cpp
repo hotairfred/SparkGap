@@ -29,7 +29,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// PFB geometry — same as openskimmer.py default.
+// PFB geometry — same as sparkgap.py default.
 static constexpr int   SR_IN  = 192000;
 static constexpr int   N_CHAN = 384;
 static constexpr int   OS     = 48;
@@ -150,7 +150,7 @@ int main()
     // bin_spacing = 500 Hz; choose 12.7 kHz → bin 25 + 200 Hz residual.
     // The dispatcher shifts the bin output by (tone_freq - residual_hz),
     // so the carrier lands at exactly tone_freq Hz in the audio. We pass
-    // tone_freq = TONE_AUDIO_HZ (700 Hz) — same as openskimmer.py.
+    // tone_freq = TONE_AUDIO_HZ (700 Hz) — same as sparkgap.py.
     const float rf_offset_hz   = 12700.0f;  // bin 25 centre + 200 Hz residual
     const float bin_centre     = lroundf(rf_offset_hz / BIN_SPACING) * BIN_SPACING;
     const float residual_hz    = rf_offset_hz - bin_centre;

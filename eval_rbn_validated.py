@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RBN-validated scoring for OpenSkimmer vs CW Skimmer.
+"""RBN-validated scoring for SparkGap vs CW Skimmer.
 
 Builds a ground truth from the union of CW Skimmer spots + our spots,
 validated against RBN network data. Scores both decoders fairly.
@@ -99,10 +99,10 @@ def main():
     print(f"=== RBN-Validated Scoring ===")
     print(f"RBN 40m CW 0300-0400Z: {len(rbn)} unique calls")
     print(f"CW Skimmer raw:        {len(cwskim)} calls ({len(cwskim & rbn)} RBN-confirmed)")
-    print(f"OpenSkimmer raw:       {len(ours)} calls ({len(ours & rbn)} RBN-confirmed)")
+    print(f"SparkGap raw:       {len(ours)} calls ({len(ours & rbn)} RBN-confirmed)")
     print(f"Validated truth:       {len(truth)} calls")
     print()
-    print(f"{'Metric':<30s} {'OpenSkimmer':>12s} {'CW Skimmer':>12s}")
+    print(f"{'Metric':<30s} {'SparkGap':>12s} {'CW Skimmer':>12s}")
     print(f"{'-'*30} {'-'*12} {'-'*12}")
     print(f"{'Score vs truth':<30s} {f'{len(our_hits)}/{len(truth)}':>12s} {f'{len(cwskim_hits)}/{len(truth)}':>12s}")
     print(f"{'Recall':<30s} {f'{100*len(our_hits)/len(truth):.0f}%':>12s} {f'{100*len(cwskim_hits)/len(truth):.0f}%':>12s}")

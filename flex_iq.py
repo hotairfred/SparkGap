@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-flex_iq.py — FlexRadio 6000 wideband I/Q receiver for OpenSkimmer.
+flex_iq.py — FlexRadio 6000 wideband I/Q receiver for SparkGap.
 
 Talks to a FlexRadio 6000/8000 series radio over the SmartSDR TCP API
 (port 4992) to set up a DAX-IQ stream at up to 192 kHz, receives

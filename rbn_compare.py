@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare OpenSkimmer spots against RBN data for a given time window.
+"""Compare SparkGap spots against RBN data for a given time window.
 
 Usage:
     python3 rbn_compare.py <our_spots.log> <rbn.csv> [--start HH:MM] [--end HH:MM] [--band 20m]
@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 def parse_our_spots(path):
-    """Parse OpenSkimmer spot log lines."""
+    """Parse SparkGap spot log lines."""
     spots = []
     pat = re.compile(r'(\d{2}:\d{2}:\d{2}).*SPOT:\s+([\d.]+)\s+(\S+)\s+(\d+)\s+dB\s+(\d+)\s+WPM\s+\[(\w+)\]')
     with open(path) as f:
@@ -68,7 +68,7 @@ def parse_rbn(path, band=None, start=None, end=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Compare OpenSkimmer vs RBN')
+    ap = argparse.ArgumentParser(description='Compare SparkGap vs RBN')
     ap.add_argument('our_spots', help='Our spot log file')
     ap.add_argument('rbn_csv', help='RBN daily CSV file')
     ap.add_argument('--start', default=None, help='Start time HH:MM (UTC)')
@@ -104,7 +104,7 @@ def main():
     widely_spotted = {c for c, sks in rbn_call_skimmer_count.items() if len(sks) >= 5}
     missed_widely = we_missed & widely_spotted
 
-    print(f"=== OpenSkimmer vs RBN Comparison ===")
+    print(f"=== SparkGap vs RBN Comparison ===")
     print(f"Our spots:    {len(our_spots)} total, {len(our_calls)} unique calls")
     print(f"RBN spots:    {len(rbn_spots)} total, {len(rbn_calls)} unique calls")
     print(f"RBN skimmers: {len(rbn_skimmers)} reporting")

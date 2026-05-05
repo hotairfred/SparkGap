@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-openskimmer.py — OpenSkimmer live CW skimmer daemon.
+sparkgap.py — SparkGap live CW skimmer daemon.
 
 Streaming architecture with dynamic decoder instances:
     1. Continuous IQ stream from Red Pitaya via HPSDR Protocol 1
@@ -11,9 +11,9 @@ Streaming architecture with dynamic decoder instances:
     6. Spots served on DX cluster telnet port
 
 Usage:
-    python3 openskimmer.py
-    python3 openskimmer.py --config skimmer.json
-    python3 openskimmer.py --file B1_recording.wav --start-min 15 --end-min 30
+    python3 sparkgap.py
+    python3 sparkgap.py --config skimmer.json
+    python3 sparkgap.py --file B1_recording.wav --start-min 15 --end-min 30
 """
 
 import faulthandler
@@ -44,7 +44,7 @@ from hpsdr_receiver import HPSDRReceiver, discover
 from flex_iq import FlexIQReceiver
 from telnet_server import SpotTelnetServer
 
-log = logging.getLogger('openskimmer')
+log = logging.getLogger('sparkgap')
 
 # ---------------------------------------------------------------------------
 # Fast C receiver for HPSDR Protocol 1 (multi-band)
@@ -4781,7 +4781,7 @@ class SpotTracker:
         return base
 
     # Peer-spot wire format. Matches "DX de SPOTTER-#: 14025.50 CALL ..."
-    # both with and without our os_tee timestamp prefix.
+    # both with and without our sg_tee timestamp prefix.
     _PEER_SPOT_RE = re.compile(
         r'^(?:\d{2}:\d{2}:\d{2}\s+)?DX de (\S+):\s+(\d+\.\d+)\s+([A-Z0-9/]{3,15})\s+'
     )
@@ -5724,7 +5724,7 @@ class SpotTracker:
         self._cycle_calls.clear()
 
 
-class OpenSkimmer:
+class SparkGap:
     """Main daemon — streaming architecture with dynamic decoder instances."""
 
     def __init__(self, config):
@@ -5818,7 +5818,7 @@ class OpenSkimmer:
             callsign=self.cfg.get('callsign', 'WF8Z'),
             node_call=self.cfg.get('node_call', 'SPARK-2'),
             skimmer_suffix=self.cfg.get('skimmer_suffix', '-#'),
-            source_tag=self.cfg.get('source_tag', 'OS'),
+            source_tag=self.cfg.get('source_tag', 'SG'),
             op_name=self.cfg.get('op_name', ''),
             qth=self.cfg.get('qth', ''),
             grid=self.cfg.get('grid', ''),
@@ -5960,7 +5960,7 @@ class OpenSkimmer:
 
         for name, center_hz, rx_idx in self._band_meta:
             cal_center = center_hz * 0.9999961
-            log.info("OpenSkimmer LIVE: %s (%.3f kHz) rx%d, telnet :%d",
+            log.info("SparkGap LIVE: %s (%.3f kHz) rx%d, telnet :%d",
                      name, cal_center / 1000, rx_idx,
                      self.cfg.get('telnet_port', 7300))
 
@@ -5981,7 +5981,7 @@ class OpenSkimmer:
         """SIGUSR1 handler — non-destructive snapshot of FT8 capture buffer
         for every band → /tmp/diag_<band-khz>_<HHMMSS>.wav (24-bit stereo
         IQ at 192 kHz). Replay with:
-          openskimmer.py --file <wav> --center-khz <khz> --start-min 0 --end-min 1
+          sparkgap.py --file <wav> --center-khz <khz> --start-min 0 --end-min 1
         FT8 buffer stores int24 values cast to float (range ±8388608) —
         we write them straight back as 24-bit PCM so the file reader gets
         the full Pitaya range. read_24bit_iq_chunk reads exactly this."""
@@ -6638,7 +6638,7 @@ def load_config(path):
 
 
 async def async_main(config):
-    skimmer = OpenSkimmer(config)
+    skimmer = SparkGap(config)
 
     def handle_signal():
         log.info("Shutting down...")
@@ -7043,7 +7043,7 @@ def run_file_mode(args, config):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='OpenSkimmer — Open Source Linux CW Skimmer',
+        description='SparkGap — Open Source Linux CW Skimmer',
         epilog='One JSON file. One process. Zero Windows.',
     )
     parser.add_argument('--config', default='skimmer.json', help='Config JSON')

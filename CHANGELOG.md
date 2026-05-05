@@ -1,4 +1,4 @@
-# OpenSkimmer changelog
+# SparkGap changelog
 
 Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
@@ -41,8 +41,8 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
   `SKIMMER/SETT` response, `CwSkimmer >` prompt, `CU AGN!` disconnect.
   Aggregator (and any future SkimSrv-aware downstream) accepts our
   cluster output as a valid Primary Skimmer source.
-- **3-way scoring tooling** — `os_tee.py`, `score_loop.py`. Hourly
-  rollup of openskimmer vs SDC vs RBN catches: per-spot precision,
+- **3-way scoring tooling** — `sg_tee.py`, `score_loop.py`. Hourly
+  rollup of sparkgap vs SDC vs RBN catches: per-spot precision,
   goldkey rate (when we + SDC agree, RBN agrees too), recall vs SDC.
 - **`score_diff.py` A/B comparison tool** — takes two HH:MM[:SS]
   windows, prints metric deltas (precision, goldkey, recall) plus
@@ -113,7 +113,7 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 - **README acknowledgments scrub** — Aggregator is by W3OA (Dick
   Williams), not VE3NEA. CWSL_Tee is by HrochL (Czech Republic),
   not VE3NEA. Dropped VE3NEA from the acknowledgments entirely
-  since OpenSkimmer doesn't actually use any of his code; CW
+  since SparkGap doesn't actually use any of his code; CW
   Skimmer is conceptual inspiration only, not a dependency.
 - **README framing rewrite** — drop hearsay, fix SDC-Connectors
   facts, trim Community section to a clean thank-you.

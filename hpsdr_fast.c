@@ -832,7 +832,7 @@ int hpsdr_ft8_swap_read(HpsdrFast *h, int rx,
 /* Diagnostic: non-destructive snapshot of the active FT8 capture buffer.
  * Unlike hpsdr_ft8_swap_read this does NOT swap or reset, so the FT8
  * minute thread's swap timing is unaffected. Use for ad-hoc IQ recording
- * (e.g. to replay through openskimmer.py --file and isolate live-vs-
+ * (e.g. to replay through sparkgap.py --file and isolate live-vs-
  * recorded decoder behavior). Holds the per-RX FT8 mutex for the memcpy;
  * recv_thread parks briefly during that window. */
 int hpsdr_iq_snapshot_read(HpsdrFast *h, int rx,

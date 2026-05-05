@@ -1,4 +1,4 @@
-# OpenSkimmer blacklist ... CALLs that should never be emitted.
+# SparkGap blacklist ... CALLs that should never be emitted.
 # Format: one CALL per line, # for comments.
 # Generated 2026-04-30 16:02 UTC from 30+ hour 3-way score-log mining (v2).
 #

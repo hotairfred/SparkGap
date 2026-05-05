@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent OpenSkimmer telnet tee. Connects to skimmer1:7300, logs in
+"""Persistent SparkGap telnet tee. Connects to skimmer1:7300, logs in
 as WF8Z, appends every received DX line to /tmp/os_stream.log with a UTC
 timestamp prefix. Auto-reconnects on disconnect.
 
@@ -7,7 +7,7 @@ Mirror of sdc_tee.py / rbn_tee.py — gives us a local rolling capture of
 our own emitted spots that the hourly scorer can read alongside the SDC
 and RBN streams.
 
-Run: nohup python3 os_tee.py > /tmp/os_tee.log 2>&1 &
+Run: nohup python3 sg_tee.py > /tmp/sg_tee.log 2>&1 &
 """
 import socket
 import time

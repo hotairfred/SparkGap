@@ -15,7 +15,7 @@ import os
 
 def read_iq_chunk(filename, start_sec, duration_sec, rate=192000):
     """Read 24-bit stereo IQ from WAV."""
-    from openskimmer import read_24bit_iq_chunk
+    from sparkgap import read_24bit_iq_chunk
     i_arr, q_arr = read_24bit_iq_chunk(filename, start_sec, duration_sec, rate)
     return np.array(i_arr, dtype=np.float64), np.array(q_arr, dtype=np.float64)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-openskimmer.py — OpenSkimmer live CW skimmer daemon.
+sparkgap.py — SparkGap live CW skimmer daemon.
 
 Streaming architecture with dynamic decoder instances:
     1. Continuous IQ stream from Red Pitaya via HPSDR Protocol 1
@@ -11,9 +11,9 @@ Streaming architecture with dynamic decoder instances:
     6. Spots served on DX cluster telnet port
 
 Usage:
-    python3 openskimmer.py
-    python3 openskimmer.py --config skimmer.json
-    python3 openskimmer.py --file B1_recording.wav --start-min 15 --end-min 30
+    python3 sparkgap.py
+    python3 sparkgap.py --config skimmer.json
+    python3 sparkgap.py --file B1_recording.wav --start-min 15 --end-min 30
 """
 
 import faulthandler
@@ -42,7 +42,7 @@ from scipy.signal import decimate as scipy_decimate
 from hpsdr_receiver import HPSDRReceiver, discover
 from telnet_server import SpotTelnetServer
 
-log = logging.getLogger('openskimmer')
+log = logging.getLogger('sparkgap')
 
 CALL_RE = re.compile(
     r'(?<![A-Z0-9])([A-Z0-9]{1,2}\d{1,2}[A-Z]{1,3}(?:/[A-Z0-9]+)?)(?![A-Z0-9])'
@@ -1789,7 +1789,7 @@ class SpotTracker:
         self._cycle_calls.clear()
 
 
-class OpenSkimmer:
+class SparkGap:
     """Main daemon — streaming architecture with dynamic decoder instances."""
 
     def __init__(self, config):
@@ -1864,7 +1864,7 @@ class OpenSkimmer:
         self.running = True
 
         cal_center = center * 0.9999961
-        log.info("OpenSkimmer LIVE: %s (%.3f kHz), telnet :%d",
+        log.info("SparkGap LIVE: %s (%.3f kHz), telnet :%d",
                  band, cal_center / 1000, self.cfg.get('telnet_port', 7300))
         return True
 
@@ -2056,7 +2056,7 @@ def load_config(path):
 
 
 async def async_main(config):
-    skimmer = OpenSkimmer(config)
+    skimmer = SparkGap(config)
 
     def handle_signal():
         log.info("Shutting down...")
@@ -2369,7 +2369,7 @@ def run_file_mode(args, config):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='OpenSkimmer — Open Source Linux CW Skimmer',
+        description='SparkGap — Open Source Linux CW Skimmer',
         epilog='One JSON file. One process. Zero Windows.',
     )
     parser.add_argument('--config', default='skimmer.json', help='Config JSON')

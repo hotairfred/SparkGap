@@ -4,7 +4,7 @@ telnet_server.py — DX cluster telnet server for CW skimmer spot output.
 
 Provides a standard DX Spider-compatible telnet interface so GTBridge,
 HRD, DXLab, or any DX cluster client can connect and receive live CW
-spots from the OpenSkimmer pipeline.
+spots from the SparkGap pipeline.
 
 Supports standard DX spot format and VE7CC CC11 format.
 
@@ -35,7 +35,7 @@ class SpotTelnetServer:
 
     def __init__(self, host: str = '0.0.0.0', port: int = 7300,
                  callsign: str = 'WF8Z', node_call: str = 'SPARK-2',
-                 skimmer_suffix: str = '-#', source_tag: str = 'OS',
+                 skimmer_suffix: str = '-#', source_tag: str = 'SG',
                  op_name: str = '', qth: str = '', grid: str = '',
                  validation_level: str = 'Normal',
                  skimsrv_version: str = '1.6.0.145'):
@@ -49,8 +49,8 @@ class SpotTelnetServer:
         # all RBN-feeder skimmers use this. The suffix is what the
         # central RBN server expects when parsing skimmer spots.
         self.skimmer_suffix = skimmer_suffix
-        # Trailing tag identifying the spot source (SDC, SkimSrv, OS for
-        # OpenSkimmer). Optional but useful for cluster filter rules
+        # Trailing tag identifying the spot source (SDC, SkimSrv, SG for
+        # SparkGap). Optional but useful for cluster filter rules
         # (e.g. CT1BOH's SKIMVALID can preference specific sources).
         self.source_tag = source_tag
         # SkimSrv impersonation fields. Aggregator's primary-skimmer
@@ -58,7 +58,7 @@ class SpotTelnetServer:
         # SETT response shape (it parses "Skimmer Server v.X.Y.Z >= 1.3"
         # from the pre-login banner and expects "SETT: vl<Level> <ranges>"
         # in response to a SKIMMER/SETT query). Spoofing v.1.6.0.145
-        # passes the version gate; identifying as OpenSkimmer in the
+        # passes the version gate; identifying as SparkGap in the
         # operator slot keeps it honest to a human reading the banner.
         self.op_name = op_name
         self.qth = qth
@@ -108,9 +108,9 @@ class SpotTelnetServer:
             # lines for operator/version metadata. The "Skimmer Server
             # v.X.Y.Z" string must satisfy Aggregator's >=1.3 version
             # check, so we spoof a known-good SkimSrv version verbatim.
-            # OpenSkimmer identifies itself in the operator-name slot
+            # SparkGap identifies itself in the operator-name slot
             # so a human reading the banner sees what we actually are.
-            op_label = self.op_name or 'OpenSkimmer'
+            op_label = self.op_name or 'SparkGap'
             # Banner order is "operated by <NAME>, <CALL>" — Aggregator's
             # parser maps the first field to skimName and the second to
             # skimCall. Reversing this trips the grid-format check
@@ -219,14 +219,14 @@ class SpotTelnetServer:
         """Send a spot to all connected clients in canonical RBN-skimmer
         wire format:
 
-          DX de WF8Z-#:   14033.42  N5TOO          CW   1 dB 27 WPM  CQ  OS  1337Z
+          DX de WF8Z-#:   14033.42  N5TOO          CW   1 dB 27 WPM  CQ  SG  1337Z
                   ^^^^                              ^^^                   ^^
                   spotter+'#' suffix                explicit mode         source tag
 
         Format matches what SkimSrv, SDC Skimmer, and other RBN-feeder
         skimmers emit. The mode column (CW/FT8/FT4/RTTY/etc) is required
         for RBN-server parsing; it lives between the dx_call and the dB
-        figure. The trailing tag (OS = OpenSkimmer) distinguishes our
+        figure. The trailing tag (SG = SparkGap) distinguishes our
         source from SkimSrv (no tag) / SDC Skimmer (SDC tag) etc., useful
         for cluster filters that preference by source.
 

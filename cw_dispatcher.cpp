@@ -458,7 +458,7 @@ int cw_disp_add_pfb_channel(cw_dispatcher_handle_t d,
 
 // Per-channel work for one IQ block. Reads a contiguous bin row from the
 // PFB output, frequency-shifts so the carrier lands at tone_freq Hz in the
-// real-valued audio (matching openskimmer.py PFBChannel), decimates,
+// real-valued audio (matching sparkgap.py PFBChannel), decimates,
 // peak-normalises to int16, appends to the audio ring, and feeds uhsdr.
 static void process_pfb_channel(channel_slot_t *s,
                                 const std::complex<float> *bin_row,
@@ -507,7 +507,7 @@ static void process_pfb_channel(channel_slot_t *s,
         if (ar > local_peak) local_peak = ar;
     }
 
-    // Update running peak (matches openskimmer.py PFBChannel logic):
+    // Update running peak (matches sparkgap.py PFBChannel logic):
     //   if peak > self._peak: self._peak = peak
     //   else:                 self._peak = 0.9999*self._peak + 0.0001*peak
     if (local_peak > peak) peak = local_peak;

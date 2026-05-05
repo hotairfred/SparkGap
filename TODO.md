@@ -1,4 +1,4 @@
-# OpenSkimmer TODO
+# SparkGap TODO
 
 _Updated 2026-04-29. Completed work lives in `git log`._
 

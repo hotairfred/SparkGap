@@ -1,5 +1,5 @@
 /*
- * rtty_core.c — RTTY decoder for OpenSkimmer
+ * rtty_core.c — RTTY decoder for SparkGap
  *
  * Goertzel dual-tone detection → AM envelope → bit recovery → Baudot
  * Based on Grayline's design doc (rtty_decoder_design.md)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""score_diff.py — A/B-compare two windows of openskimmer vs SDC vs RBN.
+"""score_diff.py — A/B-compare two windows of sparkgap vs SDC vs RBN.
 
 Reads /tmp/{os,sdc,rbn}_stream.log directly (not the hourly rollup, so
 window boundaries can be arbitrary HH:MM:SS and don't have to align to

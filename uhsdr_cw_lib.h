@@ -2,7 +2,7 @@
  * uhsdr_cw_lib.h — Reusable CW decoder API (extracted from uhsdr_cw.cpp)
  *
  * Based on UHSDR Firmware Project by Loftur E. Jonasson (TF3LJ), GPL-3.
- * Adapted for multi-instance in-process use by the OpenSkimmer project.
+ * Adapted for multi-instance in-process use by the SparkGap project.
  *
  * Usage:
  *   uhsdr_handle_t h = uhsdr_init(700.0f, 12000.0f, 0);  // freq, rate, wpm (0=auto)

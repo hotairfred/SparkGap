@@ -1,7 +1,7 @@
 /**
  * cw_pfb.cpp — Polyphase filter bank channelizer (FFTW backend).
  *
- * Reference: openskimmer.py PFBChannelizer (numpy version). The math
+ * Reference: sparkgap.py PFBChannelizer (numpy version). The math
  * here mirrors that code line for line; the comments call out where
  * the indexing differs from a textbook PFB derivation.
  *
@@ -118,7 +118,7 @@ struct cw_pfb_t {
     float bin_spacing;
 
     // Polyphase coefficients laid out as h_polyphase[n*K + k] = h_proto[k*N + n]
-    // (matches openskimmer.py: H[n, k] = h[k*N + n]).
+    // (matches sparkgap.py: H[n, k] = h[k*N + n]).
     std::vector<float> h_polyphase;
 
     // Forward-time accumulator of unprocessed IQ.

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Hourly 3-way goldkey scorer — rolls up OpenSkimmer vs SDC vs RBN.
+"""Hourly 3-way goldkey scorer — rolls up SparkGap vs SDC vs RBN.
 
 Reads three local tee logs:
-  /tmp/os_stream.log   — our own skimmer1 spot output (os_tee.py)
+  /tmp/os_stream.log   — our own skimmer1 spot output (sg_tee.py)
   /tmp/sdc_stream.log  — UT4LW SDC Skimmer on Fred's Flex (sdc_tee.py)
   /tmp/rbn_stream.log  — worldwide RBN telnet feed (rbn_tee.py)
 
 For each hour boundary, computes the per-spot precision (per Fred's
 criteria: hit if confirmed by SDC or RBN, miss if solo) and the
-goldkey rate (when openskimmer + SDC agree, what fraction is also on
+goldkey rate (when sparkgap + SDC agree, what fraction is also on
 RBN). Appends to /tmp/score_loop.log.
 
-Asymmetric coverage is fine — openskimmer scans more bands than SDC
+Asymmetric coverage is fine — sparkgap scans more bands than SDC
 on this rig, so plenty of legit catches will be solo-on-our-side.
 We track the metric anyway; the trend matters more than the absolute.
 

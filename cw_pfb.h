@@ -1,7 +1,7 @@
 /**
  * cw_pfb.h — Polyphase filter bank channelizer (standalone module).
  *
- * Mirrors openskimmer.py's PFBChannelizer (numpy):
+ * Mirrors sparkgap.py's PFBChannelizer (numpy):
  *   - n_chan bins, oversample = N/M, output_rate = input_rate * os / n_chan
  *   - Prototype: firwin lowpass at 1/(2*n_chan), kaiser(beta=10) window
  *   - Scaling: h *= sqrt(n_chan) / taps_per_chan  → unity passband gain

@@ -2,7 +2,7 @@
     "callsign": "WF8Z",
     "skimmer_suffix": "-1",
     "grid": "EM79SM",
-    "op_name": "OpenSkimmer",
+    "op_name": "SparkGap",
     "qth": "",
     "master_scp": "MASTER.SCP",
     "add_calls": "add_calls.txt",

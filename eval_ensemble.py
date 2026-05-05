@@ -8,7 +8,7 @@ import os
 
 sys.path.insert(0, '.')
 from train_model import CWDecoder, ctc_greedy_decode, compute_spectrogram
-from openskimmer import read_24bit_iq_chunk
+from sparkgap import read_24bit_iq_chunk
 from scipy.signal import decimate
 import subprocess
 

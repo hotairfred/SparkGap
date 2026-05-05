@@ -3,14 +3,14 @@
 
 Upstream:   connects to a real pitaya as a Protocol 1 client.
 Downstream: acts as a Protocol 1 server to any number of consumers
-            (SkimSrv, OpenSkimmer, etc.).  Every registered consumer
+            (SkimSrv, SparkGap, etc.).  Every registered consumer
             receives the same IQ stream simultaneously.
 
 Stretch:    --wav replays a recorded WAV as fake Protocol 1 UDP frames,
             giving fully hardware-free regression tests.
 
 Usage:
-    # Live proxy (pitaya → SkimSrv + OpenSkimmer)
+    # Live proxy (pitaya → SkimSrv + SparkGap)
     python3 hpsdr_proxy.py --pitaya 192.168.1.54
 
     # WAV replay (regression / A-B without hardware)
@@ -189,7 +189,7 @@ class WAVReplay:
                 smp = smp[:int((end_sec - start_sec) * sr)]
         except wave.Error:
             # Extensible WAV format (0xFFFE) — use our custom reader
-            from openskimmer import read_24bit_iq_chunk
+            from sparkgap import read_24bit_iq_chunk
             dur = end_sec - start_sec if end_sec else None
             if dur is None:
                 # Read entire file — estimate duration from file size

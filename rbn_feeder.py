@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rbn_feeder.py — native Linux RBN spot forwarder.
 
-Replaces VE3NEA's Aggregator. Bridges OpenSkimmer's local cluster
+Replaces VE3NEA's Aggregator. Bridges SparkGap's local cluster
 telnet (:7300) to the Reverse Beacon Network ingest server.
 
 PROTOCOL
@@ -23,7 +23,7 @@ USAGE
   python3 rbn_feeder.py --call WF8Z --grid EM79SM \\
                         --local-host 192.168.1.76 --local-port 7300
 
-Run as a daemon alongside openskimmer.py. Reads its local cluster
+Run as a daemon alongside sparkgap.py. Reads its local cluster
 telnet, parses DX-de lines, posts to RBN. Reconnects on either side.
 """
 
@@ -67,7 +67,7 @@ except ImportError:
     def s_php_h(callsigns):
         return secrets.token_hex(4)
 
-# Skimmer telnet line format produced by openskimmer.py and SkimSrv:
+# Skimmer telnet line format produced by sparkgap.py and SkimSrv:
 #   DX de WF8Z-#:    14025.50  R2HE         CW  15 dB 26 WPM  CQ  OS  1313Z
 SPOT_RE = re.compile(
     r'^DX de (\S+):\s+(\d+\.\d+)\s+(\S+)\s+(\S+)\s+'
@@ -83,7 +83,7 @@ DEFAULT_RBN_URL = 'http://x.reversebeacon.net:88/rx/6'
 
 # Aggregator advertises itself as version 6.7 in the JSON. Keep it for
 # protocol compatibility — RBN servers may parse this. Identification
-# of OpenSkimmer happens via skimName in the id payload.
+# of SparkGap happens via skimName in the id payload.
 AGG_VERSION = '6.7'
 SKIM_VERSION = 'v.1.6.0.145'  # mirrors what we put in the SkimSrv banner
 
@@ -107,7 +107,7 @@ def parse_spot(line):
         'snr':     int(snr),
         'wpm':     int(wpm) if wpm else 0,
         # body1 is "CQ" / "DE" / "BCN" (or possibly garbage); body2 is
-        # source-tag if present (e.g. "OS", "SDC").
+        # source-tag if present (e.g. "SG", "SDC").
         'cq_flag': body1.upper() if body1 else 'CQ',
         'time':    time_str,
     }
@@ -268,7 +268,7 @@ class RBNSession:
 
 
 def read_local(local_host, local_port, skim_call, spot_q, shutdown):
-    """Connect to OpenSkimmer's cluster telnet, parse DX-de lines into
+    """Connect to SparkGap's cluster telnet, parse DX-de lines into
     spot_q. Reconnect on disconnect. Runs until shutdown is set."""
     while not shutdown.is_set():
         s = None
@@ -389,11 +389,11 @@ def fetch_bands_from_skimmer(local_host, local_port, skim_call):
 
 
 def main():
-    p = argparse.ArgumentParser(description='RBN spot feeder for OpenSkimmer')
+    p = argparse.ArgumentParser(description='RBN spot feeder for SparkGap')
     p.add_argument('--call', required=True,
                    help='Operator callsign (e.g. WF8Z)')
-    p.add_argument('--name', default='OpenSkimmer',
-                   help='Operator name / source label (default: OpenSkimmer)')
+    p.add_argument('--name', default='SparkGap',
+                   help='Operator name / source label (default: SparkGap)')
     p.add_argument('--grid', required=True,
                    help='6-character grid square (e.g. EM79SM)')
     p.add_argument('--qth', default='',
@@ -402,9 +402,9 @@ def main():
                    choices=['Normal', 'Aggressive'],
                    help='Skimmer validation level (default: Normal)')
     p.add_argument('--local-host', default='127.0.0.1',
-                   help='OpenSkimmer cluster telnet hostname')
+                   help='SparkGap cluster telnet hostname')
     p.add_argument('--local-port', type=int, default=7300,
-                   help='OpenSkimmer cluster telnet port')
+                   help='SparkGap cluster telnet port')
     p.add_argument('--rbn-url', default=DEFAULT_RBN_URL,
                    help='RBN ingest base URL (default: %(default)s)')
     p.add_argument('--blacklist', default='blacklist.txt',
