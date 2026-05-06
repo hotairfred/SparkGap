@@ -1,52 +1,87 @@
-# High-confidence blacklist candidates ... 1x1 calls emitted by us repeatedly,
-# never seen by SDC or worldwide RBN. Very likely decode noise hitting random
-# SCP entries by chance. Generated 2026-04-29 from 18+ hour score-log soak.
+# High-confidence blacklist candidates ... 1x1 calls emitted by us
+# repeatedly, never seen by SDC or worldwide RBN. Generated 2026-05-06 12:17 UTC
+# from mine_blacklist.py over current /tmp/{os,sdc,rbn}_stream.log.
 #
-# Format: one CALL per line. Lines starting with # are ignored.
-# To deploy: append to blacklist.txt and restart skimmer.
+# Format: one CALL per line. # for comments.
 #
 # call  emissions  hours
-M7N    # 19 emissions across 7 hours
-M1T    # 17 emissions across 9 hours
-G4R    # 17 emissions across 6 hours
-C5R    # 10 emissions across 9 hours
-B4S    # 10 emissions across 7 hours
-M7T    # 10 emissions across 6 hours
-G9W    # 10 emissions across 4 hours
-N8A    # 10 emissions across 3 hours
-M2T    # 8 emissions across 7 hours
-M9T    # 8 emissions across 7 hours
-G2P    # 8 emissions across 6 hours
+M1T    # 26 emissions across 13 hours
+G4R    # 20 emissions across 8 hours
+M7T    # 17 emissions across 8 hours
+M2T    # 16 emissions across 11 hours
+C5R    # 16 emissions across 12 hours
+G2P    # 15 emissions across 6 hours
+M7R    # 13 emissions across 7 hours
+M9T    # 13 emissions across 11 hours
+B4S    # 13 emissions across 9 hours
+P3Z    # 12 emissions across 6 hours
+M3M    # 12 emissions across 5 hours
+G6A    # 11 emissions across 7 hours
+G9W    # 11 emissions across 5 hours
+G1M    # 10 emissions across 6 hours
+G6P    # 10 emissions across 4 hours
+B0A    # 10 emissions across 7 hours
+G8N    # 9 emissions across 6 hours
+M7V    # 9 emissions across 7 hours
+N9U    # 9 emissions across 5 hours
 E2A    # 8 emissions across 4 hours
-C7A    # 8 emissions across 4 hours
+G3G    # 8 emissions across 5 hours
+M3D    # 8 emissions across 6 hours
+G4U    # 8 emissions across 6 hours
 G1W    # 8 emissions across 3 hours
-G6A    # 7 emissions across 5 hours
-M2J    # 7 emissions across 3 hours
-G6P    # 7 emissions across 2 hours
-M7R    # 6 emissions across 6 hours
-G5K    # 6 emissions across 6 hours
-M5G    # 6 emissions across 5 hours
-G1M    # 6 emissions across 4 hours
-G3G    # 6 emissions across 4 hours
-G3B    # 6 emissions across 3 hours
-V6D    # 5 emissions across 5 hours
-M3D    # 5 emissions across 4 hours
-M7V    # 5 emissions across 4 hours
-P3C    # 5 emissions across 3 hours
-M5P    # 4 emissions across 4 hours
+V6D    # 7 emissions across 7 hours
+G5K    # 7 emissions across 7 hours
+M5G    # 7 emissions across 6 hours
+G0W    # 7 emissions across 5 hours
+G4P    # 6 emissions across 4 hours
+P3C    # 6 emissions across 4 hours
+G5V    # 6 emissions across 4 hours
+G5Q    # 6 emissions across 4 hours
+G8P    # 6 emissions across 3 hours
+M7Q    # 6 emissions across 4 hours
+K0I    # 5 emissions across 4 hours
+G8D    # 5 emissions across 5 hours
+M5P    # 5 emissions across 5 hours
+M9M    # 5 emissions across 3 hours
+M9A    # 5 emissions across 4 hours
+M4E    # 5 emissions across 3 hours
+M9N    # 5 emissions across 5 hours
+G9D    # 5 emissions across 5 hours
+B1Z    # 4 emissions across 3 hours
 M6W    # 4 emissions across 3 hours
+M1B    # 4 emissions across 3 hours
+A5T    # 4 emissions across 4 hours
+G9X    # 4 emissions across 3 hours
+M6T    # 4 emissions across 4 hours
 W1E    # 4 emissions across 3 hours
-G5V    # 4 emissions across 3 hours
-G0W    # 4 emissions across 3 hours
-M9M    # 4 emissions across 2 hours
-M1X    # 4 emissions across 2 hours
-G5Q    # 4 emissions across 2 hours
-B1Z    # 3 emissions across 3 hours
-G8D    # 3 emissions across 3 hours
+M0X    # 4 emissions across 3 hours
+G7H    # 4 emissions across 4 hours
+M8A    # 4 emissions across 4 hours
+T3T    # 4 emissions across 4 hours
+N9E    # 4 emissions across 2 hours
+K0T    # 4 emissions across 3 hours
+M1G    # 4 emissions across 3 hours
+B7O    # 3 emissions across 3 hours
 S0S    # 3 emissions across 3 hours
+A6T    # 3 emissions across 3 hours
 F5I    # 3 emissions across 3 hours
-B0A    # 3 emissions across 3 hours
-M3M    # 3 emissions across 2 hours
-M9A    # 3 emissions across 2 hours
+M1U    # 3 emissions across 3 hours
 G3Q    # 3 emissions across 2 hours
+E6E    # 3 emissions across 3 hours
+W3I    # 3 emissions across 3 hours
 M1V    # 3 emissions across 2 hours
+D4C    # 3 emissions across 3 hours
+D2A    # 3 emissions across 2 hours
+M7Z    # 3 emissions across 3 hours
+W7S    # 3 emissions across 2 hours
+G8S    # 3 emissions across 2 hours
+D4K    # 3 emissions across 2 hours
+A0I    # 3 emissions across 3 hours
+T0I    # 3 emissions across 2 hours
+K3S    # 3 emissions across 3 hours
+H6E    # 3 emissions across 3 hours
+G3N    # 3 emissions across 3 hours
+W1D    # 3 emissions across 2 hours
+N9Y    # 3 emissions across 2 hours
+T8E    # 3 emissions across 2 hours
+M1F    # 3 emissions across 2 hours

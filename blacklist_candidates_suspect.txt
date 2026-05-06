@@ -1,51 +1,133 @@
-# Suspect blacklist candidates ... 4+ char calls we emitted >=3 times across
-# >=2 hours, never confirmed by SDC or worldwide RBN. Could be:
-#  (a) genuinely real regional-only signals (don't blacklist!)
-#  (b) mangled forms of real adjacent calls (DO blacklist)
-# Spot-check before adding to real blacklist.
+# Suspect blacklist candidates ... 4+ char calls emitted by us
+# repeatedly, never seen by peers. HUMAN REVIEW ONLY — do not
+# auto-apply. Generated 2026-05-06 12:17 UTC.
 #
-# call          emissions  hours  pattern
-N2WK           #  16     3   @#@@
-K4KYN          #  14     2   @#@@@
-N1AU           #  10     2   @#@@
-W4PF           #   9     2   @#@@
-K9CW           #   8     3   @#@@
-F5KAR          #   8     3   @#@@@
-VA3SP          #   8     2   @@#@@
-W8EWH          #   8     2   @#@@@
-K4GM           #   7     2   @#@@
-EE5A           #   6     6   @@#@
-NF8M           #   6     2   @@#@
-KK4E           #   6     2   @@#@
-VA3FN          #   6     2   @@#@@
-UR5EN          #   5     5   @@#@@
-W1AAE          #   5     4   @#@@@
-NN5NN          #   5     3   @@#@@
-SE5E           #   5     3   @@#@
-WA2JQK         #   5     2   @@#@@@
-N4DT           #   5     2   @#@@
-N4FP           #   5     2   @#@@
-F5CT           #   5     2   @#@@
-IO5I           #   4     4   @@#@
-PE6E           #   4     3   @@#@
-EA2EJO         #   4     3   @@#@@@
-OG6F           #   4     2   @@#@
-WA3NZA         #   4     2   @@#@@@
-N3ST           #   4     2   @#@@
-WA9LEY         #   4     2   @@#@@@
-W1EE           #   4     2   @#@@
-SM7CIL         #   4     2   @@#@@@
-N5TER          #   3     3   @#@@@
-TM6T           #   3     3   @@#@
-EE5SP          #   3     3   @@#@@
-RT2D           #   3     2   @@#@
-W4ER           #   3     2   @#@@
-WF3T           #   3     2   @@#@
-K7MOA          #   3     2   @#@@@
-W3AT           #   3     2   @#@@
-K3GG           #   3     2   @#@@
-K5LET          #   3     2   @#@@@
-K3WA           #   3     2   @#@@
-KM4F           #   3     2   @@#@
-TA3DE          #   3     2   @@#@@
-EA5EL          #   3     2   @@#@@
+K3HHP    # 25 emissions across 5 hours
+VA3SP    # 24 emissions across 6 hours
+KD4S    # 20 emissions across 8 hours
+N2WK    # 16 emissions across 3 hours
+KV3T    # 15 emissions across 4 hours
+WA9LEY    # 14 emissions across 8 hours
+KK4E    # 14 emissions across 3 hours
+WA3NZA    # 10 emissions across 4 hours
+N4DT    # 10 emissions across 4 hours
+KD9CC    # 10 emissions across 4 hours
+W8KNX    # 10 emissions across 6 hours
+K0PG    # 10 emissions across 5 hours
+W0IZ    # 10 emissions across 2 hours
+W4PF    # 9 emissions across 2 hours
+K1IB    # 9 emissions across 3 hours
+W7CT    # 9 emissions across 3 hours
+N1CEO    # 9 emissions across 3 hours
+W4CDA    # 9 emissions across 3 hours
+W4TJM    # 9 emissions across 3 hours
+AC2FA    # 9 emissions across 3 hours
+KA2WIK    # 9 emissions across 2 hours
+W8EWH    # 8 emissions across 2 hours
+F5KAR    # 8 emissions across 3 hours
+K0NW    # 8 emissions across 4 hours
+W7TA    # 7 emissions across 2 hours
+K4MPE    # 7 emissions across 4 hours
+N9TF    # 7 emissions across 3 hours
+W3ML    # 7 emissions across 3 hours
+N5TER    # 6 emissions across 6 hours
+N4FP    # 6 emissions across 3 hours
+KJ4M    # 6 emissions across 4 hours
+KA1RVR    # 6 emissions across 4 hours
+PJ2T    # 5 emissions across 3 hours
+F5IAE    # 5 emissions across 3 hours
+KB4DE    # 5 emissions across 2 hours
+W1TI    # 5 emissions across 2 hours
+K0TT    # 5 emissions across 3 hours
+N1DG    # 5 emissions across 4 hours
+WE3U    # 5 emissions across 4 hours
+RT9U    # 5 emissions across 3 hours
+TO7K    # 5 emissions across 4 hours
+W3UL    # 5 emissions across 3 hours
+K0AD    # 5 emissions across 2 hours
+UA8J    # 4 emissions across 3 hours
+K7NT    # 4 emissions across 4 hours
+DM1I    # 4 emissions across 3 hours
+EI3JE    # 4 emissions across 4 hours
+DP5A    # 4 emissions across 2 hours
+MM1E    # 4 emissions across 4 hours
+K0PK    # 4 emissions across 3 hours
+W9II    # 4 emissions across 2 hours
+D2EB    # 4 emissions across 2 hours
+K3AE    # 4 emissions across 2 hours
+N7ZZ    # 4 emissions across 2 hours
+WR7T    # 4 emissions across 2 hours
+W9TTY    # 4 emissions across 3 hours
+IB3N    # 4 emissions across 3 hours
+WD9DWX    # 4 emissions across 3 hours
+K5UR    # 4 emissions across 2 hours
+N8KG    # 4 emissions across 4 hours
+WB9TFF    # 4 emissions across 2 hours
+N9CI    # 4 emissions across 3 hours
+N7TBU    # 4 emissions across 3 hours
+IQ1AO    # 4 emissions across 2 hours
+RT2D    # 3 emissions across 2 hours
+VE3VN    # 3 emissions across 3 hours
+K0AE    # 3 emissions across 2 hours
+VE3INE    # 3 emissions across 3 hours
+V47T    # 3 emissions across 3 hours
+OE3G    # 3 emissions across 3 hours
+K5TS    # 3 emissions across 3 hours
+DR9W    # 3 emissions across 2 hours
+K3GG    # 3 emissions across 2 hours
+K5LET    # 3 emissions across 2 hours
+VE4QZ    # 3 emissions across 2 hours
+W9DP    # 3 emissions across 3 hours
+W1AAT    # 3 emissions across 2 hours
+NN3EE    # 3 emissions across 2 hours
+W1GC    # 3 emissions across 3 hours
+W4TM    # 3 emissions across 3 hours
+W3FME    # 3 emissions across 2 hours
+N7GDE    # 3 emissions across 3 hours
+EA5EL    # 3 emissions across 2 hours
+K2YY    # 3 emissions across 2 hours
+K0DME    # 3 emissions across 2 hours
+WA3MD    # 3 emissions across 2 hours
+EU6A    # 3 emissions across 3 hours
+OT0K    # 3 emissions across 3 hours
+VE3MT    # 3 emissions across 3 hours
+W1NTI    # 3 emissions across 3 hours
+IO3E    # 3 emissions across 3 hours
+K5XI    # 3 emissions across 2 hours
+KA0P    # 3 emissions across 3 hours
+WS1E    # 3 emissions across 2 hours
+WA9Z    # 3 emissions across 3 hours
+WA8H    # 3 emissions across 2 hours
+WE3Q    # 3 emissions across 2 hours
+K3II    # 3 emissions across 3 hours
+W4KSA    # 3 emissions across 2 hours
+KN4PPD    # 3 emissions across 2 hours
+OK1WCF    # 3 emissions across 2 hours
+SE6I    # 3 emissions across 3 hours
+E4COH    # 3 emissions across 3 hours
+K2ET    # 3 emissions across 3 hours
+W4SK    # 3 emissions across 2 hours
+VE1AO    # 3 emissions across 2 hours
+K7OTA    # 3 emissions across 3 hours
+N8KL    # 3 emissions across 3 hours
+B8UEY    # 3 emissions across 3 hours
+K0TSA    # 3 emissions across 2 hours
+W9UTW    # 3 emissions across 2 hours
+N9EE    # 3 emissions across 3 hours
+W0UK    # 3 emissions across 3 hours
+N6NXV    # 3 emissions across 3 hours
+NU4N    # 3 emissions across 2 hours
+N9LF    # 3 emissions across 3 hours
+N8NCR    # 3 emissions across 3 hours
+K9IR    # 3 emissions across 2 hours
+T1RY    # 3 emissions across 3 hours
+NT9M    # 3 emissions across 2 hours
+K1IEB    # 3 emissions across 3 hours
+K0WRY    # 3 emissions across 2 hours
+T1GQ    # 3 emissions across 3 hours
+K9ELF    # 3 emissions across 3 hours
+WA7T    # 3 emissions across 2 hours
+K6LI    # 3 emissions across 2 hours
+WE9EE    # 3 emissions across 2 hours
+LZ5E    # 3 emissions across 3 hours
+4I2I    # 3 emissions across 2 hours
