@@ -77,3 +77,9 @@ S0S
 V6D
 W1E
 W3I
+
+# Operator-reported false positives (added 2026-05-06)
+# G7D — Graham/G3XTZ contest call. Reported via email 2026-05-06: 43 false
+# spots from us across 80/40/20/15m at scattered freqs, no other skimmer
+# corroborated. Pure decoder hallucination on a 3-char contest call.
+G7D
