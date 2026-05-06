@@ -1720,7 +1720,7 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
                      rf_hz / 1000.0, call, int(snr_db), text[:50])
             skimmer.telnet.broadcast_spot(
-                freq_khz=rf_hz / 1000.0,
+                freq_khz=skimmer._corrected_freq_khz(rf_hz / 1000.0),
                 dx_call=call,
                 snr=int(snr_db),
                 mode='RTTY',
@@ -5776,6 +5776,17 @@ class SparkGap:
         # Per-band IQ buffers keyed by rx_index.  For single-band configs
         # rx_index=0 is the only key (same as before).
         self._band_bufs = {}   # rx_index → {'iq': deque, 'i': [], 'q': []}
+        # Software frequency calibration. ppm_offset > 0 means our
+        # uncorrected reports run high; we subtract it before emitting.
+        # Replaces a hardware GPSDO until/unless we add the R25/R26
+        # mod + Bodnar 125 MHz reference.
+        self.ppm_offset = float(self.cfg.get('ppm_offset', 0.0))
+
+    def _corrected_freq_khz(self, raw_khz):
+        """Apply ppm_offset calibration to a freq emission. No-op when 0."""
+        if not self.ppm_offset:
+            return raw_khz
+        return raw_khz * (1.0 - self.ppm_offset * 1e-6)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -6404,7 +6415,7 @@ class SparkGap:
                     for spot in spots:
                         self.spot_count += 1
                         self.telnet.broadcast_spot(
-                            freq_khz=spot['freq_khz'],
+                            freq_khz=self._corrected_freq_khz(spot['freq_khz']),
                             dx_call=spot['call'],
                             snr=spot['snr'],
                             wpm=spot.get('wpm', 0),
@@ -6616,8 +6627,9 @@ class SparkGap:
                                         log.info("FT8 %s p%d: %s", bn, part, line)
                                         total += 1
                                         skimmer.spot_count += 1
+                                        rf_khz_corr = skimmer._corrected_freq_khz(rf_khz)
                                         skimmer.telnet.broadcast_spot(
-                                            freq_khz=rf_khz, dx_call=ft8_call,
+                                            freq_khz=rf_khz_corr, dx_call=ft8_call,
                                             snr=snr, mode='FT8',
                                             comment=msg)
                                         # Best-effort publish to skimmer/ft8/raw for pskr_feeder.
@@ -6631,7 +6643,7 @@ class SparkGap:
                                                 _pub.publish('skimmer/ft8/raw', json.dumps({
                                                     'call':    ft8_call,
                                                     'grid':    ft8_grid,
-                                                    'freq_hz': int(rf_khz * 1000),
+                                                    'freq_hz': int(rf_khz_corr * 1000),
                                                     'snr':     int(snr),
                                                     'mode':    'FT8',
                                                     'msg':     msg,

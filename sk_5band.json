@@ -36,6 +36,9 @@
     "itila_max_bins": 400,
     "use_pfb_scanner": false,
 
+    "_comment_ppm_offset": "Software frequency calibration. Subtracted from every reported freq. ppm_offset > 0 means our reports were running too high (Pitaya TCXO slow). W3RGA's daily analysis is the authoritative source — set to whatever ppm value SM7IUN flags us at on the latest standings. compute_ppm_skew.py is useful for sanity-checking shifts but hits a 10 Hz tee-rounding floor (~1 ppm resolution). Re-measure weekly. Hardware fix is the R25/R26 SMD mod + Bodnar 125 MHz GPSDO when convenient. Initial value 5.3 from W3RGA May 5 standings.",
+    "ppm_offset": 5.3,
+
     "_comment_gates": "Gate flags — defaults shown are 'ship-it' mode (permissive emit, trust cluster filtering). Each gate is a feature you can re-enable individually for stricter local behavior. See feedback_ship_it_plan.md for rationale.",
     "enable_caller_spotting":      true,
     "gate_cq_runner":              false,
