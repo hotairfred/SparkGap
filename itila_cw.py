@@ -622,6 +622,130 @@ def decode_runs(marks, wpm):
     return text
 
 
+def morse_timing_cost(marks, wpm):
+    """Confidence-on-segmentation score, adapted from ggmorse (MIT).
+
+    Lower cost = run-length pattern fits canonical Morse timing well.
+    Higher cost = decoder bit a noisy/garbled envelope that happens to
+    threshold-cross. Designed to separate "real weak decode" from
+    "noise that lands on an SCP entry" (the M5M / G7D / N3T failure mode).
+
+    Cost = sum over marks of  (dot_len_normalised - 1)^2  for dits
+         + sum over marks of  (dah_len_normalised - 3)^2  for dahs
+         + sum over spaces of (space_len_normalised - 1)^2  for element gaps
+         + 100 penalty if avg_dah / avg_dot is outside [2.5, 3.5]
+
+    Per ggmorse: marks are classified dot if normalised len < 2, dah otherwise.
+    Spaces are only scored when they fall closest to the 1-unit (element-gap)
+    expected length — the 3-unit and 7-unit gap clusters get a different role.
+
+    Args:
+      marks : 1D int8 array, 0=SPACE 1=MARK
+      wpm   : speed in WPM (drives the unit_samples scaling)
+
+    Returns:
+      float cost. Empirically: clean decodes ~0-2, garbled ~5-50+, returns
+      999.0 if too few intervals to score (typical for empty channels).
+    """
+    if marks is None or len(marks) < 4:
+        return 999.0
+    unit = unit_samples(wpm)
+    if unit <= 0:
+        return 999.0
+
+    # Run-length decompose (same shape as decode_runs)
+    runs = []
+    val = marks[0]
+    count = 1
+    for i in range(1, len(marks)):
+        if marks[i] == val:
+            count += 1
+        else:
+            runs.append((int(val), count))
+            val = marks[i]
+            count = 1
+    runs.append((int(val), count))
+
+    if len(runs) < 5:
+        return 999.0
+
+    # Drop the leading and trailing runs — they're usually partial
+    inner = runs[1:-1]
+
+    # First pass: classify marks, accumulate average dot/dah lengths in dot units
+    n_dots = 0
+    n_dahs = 0
+    sum_dot = 0.0
+    sum_dah = 0.0
+    for is_mark, dur in inner:
+        norm = dur / unit
+        if is_mark:
+            if norm < 2.0:
+                n_dots += 1
+                sum_dot += norm
+            else:
+                n_dahs += 1
+                sum_dah += norm
+
+    if n_dots < 1 or n_dahs < 1:
+        # No dits or no dahs in window — not enough timing structure to score
+        return 999.0
+
+    avg_dot = sum_dot / n_dots
+    avg_dah = sum_dah / n_dahs
+
+    # Second pass: cost contributions, normalising each mark by its class avg
+    cost_dots = 0.0
+    cost_dahs = 0.0
+    cost_spaces = 0.0
+    n_spaces = 0
+    for is_mark, dur in inner:
+        norm = dur / unit
+        if is_mark:
+            if norm < 2.0:
+                # normalised: should be ~1 dot unit
+                normalised = norm / max(avg_dot, 0.1)
+                cost_dots += (normalised - 1.0) ** 2
+            else:
+                # normalised: should be ~3 dot units
+                normalised = norm * 3.0 / max(avg_dah, 0.1)
+                cost_dahs += (normalised - 3.0) ** 2
+        else:
+            # Per ggmorse: only score gaps near the 1-unit (element) cluster.
+            # The 3-unit (letter) and 7-unit (word) gaps are *expected* to be
+            # there and have their own role; only element gaps are a confidence
+            # signal on segmentation quality. Cap absurdly long spaces too.
+            if norm < 8.0:
+                c1 = (norm - 1.0) ** 2
+                c3 = (norm - 3.0) ** 2
+                c7 = (norm - 7.0) ** 2
+                if c1 <= c3 and c1 <= c7:
+                    cost_spaces += c1
+                    n_spaces += 1
+
+    if n_spaces < 1:
+        n_spaces = 1
+        cost_spaces = 100.0
+
+    cost = (cost_dots / n_dots) + (cost_dahs / n_dahs) + (cost_spaces / n_spaces)
+
+    # Dah/dot ratio sanity check — proportional penalty for distance
+    # outside the canonical [2.5, 3.5] window. ggmorse used a binary +100
+    # which created a wall that lumped near-misses with pure noise; first
+    # validation run (2026-05-14) showed 15% of real calls stuck above
+    # cost 100 vs only 41% of garbage, defeating its discrimination value.
+    # Linear penalty (scale 20) keeps mild ratio drift cheap and pure
+    # garbage expensive without binarising the signal.
+    if avg_dot > 0:
+        ratio = avg_dah / avg_dot
+        if ratio < 2.5:
+            cost += 20.0 * (2.5 - ratio)
+        elif ratio > 3.5:
+            cost += 20.0 * (ratio - 3.5)
+
+    return cost
+
+
 def decode_runs_beam(marks, wpm, boundary_tol=0.25, max_texts=32):
     """Soft dit/dah classification via score-guided beam search.
 
@@ -945,6 +1069,12 @@ def decode_channel(env, center_khz, freq_khz, start_sec=0, em_iter=8,
     # under a dominant WPM=60 station on the same frequency).
     wpm_candidates = fit_mark_wpm_components(marks, best_wpm)
 
+    # Timing-cost (ggmorse-inspired) confidence on segmentation quality.
+    # Computed against the EM-best WPM — a per-channel signal that's low for
+    # clean decodes and high for "noise crossed threshold and decoded to
+    # something." Designed to gate M5M / G7D class false positives.
+    timing_cost = morse_timing_cost(marks, best_wpm)
+
     seen_calls = set()
     callsigns  = []
     text       = ''
@@ -976,6 +1106,7 @@ def decode_channel(env, center_khz, freq_khz, start_sec=0, em_iter=8,
         'text':       text,
         'callsigns':  callsigns,
         'gamma':      gamma_marg,
+        'timing_cost': timing_cost,
     }
 
 

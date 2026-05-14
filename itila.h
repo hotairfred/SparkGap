@@ -43,6 +43,21 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 /* Free handle and all associated memory. */
 void itila_free(itila_t h);
 
+/* Return the timing-cost (segmentation-quality confidence) score from the
+ * most recent itila_feed / itila_feed_online call.  Lower = cleaner Morse
+ * timing.  Returns 999.0 if no decode has been performed yet, or if the
+ * most recent feed had insufficient structure to score.
+ *
+ * Designed to be ANDed with existing emit filters (SCP / patt3ch /
+ * consensus) — catches the noise-decoded-to-real-call class (M5M / G7D /
+ * N3T) but cannot distinguish a clean Morse non-callsign decode from a
+ * real callsign, so it's a complement, not a replacement.
+ *
+ * Validated 2026-05-14 against B1_seg2: real calls peak at cost ~15,
+ * 3-char garbage timing-fragment decodes cluster median 19 / p75 36.
+ * Recommended gate: emit only if cost <= 30. */
+double itila_get_last_cost(itila_t h);
+
 /* BAYES_RATE: envelope sample rate this library expects */
 #define ITILA_BAYES_RATE 200
 

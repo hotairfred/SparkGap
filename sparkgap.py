@@ -1474,6 +1474,9 @@ def _get_itila_lib():
             _itila_lib.itila_free.argtypes = [_ct.c_void_p]
             _itila_lib.itila_get_wpm.restype  = _ct.c_double
             _itila_lib.itila_get_wpm.argtypes = [_ct.c_void_p]
+            # Timing-cost confidence (ggmorse-inspired, added 2026-05-14).
+            _itila_lib.itila_get_last_cost.restype  = _ct.c_double
+            _itila_lib.itila_get_last_cost.argtypes = [_ct.c_void_p]
             log.info("Loaded libitila.so")
         except OSError:
             log.warning("libitila.so not found — ITILA decoder unavailable")
@@ -2249,9 +2252,18 @@ class _ItilaScanner:
                  window_sec=120.0, min_snr=12.0,
                  band_min_khz=0.0, band_max_khz=99999.0,
                  max_bins=80, use_pfb=False, valid_calls=None,
-                 enable_caller_spotting=True):
+                 enable_caller_spotting=True,
+                 gate_timing_cost=False, timing_cost_max=30.0):
         self.valid_calls = valid_calls or set()
         self.enable_caller_spotting = bool(enable_caller_spotting)
+        # ggmorse-inspired confidence gate on segmentation quality
+        # (added 2026-05-14). Off by default; flip on to drop calls whose
+        # ITILA timing-cost exceeds timing_cost_max. Validated against
+        # B1_seg2: cost <= 30 = zero in-key loss, kills ~11% of garbage
+        # incl. structural 3-char M5M-class. Always logged regardless of
+        # the gate flag so we can observe distributions in production.
+        self.gate_timing_cost = bool(gate_timing_cost)
+        self.timing_cost_max  = float(timing_cost_max)
         from scipy.signal import butter
         self.ev_thresh       = ev_thresh
         self._window_sec     = window_sec
@@ -2378,7 +2390,16 @@ class _ItilaScanner:
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if not raw:
                 continue
-            log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+            cost = lib.itila_get_last_cost(h)
+            log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:80])
+            # Timing-cost gate (off by default).  Drops the whole decode
+            # window's call extraction when segmentation quality is too low;
+            # logs the suppression with cost so we can tune the threshold
+            # against production data.
+            if self.gate_timing_cost and cost > self.timing_cost_max:
+                log.info("ITILA cost-gate %.1f kHz: dropped raw (cost=%.2f > %.2f)",
+                         f_khz, cost, self.timing_cost_max)
+                continue
             wpm = int(round(lib.itila_get_wpm(h)))
             if wpm > 0:
                 st['wpm'] = wpm
@@ -4050,7 +4071,8 @@ class InstanceManager:
                  itila_min_snr=8.0, itila_max_bins=200,
                  use_pfb_scanner=False, valid_calls=None,
                  cw_min_khz=0.0, cw_max_khz=99999.0,
-                 enable_caller_spotting=True):
+                 enable_caller_spotting=True,
+                 gate_timing_cost=False, timing_cost_max=30.0):
         self.valid_calls = valid_calls or set()
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -4067,6 +4089,10 @@ class InstanceManager:
         self.itila_max_bins = int(itila_max_bins)
         self.use_pfb_scanner = bool(use_pfb_scanner)
         self.enable_caller_spotting = bool(enable_caller_spotting)
+        # Plumbed through to _ItilaScanner; defaults gate-off, threshold 30.
+        # Override via gate_timing_cost / timing_cost_max in sk_5band.json.
+        self.gate_timing_cost = bool(gate_timing_cost)
+        self.timing_cost_max  = float(timing_cost_max)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
@@ -4145,7 +4171,9 @@ class InstanceManager:
                     max_bins=int(self.itila_max_bins),
                     use_pfb=self.use_pfb_scanner,
                     valid_calls=getattr(self, 'valid_calls', None),
-                    enable_caller_spotting=self.enable_caller_spotting)
+                    enable_caller_spotting=self.enable_caller_spotting,
+                    gate_timing_cost=getattr(self, 'gate_timing_cost', False),
+                    timing_cost_max=getattr(self, 'timing_cost_max', 30.0))
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -6017,6 +6045,8 @@ class SparkGap:
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
                 cw_max_khz=float(self.cfg.get('cw_max_khz', 99999)),
                 enable_caller_spotting=bool(self.cfg.get('enable_caller_spotting', True)),
+                gate_timing_cost=bool(self.cfg.get('gate_timing_cost', False)),
+                timing_cost_max=float(self.cfg.get('timing_cost_max', 30.0)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref

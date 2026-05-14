@@ -117,7 +117,16 @@ typedef struct {
 
     /* Output */
     char result_buf[RESULT_BUF];
-    double last_wpm;       /* WPM from most recent successful decode */
+    double last_wpm;          /* WPM from most recent successful decode */
+    double last_timing_cost;  /* ggmorse-inspired confidence score: sum of
+                               * squared deviations from canonical Morse
+                               * timing on the most recent decode's run list.
+                               * Lower = cleaner timing. 999.0 if no decode.
+                               * Validated 2026-05-14 against B1_seg2: real
+                               * calls peak at cost ~15, garbage timing-frag
+                               * decodes (3-char SCP collisions, M5M class)
+                               * cluster median 19 / p75 36. Recommended
+                               * production gate: emit only if cost <= 30. */
 } itila_state_t;
 
 /* -------------------------------------------------------------------------
@@ -636,6 +645,130 @@ static int fit_mark_wpm_components(
 }
 
 /* -------------------------------------------------------------------------
+ * compute_timing_cost — ggmorse-inspired confidence score
+ *
+ * Sum of squared deviations from canonical Morse timing on the run list,
+ * normalised per-class.  Low cost = clean Morse timing.  High cost = noise
+ * threshold-crossed and decoded to a garbled interval pattern that happens
+ * to match an SCP entry (the M5M / G7D / N3T failure mode).
+ *
+ * Adapted (in spirit, MIT-clean reimplementation) from ggmorse.cpp:
+ *   - per-mark squared deviation, normalised by class average length
+ *   - per-element-gap squared deviation against 1-unit expected gap
+ *   - linear (not binary +100) penalty for avg_dah/avg_dot drift outside
+ *     the canonical [2.5, 3.5] window — the binary form created a wall
+ *     that lumped near-misses with pure noise; linear keeps the
+ *     discrimination smooth.
+ *
+ * Validated 2026-05-14 against B1_seg2 (40m CWT recording):
+ *   in-key real calls: median cost 0.26, max 15.0 (60 WPM operator)
+ *   3-char off-key (M5M class): median 18.9, p75 36
+ *   gate at cost <= 30: zero in-key loss, kills 11% of garbage including
+ *   most of the structural 3-char failure mode
+ *
+ * Params:
+ *   marks[T]: binary mark/space sequence
+ *   wpm    : speed estimate (drives unit_samples scaling)
+ *   scratch: pre-allocated run_t array of length >= MAX_ENV
+ *
+ * Returns cost (double); 999.0 if insufficient structure to score.
+ * ---------------------------------------------------------------------- */
+static double compute_timing_cost(const int8_t *marks, int T, double wpm,
+                                  run_t *scratch)
+{
+    if (T < 4) return 999.0;
+    double unit = unit_samples(wpm);
+    if (unit <= 0.0) return 999.0;
+
+    /* Build run list (same shape decode_runs_beam builds) */
+    int n_runs = 0;
+    int val = marks[0], cnt = 1;
+    for (int i = 1; i < T; i++) {
+        int v = marks[i];
+        if (v == val) { cnt++; }
+        else {
+            if (n_runs < MAX_ENV) {
+                scratch[n_runs].is_mark = val;
+                scratch[n_runs].dur     = cnt;
+                n_runs++;
+            }
+            val = v; cnt = 1;
+        }
+    }
+    if (n_runs < MAX_ENV) {
+        scratch[n_runs].is_mark = val;
+        scratch[n_runs].dur     = cnt;
+        n_runs++;
+    }
+    if (n_runs < 5) return 999.0;
+
+    /* Skip leading and trailing run — usually partial */
+    int lo = 1, hi = n_runs - 1;
+
+    /* Pass 1: classify marks, accumulate avg dot/dah lengths in dot units */
+    int n_dots = 0, n_dahs = 0;
+    double sum_dot = 0.0, sum_dah = 0.0;
+    for (int i = lo; i < hi; i++) {
+        if (!scratch[i].is_mark) continue;
+        double norm = scratch[i].dur / unit;
+        if (norm < 2.0) { n_dots++; sum_dot += norm; }
+        else            { n_dahs++; sum_dah += norm; }
+    }
+    if (n_dots < 1 || n_dahs < 1) return 999.0;
+
+    double avg_dot = sum_dot / n_dots;
+    double avg_dah = sum_dah / n_dahs;
+
+    /* Pass 2: cost contributions, normalising by class average */
+    double cost_dots = 0.0, cost_dahs = 0.0, cost_spaces = 0.0;
+    int n_spaces = 0;
+    double safe_dot = (avg_dot < 0.1) ? 0.1 : avg_dot;
+    double safe_dah = (avg_dah < 0.1) ? 0.1 : avg_dah;
+    for (int i = lo; i < hi; i++) {
+        double norm = scratch[i].dur / unit;
+        if (scratch[i].is_mark) {
+            if (norm < 2.0) {
+                double normalised = norm / safe_dot;
+                double d = normalised - 1.0;
+                cost_dots += d * d;
+            } else {
+                double normalised = norm * 3.0 / safe_dah;
+                double d = normalised - 3.0;
+                cost_dahs += d * d;
+            }
+        } else if (norm < 8.0) {
+            /* Only score gaps near the 1-unit (element) cluster.
+             * 3-unit (letter) and 7-unit (word) gaps have their own role. */
+            double c1 = (norm - 1.0) * (norm - 1.0);
+            double c3 = (norm - 3.0) * (norm - 3.0);
+            double c7 = (norm - 7.0) * (norm - 7.0);
+            if (c1 <= c3 && c1 <= c7) {
+                cost_spaces += c1;
+                n_spaces++;
+            }
+        }
+    }
+
+    if (n_spaces < 1) { n_spaces = 1; cost_spaces = 100.0; }
+
+    double cost = (cost_dots / n_dots)
+                + (cost_dahs / n_dahs)
+                + (cost_spaces / n_spaces);
+
+    /* Linear ratio penalty (softened from ggmorse's binary +100).  Validated
+     * 2026-05-14: original binary form parked 15% of real calls at the +100
+     * wall along with 41% of garbage, destroying discrimination.  Linear
+     * scale 20 keeps mild drift cheap and pure garbage expensive. */
+    if (avg_dot > 0.0) {
+        double ratio = avg_dah / avg_dot;
+        if (ratio < 2.5)      cost += 20.0 * (2.5 - ratio);
+        else if (ratio > 3.5) cost += 20.0 * (ratio - 3.5);
+    }
+
+    return cost;
+}
+
+/* -------------------------------------------------------------------------
  * decode_runs_beam — M7b score-guided beam search
  * (beam_state_t typedef hoisted to top of file — see itila_state_t)
  * ---------------------------------------------------------------------- */
@@ -910,6 +1043,7 @@ itila_t itila_create(int sample_rate, double lpf_hz) {
 
     st->sample_rate = sample_rate;
     st->lpf_hz      = lpf_hz;
+    st->last_timing_cost = 999.0;  /* sentinel: no decode yet */
 
     st->log_B      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
     st->log_alpha  = (double*)malloc(MAX_ENV * 2 * sizeof(double));
@@ -967,6 +1101,14 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     /* M8: multi-station WPM detection */
     double wpm_cands[2]; int n_cands;
     n_cands = fit_mark_wpm_components(st->marks, n, wpm_em, wpm_cands, 2);
+
+    /* Timing-cost confidence on segmentation quality.  Computed once on the
+     * raw EM-best WPM (wpm_em) — matches the Python prototype's choice
+     * (see itila_cw.py decode_channel which uses best_wpm = wpm_est).
+     * fit_mark_wpm_components can shift the first candidate slightly,
+     * causing C vs Python cost divergence; using wpm_em keeps parity. */
+    st->last_timing_cost = compute_timing_cost(st->marks, n, wpm_em,
+                                                st->sc_runs);
 
     /* Per-handle scratch — was function-local static; live mode races. */
     callsign_t *calls = st->sc_calls;
@@ -1136,6 +1278,11 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
     double wpm_cands[2]; int n_cands;
     n_cands = fit_mark_wpm_components(st->marks, n, wpm2, wpm_cands, 2);
 
+    /* Timing-cost confidence — same as itila_feed.  Use raw EM WPM (wpm2)
+     * not wpm_cands[0] for Python-prototype parity. */
+    st->last_timing_cost = compute_timing_cost(st->marks, n, wpm2,
+                                                st->sc_runs);
+
     /* Per-handle scratch — was function-local static; live mode races.
      * itila_feed and itila_feed_online both call decode_runs_beam +
      * extract_callsigns; sharing the same per-handle scratch is fine
@@ -1181,6 +1328,11 @@ void itila_reset_online(itila_t h)
     st->oss_nm = st->oss_A  = st->oss_s2 = 0.0;
     st->oss_wpm  = 0.0;
     st->oss_init = 0;
+}
+
+double itila_get_last_cost(itila_t h) {
+    if (!h) return 999.0;
+    return ((itila_state_t*)h)->last_timing_cost;
 }
 
 void itila_free(itila_t h) {
