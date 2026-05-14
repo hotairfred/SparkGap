@@ -50,9 +50,9 @@
     "gate_harmonic_filter":        false,
     "gate_telemetry":              true,
 
-    "_comment_timing_cost": "ITILA timing-cost gate (ggmorse-inspired, added 2026-05-14). Per decode window, libitila.so computes a confidence score on segmentation timing (lower = cleaner Morse). When gate_timing_cost is true, ITILA windows with cost > timing_cost_max are dropped before call extraction. Validated against B1_seg2: cost <= 30 = zero in-key recall loss, drops ~11% of garbage including the structural M5M-class (3-char SCP collisions). Cost is logged on every decode regardless of gate flag — flip the gate on once you've observed production distributions match the validation envelope. Disable entirely by setting gate_timing_cost=false (the default).",
-    "gate_timing_cost":            false,
-    "timing_cost_max":             30.0,
+    "_comment_timing_cost": "ITILA timing-cost gate (ggmorse-inspired). Per decode window, libitila.so computes a confidence score on segmentation timing (lower = cleaner Morse). When gate_timing_cost is true, ITILA windows with cost > timing_cost_max are dropped before call extraction. B1_seg2 validation (40m CWT) suggested gate=30 = zero in-key recall loss. First 7h of production observation (2026-05-14) showed median spot cost 19 (vs B1's 0.26) and a flood of 3-char hallucinations (G5E 78x, M3E 25x, M5A 6x) at cost > 85. Threshold raised to 100 for the initial gate-on rollout — catches the obvious M5M-class flood, preserves the marginal 30-85 cost band until we see whether real calls live there in production. Ratchet down to 50, then 30 after observing the effect at 100.",
+    "gate_timing_cost":            true,
+    "timing_cost_max":             100.0,
 
     "_comment_recent_band": "S-floor: peer-skimmer support cache (ported from N2WQ GoCluster). When peers spot a call on a band recently, our solo decode of the same call is anchored to a 1-sighting threshold. Peer threads start when peers list is non-empty regardless of gate flag — keeps the cache warm so we can flip the gate at runtime.",
     "recent_band_floor": {
