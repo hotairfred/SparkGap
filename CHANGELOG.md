@@ -2,6 +2,36 @@
 
 Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
+## 2026-05-14
+
+### Added
+- **ITILA timing-cost confidence gate** (ggmorse-inspired). Per-decode
+  signal that flags windows where ITILA's segmentation looks ratty even
+  if the resulting string matches an SCP entry. Designed to gate the
+  M5M / G7D / N3T failure mode where decoder noise threshold-crosses and
+  "decodes" to a short callsign by chance.
+  - **Algorithm:** for each decode window, normalise run lengths by class
+    average (dit / dah), sum squared deviations from canonical 1-dit /
+    3-dah / 1-unit-gap Morse timing, plus a proportional penalty if
+    `avg_dah / avg_dot` drifts outside the canonical [2.5, 3.5] window.
+  - **Validated on B1_seg2 (40 m CWT recording):** real in-key calls
+    peak at cost 15 (a 60-WPM operator); the 3-char structural noise
+    class (M5M-shape garbage) clusters at median cost 19, p75 36.
+    `cost > 30` is a zero-FN gate that drops ~11 % of garbage including
+    most of the M5M-class.
+  - **C vs Python parity:** 96.9 % gate agreement on 130 real channels,
+    median absolute delta 0.043, zero in-key disagreements.
+  - **Config:** new `gate_timing_cost` (bool, default `false`) and
+    `timing_cost_max` (float, default 30.0). Default-off: cost is
+    *always logged* on each ITILA decode (`ITILA raw kHz cost=X.XX …`)
+    but emission is unaffected until the flag is flipped. Lets us
+    observe production distributions before turning the gate on.
+  - **API:** new `double itila_get_last_cost(itila_t)` in `itila.h`.
+- **Validation tooling:** `eval_timing_cost.py` (scan a WAV, dump
+  `(call, freq, cost, in_key)` CSV + threshold sweep) and
+  `compare_c_vs_py_cost.py` (parity harness between C library and
+  Python prototype).
+
 ## 2026-05-13
 
 ### Fixed

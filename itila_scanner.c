@@ -128,6 +128,10 @@ struct ItilaSc {
                              double freq_khz, double ev_thresh);
     void (*dec_free)(void *h);
     double (*dec_get_wpm)(void *h);
+    /* Optional: per-handle timing-cost confidence score from the most
+     * recent dec_feed call.  NULL if older libitila.so without the API;
+     * decode loop falls back to cost=999.0 (sentinel) in that case. */
+    double (*dec_get_last_cost)(void *h);
     double ev_thresh;
 };
 
@@ -715,14 +719,25 @@ void itila_sc_set_decoder(ItilaSc *sc,
     sc->dec_feed    = feed_fn;
     sc->dec_free    = free_fn;
     sc->dec_get_wpm = get_wpm_fn;
+    sc->dec_get_last_cost = NULL;  /* optional — set via itila_sc_set_cost_fn */
     sc->ev_thresh   = ev_thresh;
+}
+
+/* Optional setter for the timing-cost API (added 2026-05-14).  Decoupled
+ * from set_decoder so callers without the API can keep the old 5-arg
+ * signature working.  When the cost fn is set, decode_ready populates
+ * ScDecodeResult.cost; otherwise cost is sentinel 999.0. */
+void itila_sc_set_cost_fn(ItilaSc *sc, double (*get_last_cost_fn)(void*)) {
+    sc->dec_get_last_cost = get_last_cost_fn;
 }
 
 typedef struct {
     double f_hz;
     double snr;
     int    wpm;
+    int    _pad;     /* keep 8-byte alignment for the trailing double */
     char   text[256];
+    double cost;     /* timing-cost confidence; 999.0 if no API available */
 } ScDecodeResult;
 
 int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
@@ -757,6 +772,10 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
                     r->f_hz = b->f_hz;
                     r->snr  = b->snr_db;
                     r->wpm  = (int)(sc->dec_get_wpm(handles[p]) + 0.5);
+                    r->_pad = 0;
+                    r->cost = sc->dec_get_last_cost
+                              ? sc->dec_get_last_cost(handles[p])
+                              : 999.0;  /* sentinel when API unavailable */
                     int len = strlen(raw);
                     if (len > 255) len = 255;
                     memcpy(r->text, raw, len);

@@ -191,6 +191,7 @@ re-enabled individually for stricter local behavior:
 | `gate_recent_band_floor` | `false` | S-floor: anchor solo decode if peer skimmers spotted the same call on the same band recently |
 | `gate_harmonic_filter` | `false` | Drop apparent 2x-5x harmonic spurs of recent same-call spots (RX intermod artifacts) |
 | `gate_telemetry` | `true`  | Log "would-gate" decisions even when gate is off (diagnostic) |
+| `gate_timing_cost` | `false` | Drop ITILA decode windows whose segmentation timing cost exceeds `timing_cost_max` (default 30). Targets the M5M / G7D class where decoder noise threshold-crosses and "decodes" to a short callsign by chance. Cost is logged on every decode regardless of the flag — flip on once production distributions look like the B1_seg2 validation envelope. |
 
 Plus the standard knobs:
 

@@ -1913,6 +1913,13 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
             _ct.c_void_p,
             _ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
             _ct.c_double]
+        # Optional: itila_sc_set_cost_fn (added 2026-05-14).  Older
+        # libitila_scanner.so won't have this symbol; tolerate absence.
+        try:
+            lib.itila_sc_set_cost_fn.restype  = None
+            lib.itila_sc_set_cost_fn.argtypes = [_ct.c_void_p, _ct.c_void_p]
+        except AttributeError:
+            pass
         lib.itila_sc_decode_ready.restype  = _ct.c_int
         lib.itila_sc_decode_ready.argtypes = [
             _ct.c_void_p, _ct.c_int,
@@ -2307,9 +2314,16 @@ class _ItilaScanner:
                 _ct.cast(itila_lib.itila_free, _ct.c_void_p),
                 _ct.cast(itila_lib.itila_get_wpm, _ct.c_void_p),
                 _ct.c_double(ev_thresh))
+            # Optional cost fn — tolerate older libitila_scanner.so
+            # (decode_ready falls back to sentinel cost=999.0 if not set).
+            if hasattr(self._sc._lib, 'itila_sc_set_cost_fn'):
+                self._sc._lib.itila_sc_set_cost_fn(
+                    self._sc._h,
+                    _ct.cast(itila_lib.itila_get_last_cost, _ct.c_void_p))
             self._c_decode = True
             # Pre-allocate result buffer for C decode loop
-            self._decode_results = (_ct.c_char * (280 * 128))()
+            # NOTE: ScDecodeResult is now 288 bytes (added 8-byte trailing cost field).
+            self._decode_results = (_ct.c_char * (288 * 128))()
         else:
             self._c_decode = False
 
@@ -2456,10 +2470,10 @@ class _ItilaScanner:
         import ctypes as _ct
         if not self._sc or not getattr(self, '_c_decode', False):
             return
-        # ScDecodeResult: {double f_hz(8), double snr(8), int wpm(4), pad(4), char text[256]}
-        # Total: 280 bytes per result (with padding)
+        # ScDecodeResult: {double f_hz(8), double snr(8), int wpm(4), pad(4),
+        # char text[256], double cost(8)} — 288 bytes per result.
         max_results = 128
-        result_size = 8 + 8 + 4 + 4 + 256  # 280 bytes
+        result_size = 8 + 8 + 4 + 4 + 256 + 8  # 288 bytes
         buf = _ct.create_string_buffer(result_size * max_results)
         n = self._sc._lib.itila_sc_decode_ready(
             self._sc._h, _ct.c_int(self._window_samples),
@@ -2471,12 +2485,18 @@ class _ItilaScanner:
             f_hz = _ct.c_double.from_buffer(buf, offset).value
             snr = _ct.c_double.from_buffer(buf, offset + 8).value
             wpm = _ct.c_int.from_buffer(buf, offset + 16).value
-            raw = buf[offset + 24:offset + result_size].split(b'\0')[0].decode('ascii', errors='replace')
+            # text occupies bytes 24..279; cost is the trailing double at 280.
+            raw = buf[offset + 24:offset + 280].split(b'\0')[0].decode('ascii', errors='replace')
+            cost = _ct.c_double.from_buffer(buf, offset + 280).value
 
             if not raw:
                 continue
             f_khz = f_hz / 1000.0
-            log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+            log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:80])
+            if self.gate_timing_cost and cost > self.timing_cost_max:
+                log.info("ITILA cost-gate %.1f kHz: dropped raw (cost=%.2f > %.2f)",
+                         f_khz, cost, self.timing_cost_max)
+                continue
 
             # Ensure Python bin state exists for ticker tape
             if f_hz not in self._bins:
@@ -6278,10 +6298,12 @@ class SparkGap:
                     if sc:
                         sc._process_ready()
 
-            # Process decode results — poll from C worker's result buffer
+            # Process decode results — poll from C worker's result buffer.
+            # ScDecodeResult is 288 bytes (text 24..279, cost 280..287); must
+            # match RESULT_SIZE in hpsdr_fast.c and ScDecodeResult in itila_scanner.c.
             if use_c and getattr(self, '_worker_started', False):
                 import ctypes as _ct
-                result_size = 280
+                result_size = 288
                 max_poll = 128
                 if not hasattr(self, '_poll_buf'):
                     self._poll_buf = _ct.create_string_buffer(result_size * max_poll)
@@ -6294,17 +6316,26 @@ class SparkGap:
                     f_hz = _ct.c_double.from_buffer(poll_buf, off).value
                     snr = _ct.c_double.from_buffer(poll_buf, off + 8).value
                     wpm = _ct.c_int.from_buffer(poll_buf, off + 16).value
-                    raw = poll_buf[off+24:off+result_size].split(b'\0')[0].decode('ascii', errors='replace')
+                    raw = poll_buf[off+24:off+280].split(b'\0')[0].decode('ascii', errors='replace')
+                    cost = _ct.c_double.from_buffer(poll_buf, off + 280).value
                     if not raw:
                         continue
                     f_khz = f_hz / 1000.0
-                    log.info("ITILA raw %.1f kHz: %r", f_khz, raw[:80])
+                    log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:80])
                     # Find or create bin state for ticker tape
                     scanner = None
                     for mgr in self.managers:
                         if mgr._itila_scanner:
                             scanner = mgr._itila_scanner
                             break
+                    # Timing-cost gate (gated off by default at scanner-level).
+                    # Drop the whole decode window's downstream processing when
+                    # segmentation is too sloppy and the gate is enabled.
+                    if scanner and getattr(scanner, 'gate_timing_cost', False) \
+                            and cost > getattr(scanner, 'timing_cost_max', 30.0):
+                        log.info("ITILA cost-gate %.1f kHz: dropped raw (cost=%.2f > %.2f)",
+                                 f_khz, cost, scanner.timing_cost_max)
+                        continue
                     if not scanner:
                         continue
                     if f_hz not in scanner._bins:

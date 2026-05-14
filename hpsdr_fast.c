@@ -111,7 +111,7 @@ typedef struct {
 
     /* Result ring buffer — worker writes, Python reads */
     #define RESULT_MAX 256
-    #define RESULT_SIZE 280   /* ScDecodeResult: 8+8+4+4+256 bytes */
+    #define RESULT_SIZE 288   /* ScDecodeResult: 8+8+4+4+256+8 bytes (cost trailing) */
     uint8_t result_buf[RESULT_MAX * RESULT_SIZE];
     volatile int result_write;
     volatile int result_read;
