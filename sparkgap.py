@@ -4640,6 +4640,7 @@ class SpotTracker:
         'gate_patt3ch_filter':         False,  # drop bypass calls not matching patt3ch.lst
         'gate_bypass_consensus':       False,  # bypass goes through freq consensus vs simple count
         'gate_scp_bucket_substitute':  False,  # emit bucket form instead of raw call
+        'gate_short_scp_bucket':       True,   # suppress bucket-substitute into ≤3-char targets w/o peer corroboration (M5M class)
         'gate_recent_band_floor':      False,  # anchor solo decode if peers saw it recently (S-floor)
         'gate_harmonic_filter':        False,  # drop 2x-5x harmonic spurs of same-call recent spots
         'enable_caller_spotting':      True,   # extract callers AND runner from QSO buffer (c042491)
@@ -5492,9 +5493,26 @@ class SpotTracker:
             # stay distinct (both SCP-valid → no merge). Bucketing always
             # logs the mapping; whether to SUBSTITUTE the call (emit bucket
             # form instead of raw) is controlled by gate_scp_bucket_substitute.
+            #
+            # Short-target guard (M5M / G7D class): a 3-char SCP target is a
+            # noise magnet — the edit-1 neighbourhood is ~62 alternatives at
+            # every position, so random noise routinely lands "next to" one.
+            # 2026-05-14 production data: 12 bucket-substitutions to G5E /
+            # M3E / M5A in 24 min (all from noise inputs like D5E / E5E / E3E
+            # / T5A). For targets ≤3 chars, require peer-skimmer corroboration
+            # via S-floor cache before allowing the substitution. Falls back
+            # to raw-call processing otherwise (which will likely be filtered
+            # downstream by SCP / patt3ch since the raw is non-SCP).
             if '/' not in call:
                 _bucket = self._scp_bucket(call)
                 if _bucket != call and _bucket in self.valid_calls:
+                    if (len(_bucket) <= 3
+                            and self.gate_config.get('gate_short_scp_bucket', True)
+                            and not self._has_recent_band_support(_bucket, freq_khz, now)):
+                        log.info("SCP bucket: %s → %s @ %.1f kHz SUPPRESSED "
+                                 "(short target, no peer corroboration)",
+                                 call, _bucket, freq_khz)
+                        continue
                     log.info("SCP bucket: %s → %s @ %.1f kHz", call, _bucket, freq_khz)
                     if self.gate_config['gate_scp_bucket_substitute']:
                         call = _bucket
