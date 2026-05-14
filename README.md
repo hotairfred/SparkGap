@@ -221,6 +221,11 @@ Accepts 16-bit and 24-bit stereo IQ WAV files at 192 kHz.
   per-band IQ buffer to `/tmp/diag_<band>_<HHMMSS>.wav` for offline
   replay (requires `enable_ft8: true` — taps the FT8 capture buffer).
 
+## Development
+
+SparkGap is developed using Claude Code as the primary development tool.
+Contributors are encouraged to use Claude Code for consistency.
+
 ## License
 
 GPLv3.  See `LICENSE`.
