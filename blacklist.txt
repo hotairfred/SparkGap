@@ -83,3 +83,20 @@ W3I
 # spots from us across 80/40/20/15m at scattered freqs, no other skimmer
 # corroborated. Pure decoder hallucination on a 3-char contest call.
 G7D
+
+# Operator-reported false positives (added 2026-05-13)
+# Reported via email: 5 bogus spots on 10m the same evening — SA6P, M5M,
+# E6AQ, A5N, N3T. All confirmed in our sparkgap.log as decoder hallucinations
+# on short SCP entries:
+#   N3T, A5N: 1x1 patterns, raw was pure E/T monocharacter noise [unverified]
+#   SA6P, E6AQ: 4-char SCP [exact] matches on noise-only raw decodes
+#   M5M: bucket-substitute target — 4 hits in 5 hours, raw was X5M/K5M/N5M/I5M
+#        before edit-1 substitution mapped them all to M5M. Symptom of a
+#        systemic issue with 3-char SCP entries acting as noise magnets via
+#        gate_scp_bucket_substitute. TODO revisit bucket-substitute behaviour
+#        for sub-4-char targets.
+N3T
+A5N
+SA6P
+E6AQ
+M5M

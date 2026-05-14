@@ -2,6 +2,63 @@
 
 Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
+## 2026-05-13
+
+### Fixed
+- **Memory leak in `SpotTracker._rb_support` (S-floor peer cache)** — root
+  cause of the 2026-05-13 OOM kill. The RBN worldwide telnet tee fed every
+  spot worldwide into `_ingest_support`, which wrote
+  `_rb_support[(bucket, band)][spotter] = ts` with no eviction.
+  `_has_recent_band_support` filtered stale entries at read time but never
+  deleted them. Six days × hundreds of spots/minute = ~1.7 GB/day growth,
+  hit kernel OOM at 14.5 GB RSS after 6-day uptime. Fix: new
+  `SpotTracker._sweep_rb_support(now)` method that prunes spotters older
+  than `_rb_window_sec` and drops empty `(bucket, band)` keys; called every
+  5 min from main loop. Validation: RSS plateaus at ~3.4 GB within 5 min
+  of restart (was monotonically rising before).
+- **8-hour silent dead-air problem** — the OOM kill went unnoticed for
+  8 hours because there is no liveness alarm. Memory note saved for a
+  watchdog (systemd `--user` Restart=on-failure + MQTT heartbeat that
+  comms_watch can alarm on) but not yet shipped.
+
+### Added
+- **RSS heartbeat in Status block** (`sparkgap.py:6506`). Reads VmRSS from
+  `/proc/self/status` every 30 s, logs `Mem: rss_kb=NNN rb_buckets=NNN`.
+  Provides curve data for future leak diagnosis + regression detection
+  on the S-floor cache size specifically.
+- **Operator-reported blacklist entries** — 5 calls added under a new
+  2026-05-13 "Operator-reported" block: `N3T, A5N, SA6P, E6AQ, M5M`.
+  All confirmed in `/tmp/sparkgap.log` as decoder noise on short
+  MASTER.SCP entries. M5M was the smoking gun: 4 different noise inputs
+  (X5M / K5M / N5M / I5M) all bucket-substituted to the same target in
+  5 hours. Memory note saved to revisit `gate_scp_bucket_substitute`
+  behaviour for sub-4-char SCP targets (likely a length floor of ≥4).
+
+## 2026-05-07
+
+### Changed
+- **`ppm_offset` reset to 0.0** for clean baseline measurement. W3RGA Day 4
+  flagged us at +5.3 ppm; we applied `ppm_offset = 5.3` and Day 5 came back
+  at −4.8 ppm — a sign-flip overshoot. Interpretation: the +5.3 was thermal
+  transient from the 04-30 8-band switch-on (more receivers active = more
+  TCXO heat = more drift). After 24 h soak the natural drift had settled
+  to roughly +0.5 ppm, so the −5.3 correction overshot. Resetting to 0.0
+  lets W3RGA Day 6 reveal the actual stable thermal-equilibrium drift
+  before we pick a permanent offset.
+  - **Day 6 confirmed: +0.1 ppm** (rank #41/199, 3545 spots, 0.34% dupe).
+    Same skew as W3RGA himself. Best calibration figure we've ever shown.
+    Both hypotheses validated — sign was right, magnitude was thermal.
+    Leaving `ppm_offset = 0.0` as the steady-state value.
+
+### Fixed
+- **Stale hardcoded ppm constant in startup banner** (`sparkgap.py:6007`).
+  The "SparkGap LIVE: 3590000 (3589.986 kHz)" line was multiplying centre
+  frequencies by `0.9999961` (a baked-in 3.9 ppm correction), independent
+  of the actual `ppm_offset` config — leftover from a pre-`ppm_offset`
+  era. Cosmetic only; the spot emit path already routes through
+  `_corrected_freq_khz()` and was honouring the JSON config correctly.
+  Banner now also routes through `_corrected_freq_khz()`.
+
 ## 2026-04-30
 
 ### Added

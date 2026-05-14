@@ -4786,6 +4786,28 @@ class SpotTracker:
         with self._rb_lock:
             self._rb_support[(bucket, band)][spotter] = ts
 
+    def _sweep_rb_support(self, now):
+        """Drop spotters with ts < now - _rb_window_sec and remove empty
+        (bucket, band) entries. Without this, the RBN-tee feed of every
+        worldwide spot accretes forever and dominates process memory
+        (~1.7 GB/day on a 6-day run before OOM, 2026-05-13). Returns
+        (n_buckets_dropped, n_spotters_dropped, n_buckets_remaining)
+        for telemetry."""
+        cutoff = now - self._rb_window_sec
+        spotters_dropped = 0
+        with self._rb_lock:
+            empty_keys = []
+            for key, spotters in self._rb_support.items():
+                stale = [s for s, ts in spotters.items() if ts < cutoff]
+                for s in stale:
+                    del spotters[s]
+                spotters_dropped += len(stale)
+                if not spotters:
+                    empty_keys.append(key)
+            for k in empty_keys:
+                del self._rb_support[k]
+            return len(empty_keys), spotters_dropped, len(self._rb_support)
+
     def _has_recent_band_support(self, call, freq_khz, now):
         """True if `call` has been seen by >= min_spotters distinct spotters
         on this band within `_rb_window_sec`. Self ('OS:self') counts as a
@@ -6004,9 +6026,9 @@ class SparkGap:
         self.running = True
 
         for name, center_hz, rx_idx in self._band_meta:
-            cal_center = center_hz * 0.9999961
+            cal_center_khz = self._corrected_freq_khz(center_hz / 1000.0)
             log.info("SparkGap LIVE: %s (%.3f kHz) rx%d, telnet :%d",
-                     name, cal_center / 1000, rx_idx,
+                     name, cal_center_khz, rx_idx,
                      self.cfg.get('telnet_port', 7300))
 
         # SIGUSR1 → snapshot the current IQ buffer for every enabled band
@@ -6138,8 +6160,10 @@ class SparkGap:
 
         scan_interval = self.cfg.get('scan_interval', 5)
         status_interval = self.cfg.get('status_interval', 30)
+        rb_sweep_interval = 300  # 5 min — S-floor cache eviction
         last_scan = 0
         last_status = 0
+        last_rb_sweep = 0
 
         while self.running:
             now = time.time()
@@ -6478,6 +6502,36 @@ class SparkGap:
                                  env_drops_total, bins_total, bins_peak)
                     except Exception as e:
                         log.warning("Health probe failed: %s", e)
+
+                # RSS heartbeat — 2026-05-13 OOM diagnostic. Reads VmRSS
+                # from /proc/self/status (linux-only; no-op on other OS).
+                try:
+                    with open('/proc/self/status') as _sf:
+                        for _ln in _sf:
+                            if _ln.startswith('VmRSS:'):
+                                rss_kb = int(_ln.split()[1])
+                                rb_buckets = len(self.tracker._rb_support) \
+                                    if getattr(self, 'tracker', None) else 0
+                                log.info("Mem: rss_kb=%d rb_buckets=%d",
+                                         rss_kb, rb_buckets)
+                                break
+                except Exception:
+                    pass
+
+            # S-floor cache sweep — bound the RBN-tee peer cache to
+            # _rb_window_sec. Without this, /proc/self/status VmRSS grows
+            # ~1.7 GB/day until OOM (observed 2026-05-13 after 6-day run).
+            if now - last_rb_sweep >= rb_sweep_interval:
+                last_rb_sweep = now
+                try:
+                    if self.tracker is not None:
+                        n_buckets, n_spotters, remaining = \
+                            self.tracker._sweep_rb_support(now)
+                        if n_buckets or n_spotters:
+                            log.info("S-floor sweep: dropped %d buckets, %d spotters; %d buckets remaining",
+                                     n_buckets, n_spotters, remaining)
+                except Exception as e:
+                    log.warning("S-floor sweep failed: %s", e)
 
             # FT8 decode — aligned to minute boundaries, runs in thread
             if use_c and getattr(self, '_worker_started', False) \

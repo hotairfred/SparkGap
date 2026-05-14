@@ -36,8 +36,8 @@
     "itila_max_bins": 400,
     "use_pfb_scanner": false,
 
-    "_comment_ppm_offset": "Software frequency calibration. Subtracted from every reported freq. ppm_offset > 0 means our reports were running too high (Pitaya TCXO slow). W3RGA's daily analysis is the authoritative source — set to whatever ppm value SM7IUN flags us at on the latest standings. compute_ppm_skew.py is useful for sanity-checking shifts but hits a 10 Hz tee-rounding floor (~1 ppm resolution). Re-measure weekly. Hardware fix is the R25/R26 SMD mod + Bodnar 125 MHz GPSDO when convenient. Initial value 5.3 from W3RGA May 5 standings.",
-    "ppm_offset": 5.3,
+    "_comment_ppm_offset": "Software frequency calibration. Subtracted from every reported freq. ppm_offset > 0 means our reports were running too high (Pitaya TCXO slow). W3RGA's daily analysis is the authoritative source — set to whatever ppm value SM7IUN flags us at on the latest standings. compute_ppm_skew.py is useful for sanity-checking shifts but hits a 10 Hz tee-rounding floor (~1 ppm resolution). Hardware fix is the R25/R26 SMD mod + Bodnar 125 MHz GPSDO when convenient. CRITICAL LESSON (2026-05-07): allow 24+ hours of thermal soak after any band-count or load change before chasing a W3RGA skew flag. The +5.3 ppm flagged on Day 4 was thermal transient from the 04-30 8-band switch-on; correcting against it overshot to -4.8 (Day 5). After resetting to 0.0 the steady-state drift came in at +0.1 ppm on Day 6 — same as W3RGA himself. Don't react to one day's skew; wait for thermal equilibrium.",
+    "ppm_offset": 0.0,
 
     "_comment_gates": "Gate flags — defaults shown are 'ship-it' mode (permissive emit, trust cluster filtering). Each gate is a feature you can re-enable individually for stricter local behavior. See feedback_ship_it_plan.md for rationale.",
     "enable_caller_spotting":      true,
