@@ -4617,6 +4617,68 @@ class InstanceManager:
         return sum(g.count for g in self.instances.values())
 
 
+# --- Morse-aware character-confusion table --------------------------------
+# Used by SpotTracker._scp_bucket to constrain SCP edit-1 corrections to
+# real CW decoder confusions (insert/delete of dit-dah elements) rather
+# than arbitrary letter substitutions. Letter-edit-1 treated N=`-.` and
+# W=`.--` as neighbors and silently rewrote NT2J → WT2J on 2026-05-15
+# even though no real decoder confuses N for W. This table is used to
+# generate per-character neighbor sets where each pair is within
+# `_MORSE_MAX_INDEL` insert/delete operations on the dit-dah sequence.
+
+_MORSE_TABLE = {
+    'A': '.-',    'B': '-...',  'C': '-.-.',  'D': '-..',   'E': '.',
+    'F': '..-.',  'G': '--.',   'H': '....',  'I': '..',    'J': '.---',
+    'K': '-.-',   'L': '.-..',  'M': '--',    'N': '-.',    'O': '---',
+    'P': '.--.',  'Q': '--.-',  'R': '.-.',   'S': '...',   'T': '-',
+    'U': '..-',   'V': '...-',  'W': '.--',   'X': '-..-',  'Y': '-.--',
+    'Z': '--..',
+    '0': '-----', '1': '.----', '2': '..---', '3': '...--',
+    '4': '....-', '5': '.....', '6': '-....', '7': '--...',
+    '8': '---..', '9': '----.',
+}
+
+_MORSE_MAX_INDEL = 2  # accept char swap iff dit-dah codes within 2 ins/del
+
+
+def _morse_indel_distance(a, b):
+    """Levenshtein with substitution disallowed — only insert/delete.
+    Equivalent to len(a) + len(b) - 2*LCS(a, b). Captures the CW
+    decoder failure mode where elements get eaten by fades or
+    hallucinated from noise; rejects mid-character dit↔dah swaps
+    which require precise mistiming and rarely occur."""
+    n, m = len(a), len(b)
+    prev = [0] * (m + 1)
+    for i in range(1, n + 1):
+        curr = [0] * (m + 1)
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(prev[j], curr[j - 1])
+        prev = curr
+    return n + m - 2 * prev[m]
+
+
+def _build_morse_confusable_map(max_indel):
+    """For each char in _MORSE_TABLE, the frozenset of other chars
+    whose Morse code is within `max_indel` insert/delete operations.
+    Real CW confusions (E↔I, R↔N↔G, S↔H↔5, B↔D, U↔V, C↔K) appear at
+    distance ≤2. Aurally distinct pairs (N↔W, K↔V, I↔W) sit at ≥3
+    and are excluded."""
+    out = {}
+    chars = list(_MORSE_TABLE.keys())
+    for c1 in chars:
+        m1 = _MORSE_TABLE[c1]
+        neighbors = {c2 for c2 in chars
+                     if c2 != c1 and _morse_indel_distance(m1, _MORSE_TABLE[c2]) <= max_indel}
+        out[c1] = frozenset(neighbors)
+    return out
+
+
+_MORSE_CONFUSABLE = _build_morse_confusable_map(_MORSE_MAX_INDEL)
+
+
 class SpotTracker:
     """Validates spots using temporal consistency + fuzzy SCP matching.
 
@@ -5082,12 +5144,18 @@ class SpotTracker:
 
     def _scp_bucket(self, call):
         """Map a call to its consensus bucket: nearest SCP-valid call within
-        edit distance 1 (substitution), or after trimming ≤2 leading
-        noise-prefix chars (E/T/I/S) plus another edit-1 substitution.
-        Returns the call itself if no unambiguous SCP neighbor exists.
-        Collapses garbled variants (VM4FO, ITM4FO, EVM4FO → KM4FO) into
-        one vote bucket while keeping distinct SCP-valid calls (K8MA vs
-        K8MR) separate. Cached per-call (deterministic mapping)."""
+        one Morse-confusable character substitution (see _MORSE_CONFUSABLE),
+        or after trimming ≤2 leading noise-prefix chars (E/T/I/S) and
+        looking for an exact SCP hit. Returns the call itself if no
+        unambiguous neighbor exists. Cached per-call.
+
+        Why Morse-confusable rather than letter-edit-1: letter-level edit-1
+        treats N(-.) and W(.--) as neighbors even though their dit-dah
+        codes are 3 ins/del operations apart and no real decoder confuses
+        them. The Morse-aware map bounds character swaps to actual CW
+        failure modes (fade eats an element / noise spike inserts one),
+        so legitimate raw decodes like NT2J no longer get silently
+        rewritten to dictionary neighbors like WT2J (2026-05-15 incident)."""
         if not hasattr(self, '_bucket_cache'):
             self._bucket_cache = {}
         if call in self._bucket_cache:
@@ -5096,21 +5164,27 @@ class SpotTracker:
             self._bucket_cache[call] = call
             return call
 
-        def _edit1_unique_scp(s):
-            """Return the unique SCP-valid edit-1 substitution of s, or
-            None if zero or 2+ matches (ambiguous → no merge)."""
+        def _morse_neighbor_unique_scp(s):
+            """Return the unique SCP-valid call reachable from s by a
+            single Morse-confusable character swap, or None if zero or
+            2+ matches (ambiguous → no merge). Only swaps where the
+            replaced and replacement characters' Morse codes are within
+            _MORSE_MAX_INDEL ins/del operations are considered."""
             matches = set()
             for i in range(len(s)):
-                for c in self._BUCKET_CHARS:
-                    if c == s[i]: continue
-                    cand = s[:i] + c + s[i+1:]
+                neighbors = _MORSE_CONFUSABLE.get(s[i])
+                if not neighbors:
+                    continue
+                prefix, suffix = s[:i], s[i+1:]
+                for c in neighbors:
+                    cand = prefix + c + suffix
                     if cand in self.valid_calls:
                         matches.add(cand)
                         if len(matches) > 1:
                             return None
             return matches.pop() if len(matches) == 1 else None
 
-        bucket = _edit1_unique_scp(call)
+        bucket = _morse_neighbor_unique_scp(call)
         if bucket:
             self._bucket_cache[call] = bucket
             return bucket
@@ -5319,15 +5393,24 @@ class SpotTracker:
 
     def _correct_leading_letter(self, call):
         """If `call` looks like a leading-letter substitution of a single SCP
-        call, return that SCP call.  Returns None if `call` is already in SCP,
-        if no SCP variant matches, or if multiple variants match (ambiguous).
+        call AND the substitution is Morse-confusable (the two leading
+        letters' dit-dah codes are within _MORSE_MAX_INDEL ins/del ops),
+        return that SCP call. Returns None if `call` is in SCP, no SCP
+        variant matches, multiple match (ambiguous), or the single match
+        requires an aurally-distinct letter swap.
 
         Diagnoses the Bayesian decoder's most common failure on weak signals:
-        the first character lands on a Morse-confusable letter.  Examples
-        from live SDC diff (2026-04-26 05:04-05:09 UTC):
-            T1LZ  → K1LZ    SB9BUN → HB9BUN    E5IN → F5IN
-            MM8U  → GM8U    E4HRM  → DL4HRM (2-edit, not handled here)
-        """
+        the first character lands on a Morse-confusable letter (fade eats a
+        leading element or noise spike inserts one). Examples from live SDC
+        diff (2026-04-26 05:04-05:09 UTC):
+            T1LZ  → K1LZ   (T=- ↔ K=-.- : indel 2 ✓)
+            SB9BUN→ HB9BUN (S=... ↔ H=.... : indel 1 ✓)
+            MM8U  → GM8U   (M=-- ↔ G=--. : indel 1 ✓)
+
+        The Morse-confusable gate prevents incidents like I0HXL→W0HXL
+        (2026-05-15 02:13 UTC) where I=`..` and W=`.--` are 3 ins/del
+        apart — no real decoder confuses them, the call had a unique
+        suffix match by coincidence."""
         if call in self.valid_calls:
             return None
         if len(call) < 4 or len(call) > 7:
@@ -5339,9 +5422,14 @@ class SpotTracker:
         # Single-match policy: only correct when unambiguous.  Many SCP suffixes
         # (e.g. "1AW") have dozens of valid prefixes — substituting the first
         # one would be wrong as often as right.
-        if len(candidates) == 1:
-            return candidates[0]
-        return None
+        if len(candidates) != 1:
+            return None
+        cand = candidates[0]
+        # Morse-confusability gate: the replacement leading letter must be
+        # within _MORSE_MAX_INDEL ins/del operations of the original.
+        if cand[0] not in _MORSE_CONFUSABLE.get(call[0], frozenset()):
+            return None
+        return cand
 
     def _fuzzy_match(self, fragment, max_dist=1):
         """Find SCP callsigns within edit distance max_dist of fragment.
