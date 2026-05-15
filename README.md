@@ -6,8 +6,11 @@ Open-source, Linux-native, multi-mode amateur radio skimmer.
 **CW + FT8 + RTTY** on multiple bands simultaneously, feeding RBN-style
 spot output via telnet.
 
-> **Status:** alpha. Actively developed. Tested in production on a
-> Red Pitaya STEMlab 125-14 with a 5-band antenna.
+> **Status:** alpha. Actively developed. Running in production on a
+> Red Pitaya STEMlab 125-14 (8 bands: 80m / 40m / 30m / 20m / 17m /
+> 15m / 12m / 10m) feeding the Reverse Beacon Network as `WF8Z-#`
+> via Aggregator, and PSKReporter directly via the built-in
+> `pskr_feeder.py`.
 >
 > **Reference comparisons (comparable, not claiming superiority):**
 >
@@ -55,8 +58,11 @@ For benchmarking we compare two ways:
 ## What works today
 
 - **Multi-band CW skimming** via Red Pitaya (HPSDR Protocol 1).
-  5 bands simultaneously on a stock Pitaya 125-14, sustained.
+  8 bands simultaneously on a stock Pitaya 125-14, sustained
+  (80 / 40 / 30 / 20 / 17 / 15 / 12 / 10 m).
 - **FT8 decoding** on each band's WSPR/FT8 sub-band, minute-aligned.
+- **PSKReporter feeder** (`pskr_feeder.py`) — pushes FT8 decodes to
+  PSKReporter via IPFIX/UDP. Visible as `WF8Z-1` on the global map.
 - **RTTY skimming** (currently runs alongside FT8; auto-disabled
   outside RTTY contests).
 - **Modern Bayesian CW decoder (ITILA)** with thread-safe per-handle
@@ -78,10 +84,11 @@ For benchmarking we compare two ways:
 - **Hardware abstraction** beyond Red Pitaya HPSDR.  RX-888, SDRPlay,
   Hermes Lite 2 backends would each require a plugin author who owns
   that hardware.  See the IqSource discussion in the project docs.
-- **PSKReporter feeder for FT8 / FT4.**  RBN's ingest pipe is
-  CW + RTTY only; FT8/FT4 spots reach the wider community via
-  PSKReporter, which is a separate protocol entirely.  A
-  `pskr_feeder.py` would close that gap.
+- **Native RBN feeder.**  `rbn_feeder.py` exists and speaks the
+  Aggregator-equivalent HTTP/JSON protocol, but isn't yet
+  enabled-by-default — we currently bridge through Aggregator on a
+  Windows box. Coordinate with RBN-OPS before pointing a native
+  feeder at production.
 - **Documentation polish.**  This README is the start; expect rough
   edges in install, config, and operations until the project matures.
 - **Validated multi-recording test suite.**  We have one rigorous
@@ -118,7 +125,8 @@ Configure: copy `sk_5band.json` and edit:
   "callsign": "YOUR_CALL",
   "grid": "YOUR_GRID",
   "sdr_ip": "192.168.X.X",
-  "bands": [3590000, 7090000, 14090000, 21090000, 28090000],
+  "bands": [3590000, 7090000, 10118000, 14090000,
+            18083000, 21090000, 24902000, 28090000],
   "enable_ft8": true,
   ...
 }
@@ -191,7 +199,8 @@ re-enabled individually for stricter local behavior:
 | `gate_recent_band_floor` | `false` | S-floor: anchor solo decode if peer skimmers spotted the same call on the same band recently |
 | `gate_harmonic_filter` | `false` | Drop apparent 2x-5x harmonic spurs of recent same-call spots (RX intermod artifacts) |
 | `gate_telemetry` | `true`  | Log "would-gate" decisions even when gate is off (diagnostic) |
-| `gate_timing_cost` | `false` | Drop ITILA decode windows whose segmentation timing cost exceeds `timing_cost_max` (default 30). Targets the M5M / G7D class where decoder noise threshold-crosses and "decodes" to a short callsign by chance. Cost is logged on every decode regardless of the flag — flip on once production distributions look like the B1_seg2 validation envelope. |
+| `gate_timing_cost` | `false` (in code; `sk_5band.json` overrides to `true`) | Drop ITILA decode windows whose segmentation timing cost exceeds `timing_cost_max`. B1_seg2 validation suggested 30; production shipped at 100 (median emit-cost in production was higher than the recording's, so 100 catches the obvious M5M-class flood without clipping marginal real calls). Targets the M5M / G7D class where decoder noise threshold-crosses and "decodes" to a short callsign by chance. Cost is logged on every decode regardless of the flag. |
+| `gate_short_scp_bucket` | `true` | When a SCP bucket-substitute target is ≤3 chars, require peer-skimmer corroboration before allowing the substitution. Short SCP entries are noise magnets (G5E, M3E, M5A class); without this guard, decoder garbage routinely lands edit-1 from one of them. Skipped for ≥4-char targets. |
 
 Plus the standard knobs:
 

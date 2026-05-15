@@ -2,6 +2,42 @@
 
 Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
+## 2026-05-15
+
+### Added
+- **Morse-aware character-confusion gate on SCP correction**
+  (`sparkgap.py` _MORSE_TABLE / _MORSE_CONFUSABLE). Letter-level edit-1
+  was incorrectly treating aurally-distinct letter pairs as neighbors —
+  e.g. N=`-.` and W=`.--` are 3 ins/del operations apart in dit-dah
+  space but letter-edit-1 considered them edit-1, silently rewriting
+  raw decodes like NT2J to WT2J because WT2J was the only edit-1
+  neighbor in MASTER.SCP. The new gate constrains every character swap
+  in SCP correction (both `_scp_bucket` general path and
+  `_correct_leading_letter` first-character path) to pairs within
+  `_MORSE_MAX_INDEL=2` insert/delete operations on the dit-dah sequence.
+  Captures real CW failure modes (fade eats an element, noise spike
+  inserts one) — E↔I, R↔N↔G, S↔H, B↔D, U↔V, C↔K all ≤2 — while
+  rejecting aurally distinct pairs (N↔W=3, I↔W=3, H↔W=5, K↔V=3).
+  Validated against MASTER.SCP (50,419 entries): NT2J cluster returns
+  None instead of WT2J; legit single-char noise corrections
+  (1F8Z→WF8Z, C3LR→K3LR, B5RZ→N5RZ) still resolve.
+- **Short-target SCP bucket-substitute guard exclude_self mode.**
+  `_has_recent_band_support(... exclude_self=True)` for the short-
+  target guard prevents cross-skimmer collective hallucination: when
+  `OS:self` was counted as a corroborator, our own past emission of a
+  noise-substituted 3-char call would self-vouch any future
+  substitution, and any RBN peer worldwide that also hallucinated the
+  same call satisfied the 2-spotter minimum. Now the short-target
+  guard requires `_rb_min_spotters` *external* peer skimmers. S-floor
+  sighting-threshold path keeps the default `exclude_self=False`
+  (own confirmation still anchors S-floor).
+
+### Fixed
+- **G5E noise flood through cross-skimmer corroboration.** 7-hour
+  observation post-length-aware-fix showed 24 G5E emitted despite 69
+  SUPPRESSED (peer cache including `OS:self` lowered the bar).
+  Confirmed zero G5E emit after exclude_self fix shipped 00:40 UTC.
+
 ## 2026-05-14
 
 ### Added
@@ -21,16 +57,36 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
     most of the M5M-class.
   - **C vs Python parity:** 96.9 % gate agreement on 130 real channels,
     median absolute delta 0.043, zero in-key disagreements.
-  - **Config:** new `gate_timing_cost` (bool, default `false`) and
-    `timing_cost_max` (float, default 30.0). Default-off: cost is
-    *always logged* on each ITILA decode (`ITILA raw kHz cost=X.XX …`)
-    but emission is unaffected until the flag is flipped. Lets us
-    observe production distributions before turning the gate on.
+  - **Config:** new `gate_timing_cost` (bool, default `false` in code,
+    flipped to `true` in `sk_5band.json` after first 7 h of observation)
+    and `timing_cost_max` (float, default 30.0; production threshold
+    set to 100.0 to match the observed live distribution — the
+    M5M-class hallucinations cluster above 85, while real emissions
+    stayed under 75). Cost is *always logged* on each ITILA decode
+    (`ITILA raw kHz cost=X.XX …`).
   - **API:** new `double itila_get_last_cost(itila_t)` in `itila.h`.
+  - **C-worker plumbing.** `libitila_scanner.so` exposes
+    `itila_sc_set_cost_fn()`; `ScDecodeResult` extended 280→288 bytes
+    with trailing `double cost`; `libhpsdr_fast.so` `RESULT_SIZE`
+    bumped accordingly; Python `_ItilaScanner.run` parses cost from
+    offset 280 and applies the gate before emission.
+- **Length-aware SCP bucket-substitute guard** (M5M class). When the
+  substitute target is ≤3 chars, require at least `_rb_min_spotters`
+  peer-skimmer corroborations on the same band within
+  `_rb_window_sec` before allowing the substitution. Short SCP
+  entries are noise magnets (each position has ~62 edit-1 neighbours
+  so random decoder output routinely lands next to one). Combined
+  with the cost gate, kills the M5M / G5E / G7D laundering pattern
+  while leaving long-target corrections (VM4FO → KM4FO etc.) intact.
+  New `gate_short_scp_bucket` flag (default `true` in code, no JSON
+  override needed).
 - **Validation tooling:** `eval_timing_cost.py` (scan a WAV, dump
   `(call, freq, cost, in_key)` CSV + threshold sweep) and
   `compare_c_vs_py_cost.py` (parity harness between C library and
   Python prototype).
+- **README Development section** — explicit note that SparkGap is
+  developed using Claude Code as the primary development tool
+  (matches NereusSDR / AetherSDR / GTBridge convention).
 
 ## 2026-05-13
 
