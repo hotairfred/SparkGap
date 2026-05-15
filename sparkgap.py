@@ -4857,11 +4857,22 @@ class SpotTracker:
                 del self._rb_support[k]
             return len(empty_keys), spotters_dropped, len(self._rb_support)
 
-    def _has_recent_band_support(self, call, freq_khz, now):
+    def _has_recent_band_support(self, call, freq_khz, now, exclude_self=False):
         """True if `call` has been seen by >= min_spotters distinct spotters
-        on this band within `_rb_window_sec`. Self ('OS:self') counts as a
-        spotter, so once we've confirmed the call once it's anchored for
-        the window."""
+        on this band within `_rb_window_sec`.
+
+        By default, self ('OS:self') counts as a spotter — once we've
+        confirmed the call once, it's anchored for the window. That works
+        for the S-floor sighting-threshold path (where we trust our own
+        recent confirmation).
+
+        For the short-target bucket-substitute guard, set exclude_self=True:
+        we should not let our own past emission of a noisy 3-char call
+        validate the next noise-substituted version of the same call.
+        This closes the cross-skimmer collective-hallucination feedback
+        loop seen 2026-05-14 with G5E (multiple skimmers worldwide
+        hallucinated the same 3-char SCP entries, corroborating each
+        other's mistakes via the peer-tee feed)."""
         band = self._band_id_for_freq(freq_khz)
         if band is None:
             return False
@@ -4869,7 +4880,8 @@ class SpotTracker:
         cutoff = now - self._rb_window_sec
         with self._rb_lock:
             spotters = self._rb_support.get((bucket, band), {})
-            live = sum(1 for ts in spotters.values() if ts >= cutoff)
+            live = sum(1 for sp, ts in spotters.items()
+                       if ts >= cutoff and not (exclude_self and sp == 'OS:self'))
         return live >= self._rb_min_spotters
 
     def _effective_min_sightings(self, call, freq_khz, snr=0, now=None):
@@ -5508,7 +5520,7 @@ class SpotTracker:
                 if _bucket != call and _bucket in self.valid_calls:
                     if (len(_bucket) <= 3
                             and self.gate_config.get('gate_short_scp_bucket', True)
-                            and not self._has_recent_band_support(_bucket, freq_khz, now)):
+                            and not self._has_recent_band_support(_bucket, freq_khz, now, exclude_self=True)):
                         log.info("SCP bucket: %s → %s @ %.1f kHz SUPPRESSED "
                                  "(short target, no peer corroboration)",
                                  call, _bucket, freq_khz)
