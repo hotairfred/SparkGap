@@ -2343,6 +2343,7 @@ class _ItilaScanner:
             'text_buf': '',       # rolling accumulated raw decode text
             'spotted': set(),     # calls already spotted on this bin
             'last_cq_time': 0.0,  # wall time of last CQ trigger on this bin
+            'window_id_next': 0,  # monotonic counter for SpotIntent.window_id
         }
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
@@ -2429,7 +2430,7 @@ class _ItilaScanner:
             call = _itila_extract_cq_call(raw, self.valid_calls)
             if call and call not in st['spotted']:
                 st['spotted'].add(call)
-                st['pending'].append(f'CQ {call} ')
+                _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                 log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
                 if self._sc:
                     self._sc._lib.itila_sc_mark_evidence(
@@ -2448,7 +2449,7 @@ class _ItilaScanner:
                     for c in calls_in_raw:
                         if c not in st['spotted']:
                             st['spotted'].add(c)
-                            st['pending'].append(f'CQ {c} ')
+                            _emit_intent(st, f_khz, c, wpm, is_runner=False, raw_text=raw)
                             log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, all)",
                                      f_khz, c, wpm, int(now - st['last_cq_time']))
                             if self._sc:
@@ -2458,7 +2459,7 @@ class _ItilaScanner:
                     call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
                     if call and call not in st['spotted']:
                         st['spotted'].add(call)
-                        st['pending'].append(f'CQ {call} ')
+                        _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                         log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
                                  f_khz, call, wpm, int(now - st['last_cq_time']))
                         if self._sc:
@@ -2503,6 +2504,7 @@ class _ItilaScanner:
                 self._bins[f_hz] = {
                     'h100': None, 'h200': None, 'pending': [], 'wpm': 0, 'snr': 0.0,
                     'text_buf': '', 'spotted': set(), 'last_cq_time': 0.0,
+                    'window_id_next': 0,
                 }
             st = self._bins[f_hz]
             st['snr'] = snr
@@ -2518,7 +2520,7 @@ class _ItilaScanner:
             call = _itila_extract_cq_call(raw, self.valid_calls)
             if call and call not in st['spotted']:
                 st['spotted'].add(call)
-                st['pending'].append(f'CQ {call} ')
+                _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                 log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)", f_khz, call, wpm, raw[:60])
                 if self._sc:
                     self._sc._lib.itila_sc_mark_evidence(
@@ -2531,7 +2533,7 @@ class _ItilaScanner:
                     for c in calls_in_raw:
                         if c not in st['spotted']:
                             st['spotted'].add(c)
-                            st['pending'].append(f'CQ {c} ')
+                            _emit_intent(st, f_khz, c, wpm, is_runner=False, raw_text=raw)
                             log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, all)",
                                      f_khz, c, wpm, int(now - st['last_cq_time']))
                             if self._sc:
@@ -2541,7 +2543,7 @@ class _ItilaScanner:
                     call = _itila_extract_cq_call(st['text_buf'], self.valid_calls)
                     if call and call not in st['spotted']:
                         st['spotted'].add(call)
-                        st['pending'].append(f'CQ {call} ')
+                        _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                         log.info("ITILA context %.1f kHz: %s %d WPM (CQ %ds ago, runner)",
                                  f_khz, call, wpm, int(now - st['last_cq_time']))
                         if self._sc:
@@ -2549,15 +2551,16 @@ class _ItilaScanner:
                                 self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
-        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm).
+        """Returns list of SpotIntent records, one per ready window-extraction.
 
-        Yields ONE result per pending entry — never joins entries.  Each
-        pending entry comes from a single ITILA window's Path 1/2 extraction
-        and represents one decode event.  Joining them previously caused
-        SpotTracker's per-event gates (cq_runner, has_context, sighting
-        counts) to operate on conflated text and silently suppress
-        legitimate runners — see project_itila_pending_merge_bug.md for the
-        K0TG / N4BA worked example.
+        Each pending entry is a structured SpotIntent built by _emit_intent
+        when Path 1 or Path 2 extracts a callsign.  Replaces the previous
+        synthetic 'CQ <call> ' string IPC — eliminates the re-parsing
+        ambiguity that caused the K0TG/N4BA-class bugs, and carries the
+        runner/caller distinction directly via intent.is_runner.
+
+        Caller (InstanceManager.collect_all) is responsible for dispatching
+        these to tracker.process_intent() rather than tracker.process().
         """
         results = []
         for f_hz, st in self._bins.items():
@@ -2565,9 +2568,7 @@ class _ItilaScanner:
                 continue
             pending = st['pending']
             st['pending'] = []
-            for entry in pending:
-                results.append((f_hz/1000.0, st['snr'], entry, entry,
-                                id(st), 'itila', st['wpm']))
+            results.extend(pending)
         return results
 
     def _free_bin_handles(self, f_hz):
@@ -4691,6 +4692,54 @@ def _build_morse_confusable_map(max_indel):
 _MORSE_CONFUSABLE = _build_morse_confusable_map(_MORSE_MAX_INDEL)
 
 
+# -----------------------------------------------------------------------------
+# SpotIntent — structured channel between decoders that already know what call
+# they extracted (currently just _ItilaScanner) and SpotTracker.  Replaces the
+# synthetic "CQ <call> " string IPC for ITILA; uhsdr_cw / bmorse / hamfist
+# continue to emit streamed text via the legacy path.
+#
+# Why this exists: the string channel forced tracker.process() to re-parse
+# what the scanner already knew (call identity, runner-vs-caller, window
+# boundary).  That re-parsing produced an entire class of bugs — see
+# docs/scanner_tracker_ipc_refactor.md and the K0TG/N4BA worked example.
+# Carrying the structured fields directly eliminates the ambiguity at the
+# source.
+# -----------------------------------------------------------------------------
+from dataclasses import dataclass, field
+
+@dataclass
+class SpotIntent:
+    call:      str         # callsign as extracted (uppercase, no slash strip)
+    freq_khz:  float
+    snr_db:    float
+    wpm:       int
+    is_runner: bool        # True = Path 1 (call extracted adjacent to CQ trigger)
+                           # False = Path 2 (caller-spotting, repeated calls in
+                           # rolling buffer after a recent CQ on this bin)
+    raw_text:  str = ''    # window's primary_text — telemetry / debug only
+    window_id: int = 0     # monotonic per-bin counter; lets downstream group
+                           # multiple intents from one window without text reparse
+    bin_id:    int = 0     # id(bin_state) — stable for bin lifetime
+
+
+def _emit_intent(st, f_khz, call, wpm, is_runner, raw_text=''):
+    """Construct + append a SpotIntent to a scanner-bin pending queue.
+
+    Centralizes intent construction so all three ITILA emit paths
+    (_process_ready, _process_ready_c, async_main C-drain) build records
+    identically.  Auto-increments bin's window_id counter.
+    """
+    intent = SpotIntent(
+        call=call, freq_khz=f_khz, snr_db=st['snr'], wpm=wpm,
+        is_runner=is_runner,
+        raw_text=raw_text[:80] if raw_text else '',
+        window_id=st['window_id_next'],
+        bin_id=id(st),
+    )
+    st['window_id_next'] += 1
+    st['pending'].append(intent)
+
+
 class SpotTracker:
     """Validates spots using temporal consistency + fuzzy SCP matching.
 
@@ -5477,6 +5526,25 @@ class SpotTracker:
                 curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(c1 != c2)))
             prev = curr
         return prev[-1]
+
+    def process_intent(self, intent):
+        """Consume a structured SpotIntent from _ItilaScanner.
+
+        Behavior-compatible thin wrapper: synthesizes the same "CQ <call> "
+        text the legacy collect() path used to produce, then delegates to
+        process() with dec_type='itila'.  This keeps the gate semantics
+        bit-identical to the deployed text path — the refactor's value is in
+        eliminating the string-IPC ambiguity at the source (one window event
+        = one process_intent call, regardless of how many extractions
+        happened in that window), not in re-tuning the gates.
+
+        Future optimization: process() could grow optional hints
+        (extracted_call, is_runner, has_cq_context) to skip the
+        re-parsing step.  Deferred until this wrapper proves stable.
+        """
+        synth = f'CQ {intent.call} '
+        return self.process(intent.freq_khz, intent.snr_db, synth, synth,
+                            intent.bin_id, dec_type='itila', wpm=intent.wpm)
 
     def process(self, freq_khz, snr, text, context_text=None, decoder_id=0,
                 dec_type='primary', wpm=0):
@@ -6488,6 +6556,7 @@ class SparkGap:
                             'h100': None, 'h200': None, 'pending': [],
                             'wpm': 0, 'snr': 0.0, 'text_buf': '',
                             'spotted': set(), 'last_cq_time': 0.0,
+                            'window_id_next': 0,
                         }
                     st = scanner._bins[f_hz]
                     st['snr'] = snr
@@ -6499,7 +6568,7 @@ class SparkGap:
                     call = _itila_extract_cq_call(raw, self.tracker.valid_calls)
                     if call and call not in st['spotted']:
                         st['spotted'].add(call)
-                        st['pending'].append(f'CQ {call} ')
+                        _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                         log.info("ITILA scan %.1f kHz: %s %d WPM (raw: %s)",
                                  f_khz, call, wpm, raw[:60])
                     elif now - st['last_cq_time'] < 120.0:
@@ -6507,7 +6576,7 @@ class SparkGap:
                         call = _itila_extract_cq_call(st['text_buf'], self.tracker.valid_calls)
                         if call and call not in st['spotted']:
                             st['spotted'].add(call)
-                            st['pending'].append(f'CQ {call} ')
+                            _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                             log.info("ITILA context %.1f kHz: %s %d WPM",
                                      f_khz, call, wpm)
                 else:
@@ -6631,17 +6700,29 @@ class SparkGap:
             max_spot_wpm = self.cfg.get('max_spot_wpm', 0)  # 0 = unlimited
             for (_band_name, _center_hz, _rx_idx), mgr in zip(self._band_meta, self.managers):
                 results = mgr.collect_all()
-                for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
-                    log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
-                    alnum = re.sub(r'[^A-Z0-9]', '', (ctx or text).upper())
-                    if len(alnum) < 4:
-                        continue
-                    if max_spot_wpm and wpm > max_spot_wpm:
-                        log.debug("WPM cap: %.1f kHz %d WPM > %d, skipped",
-                                  rf_khz, wpm, max_spot_wpm)
-                        continue
-                    spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                                 dec_type=dec_type, wpm=wpm)
+                for result in results:
+                    # Dispatch on result type: ITILA scanner emits SpotIntent
+                    # records (no text re-parsing needed); uhsdr/bmorse/hamfist
+                    # emit legacy 7-tuples (streamed character text).  Both
+                    # branches end up with a `spots` list handled uniformly.
+                    if isinstance(result, SpotIntent):
+                        if max_spot_wpm and result.wpm > max_spot_wpm:
+                            log.debug("WPM cap: %.1f kHz %d WPM > %d, skipped",
+                                      result.freq_khz, result.wpm, max_spot_wpm)
+                            continue
+                        spots = self.tracker.process_intent(result)
+                    else:
+                        rf_khz, snr, text, ctx, dec_id, dec_type, wpm = result
+                        log.debug("DECODED %.1f kHz: %r", rf_khz, text[:120])
+                        alnum = re.sub(r'[^A-Z0-9]', '', (ctx or text).upper())
+                        if len(alnum) < 4:
+                            continue
+                        if max_spot_wpm and wpm > max_spot_wpm:
+                            log.debug("WPM cap: %.1f kHz %d WPM > %d, skipped",
+                                      rf_khz, wpm, max_spot_wpm)
+                            continue
+                        spots = self.tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                                     dec_type=dec_type, wpm=wpm)
                     for spot in spots:
                         self.spot_count += 1
                         self.telnet.broadcast_spot(
@@ -7269,11 +7350,16 @@ def run_file_mode(args, config):
 
             # Collect output periodically
             results = manager.collect_all()
-            for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
-                total_chars += len(text)
-                total_results += 1
-                spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                        dec_type=dec_type, wpm=wpm)
+            for result in results:
+                if isinstance(result, SpotIntent):
+                    total_results += 1
+                    spots = tracker.process_intent(result)
+                else:
+                    rf_khz, snr, text, ctx, dec_id, dec_type, wpm = result
+                    total_chars += len(text)
+                    total_results += 1
+                    spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                            dec_type=dec_type, wpm=wpm)
                 for spot in spots:
                     all_spots.append(spot)
                     spotted_freqs.add(spot['freq_khz'])
@@ -7285,11 +7371,16 @@ def run_file_mode(args, config):
         import time as _time
         _time.sleep(0.5)
         results = manager.collect_all()
-        for rf_khz, snr, text, ctx, dec_id, dec_type, wpm in results:
-            total_chars += len(text)
-            total_results += 1
-            spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
-                                    dec_type=dec_type, wpm=wpm)
+        for result in results:
+            if isinstance(result, SpotIntent):
+                total_results += 1
+                spots = tracker.process_intent(result)
+            else:
+                rf_khz, snr, text, ctx, dec_id, dec_type, wpm = result
+                total_chars += len(text)
+                total_results += 1
+                spots = tracker.process(rf_khz, snr, text, ctx, dec_id,
+                                        dec_type=dec_type, wpm=wpm)
             for spot in spots:
                 all_spots.append(spot)
 
