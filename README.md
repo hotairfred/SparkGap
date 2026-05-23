@@ -65,9 +65,11 @@ For benchmarking we compare two ways:
   PSKReporter via IPFIX/UDP. Visible as `WF8Z-1` on the global map.
 - **RTTY skimming** (currently runs alongside FT8; auto-disabled
   outside RTTY contests).
-- **Modern Bayesian CW decoder (ITILA)** with thread-safe per-handle
-  state, lazy bin-spawn (filters noise-driven candidates before
-  burning decoder cycles on garbage), and per-bin envelope smoothing.
+- **Bayesian, soft-decision-keystate CW decoder** ("ITILA" in the
+  source — full pipeline below in *How the decoder works*).
+  2-state HMM forward-backward with EM parameter estimation and
+  16-bin WPM marginalization; lazy bin-spawn filters noise-driven
+  candidates before burning decoder cycles on garbage.
 - **Adaptive consensus gates** controlled by config flags — every
   precision/recall trade-off is a knob the operator can turn for
   their use case.  Default ("ship-it") mode is permissive emit;
@@ -78,6 +80,72 @@ For benchmarking we compare two ways:
 - **Diagnostic infrastructure** for validating against SDC and RBN
   reference streams (`sdc_tee.py`, `rbn_tee.py`, `score_loop.py`,
   `score_diff.py`).
+
+## How the decoder works
+
+The CW decoder ("ITILA" in the source — named after MacKay's *Information
+Theory, Inference, and Learning Algorithms* textbook that motivated the
+approach, not a single named algorithm) is a **Bayesian, soft-decision
+keystate decoder**.  It maintains continuous `P(key=down | t)` posteriors
+all the way through to character matching rather than thresholding the
+envelope into bits at any intermediate stage.
+
+The pipeline, per channel:
+
+1. **Channelization.** Per-bin IIR LPF on the FFT-decimated baseband,
+   producing a real-valued envelope at 200 Hz.
+2. **EM parameter estimation.** A two-state Gaussian-mixture EM iterates
+   the noise mean (`nm`), signal amplitude (`A`), observation variance
+   (`σ²`), and dit unit length (WPM) for this channel.  Warm-starts from
+   the previous window's converged parameters when available.
+3. **HMM forward-backward.** Given the EM-fit observation model and a
+   two-state Markov transition matrix derived from the estimated WPM,
+   `fb_core` (C extension) computes the per-sample posteriors
+   `γ[t,0] = P(space | observation)` and `γ[t,1] = P(mark | observation)`.
+   These are continuous, never thresholded inside the decoder.
+4. **Speed marginalization.**  Sixteen WPM bins span 8-60 WPM; the
+   forward-backward log-evidence is computed at each bin and used to
+   marginalize γ across speed hypotheses (`gamma_marg`).  Multi-station
+   density triggers GMM WPM detection (M8): two candidate WPMs decoded
+   in parallel so a slow runner doesn't lose to a faster caller's clock.
+5. **Late quantization.** `γ_marg[:,1] > 0.5` produces the binary
+   mark/space stream — the *only* threshold in the whole decoder, and it
+   happens once the posterior has integrated evidence across the full
+   window.
+6. **Beam-search run-length decode.** A 64-wide beam search over the
+   mark/space run-lengths consumes Morse-element timing log-likelihoods
+   (canonical dit / dah / inter-element / inter-character / inter-word
+   gaps) plus an ambiguity-aware emission model.  Returns the top-K
+   decoded text hypotheses.
+7. **Callsign extraction.** Three-pass regex+SCP scan of the decoded
+   text: literal SCP match, length-bounded substring scan, and a
+   Morse-distance-aware edit-1 correction (e.g. `T1LZ → K1LZ`).
+8. **Adaptive consensus gates.**  Outside the decoder, in `SpotTracker`,
+   per-frequency leader / CQ-runner / harmonic / blacklist / patt3ch
+   gates filter what becomes a spot.  Every gate is a config flag so the
+   operator can tune precision/recall.
+
+What this means relative to other open-source CW decoders:
+
+- **Not threshold-based.** Threshold decoders (cwdaemon, fldigi's
+  default CW) make a hard mark/space decision per sample and lose
+  posterior evidence.  Skimmer's reputation rests on *not* doing that;
+  SparkGap doesn't either.
+- **Speed is marginalized, not assumed.** Many decoders need the
+  operator to set WPM (or auto-detect on training data once).  SparkGap
+  re-fits per window, every window, with a 60 s context.
+- **Soft keystate, but post-decode SCP fusion is shallow.**  Right now
+  SCP / patt3ch corrections are applied *after* the beam decode picks a
+  winner.  Combining word-level priors *during* beam selection (BALUN
+  vs BALAN style) is a known open area — tested on a 15-min CWT
+  recording (`research/fusion_per_window.py`); +0.1 pp recall in that
+  dataset, but the test conditions weren't dense enough to exercise it.
+  Open question.
+
+Source: `itila_core.c` (full implementation, ~1400 lines C),
+`fb_core.c` (forward-backward kernel), `itila_scanner.c` (band-wide
+channelizer + lazy bin-spawn), and `_ItilaScanner` + `SpotTracker` in
+`sparkgap.py` for the Python orchestration.
 
 ## What's not yet there
 
