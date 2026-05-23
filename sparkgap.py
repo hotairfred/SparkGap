@@ -2549,13 +2549,25 @@ class _ItilaScanner:
                                 self._sc._h, _ct.c_double(f_hz))
 
     def collect(self):
-        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm)."""
+        """Returns list of (rf_khz, snr, text, text, bin_id, 'itila', wpm).
+
+        Yields ONE result per pending entry — never joins entries.  Each
+        pending entry comes from a single ITILA window's Path 1/2 extraction
+        and represents one decode event.  Joining them previously caused
+        SpotTracker's per-event gates (cq_runner, has_context, sighting
+        counts) to operate on conflated text and silently suppress
+        legitimate runners — see project_itila_pending_merge_bug.md for the
+        K0TG / N4BA worked example.
+        """
         results = []
         for f_hz, st in self._bins.items():
-            if st['pending']:
-                text = ''.join(st['pending'])
-                st['pending'] = []
-                results.append((f_hz/1000.0, st['snr'], text, text, id(st), 'itila', st['wpm']))
+            if not st['pending']:
+                continue
+            pending = st['pending']
+            st['pending'] = []
+            for entry in pending:
+                results.append((f_hz/1000.0, st['snr'], entry, entry,
+                                id(st), 'itila', st['wpm']))
         return results
 
     def _free_bin_handles(self, f_hz):
@@ -5711,8 +5723,23 @@ class SpotTracker:
                                 log.info("FREQ COMMIT: %s @ bin=%d (%d/%d sightings, thresh=%d)",
                                          call, freq_bin, winner_n, total_at_freq, thresh)
 
+                # CQ-runner bypasses freq-leader gate.  _is_freq_leader was
+                # designed to suppress decoder hallucinations of a single
+                # real call (K4R / K4RU / K4RUM all from K4RUM) — it picks
+                # the call with most recent sightings at this freq.  But it
+                # also blocks the legitimate runner when callers spotted
+                # first ratchet the leader count up.  K0TG (real CQer at
+                # 7040.9) got 1 sighting per window, KK4E/W6SX/VE3KP cycled
+                # through as leaders, K0TG never caught up → never spotted
+                # for 15 min of CW. Runner bypass is safe because cq_runner
+                # identification is per-call: only the specific call adjacent
+                # to a CQ trigger bypasses; hallucinations of that call
+                # (different SCP buckets) still compete normally.
+                _is_cq_runner_here = (cq_runner_bucket is not None
+                                      and _call_bucket == cq_runner_bucket)
                 if gate and self._can_respot(call, freq_khz, now) \
-                        and self._is_freq_leader(call, freq_bin, now):
+                        and (_is_cq_runner_here
+                             or self._is_freq_leader(call, freq_bin, now)):
                     if len(self._cycle_calls[call]) < 3:  # hallucination check
                         if self._harmonic_check(call, freq_khz, snr, now):
                             continue
