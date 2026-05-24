@@ -5,6 +5,36 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 ## 2026-05-24
 
 ### Deployed
+- **Decode-thread separation + scanner lock release `sparkgap-decode-thread-split`
+  → `main` 1cb74fc → skimmer1.**  Structural fix for the bin-pressure
+  ceiling documented in `feedback_bin_saturation_ceiling.md` and
+  re-confirmed by the SNR=8 deploy regression earlier today (ring_drops
+  92.7%).  Two paired C-side changes:
+  - `itila_scanner.c`: `itila_sc_decode_ready` releases the scanner mutex
+    around each `dec_feed` call (env data copied to heap buffer before
+    unlock, results stored and envelope shifted after re-acquire).  New
+    `ScBin.in_decode` flag prevents bin eviction during the unlock
+    window — both eviction sites in `feed_iq` skip mid-decode bins so
+    `bin_free_decoders` can't free `h100`/`h200` out from under the
+    decode thread.
+  - `hpsdr_fast.c`: split each per-RX worker into `drain_worker`
+    (ring→scanner_feed, fast loop, 5ms idle) and `decode_worker`
+    (scanner_decode→result push, slow loop, 20ms idle).  Paired with
+    the lock release above, drain refills env buffers concurrently with
+    decode instead of being serialized behind it.
+  Pre-deploy peer review by Squelch (clean security scan + all 6
+  concurrency invariants verified + one substantive `f_khz`
+  per-iteration-snapshot fix applied).  Behavior-bit-identical on
+  B1_seg2 file mode (49/56 strict / 51/56 tolerant).  15-min bake on
+  skimmer1: ring_drops 0% across 11M samples even during a bin ramp
+  from 15→225 (pre-split that rapid spawn would have caused decode
+  lockout); zero crashes/tracebacks; NLWP=23 (was 15 pre-split, +8
+  decode_workers as expected); sweep still firing every 5 min with the
+  new no-drops log line.
+  Unblocks the SNR=8 and cluster_hz=50 deploys that were rolled back
+  earlier today for bin-pressure regression — those experiments can
+  now be re-attempted with this fix as the structural underpinning.
+
 - **Memory-leak sweep `sparkgap-memory-sweep` → `main` 131393d → skimmer1**
   + first-sweep init bug fix `9a71238` on top.  Adds
   `SpotTracker._sweep_all_caches(now)` that prunes 6 dicts which had
