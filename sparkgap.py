@@ -6954,6 +6954,12 @@ class SparkGap:
                 # _bypass_* / _sighting_times. Same leak class as
                 # _rb_support; observed 2026-05-24 RSS 5 GB -> 9 GB
                 # over 12 h on production from these dicts accumulating.
+                #
+                # Logs every cycle — including zero-drop cycles ("no drops")
+                # — so the on-call has positive confirmation the sweep
+                # actually fired, not just "inferred to have fired because
+                # S-floor logged and no failure log appeared".  Squelch
+                # endorsed this after the 2026-05-24 1h-bake check.
                 try:
                     if self.tracker is not None:
                         stats = self.tracker._sweep_all_caches(now)
@@ -6965,6 +6971,8 @@ class SparkGap:
                                 for k, (dropped, rem) in nz.items()
                             )
                             log.info("Tracker cache sweep: %s", parts)
+                        else:
+                            log.info("Tracker cache sweep: no drops")
                 except Exception as e:
                     log.warning("Tracker cache sweep failed: %s", e)
 
