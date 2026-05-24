@@ -4,23 +4,38 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
 ## 2026-05-24
 
-### Changed
-- **`sk_5band.json`: `signal_min_snr` 12 → 8** to lower the CFAR bin-spawn
-  threshold.  External review (cwskimmer doc 08) flagged 12 dB as
-  conservative — measured peer skimmer thresholds sit around 4-6 dB and
-  9 dB CQers never spawned a bin under our floor.  File-mode A/B on
-  B1_seg2 0-15min vs the deployed cq_runner-bypass baseline:
-  49/56 → 52/56 recall (+3 CQers: AD4UB, HA9RE, W6KC, including HA9RE
-  which the per-window diagnostic had flagged "never in any beam" — so
-  the bin floor was the actual blocker, not weak-signal decode failure).
-  Total spots 229 → 211 (−18 net); 12/14 new spots in SCP, 26/32 lost
-  spots in SCP (bin-budget churn — weaker peaks displace some callers).
-  Downstream gate stack (timing_cost=100 + scp_bucket_substitute +
-  short_scp_bucket) absorbed FPs as predicted — only 2 non-SCP via
-  Method 3 edit-1 fuzz.  Tested but NOT deployed in same commit:
-  cluster_hz 150→50 (recovers HA9RE too, but pulls in 45 non-SCP
-  noise-tail entries via scp_bypass_threshold; defer until tighter
-  bypass threshold or noise blanker lands).
+### Reverted
+- **`sk_5band.json`: `signal_min_snr` 8 → 12** (rolled back ~20 min after
+  deploy of cc2daf7).  The file-mode A/B showed +3 CQer recall with
+  contained FPs and clean SCP-valid mix, but production behavior was
+  catastrophically different: after 18 min on skimmer1 with all 8 bands
+  live, `ring_drops=92.7%`, `env_drops=389M`, every scanner pinned at
+  `peak=400`, CPU 575% on 6 cores, load avg 9.37.  The C-side IQ ring
+  buffer was overflowing because the decoder couldn't keep up — fewer
+  spots reached the output than the deployed cq_runner-bypass baseline
+  (~1/min vs 2.91/min), the opposite of what the file-mode test
+  predicted.  Root cause: file-mode runs one band single-threaded; live
+  runs 8 bands concurrently and the SNR=8 threshold spawns enough
+  additional bins to push every scanner to max_bins=400 at the same
+  time, blowing the per-RX-worker decode budget (the failure mode
+  documented in feedback_bin_saturation_ceiling.md).  At SNR=12 we were
+  within budget at 400 bins; at SNR=8 we're not.
+
+### Lessons recorded
+- **File-mode B1_seg2 A/B does not characterize live multi-band
+  bin-pressure.** B1_seg2 is a single 40m recording at 7090 ±100 kHz.
+  Live load is 8 bands × 400 max_bins.  Any change that increases bin
+  spawn rate needs a *production-density* test before deploy — either
+  via a longer multi-band capture replay, or a short live-shadow with
+  rollback hot.  Tested-but-not-shipped: cluster_hz 150→50, same risk
+  profile; should not deploy without an actual ring-drop measurement at
+  production density.
+- **Watch `ring_drops` and `env_drops` post-deploy.**  The decisive
+  signal was the Health: log line, not spot count.  CW spot rate looked
+  *low* (1/min vs 2.91 baseline) — easy to mistake for "CW activity is
+  quiet now" until I checked the Health line.  Going forward, the
+  post-deploy 15-min check needs a Health-line summary, not just a spot
+  count.
 
 ## 2026-05-23
 
