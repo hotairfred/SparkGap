@@ -4828,12 +4828,17 @@ class SpotTracker:
 
         # Exact match tracking
         self._tracking = defaultdict(lambda: {
-            'freq': 0, 'count': 0, 'last_spotted': 0, 'snr': 0
+            'freq': 0, 'count': 0, 'last_spotted': 0, 'last_seen': 0, 'snr': 0
         })
         # Non-SCP callsign bypass: (call, freq_bin) → decode count
         self._bypass_counts = defaultdict(int)
         # Bypass calls already emitted — emit once per (call, freq_bin)
         self._bypass_spotted = set()
+        # Per-key last-seen timestamps for cache eviction.  Without these,
+        # _bypass_counts / _bypass_spotted accrete forever on the worldwide
+        # RBN-tee feed.  Same class of leak as _rb_support pre-2026-05-13.
+        self._bypass_counts_ts = {}     # (call, freq_bin_int) → last update ts
+        self._bypass_spotted_ts = {}    # (call, freq_bin_int) → last add ts
         # Per-frequency sighting counts: (call, freq_bin) → count
         self._freq_sightings = defaultdict(int)
 
@@ -4957,6 +4962,108 @@ class SpotTracker:
             return
         with self._rb_lock:
             self._rb_support[(bucket, band)][spotter] = ts
+
+    # TTLs for _sweep_all_caches.  Conservative: long enough that a CQer
+    # who works once an hour stays cached; short enough that 12+ hour
+    # accumulation doesn't OOM.
+    SWEEP_TRACKING_TTL_SEC      = 86400   # 24h — _tracking[call] per-call sighting metadata
+    SWEEP_HARM_HISTORY_TTL_SEC  =  3600   # 1h — _harm_history[bucket] per-spot tuples
+    SWEEP_BYPASS_TTL_SEC        = 86400   # 24h — _bypass_counts / _bypass_spotted
+    SWEEP_SIGHTING_KEYS_TTL_SEC =  7200   # 2h — _sighting_times / _freq_sighting_times empty-key drop
+
+    def _sweep_all_caches(self, now):
+        """Periodic eviction of long-lived SpotTracker dicts that
+        accumulate forever from the worldwide RBN-tee feed.  Same
+        leak class as _rb_support pre-2026-05-13; observed 2026-05-24
+        RSS climbing from 5 GB to 9 GB over 12 h with steady growth
+        in _tracking / _harm_history / _bypass_* / _sighting_times.
+
+        Returns a dict of {dict_name: (n_dropped, n_remaining)} for
+        telemetry.  Caller logs only non-empty drops to keep the log
+        readable.
+
+        Each TTL is conservative — see SWEEP_*_TTL_SEC constants above
+        and the rationale in the comment there.  The fix mirrors the
+        _sweep_rb_support pattern: prune values where applicable, then
+        drop empty/stale keys.
+        """
+        stats = {}
+
+        # All iterations snapshot via list(...) before mutation.  The
+        # SpotTracker is called from the main asyncio loop's coroutines
+        # AND from a background RBN-telnet thread; concurrent dict
+        # mutation during iteration would raise RuntimeError on the
+        # background path.  _rb_support uses an explicit lock; for the
+        # other dicts, snapshot-first is the cheaper pattern.
+
+        # 1. _tracking[call] — drop entries whose last_seen is stale.
+        cutoff = now - self.SWEEP_TRACKING_TTL_SEC
+        stale = [c for c, info in list(self._tracking.items())
+                 if info.get('last_seen', 0) < cutoff
+                 and info.get('last_spotted', 0) < cutoff]
+        for c in stale:
+            self._tracking.pop(c, None)
+        stats['tracking'] = (len(stale), len(self._tracking))
+
+        # 2. _harm_history[bucket] — trim list to fresh-only, drop empty.
+        cutoff = now - self.SWEEP_HARM_HISTORY_TTL_SEC
+        empty = []; tuples_dropped = 0
+        for bucket, entries in list(self._harm_history.items()):
+            fresh = [(f, s, t) for f, s, t in entries if t >= cutoff]
+            tuples_dropped += len(entries) - len(fresh)
+            if fresh:
+                self._harm_history[bucket] = fresh
+            else:
+                empty.append(bucket)
+        for b in empty:
+            self._harm_history.pop(b, None)
+        stats['harm_history'] = (len(empty), len(self._harm_history))
+        stats['harm_history_tuples'] = (tuples_dropped, -1)
+
+        # 3. _bypass_counts / _bypass_spotted — drop stale per ts companions.
+        # Pair-write discipline at the two write sites (search for
+        # '_bypass_counts_ts[' and '_bypass_spotted_ts[' assignments;
+        # currently ~lines 5984 and 5994) keeps the ts dicts in sync
+        # with the live dicts.
+        #
+        # Deliberate design: iterate the _ts dict (NOT the main dict)
+        # when deciding what to evict.  If a future write site forgets
+        # to set the ts companion, the entry stays alive in the main
+        # dict — a *visible leak* in the Mem: line — rather than silent
+        # data loss via "no ts entry = drop everything matching".  Catch
+        # via Mem: counts drift, not via silent corruption.
+        cutoff = now - self.SWEEP_BYPASS_TTL_SEC
+        stale = [k for k, ts in list(self._bypass_counts_ts.items()) if ts < cutoff]
+        for k in stale:
+            self._bypass_counts.pop(k, None)
+            self._bypass_counts_ts.pop(k, None)
+        stats['bypass_counts'] = (len(stale), len(self._bypass_counts))
+
+        stale = [k for k, ts in list(self._bypass_spotted_ts.items()) if ts < cutoff]
+        for k in stale:
+            self._bypass_spotted.discard(k)
+            self._bypass_spotted_ts.pop(k, None)
+        stats['bypass_spotted'] = (len(stale), len(self._bypass_spotted))
+
+        # 4. _sighting_times / _freq_sighting_times — values are already
+        # trimmed in-place at read time, but empty-list keys never get
+        # deleted.  Drop empty/stale ones.  Use a TTL on last entry
+        # rather than just "list empty" because empty lists usually get
+        # rewritten back to non-empty on the next sighting.
+        cutoff = now - self.SWEEP_SIGHTING_KEYS_TTL_SEC
+        stale = [k for k, lst in list(self._sighting_times.items())
+                 if not lst or max(t for t, _ in lst) < cutoff]
+        for k in stale:
+            self._sighting_times.pop(k, None)
+        stats['sighting_times'] = (len(stale), len(self._sighting_times))
+
+        stale = [k for k, lst in list(self._freq_sighting_times.items())
+                 if not lst or max(t for t, _ in lst) < cutoff]
+        for k in stale:
+            self._freq_sighting_times.pop(k, None)
+        stats['freq_sighting_times'] = (len(stale), len(self._freq_sighting_times))
+
+        return stats
 
     def _sweep_rb_support(self, now):
         """Drop spotters with ts < now - _rb_window_sec and remove empty
@@ -5721,6 +5828,7 @@ class SpotTracker:
                 info['count'] += 1
                 info['freq'] = freq_khz
                 info['snr'] = max(info['snr'], snr)
+                info['last_seen'] = now   # for _sweep_all_caches TTL
                 self._record_sighting(call, freq_bin, now)
                 recent_count = self._count_recent_sightings(call, freq_bin, now)
                 # Context check: only look at RECENT text (last ~500 chars)
@@ -5878,6 +5986,7 @@ class SpotTracker:
                     bypass_freq = int(round(freq_khz))
                     bkey_count = (call, bypass_freq)
                     self._bypass_counts[bkey_count] += 1
+                    self._bypass_counts_ts[bkey_count] = now
                     if self._bypass_counts[bkey_count] < self.scp_bypass_threshold:
                         bypass_gate = False
 
@@ -5887,6 +5996,7 @@ class SpotTracker:
                     if self._harmonic_check(call, freq_khz, snr, now):
                         continue
                     self._bypass_spotted.add(bkey)
+                    self._bypass_spotted_ts[bkey] = now
                     log.info("SCP bypass: %s at %.1f kHz [patt3ch=%s]",
                              call, freq_khz, patt3ch_match or 'none')
                     self._mark_spotted(call, freq_khz, now)
@@ -5975,6 +6085,7 @@ class SpotTracker:
                 # Check consensus against SCP — exact first, then fuzzy
                 if consensus_str in self.valid_calls:
                     info = self._tracking[consensus_str]
+                    info['last_seen'] = now
                     if self._can_respot(consensus_str, freq_khz, now) \
                             and self._is_freq_leader(consensus_str, freq_bin, now):
                         if consensus_str not in self.blacklist:
@@ -6004,6 +6115,7 @@ class SpotTracker:
                     if fuzzy and avg_confidence >= 0.90:
                         best_call, best_dist = min(fuzzy, key=lambda x: x[1])
                         info = self._tracking[best_call]
+                        info['last_seen'] = now
                         if self._can_respot(best_call, freq_khz, now) \
                                 and self._is_freq_leader(best_call, freq_bin, now):
                             if best_call not in self.blacklist:
@@ -6797,10 +6909,23 @@ class SparkGap:
                         for _ln in _sf:
                             if _ln.startswith('VmRSS:'):
                                 rss_kb = int(_ln.split()[1])
-                                rb_buckets = len(self.tracker._rb_support) \
-                                    if getattr(self, 'tracker', None) else 0
-                                log.info("Mem: rss_kb=%d rb_buckets=%d",
-                                         rss_kb, rb_buckets)
+                                t = getattr(self, 'tracker', None)
+                                # Tracker cache sizes for leak observability.
+                                # Pre-2026-05-24-sweep, these grew unbounded:
+                                # tracking + harm_history were the biggest.
+                                if t:
+                                    sizes = (
+                                        f" rb={len(t._rb_support)}"
+                                        f" tr={len(t._tracking)}"
+                                        f" hh={len(t._harm_history)}"
+                                        f" bc={len(t._bypass_counts)}"
+                                        f" bs={len(t._bypass_spotted)}"
+                                        f" st={len(t._sighting_times)}"
+                                        f" fst={len(t._freq_sighting_times)}"
+                                    )
+                                else:
+                                    sizes = ""
+                                log.info("Mem: rss_kb=%d%s", rss_kb, sizes)
                                 break
                 except Exception:
                     pass
@@ -6819,6 +6944,24 @@ class SparkGap:
                                      n_buckets, n_spotters, remaining)
                 except Exception as e:
                     log.warning("S-floor sweep failed: %s", e)
+
+                # Additional cache sweep — _tracking / _harm_history /
+                # _bypass_* / _sighting_times. Same leak class as
+                # _rb_support; observed 2026-05-24 RSS 5 GB -> 9 GB
+                # over 12 h on production from these dicts accumulating.
+                try:
+                    if self.tracker is not None:
+                        stats = self.tracker._sweep_all_caches(now)
+                        nz = {k: v for k, v in stats.items() if v[0]}
+                        if nz:
+                            parts = ', '.join(
+                                f"{k}={dropped}->{rem}" if rem >= 0
+                                else f"{k}_dropped={dropped}"
+                                for k, (dropped, rem) in nz.items()
+                            )
+                            log.info("Tracker cache sweep: %s", parts)
+                except Exception as e:
+                    log.warning("Tracker cache sweep failed: %s", e)
 
             # FT8 decode — aligned to minute boundaries, runs in thread
             if use_c and getattr(self, '_worker_started', False) \
