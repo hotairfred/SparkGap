@@ -8,7 +8,7 @@
     "add_calls": "add_calls.txt",
     "decoder_speeds": [],
     "max_channels": 300,
-    "signal_min_snr": 12,
+    "signal_min_snr": 8,
     "use_itila": true,
     "itila_window_sec": 60,
     "itila_ev_thresh": 1.5,
