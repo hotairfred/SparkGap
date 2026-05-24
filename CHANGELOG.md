@@ -4,6 +4,37 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
 ## 2026-05-24
 
+### Deployed
+- **IPC refactor `sparkgap-ipc-refactor` → `main` 8c81bd4 → skimmer1.**
+  Replaces synthetic `'CQ <call> '` string IPC between `_ItilaScanner`
+  and `SpotTracker` with structured `SpotIntent` dataclass records.
+  Scanner-side: 8 emit sites (Path 1 / Path 2 across 3 scanner code
+  paths) replaced with `_emit_intent()` helper.  Tracker-side: new
+  `process_intent()` entry point — currently a thin wrapper synthesizing
+  the legacy text and delegating to `process(dec_type='itila')`, keeping
+  gate behavior bit-identical to today.  Value is at the IPC seam:
+  eliminates the K0TG/N4BA-class pending-merge bug class at the layer
+  boundary, sets up future Method 0 slash extraction (intent.call
+  carries slashes literally).  Pre-deploy peer review by Squelch (clean
+  security scan, architecture verified, two doc clarifications
+  requested + applied before merge).  Behavior-bit-identical on B1_seg2
+  (49/56 strict / 51/56 slash-tolerant, ±1 caller spot of churn).
+  Post-deploy 15-min bake clean: ring_drops=0%, env_drops=0, bins
+  151-177/peak=113 (well under 400 ceiling), zero crashes/tracebacks.
+
+### Deploy-discipline lesson
+- **`pgrep -f "<pattern>"` matches the SSH session's own cmdline** when
+  the pattern appears in the embedded ssh command string.  During the
+  IPC refactor deploy, `pgrep -f "python3 sparkgap.py"` returned the
+  SSH bash shell PID instead of the actual sparkgap process; `kill`
+  hit the wrong PID, the fresh-launched sparkgap crashed at telnet
+  :7300 port-bind because the real sparkgap was still holding the
+  port.  Only the fortunate fact that the unkilled old process kept
+  running prevented an outage window.  **Going forward: kill PID by
+  explicit number, not via `pgrep`-of-substring.**  Either resolve PID
+  with `pgrep -fox '<exact cmdline>'` or query `/proc/*/cmdline`
+  directly via awk.
+
 ### Added
 - **`tools/eval/score_b1_seg2.py`** — slash-tolerant scoring for file-mode
   runs against `cq_key_56.txt`.  Replaces throwaway inline scoring
