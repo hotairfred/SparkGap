@@ -35,6 +35,23 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
   earlier today for bin-pressure regression — those experiments can
   now be re-attempted with this fix as the structural underpinning.
 
+- **`itila_scanner.c`: `cluster_hz` 150 → 50 (b96e459 → skimmer1).**
+  Re-attempted on the decode-thread-split substrate after morning revert.
+  Motivation: RBN cross-reference triage showed K1GU @ 7041.3 and KC7V
+  @ 7039.3 were co-channel-blocked by stronger neighbors within 150 Hz
+  (WJ9B 7041.2, N8KH 7039.2); file-mode A/B also recovered HA9RE.
+  22-min skimmer1 bake passed: `ring_drops=0/10.6M (0%)`, `env_drops`
+  rose to 17442 in first 2 min then **froze** (early decoder catch-up
+  transient, not the runaway pattern that killed the SNR=8 retry which
+  kept climbing past 14M in 30 sec), bins 449-484 oscillating with
+  peak=313 (under the 400 ceiling), CPU 255% (vs 535% SNR=8 failure,
+  vs 180% baseline), zero crashes.  Headline: **CW spot rate +75%**
+  (2.4/min pre → 4.2/min post, same skimmer same hour).  RSS 6.8 GB
+  (vs 3.9 GB pre) — tracks 2.5× bin count via env buffer footprint,
+  not a leak signature.  The decode-thread split (1cb74fc) is what
+  made cluster=50 viable — drain refills env buffers concurrently with
+  decode, absorbing the 2.5× bin density without serializing.
+
 - **Memory-leak sweep `sparkgap-memory-sweep` → `main` 131393d → skimmer1**
   + first-sweep init bug fix `9a71238` on top.  Adds
   `SpotTracker._sweep_all_caches(now)` that prunes 6 dicts which had
