@@ -4859,6 +4859,11 @@ class SpotTracker:
         self._freq_leader = {}
         self._freq_committed = {}      # freq_bin -> (call, commit_time)
         self._freq_sighting_times = defaultdict(list)  # freq_bin -> [(t, call), ...]
+        self._sighting_times      = defaultdict(list)  # bucket -> [(t, freq_bin), ...]
+        # ^ _sighting_times was lazily created in _record_sighting; that
+        # caused _sweep_all_caches to AttributeError on first invocation
+        # if no sighting had been recorded yet.  Init both eagerly so the
+        # first sweep (within 5 min of process start) doesn't fail.
 
         # Build SCP prefix index for fast fuzzy matching
         self._scp_by_len = defaultdict(list)
