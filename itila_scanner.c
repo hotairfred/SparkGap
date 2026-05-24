@@ -78,6 +78,14 @@ typedef struct {
     /* ITILA decoder handles — created lazily, one per LPF path */
     void  *h100;
     void  *h200;
+
+    /* Set non-zero while itila_sc_decode_ready is inside dec_feed for this
+     * bin with the scanner lock released.  Eviction sites (in feed_iq path)
+     * check this and skip the bin if it's mid-decode -- otherwise
+     * bin_free_decoders would free h100/h200 while the decode thread is
+     * using them.  Cleared when decode_ready re-acquires the lock and is
+     * done with the bin. */
+    int    in_decode;
 } ScBin;
 
 /* ---- scanner ---- */
@@ -305,6 +313,8 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         int rate_12k = sc->sample_rate / SC_DEC1;
         for (int b = 0; b < SC_MAX_BINS; b++) {
             if (!sc->bins[b].active) continue;
+            /* Skip mid-decode bins — see ScBin.in_decode comment. */
+            if (sc->bins[b].in_decode) continue;
             int age      = sc->total_samples - sc->bins[b].created_sample;
             int since_ev = sc->total_samples - sc->bins[b].last_evidence;
             int stale    = 0;
@@ -390,6 +400,9 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
             int oldest_age = 0;
             for (int b = 0; b < SC_MAX_BINS; b++) {
                 if (!sc->bins[b].active) continue;
+                /* Skip bins that decode_ready is currently using under
+                 * released lock — see ScBin.in_decode comment. */
+                if (sc->bins[b].in_decode) continue;
                 int age = sc->total_samples - sc->bins[b].created_sample;
                 int since_ev = sc->total_samples - sc->bins[b].last_evidence;
                 /* Never produced evidence and >120s old
@@ -743,6 +756,15 @@ typedef struct {
 int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
                            ScDecodeResult *results, int max_results) {
     if (!sc->dec_create || !sc->dec_feed) return 0;
+    if (window_samples <= 0 || window_samples > SC_ENV_CAP) return 0;
+
+    /* Heap-allocated env-copy buffer.  VLA on stack would also work
+     * (window_samples is typically 12000 -> 96 KB), but with up to 8
+     * per-RX decode threads each in this function, we'd hit pthread
+     * stack limits at unusual window sizes.  One heap allocation per
+     * call is negligible relative to the dec_feed cost. */
+    double *env_local = (double *)malloc((size_t)window_samples * sizeof(double));
+    if (!env_local) return 0;
 
     pthread_mutex_lock(&sc->lock);
     int n_results = 0;
@@ -755,27 +777,62 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
         if (!b->h100) b->h100 = sc->dec_create(200, 100.0);
         if (!b->h200) b->h200 = sc->dec_create(200, 200.0);
 
-        double f_khz = b->f_hz / 1000.0;
-
-        while (b->env_n >= window_samples) {
-            /* Decode both 100 Hz and 200 Hz paths */
+        while (b->env_n >= window_samples && n_results < max_results) {
+            /* Snapshot bin state for result emission (b->snr_db, b->f_hz)
+             * before we release the lock; the drain thread may update
+             * these during the unlock window.  f_khz derived from the
+             * SAME per-iteration snapshot so dec_feed and the emitted
+             * result agree on the frequency even if a future code path
+             * mutates b->f_hz mid-iteration (e.g. fine-tuning toward
+             * carrier offset).  Squelch caught this latent inconsistency
+             * in pre-deploy review 2026-05-24. */
+            double snr_local = b->snr_db;
+            double f_hz_local = b->f_hz;
+            double f_khz = f_hz_local / 1000.0;
             void *handles[2] = { b->h100, b->h200 };
-            double *envs[2]  = { b->env100, b->env200 };
 
+            /* Mark bin in-decode so the eviction sites in feed_iq won't
+             * free our captured handles during the unlock window. */
+            b->in_decode = 1;
+
+            int bin_evicted = 0;
             for (int p = 0; p < 2; p++) {
                 if (!handles[p]) continue;
-                const char *raw = sc->dec_feed(handles[p], envs[p],
+                if (n_results >= max_results) break;
+
+                /* Copy env data to local buffer while under lock — drain
+                 * thread will be writing to b->env100/env200 during the
+                 * unlock window and we can't have dec_feed see torn data. */
+                double *src = (p == 0) ? b->env100 : b->env200;
+                memcpy(env_local, src, (size_t)window_samples * sizeof(double));
+
+                /* Release scanner lock for the expensive dec_feed call.
+                 * Pre-fix this was held across 400 bins x 2 paths x ~30ms
+                 * each = ~24 s lockout, causing the IQ ring to overflow
+                 * (feedback_bin_saturation_ceiling.md, 2026-04-26).  With
+                 * the lock released drain can run scanner_feed concurrently. */
+                pthread_mutex_unlock(&sc->lock);
+                const char *raw = sc->dec_feed(handles[p], env_local,
                                                 window_samples, f_khz,
                                                 sc->ev_thresh);
-                if (raw && raw[0] && n_results < max_results) {
-                    ScDecodeResult *r = &results[n_results];
-                    r->f_hz = b->f_hz;
-                    r->snr  = b->snr_db;
-                    r->wpm  = (int)(sc->dec_get_wpm(handles[p]) + 0.5);
-                    r->_pad = 0;
-                    r->cost = sc->dec_get_last_cost
+                double cost = sc->dec_get_last_cost
                               ? sc->dec_get_last_cost(handles[p])
-                              : 999.0;  /* sentinel when API unavailable */
+                              : 999.0;
+                int wpm = (int)(sc->dec_get_wpm(handles[p]) + 0.5);
+                pthread_mutex_lock(&sc->lock);
+
+                /* After re-locking: bin must still be active (in_decode
+                 * guard above prevents eviction, but defensive check
+                 * doesn't hurt). */
+                if (!b->active) { bin_evicted = 1; break; }
+
+                if (raw && raw[0]) {
+                    ScDecodeResult *r = &results[n_results];
+                    r->f_hz = f_hz_local;
+                    r->snr  = snr_local;
+                    r->wpm  = wpm;
+                    r->_pad = 0;
+                    r->cost = cost;
                     int len = strlen(raw);
                     if (len > 255) len = 255;
                     memcpy(r->text, raw, len);
@@ -787,14 +844,24 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
                 }
             }
 
-            /* Shift envelope buffer — drain window_samples */
+            /* Clear in-decode under lock before shifting envelope or
+             * exiting this bin.  Eviction can resume on this bin
+             * afterward if it's stale. */
+            b->in_decode = 0;
+            if (bin_evicted) break;
+
+            /* Shift envelope buffer — drain window_samples.  Drain may
+             * have appended more samples during the unlock window, so
+             * we use the CURRENT b->env_n, not a pre-unlock cache. */
             int rem = b->env_n - window_samples;
+            if (rem < 0) rem = 0;  /* defensive — shouldn't happen */
             memmove(b->env100, b->env100 + window_samples, rem * sizeof(double));
             memmove(b->env200, b->env200 + window_samples, rem * sizeof(double));
             b->env_n = rem;
         }
     }
     pthread_mutex_unlock(&sc->lock);
+    free(env_local);
     return n_results;
 }
 

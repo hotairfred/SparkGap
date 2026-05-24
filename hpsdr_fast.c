@@ -152,8 +152,19 @@ typedef struct {
      * all RXs, but ITILA's per-channel Bayesian decode could stall one
      * RX long enough that the others' rings overflowed (measured 415M
      * sample drops vs 8M packets received in 4 min, ~50% loss). Per-RX
-     * workers eliminate the cross-RX head-of-line blocking. */
-    pthread_t worker_threads[MAX_RX];
+     * workers eliminate the cross-RX head-of-line blocking.
+     *
+     * 2026-05-24 update: ALSO split each per-RX worker into two threads:
+     *   drain_threads[rx]  — drains ring + feeds scanner (fast loop)
+     *   decode_threads[rx] — runs scanner_decode and pushes results
+     * The scanner_decode call holds a coarse mutex inside libitila_scanner;
+     * during 400-bin decode bursts that mutex was held ~24 s, starving the
+     * drain side and causing ring overflow (feedback_bin_saturation_ceiling
+     * 2026-04-26, observed again 2026-05-24 SNR=8 deploy).  Paired with the
+     * itila_sc_decode_ready change to release the lock around dec_feed, the
+     * thread split lets drain run concurrently with decode. */
+    pthread_t drain_threads[MAX_RX];
+    pthread_t decode_threads[MAX_RX];
     int worker_running;
     /* args for per-RX worker threads (must outlive the thread).
      * `h` is void* to avoid a forward-decl tangle with the typedef;
@@ -399,7 +410,8 @@ void hpsdr_start(HpsdrFast *h) {
     pthread_create(&h->thread, NULL, recv_thread, h);
 }
 
-static void *scanner_worker(void *arg);
+static void *drain_worker(void *arg);
+static void *decode_worker(void *arg);
 
 void hpsdr_set_scanner(HpsdrFast *h, int rx_index, void *scanner_handle,
                         sc_feed_iq_fn feed_fn, double scale) {
@@ -594,13 +606,19 @@ void hpsdr_start_worker(HpsdrFast *h) {
     h->result_read = 0;
     h->result_count = 0;
     h->worker_running = 1;
-    /* Spawn one worker per receiver. Each handles its own ring +
-     * scanner + decode independently — no cross-RX serialization. */
+    /* Spawn TWO workers per receiver: drain (ring -> scanner_feed, fast)
+     * and decode (scanner_decode -> results, slow).  The split lets the
+     * decode side hold the scanner mutex while drain runs concurrently;
+     * paired with itila_sc_decode_ready releasing the lock around its
+     * dec_feed call, the ring stays empty during decode bursts.  See
+     * feedback_bin_saturation_ceiling.md + the 2026-05-24 split. */
     for (int rx = 0; rx < h->n_receivers; rx++) {
         h->worker_arg[rx].h = h;
         h->worker_arg[rx].rx = rx;
-        pthread_create(&h->worker_threads[rx], NULL,
-                       scanner_worker, &h->worker_arg[rx]);
+        pthread_create(&h->drain_threads[rx], NULL,
+                       drain_worker, &h->worker_arg[rx]);
+        pthread_create(&h->decode_threads[rx], NULL,
+                       decode_worker, &h->worker_arg[rx]);
     }
 }
 
@@ -608,7 +626,8 @@ void hpsdr_stop_worker(HpsdrFast *h) {
     if (!h->worker_running) return;
     h->worker_running = 0;
     for (int rx = 0; rx < h->n_receivers; rx++) {
-        pthread_join(h->worker_threads[rx], NULL);
+        pthread_join(h->drain_threads[rx], NULL);
+        pthread_join(h->decode_threads[rx], NULL);
     }
 }
 
@@ -662,21 +681,22 @@ int hpsdr_drain(HpsdrFast *h, int rx_index, double *i_out, double *q_out, int ma
     return n;
 }
 
-/* ---- worker thread: one per RX. Drains its own ring, feeds its
- * own scanner, calls decode_ready. No cross-RX head-of-line blocking. */
-static void *scanner_worker(void *arg) {
+/* ---- drain thread: one per RX.  Drains the IQ ring and feeds the
+ * scanner (fast path — scanner_feed only touches env buffers, holds the
+ * scanner mutex very briefly).  Runs concurrent with decode_worker which
+ * holds the scanner mutex longer during dec_feed calls.  The split is
+ * what prevents the ~24 s ring-overflow lockout observed pre-split. */
+static void *drain_worker(void *arg) {
     struct { void *h; int rx; } *wa = arg;
     HpsdrFast *h = (HpsdrFast *)wa->h;
     int rx = wa->rx;
     #define WCHUNK 19200  /* 100ms at 192 kHz */
     double i_tmp[WCHUNK], q_tmp[WCHUNK];
-    uint8_t dec_buf[64 * RESULT_SIZE];
 
     while (h->worker_running) {
         int did_work = 0;
 
         if (h->rx_enabled[rx] && h->scanners[rx] && h->scanner_feed[rx]) {
-            /* Drain ring buffer → feed scanner */
             RxRing *r = &h->rx[rx];
             int avail = ring_avail(r);
             while (avail > 0) {
@@ -692,33 +712,54 @@ static void *scanner_worker(void *arg) {
                 did_work = 1;
                 avail = ring_avail(r);
             }
-
-            /* Decode ready windows.  scanner_decode[rx] may be NULL if
-             * Python is handling decode for this RX (e.g. PFB scanner). */
-            if (h->scanner_decode[rx] && h->window_samples_rx[rx] > 0) {
-                int n_dec = h->scanner_decode[rx](h->scanners[rx],
-                                               h->window_samples_rx[rx],
-                                               dec_buf, 64);
-                if (n_dec > 0) {
-                    pthread_mutex_lock(&h->result_lock);
-                    for (int d = 0; d < n_dec; d++) {
-                        if (h->result_count >= RESULT_MAX) break;
-                        int wp = h->result_write;
-                        memcpy(h->result_buf + wp * RESULT_SIZE,
-                               dec_buf + d * RESULT_SIZE, RESULT_SIZE);
-                        h->result_write = (wp + 1) % RESULT_MAX;
-                        h->result_count++;
-                    }
-                    pthread_mutex_unlock(&h->result_lock);
-                    did_work = 1;
-                }
-            }
         }
 
         if (!did_work) usleep(5000); /* 5ms idle sleep */
     }
     return NULL;
     #undef WCHUNK
+}
+
+/* ---- decode thread: one per RX.  Calls scanner_decode and pushes
+ * results to the cross-RX result buffer.  scanner_decode may hold the
+ * scanner mutex for a while (the dec_feed loop) but releases it around
+ * each dec_feed invocation so the drain thread can refill env buffers
+ * concurrently.  scanner_decode[rx] may be NULL if Python handles
+ * decode for this RX (e.g. PFB scanner) — in that case this thread
+ * does nothing but the drain thread still runs. */
+static void *decode_worker(void *arg) {
+    struct { void *h; int rx; } *wa = arg;
+    HpsdrFast *h = (HpsdrFast *)wa->h;
+    int rx = wa->rx;
+    uint8_t dec_buf[64 * RESULT_SIZE];
+
+    while (h->worker_running) {
+        int did_work = 0;
+
+        if (h->rx_enabled[rx] && h->scanners[rx]
+                && h->scanner_decode[rx] && h->window_samples_rx[rx] > 0) {
+            int n_dec = h->scanner_decode[rx](h->scanners[rx],
+                                           h->window_samples_rx[rx],
+                                           dec_buf, 64);
+            if (n_dec > 0) {
+                pthread_mutex_lock(&h->result_lock);
+                for (int d = 0; d < n_dec; d++) {
+                    if (h->result_count >= RESULT_MAX) break;
+                    int wp = h->result_write;
+                    memcpy(h->result_buf + wp * RESULT_SIZE,
+                           dec_buf + d * RESULT_SIZE, RESULT_SIZE);
+                    h->result_write = (wp + 1) % RESULT_MAX;
+                    h->result_count++;
+                }
+                pthread_mutex_unlock(&h->result_lock);
+                did_work = 1;
+            }
+        }
+
+        if (!did_work) usleep(20000); /* 20ms idle — decode-side polls
+                                       * less aggressively than drain */
+    }
+    return NULL;
 }
 
 /* Poll decoded results — called from Python */
