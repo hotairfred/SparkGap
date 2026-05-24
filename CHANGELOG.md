@@ -2,6 +2,95 @@
 
 Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
+## 2026-05-24
+
+### Changed
+- **`sk_5band.json`: `signal_min_snr` 12 → 8** to lower the CFAR bin-spawn
+  threshold.  External review (cwskimmer doc 08) flagged 12 dB as
+  conservative — measured peer skimmer thresholds sit around 4-6 dB and
+  9 dB CQers never spawned a bin under our floor.  File-mode A/B on
+  B1_seg2 0-15min vs the deployed cq_runner-bypass baseline:
+  49/56 → 52/56 recall (+3 CQers: AD4UB, HA9RE, W6KC, including HA9RE
+  which the per-window diagnostic had flagged "never in any beam" — so
+  the bin floor was the actual blocker, not weak-signal decode failure).
+  Total spots 229 → 211 (−18 net); 12/14 new spots in SCP, 26/32 lost
+  spots in SCP (bin-budget churn — weaker peaks displace some callers).
+  Downstream gate stack (timing_cost=100 + scp_bucket_substitute +
+  short_scp_bucket) absorbed FPs as predicted — only 2 non-SCP via
+  Method 3 edit-1 fuzz.  Tested but NOT deployed in same commit:
+  cluster_hz 150→50 (recovers HA9RE too, but pulls in 45 non-SCP
+  noise-tail entries via scp_bypass_threshold; defer until tighter
+  bypass threshold or noise blanker lands).
+
+## 2026-05-23
+
+### Fixed
+- **CW spot suppression in SpotTracker** (sparkgap.py, commit `4cbc048`).
+  `_is_freq_leader` was designed to suppress decoder hallucinations of
+  one real call (K4R / K4RU / K4RUM from a single K4RUM CQ) by emitting
+  only the call with most recent sightings at a freq.  Side-effect: when
+  callers spotted first ratcheted the leader count up, the actual runner
+  never overtook.  Worked example on B1_seg2 7040.9 kHz: K0TG (real CQer)
+  decoded in 40 windows, extracted as cq_runner 9 times, never spotted —
+  KK4E / W6SX / VE3KP cycled through as leaders, K0TG got only 1 sighting
+  per appearance and lost every leadership check.
+  Fix: the call identified as cq_runner via `_itila_extract_cq_call`
+  bypasses `_is_freq_leader`.  Hallucinations of the runner still
+  compete normally (they have different SCP buckets).  File-mode A/B
+  on B1_seg2 0-15min: 44/56 → 49/56 recall (+8.9 pp), 174 → 229 spots,
+  zero spots lost.  Production effect: deployed to skimmer1 at 21:15 UTC,
+  CW spot rate jumped from 0.90/min to 2.91/min (3.2× lift) measured
+  in the first 19 min.  Recovered five known CQers (K0TG, K1RV, N5XZ,
+  NQ2W, W4SPR) on B1_seg2.
+
+- **`_ItilaScanner.collect()` per-entry pending flush** (sparkgap.py,
+  same commit).  Defensive correctness: previously joined all pending
+  entries into one tracker.process() call with `''.join()`, which
+  conflated multiple window events.  When two CQers' windows accumulated
+  between collect_all calls, `_itila_extract_cq_call` on the joined text
+  tie-broke by "most-frequent, last" and picked the wrong runner —
+  silently suppressing the earlier one via the cq_runner gate.  Now
+  yields one result per pending entry; each tracker invocation sees
+  exactly one window's data.  Doesn't fire on B1_seg2 (windows don't
+  accumulate between collects in that workload), but real and worth
+  closing.
+
+### Added
+- **README "How the decoder works" section** (commit `8df7c89`).
+  Names the actual algorithm — *2-state HMM forward-backward + EM
+  parameter estimation + 16-bin WPM marginalization + late thresholding
+  + 64-wide beam search* — rather than just referencing "ITILA" (which
+  is MacKay's textbook).  Spells out the pipeline end-to-end with file
+  pointers (`itila_core.c`, `fb_core.c`, `itila_scanner.c`).  Explicitly
+  notes what's deliberately NOT done (word-level prior fusion during
+  beam search — tested 2026-05-23 via `research/fusion_per_window.py`,
+  +0.1 pp lift, open question).  Addresses external review feedback that
+  readers couldn't tell the decoder did soft keystate without going to
+  the .c source.
+
+- **`research/fusion_per_window.py`** — diagnostic measuring per-window
+  fusion lift directly from beam-dump data.  Replaces the original
+  per-freq-aggregated diagnostic at `research/beam_fusion_diag.py` which
+  compared "first window's text0" against "any beam at any window" (an
+  asymmetric comparison that overstated the rescuable population by
+  ~10).  Correct per-window number on B1_seg2: +0.10 pp lift, 4 rescues
+  per 4080 windows.  Per-CQer ceiling identical between baseline and
+  fusion (52/56 = 92.86% — both find the same calls in text0 of some
+  window across 15 min).
+
+- **`docs/scanner_tracker_ipc_refactor.md`** — design doc for replacing
+  the synthetic-text channel between `_ItilaScanner` and `SpotTracker`
+  with structured `SpotIntent` records.  Captures the bug class
+  (string-IPC ambiguity → tracker re-parsing → conflated per-event
+  gates) and the migration plan.  Refactor partially implemented on
+  branch `sparkgap-ipc-refactor` (commit `e67cd10` on atlas).
+
+### Changed
+- **Repo history cleaned of NAS credential `Cl4ude01`** via
+  `git filter-repo`, rewriting 248 commits' versions of `run_cwt.sh`
+  (Grayline driving).  All branches re-SHA'd accordingly.  Backup at
+  `/mnt/atlas/skimmer/openskimmer.git.bak-20260523-225822-prefilter`.
+
 ## 2026-05-15
 
 ### Added
