@@ -328,13 +328,20 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         }
     }
 
-    /* Cluster (150 Hz), keep strongest per cluster, spawn new bins.
-     * Tightened from 300 Hz to match 50 Hz grid + FIR selectivity. */
-    double cluster_hz = 150.0;
+    /* Cluster (50 Hz), keep strongest per cluster, spawn new bins.
+     * History: started at 300 Hz, tightened to 150 Hz on 2026-04-22
+     * (commit 45467f1 alongside FIR decimation work).  Tightened again
+     * to 50 Hz on 2026-05-24 after RBN cross-reference triage showed
+     * K1GU @ 7041.3 and KC7V @ 7039.3 were co-channel-blocked by
+     * stronger neighbors within 150 Hz (WJ9B at 7041.2, N8KH at 7039.2).
+     * File-mode A/B recovered HA9RE the same way.  Held until decode-
+     * thread split (1cb74fc) addressed the bin-pressure ceiling that
+     * tighter clustering would otherwise hit. */
+    double cluster_hz = 50.0;
     for (int i = 0; i < np; i++) {
         double f_hz = peaks[i].f_hz;
 
-        /* Skip if within 150 Hz of any active bin — but update its SNR */
+        /* Skip if within cluster_hz of any active bin — but update its SNR */
         int found = 0;
         int blocking_bin = -1;
         for (int b = 0; b < SC_MAX_BINS; b++) {
