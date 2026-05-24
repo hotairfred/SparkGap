@@ -5,6 +5,37 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 ## 2026-05-24
 
 ### Deployed
+- **Memory-leak sweep `sparkgap-memory-sweep` → `main` 131393d → skimmer1**
+  + first-sweep init bug fix `9a71238` on top.  Adds
+  `SpotTracker._sweep_all_caches(now)` that prunes 6 dicts which had
+  unbounded growth (same class as the 2026-05-13 `_rb_support` leak):
+  `_tracking`, `_harm_history`, `_bypass_counts`/`_bypass_spotted`,
+  `_sighting_times`/`_freq_sighting_times`.  Conservative TTLs as
+  class constants (24 h for `tracking`/`bypass`, 1 h for
+  `harm_history`, 2 h for `sighting_keys`).  Same 5-min sweep
+  interval as `_sweep_rb_support`.  Extended the `Mem:` log line to
+  show `rss_kb=N rb=N tr=N hh=N bc=N bs=N st=N fst=N` for direct
+  per-dict observability — the missing piece from the May 13 fix.
+  Pair-write discipline on `_bypass_*_ts` companion dicts; sweep
+  iterates the `_ts` dict so a missing pair-write leaks visibly
+  rather than corrupting silently.  Pre-deploy peer review by Squelch
+  (clean security scan + all 5 review criteria verified + two design
+  choices called out positively).
+  Motivation: production RSS climbed 5 GB → 9 GB over 12 h post-
+  IPC-refactor deploy at ~320 MB/h, trending toward another OOM by
+  week's end.  Source-code audit found the 6 leak classes; this fix
+  closes them.  Bake verification pending (1 h+ — `_harm_history`
+  1 h TTL is the first to start ageing out).
+
+- **First-sweep init bug fix (`9a71238`).**  `_sighting_times` was
+  lazily created in `_record_sighting()` at first sighting; the first
+  `_sweep_all_caches` invocation could fire before any sighting was
+  recorded (5-min sweep interval vs slow sighting accumulation on
+  cold start) and AttributeError out — caught by `try/except` so
+  production was unaffected, but the sweep silently no-op'd that
+  cycle.  Fix: init `_sighting_times` eagerly in `__init__` alongside
+  `_freq_sighting_times`.  Pure additive 5-line change.
+
 - **IPC refactor `sparkgap-ipc-refactor` → `main` 8c81bd4 → skimmer1.**
   Replaces synthetic `'CQ <call> '` string IPC between `_ItilaScanner`
   and `SpotTracker` with structured `SpotIntent` dataclass records.
