@@ -4,6 +4,35 @@ Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
 ## 2026-05-24
 
+### Added
+- **`tools/eval/score_b1_seg2.py`** — slash-tolerant scoring for file-mode
+  runs against `cq_key_56.txt`.  Replaces throwaway inline scoring
+  scripts that got the slash case wrong: `cq_key_56` stores literal
+  `PJ2/AG3I` and `W1AW/0` (the operators' portable announcements during
+  the contest), but RBN strips slashes and MASTER.SCP holds base calls
+  only, so the extractor emits `AG3I` and `W1AW`.  Strict string compare
+  misses those — slash-tolerant compare credits them.
+  Effect on the deployed cq_runner-bypass run (commit `c133b1b`):
+  49/56 strict → **51/56 = 91.1%** tolerant.  +2 pp on every variant
+  ever tested (baseline, bypass-fix, SNR=8, cluster=50 — same +2 each).
+  README claim **stays at 81%** pending a multi-recording benchmark
+  suite; bumping to 91% on a single recording is the kind of overclaim
+  that bites in 2 weeks when seg1 or seg3 shows 78%.  Methodology
+  rationale + matching rule lives in
+  `memory/project_b1_seg2_scoring_methodology.md`.
+
+### Tried + reverted same session
+- **Method 0 (slash-literal extraction) in `run_file_mode`** — Squelch's
+  proposal to add a slash-aware regex before Methods 1-3.  Tested
+  2026-05-24, REVERTED before commit: was inert in the current data
+  flow.  Reason: file-mode end-of-session extractor walks
+  `inst.decoded_text` (uhsdr_cw subprocess outputs); ITILA's slash-bearing
+  text lives in `_itila_scanner._bins[].text_buf`, a different buffer
+  the extractor never sees.  Architectural issue the IPC refactor
+  (branch `sparkgap-ipc-refactor`, `e67cd10`) is designed to fix —
+  SpotIntent records carry the call literally, slashes flow through.
+  Method 0 has nothing to find until that refactor lands.
+
 ### Reverted
 - **`sk_5band.json`: `signal_min_snr` 8 → 12** (rolled back ~20 min after
   deploy of cc2daf7).  The file-mode A/B showed +3 CQer recall with
