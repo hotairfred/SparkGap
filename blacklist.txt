@@ -100,3 +100,14 @@ A5N
 SA6P
 E6AQ
 M5M
+
+# Hand-added 2026-05-25 pending next mine_blacklist.py cycle:
+#   SE5E: dit-heavy hallucination (S=···, E=·, 5=·····, E=· → 10 consecutive
+#         dits).  Same family as EE5E/TT5T/NN5N (already in file-mode
+#         FALSE_POS_EVAL but NOT in live blacklist).  Sighted twice 2026-05-25
+#         03-04Z: 28037.1 (10m at 03Z, band closed) + 3532.0 via
+#         gate_scp_bucket_substitute SS5E→SE5E.  SE5E IS a real Swedish call
+#         in SCP, but propagation + raw decoder text confirm both events were
+#         hallucinations.  Structural fix needed: extend gate_short_scp_bucket
+#         (M5M class) to reject all-dit short calls without peer corroboration.
+SE5E
