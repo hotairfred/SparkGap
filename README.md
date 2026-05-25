@@ -12,11 +12,20 @@ spot output via telnet.
 > via Aggregator, and PSKReporter directly via the built-in
 > `pskr_feeder.py`.
 >
-> **Reference comparisons (comparable, not claiming superiority):**
+> **Reference comparisons:**
 >
-> - **File replay** against a 15-min CW contest recording (B1_seg2)
->   with a SkimSrv-generated answer key: catches 81% of the keyed
->   calls. Each catches some calls the other doesn't.
+> - **File replay** against a 15-min CW contest recording (B1_seg2,
+>   40m, 2026-03-19 03:15–03:30 UTC) scored against RBN historical
+>   data as the third-party validator:
+>   - SparkGap recall vs RBN-consensus (≥2 worldwide skimmers
+>     confirming): **49.7%** (76 of 153 calls).
+>   - CW Skimmer offline mode on the same audio: **22.9%** (35 of 153).
+>   - **47 RBN-validated calls SparkGap found that CW Skimmer missed**;
+>     CW Skimmer found 6 we missed.
+>   - Of 274 unique SparkGap spots, 96 (35%) are independently
+>     validated by RBN or CW Skimmer; 178 are unverified — mix of
+>     real local stations (RBN missed) and false positives (we don't
+>     have a per-file SDC tee to disambiguate the file-replay mode).
 >
 > - **Live deployment** alongside UT4LW's SDC-Connectors (actively-
 >   maintained closed-source alternative) on a shared antenna split:
@@ -26,8 +35,10 @@ spot output via telnet.
 >
 > SDC-Connectors has years of contest tuning we don't yet match. We
 > have features it doesn't (open source, multi-mode in one process,
-> packet-loss telemetry). Comparable, complementary, not competing on
-> winning a single benchmark.
+> packet-loss telemetry). The CW Skimmer file-replay comparison
+> measures recall on the same RF, not precision; we don't claim
+> overall superiority on a single recording.  Methodology in
+> `tools/eval/b1_benchmark.py` and `eval_rbn_validated.py`.
 >
 > A Linux-native RBN feeder is in development.  In the meantime,
 > sparkgap's `:7300` telnet is SkimSrv-format-compatible and
