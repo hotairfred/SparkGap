@@ -152,11 +152,11 @@ channelizer + lazy bin-spawn), and `_ItilaScanner` + `SpotTracker` in
 - **Hardware abstraction** beyond Red Pitaya HPSDR.  RX-888, SDRPlay,
   Hermes Lite 2 backends would each require a plugin author who owns
   that hardware.  See the IqSource discussion in the project docs.
-- **Native RBN feeder.**  `rbn_feeder.py` exists and speaks the
-  Aggregator-equivalent HTTP/JSON protocol, but isn't yet
-  enabled-by-default — we currently bridge through Aggregator on a
-  Windows box. Coordinate with RBN-OPS before pointing a native
-  feeder at production.
+- **Hardened multi-host setup.**  rbn_feeder.py works (see
+  `docs/rbn-feeding.md`) but the production deployment we're running
+  is a single-host install.  Operators who want to split skimmer and
+  feeder onto different boxes should treat their setup as bespoke
+  until we publish a tested multi-host recipe.
 - **Documentation polish.**  This README is the start; expect rough
   edges in install, config, and operations until the project matures.
 - **Validated multi-recording test suite.**  We have one rigorous
@@ -242,13 +242,13 @@ SparkGap emits standard DX-cluster spots locally on telnet :7300
 in SkimSrv-compatible wire format.
 
 **Recommended path today:** bridge through Aggregator on a Windows
-box pointed at sparkgap's `:7300` telnet. Aggregator handles
-upstream registration and authentication with RBN; sparkgap
-provides the decoder + multi-band scanning.
+box pointed at sparkgap's `:7300` telnet.  That setup still works
+for operators who already have Aggregator licensed and don't want to
+change.
 
-A `rbn_feeder.py` exists as a placeholder for an eventual
-fully-Linux-native path. It's not ready for general use yet — if
-you're interested in beta-testing it, get in touch.
+For an all-Linux native path, `rbn_feeder.py` reads sparkgap's local
+`:7300` telnet and posts spots directly to RBN — no Windows / no
+Aggregator required.  See `docs/rbn-feeding.md` for setup.
 
 ## Configuration: gate flags
 
