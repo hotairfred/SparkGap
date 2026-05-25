@@ -4845,6 +4845,7 @@ class SpotTracker:
         'gate_bypass_consensus':       False,  # bypass goes through freq consensus vs simple count
         'gate_scp_bucket_substitute':  False,  # emit bucket form instead of raw call
         'gate_short_scp_bucket':       True,   # suppress bucket-substitute into ≤3-char targets w/o peer corroboration (M5M class)
+        'gate_short_scp_exact':        True,   # require 2nd-sighting before emitting ≤3-char SCP via ITILA [exact] path (G5E/SE5E class) — closes the M5M-gate bypass where ITILA synth "CQ <call>" auto-sets has_context
         'gate_recent_band_floor':      False,  # anchor solo decode if peers saw it recently (S-floor)
         'gate_harmonic_filter':        False,  # drop 2x-5x harmonic spurs of same-call recent spots
         'enable_caller_spotting':      True,   # extract callers AND runner from QSO buffer (c042491)
@@ -5148,6 +5149,25 @@ class SpotTracker:
         for k in stale:
             self._freq_sighting_times.pop(k, None)
         stats['freq_sighting_times'] = (len(stale), len(self._freq_sighting_times))
+
+        # 6. _short_scp_exact_attempts — drop entries past their TTL.  Keyed
+        # by (call, freq_bin); value is list of timestamps.  Per-entry TTL
+        # is SHORT_SCP_EXACT_TTL (=600s); also drop keys whose newest
+        # timestamp is past that.
+        if hasattr(self, '_short_scp_exact_attempts'):
+            cutoff = now - self.SHORT_SCP_EXACT_TTL
+            stale = []; tuples_dropped = 0
+            for key, ts_list in list(self._short_scp_exact_attempts.items()):
+                fresh = [t for t in ts_list if t >= cutoff]
+                tuples_dropped += len(ts_list) - len(fresh)
+                if fresh:
+                    self._short_scp_exact_attempts[key] = fresh
+                else:
+                    stale.append(key)
+            for k in stale:
+                self._short_scp_exact_attempts.pop(k, None)
+            stats['short_scp_exact_attempts'] = (
+                len(stale), len(self._short_scp_exact_attempts))
 
         return stats
 
@@ -5720,6 +5740,12 @@ class SpotTracker:
             prev = curr
         return prev[-1]
 
+    # Sliding-window TTL for the short-SCP exact-decode gate (seconds).
+    # Generous enough to catch casual ops who CQ every few minutes, tight
+    # enough that random noise hallucinations don't accumulate across
+    # bands.  See _short_scp_exact_attempts below.
+    SHORT_SCP_EXACT_TTL = 600
+
     def process_intent(self, intent):
         """Consume a structured SpotIntent from _ItilaScanner.
 
@@ -5735,6 +5761,33 @@ class SpotTracker:
         (extracted_call, is_runner, has_cq_context) to skip the
         re-parsing step.  Deferred until this wrapper proves stable.
         """
+        # gate_short_scp_exact: require a second sighting at the same freq
+        # for ≤3-char SCP calls coming via the ITILA [exact] path.  The
+        # synthetic "CQ <call> " below auto-sets has_context in process(),
+        # which bypasses the multi-sighting requirement -- letting G5E,
+        # SE5E, M5M-class noise hallucinations emit on a single decode
+        # window.  Track per-(call, freq_bin) attempts in a 10-min sliding
+        # window; emit only on the 2nd+ occurrence.  Real CW contest CQers
+        # repeat continuously so the one-window delay is acceptable; noise
+        # rarely reproduces the same call at the same freq inside the TTL.
+        if (self.gate_config.get('gate_short_scp_exact', True)
+                and len(intent.call) <= 3
+                and intent.call in self.valid_calls):
+            freq_bin = int(round(intent.freq_khz * 2))  # match SpotTracker's 500 Hz bin
+            key = (intent.call, freq_bin)
+            now = time.time()
+            if not hasattr(self, '_short_scp_exact_attempts'):
+                self._short_scp_exact_attempts = {}
+            cutoff = now - self.SHORT_SCP_EXACT_TTL
+            recent = [t for t in self._short_scp_exact_attempts.get(key, ()) if t >= cutoff]
+            if not recent:
+                self._short_scp_exact_attempts[key] = [now]
+                if self.gate_config.get('gate_telemetry', True):
+                    log.debug("GATE short_scp_exact: %s @ %.1f kHz first sighting (deferred)",
+                              intent.call, intent.freq_khz)
+                return []
+            recent.append(now)
+            self._short_scp_exact_attempts[key] = recent
         synth = f'CQ {intent.call} '
         return self.process(intent.freq_khz, intent.snr_db, synth, synth,
                             intent.bin_id, dec_type='itila', wpm=intent.wpm)
