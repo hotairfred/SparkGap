@@ -6908,30 +6908,68 @@ class SparkGap:
                         log.warning("Health probe failed: %s", e)
 
                 # RSS heartbeat — 2026-05-13 OOM diagnostic. Reads VmRSS
-                # from /proc/self/status (linux-only; no-op on other OS).
+                # + VmData from /proc/self/status (linux-only).  VmData
+                # added 2026-05-25 to discriminate "trim actually
+                # released memory" (VmData drops) vs "Linux paged out
+                # but heap is still fragmented" (only RSS drops).
                 try:
+                    rss_kb = None; data_kb = None
                     with open('/proc/self/status') as _sf:
                         for _ln in _sf:
-                            if _ln.startswith('VmRSS:'):
-                                rss_kb = int(_ln.split()[1])
-                                t = getattr(self, 'tracker', None)
-                                # Tracker cache sizes for leak observability.
-                                # Pre-2026-05-24-sweep, these grew unbounded:
-                                # tracking + harm_history were the biggest.
-                                if t:
-                                    sizes = (
-                                        f" rb={len(t._rb_support)}"
-                                        f" tr={len(t._tracking)}"
-                                        f" hh={len(t._harm_history)}"
-                                        f" bc={len(t._bypass_counts)}"
-                                        f" bs={len(t._bypass_spotted)}"
-                                        f" st={len(t._sighting_times)}"
-                                        f" fst={len(t._freq_sighting_times)}"
-                                    )
-                                else:
-                                    sizes = ""
-                                log.info("Mem: rss_kb=%d%s", rss_kb, sizes)
-                                break
+                            if _ln.startswith('VmRSS:'):  rss_kb  = int(_ln.split()[1])
+                            elif _ln.startswith('VmData:'): data_kb = int(_ln.split()[1])
+                    if rss_kb is None:
+                        raise RuntimeError("VmRSS not found")
+                    t = getattr(self, 'tracker', None)
+                    # Tracker cache sizes for leak observability.
+                    # Pre-2026-05-24-sweep, these grew unbounded:
+                    # tracking + harm_history were the biggest.
+                    if t:
+                        sizes = (
+                            f" rb={len(t._rb_support)}"
+                            f" tr={len(t._tracking)}"
+                            f" hh={len(t._harm_history)}"
+                            f" bc={len(t._bypass_counts)}"
+                            f" bs={len(t._bypass_spotted)}"
+                            f" st={len(t._sighting_times)}"
+                            f" fst={len(t._freq_sighting_times)}"
+                        )
+                    else:
+                        sizes = ""
+                    # Heap arena count — counts [heap] segments in
+                    # /proc/self/maps.  After MALLOC_ARENA_MAX=2 was
+                    # set in launcher env (2026-05-25), this stayed
+                    # bounded; before, fragmentation produced 1800+
+                    # mmap regions.  Note: a single logical heap can
+                    # be split into many contiguous [heap] VMAs as it
+                    # grows — the count tracks fragmentation, not the
+                    # arena count itself (which is capped by env var).
+                    try:
+                        with open('/proc/self/maps') as _mf:
+                            n_heap = sum(1 for _l in _mf if '[heap]' in _l)
+                    except Exception:
+                        n_heap = -1
+                    log.info("Mem: rss_kb=%d data_kb=%d heaps=%d%s",
+                             rss_kb, data_kb if data_kb else -1, n_heap, sizes)
+                    # malloc_trim — return free heap pages to OS.
+                    # cluster=50's per-scan malloc/free churn (5 buffers
+                    # x 376 scans/sec x 8 bands) fragments glibc arenas;
+                    # without explicit trim, freed memory stays
+                    # committed.  Observed 2026-05-24: VmData 34.6 GB
+                    # vs RSS 13 GB + 1804 mmap regions = ideal
+                    # fragmentation signature, leading to OOM at 14 GB
+                    # in 4h.  Called per Mem heartbeat (~30s) so trim
+                    # cost is amortized.  Combine with MALLOC_ARENA_MAX=2
+                    # in launcher env for best fragmentation reduction.
+                    try:
+                        if not hasattr(self, '_libc'):
+                            import ctypes as _ct
+                            self._libc = _ct.CDLL('libc.so.6')
+                            self._libc.malloc_trim.argtypes = [_ct.c_size_t]
+                            self._libc.malloc_trim.restype = _ct.c_int
+                        self._libc.malloc_trim(0)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 

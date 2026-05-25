@@ -27,7 +27,20 @@
 #define N_SPEED_BINS    16
 #define WPM_MIN         8.0
 #define WPM_MAX         60.0
-#define MAX_ENV         200000   /* ~16.7 min at 200 Hz */
+#define MAX_ENV         16384    /* ~82 s at 200 Hz.  Was 200000 — sized
+                                  * for a hypothetical 16.7-min window
+                                  * that nothing actually uses.  Real
+                                  * callers feed windows <= SC_ENV_CAP
+                                  * (15000) from itila_sc_decode_ready,
+                                  * or window_sec * ITILA_BAYES_RATE
+                                  * (60s * 200Hz = 12000) from
+                                  * _ItilaCallProcess.  Dropping to 16384
+                                  * (next power of 2 above 15000) shrinks
+                                  * each ITILA handle from ~19.4 MB to
+                                  * ~1.5 MB.  At 800 bins x 2 handles
+                                  * that's 31 GB -> 2.4 GB of decoder
+                                  * state — fits cluster=50 steady state
+                                  * in the 14 GB skimmer1 RAM budget. */
 #define MAX_BEAM        64       /* working beam before pruning */
 #define MAX_TEXTS       32       /* final hypothesis cap */
 #define MAX_SYM         8        /* max Morse symbol length + null */

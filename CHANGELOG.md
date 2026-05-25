@@ -2,6 +2,60 @@
 
 Pre-1.0 alpha. No versioned releases yet — entries are dated.
 
+## 2026-05-25
+
+### Fixed (production-critical)
+- **OOM leak from cluster=50 deploy → emergency restart + leak fix.**
+  cluster=50 (deployed 2026-05-24 as b96e459) was leaking ~3.5 GB/hr on
+  skimmer1, reached 13.6 GB RSS / 14 GB total at 4h uptime.  Forced
+  emergency restart at 02:12Z.  Three composable fixes shipped:
+  - **`itila_core.c` `MAX_ENV` 200000 → 16384.**  Was sized for a
+    hypothetical 16.7-min decode window that no caller actually feeds;
+    real windows are 12000–15000 samples.  The decoder only writes the
+    first N positions of its log_B/alpha/beta/gamma/gamma_marg buffers,
+    but glibc reserves the full MAX_ENV virtual space.  Drop to 16384
+    (next power of 2 above SC_ENV_CAP=15000) shrinks per-handle
+    *reservation* from 19.4 MB to 1.5 MB.  Measured *committed* RSS
+    delta: ~1 MB/handle.  At 800 bins × 2 handles ≈ 1.6 GB savings.
+    Real, not silver-bullet — bigger payoff is reduced virtual address
+    space pressure and arena bookkeeping cost.
+  - **`malloc_trim(0)` per Mem heartbeat (~30s) in `sparkgap.py`.**  Was
+    the dominant fix.  cluster=50 amplified per-FFT/per-IQ-feed
+    malloc/free churn (5 buffers × 376 scans/sec × 8 bands) that
+    fragmented glibc arenas.  Without explicit trim, freed memory
+    stayed committed.  Diagnostic signature: VmData 34.6 GB vs RSS
+    13 GB + 1804 mmap regions.  Post-deploy: RSS oscillates in a
+    4.6–5.4 GB band, VmData/RSS ratio 1.33 (was 2.66), mmap regions
+    cut to ~860.
+  - **`MALLOC_ARENA_MAX=2` env var in launcher.**  Caps glibc's
+    per-thread arena count (default = 8 × CPU count = 48 on 6-core).
+    Decode-thread split (1cb74fc, 2026-05-24) doubled per-RX worker
+    count → doubled active arenas → fragmentation surface stepped up.
+    `=2` forces threads to share a tiny pool at the cost of malloc
+    contention.  Combined with `malloc_trim`, the two compose.
+  Squelch peer review of all three knobs + MacKay-grounded
+  fragmentation analysis pre-deploy.  45-min bake on skimmer1
+  confirmed durable: RSS sawtooth between 4.56 GB (post-trim) and
+  5.38 GB (pre-trim), ring_drops=0/26.8M, env_drops=8667 frozen,
+  CW spot rate ~5/min (better than pre-fix 4.2/min).  Cluster=50 now
+  fits in 14 GB RAM with 8.6 GB headroom.
+
+### Added
+- **Extended `Mem:` log heartbeat with `data_kb` (VmData) + `heaps`
+  (count of `[heap]` segments in /proc/self/maps).**  Diagnostic
+  observability for distinguishing "trim actually released memory"
+  (VmData drops alongside RSS) from "Linux paged out but heap is
+  still fragmented" (only RSS drops).  Per Squelch's pre-deploy
+  request.
+
+### Deploy-discipline lesson
+- **Service SIGTERM didn't exit cleanly within 20s either time** the
+  emergency restart fired.  Python process appears stuck in C-side
+  `dec_feed` or similar non-interruptible call; SIGKILL after the
+  timeout is the only reliable exit path.  Hygiene issue worth
+  investigating but not blocking.  Watchdog scripts should expect
+  `SIGTERM → wait 20s → SIGKILL` pattern.
+
 ## 2026-05-24
 
 ### Deployed
