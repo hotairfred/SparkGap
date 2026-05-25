@@ -124,3 +124,23 @@ SE5E
 #         decodes, not just bucket-substituted output.  Today's M5M-class
 #         guards only check the bucket path.
 G5E
+
+#   I5I:  3-char dit-heavy hallucination (I=·· 5=····· I=·· — 9 dits).
+#         NOT in MASTER.SCP — emitted as [unverified] via
+#         scp_bypass_threshold=2 path after 2 noise sightings.  Bypass
+#         path has no length floor; structural fix: add ≤3-char filter
+#         to bypass emit path so non-SCP short calls require additional
+#         corroboration.  Observed 2026-05-25 19:58Z (28037.2) +
+#         20:39Z (10122.5).
+#
+#   SE5I: 4-char dit-heavy bucket target (S=··· E=· 5=····· I=·· — 11 dits).
+#         IN MASTER.SCP.  Hit through SCP-bucket substitute path
+#         (SU5I→SE5I 14022.0, SI5I→SE5I 7055.9 + 10102.2 — all on
+#         2026-05-25).  Bypasses gate_short_scp_bucket because that
+#         gate only checks ≤3-char targets, SE5I is 4 chars.
+#         Structural fix needed: extend the bucket guard to ≤4 chars
+#         (covers SE5E/SE5I/SE5S/SE5T/II5T class).  Same for
+#         gate_short_scp_exact.  Both pending B1_seg2 A/B to verify
+#         real 4-char contest CQers don't lose recall.
+I5I
+SE5I
