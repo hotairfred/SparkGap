@@ -41,6 +41,15 @@ spot output via telnet.
 >   positives.  Live mode disambiguates these via SDC tee; the file
 >   replay does not.
 >
+> - **The "local but not global" bucket exists**: of those 96
+>   validated spots, **20 are calls where SparkGap and CW Skimmer
+>   independently agreed but RBN missed entirely** — two different
+>   decoders, different algorithms, both saw the signal that no
+>   worldwide skimmer ≥2-consensus-confirmed. That's empirical
+>   evidence for the "RBN-only scoring underweights local coverage"
+>   argument: an antenna-co-located decoder catches stations RBN's
+>   distributed network doesn't.
+>
 > - **Live deployment** alongside UT4LW's SDC-Connectors (actively-
 >   maintained closed-source alternative) on a shared antenna split:
 >   matches 67% of SDC-Connectors' spots in the first 17 minutes of
