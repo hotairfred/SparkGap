@@ -6445,6 +6445,13 @@ class SparkGap:
         # Falls back to the global signal_min_snr when not set.
         pfb_min_snr = self.cfg.get('pfb_min_snr')
         global_min_snr = float(self.cfg.get('signal_min_snr', 8.0))
+        # Per-band signal_min_snr override, keyed by center_hz as a string
+        # (JSON object keys must be strings).  Use this to raise the CFAR
+        # threshold on bands with heavy local QRM that produces phantom bins
+        # (10m birdies, etc) — observed 2026-05-25 with 229+ bins on 10m at
+        # ~1% spawn-to-CW-spot conversion.  Numeric value is dB above CFAR
+        # local-median.  Takes precedence over pfb_min_snr.
+        per_band_min_snr = self.cfg.get('per_band_min_snr', {}) or {}
         self.managers = []
         for _name, _center_hz, _rx_idx in self._band_meta:
             use_pfb_here = (pfb_global
@@ -6452,6 +6459,15 @@ class SparkGap:
                             or _center_hz in pfb_band_hz)
             min_snr_here = (float(pfb_min_snr) if (use_pfb_here and pfb_min_snr is not None)
                             else global_min_snr)
+            # Per-band override wins if present
+            override = per_band_min_snr.get(str(_center_hz))
+            if override is None:
+                override = per_band_min_snr.get(_name)
+            if override is not None:
+                old = min_snr_here
+                min_snr_here = float(override)
+                log.info("Per-band min_snr override for %s (%d Hz): %.1f -> %.1f dB",
+                         _name, _center_hz, old, min_snr_here)
             mgr = InstanceManager(
                 sample_rate=rx_sample_rate,
                 decoder_bin=self.cfg.get('decoder_bin', './uhsdr_cw'),
