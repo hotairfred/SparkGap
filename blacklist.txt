@@ -111,3 +111,16 @@ M5M
 #         hallucinations.  Structural fix needed: extend gate_short_scp_bucket
 #         (M5M class) to reject all-dit short calls without peer corroboration.
 SE5E
+
+#   G5E:  same M5M class — 3-char SCP entry acting as noise magnet.  Operator
+#         complained 2026-05-13.  Earlier fixes (length-aware bucket guard
+#         b0a720b, exclude_self 62a72be) closed the bucket-substitute path
+#         but NOT the [exact] direct-decode path.  ITILA occasionally
+#         squeezes "G5E" out of the random E/T/I noise stream when the
+#         decoder's beam search hits a short SCP entry.  Reappeared 2026-05-25
+#         16:30Z on 28036.7 kHz, in the 28030-28049 RFI-or-noise zone that
+#         had 195 phantom bins decoding pure noise.  Structural fix needed:
+#         extend the short-call corroboration gate to cover [exact] direct
+#         decodes, not just bucket-substituted output.  Today's M5M-class
+#         guards only check the bucket path.
+G5E
