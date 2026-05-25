@@ -41,6 +41,8 @@
     "max_bins": 300,
     "lna_gain": 20,
     "enable_ft8": true,
+    "_comment_enable_rtty": "enable_rtty: independent of enable_ft8. RTTY scan piggybacks on the same minute-aligned IQ snapshot (no extra capture cost) and looks for FSK pairs in each band's RTTY-contest sub-band. Default true for backward-compatibility (previously bundled under enable_ft8). Set false to disable RTTY scan without disabling FT8 — useful for non-RTTY-contest weekends to avoid the small CPU cost of pair-detection across all bands.",
+    "enable_rtty": true,
     "itila_max_bins": 400,
     "use_pfb_scanner": false,
 

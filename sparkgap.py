@@ -6565,9 +6565,11 @@ class SparkGap:
 
         # SIGUSR1 → snapshot the current IQ buffer for every enabled band
         # to /tmp/diag_<band>_<HHMMSS>.wav for live-vs-replay diagnostics.
-        # Reuses the FT8 capture buffer (must have enable_ft8=true).
+        # Reuses the FT8/RTTY capture buffer (requires either enable_ft8
+        # or enable_rtty so the C-side accumulator is allocated).
         if (getattr(self, '_use_c_receiver', False)
-                and self.cfg.get('enable_ft8', True)):
+                and (self.cfg.get('enable_ft8',  True)
+                     or self.cfg.get('enable_rtty', True))):
             try:
                 signal.signal(signal.SIGUSR1, self._diag_iq_snapshot)
                 log.info("SIGUSR1 handler installed: kill -USR1 %d for IQ snapshot", os.getpid())
@@ -6750,8 +6752,13 @@ class SparkGap:
                                 self.receiver._h, decode_ptr,
                                 _ct.c_int(window_samples))
                     self._pfb_managers = []  # no Python decode poll needed
-                    # Enable FT8 raw IQ accumulation per band (skipped if disabled)
-                    if self.cfg.get('enable_ft8', True):
+                    # Enable per-band IQ capture buffer for FT8/RTTY minute-
+                    # aligned decode.  The C-side accumulator is shared by
+                    # both modes (RTTY scan piggybacks on the FT8 snapshot
+                    # for free), so allocate it if EITHER is enabled.
+                    enable_ft8  = bool(self.cfg.get('enable_ft8',  True))
+                    enable_rtty = bool(self.cfg.get('enable_rtty', True))
+                    if enable_ft8 or enable_rtty:
                         FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
                                      14090: 14074, 18083: 18100,
                                      21090: 21074, 24902: 24915,
@@ -6764,9 +6771,12 @@ class SparkGap:
                                     self.receiver._h, ri,
                                     _ct.c_double(ft8_khz * 1000.0),
                                     _ct.c_double(float(ch)))
-                                log.info("FT8 accumulator enabled rx%d: %.0f kHz", ri, ft8_khz)
+                                log.info("IQ-capture accumulator enabled rx%d: %.0f kHz "
+                                         "(ft8=%s rtty=%s)", ri, ft8_khz,
+                                         enable_ft8, enable_rtty)
                     else:
-                        log.info("FT8 disabled by config (enable_ft8=false)")
+                        log.info("FT8 + RTTY both disabled by config "
+                                 "(enable_ft8=false enable_rtty=false)")
                     self.receiver.lib.hpsdr_start_worker(self.receiver._h)
                     self._worker_started = True
                     log.info("C worker thread started (%d bands, CW+FT8)",
@@ -7220,9 +7230,12 @@ class SparkGap:
                 except Exception as e:
                     log.warning("Tracker cache sweep failed: %s", e)
 
-            # FT8 decode — aligned to minute boundaries, runs in thread
+            # FT8 / RTTY decode — both modes consume the same minute-aligned
+            # IQ snapshot.  Run if EITHER is enabled.  FT8 + RTTY are gated
+            # individually below.
             if use_c and getattr(self, '_worker_started', False) \
-                    and self.cfg.get('enable_ft8', True):
+                    and (self.cfg.get('enable_ft8', True)
+                         or self.cfg.get('enable_rtty', True)):
                 ft8_now = time.time()
                 ft8_sec = ft8_now % 60
                 ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
@@ -7281,13 +7294,18 @@ class SparkGap:
                                          fi_60, fq_60, take))
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
+                            # Re-read flags inside the thread so a runtime
+                            # config edit could take effect at the next
+                            # minute boundary (not currently used but cheap).
+                            enable_ft8  = bool(skimmer.cfg.get('enable_ft8',  True))
+                            enable_rtty = bool(skimmer.cfg.get('enable_rtty', True))
                             import subprocess, wave
                             from scipy.signal import resample_poly
                             from numpy.fft import fft, ifft
                             ft8_bin = '/home/sparkgap/decode_ft8'
                             total = 0
                             seen_msgs = set()  # dedupe across sliding windows
-                            for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
+                            for bn, ri, ck, ft8_khz, fi, fq, n in (jobs if enable_ft8 else []):
                                 iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                 offset_hz = (ft8_khz - ck) * 1000
                                 t = np.arange(n) / 192000
@@ -7394,21 +7412,25 @@ class SparkGap:
                                                 pass
                                         log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
                                                  rf_khz, ft8_call, snr, msg)
-                            log.info("FT8 cycle done: %d spots across %d bands",
-                                     total, len(jobs))
+                            if enable_ft8:
+                                log.info("FT8 cycle done: %d spots across %d bands",
+                                         total, len(jobs))
                             # RTTY scan piggybacks on the same minute snapshot.
                             # Run after FT8 so the FT8 spots flow first.
-                            rtty_lib = _get_rtty_lib()
-                            if rtty_lib is not None:
-                                rtty_total = 0
-                                for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
-                                    try:
-                                        rtty_total += _rtty_scan_band(
-                                            skimmer, rtty_lib, bn, ck, fi, fq, n)
-                                    except Exception as e:
-                                        log.warning("RTTY scan %s: %s", bn, e)
-                                log.info("RTTY cycle done: %d spots across %d bands",
-                                         rtty_total, len(jobs))
+                            # Independent of enable_ft8 — controlled by
+                            # enable_rtty (default true for backward compat).
+                            if enable_rtty:
+                                rtty_lib = _get_rtty_lib()
+                                if rtty_lib is not None:
+                                    rtty_total = 0
+                                    for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
+                                        try:
+                                            rtty_total += _rtty_scan_band(
+                                                skimmer, rtty_lib, bn, ck, fi, fq, n)
+                                        except Exception as e:
+                                            log.warning("RTTY scan %s: %s", bn, e)
+                                    log.info("RTTY cycle done: %d spots across %d bands",
+                                             rtty_total, len(jobs))
                             skimmer._ft8_running = False
                         import threading
                         threading.Thread(target=_ft8_decode,
