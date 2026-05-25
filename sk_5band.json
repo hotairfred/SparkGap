@@ -33,10 +33,8 @@
     "exclude_ft8_freqs": true,
     "exclude_ft4_freqs": false,
 
-    "_comment_per_band_snr": "Per-band CFAR threshold override (dB above local-median).  Use to suppress phantom-bin spawns on bands with heavy local QRM/birdies.  Keys are receiver center_hz (string) or band name.  Overrides signal_min_snr global.  Observed 2026-05-25: 10m had 229+ active bins at ~1% spawn-to-spot conversion; bumping to 15 dB filters the bottom rung of noise-floor peaks while keeping real signals.",
-    "per_band_min_snr": {
-        "28090000": 15
-    },
+    "_comment_per_band_snr": "Per-band CFAR threshold override (dB above local-median).  Use to suppress phantom-bin spawns on bands with heavy local QRM/birdies.  Keys are receiver center_hz (string) or band name.  Overrides signal_min_snr global.  Observed 2026-05-25: 10m had 229+ active bins, but WF8Z's Flex shows quiet band on same antenna => phantoms are likely Pitaya-side spurs/birdies, not noise-floor false alarms.  Raising SNR loses real spots without killing spurs.  Reverted to global 12 dB pending freq-dump diagnostic to identify stable artifact frequencies.",
+    "per_band_min_snr": {},
 
     "telnet_port": 7300,
     "scp_bypass_threshold": 2,

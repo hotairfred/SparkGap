@@ -7035,6 +7035,28 @@ class SparkGap:
                                 for n, c, a in per_band
                             ]
                             log.info("BinAge: %s", " ".join(parts))
+                        # Diagnostic: when any band has lots of bins, dump
+                        # the actual frequencies.  Stable spurs/birdies show
+                        # as repeating freqs across snapshots; CFAR
+                        # statistical false alarms show as spread.  Threshold
+                        # of 80 bins keeps the log quiet for typical bands.
+                        DUMP_FREQS_IF_BINS_OVER = 80
+                        freqs_buf = (_ct.c_double * 512)()
+                        for i, mgr in enumerate(self.managers):
+                            name = self._band_meta[i][0] if i < len(self._band_meta) else f"b{i}"
+                            wrapper = getattr(mgr, '_itila_scanner', None)
+                            sc = getattr(wrapper, '_sc', None) if wrapper else None
+                            if not (sc and sc._h):
+                                continue
+                            n = sc._lib.itila_sc_bin_count(sc._h)
+                            if n < DUMP_FREQS_IF_BINS_OVER:
+                                continue
+                            n_freqs = sc._lib.itila_sc_list_bins(sc._h, freqs_buf, 512)
+                            khz_sorted = sorted(freqs_buf[j] / 1000.0
+                                                for j in range(n_freqs))
+                            log.info("BinFreqs %s (%d bins): %s",
+                                     name, n_freqs,
+                                     ",".join(f"{x:.1f}" for x in khz_sorted))
                     except Exception as e:
                         log.warning("Health probe failed: %s", e)
 
