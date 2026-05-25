@@ -1892,6 +1892,14 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         lib.itila_sc_list_bins.restype  = _ct.c_int
         lib.itila_sc_list_bins.argtypes = [
             _ct.c_void_p, _ct.POINTER(_ct.c_double), _ct.c_int]
+        # Optional bin-age listing (added 2026-05-25 for 4x bin growth
+        # diagnostic).  Older libitila_scanner.so won't have this symbol.
+        try:
+            lib.itila_sc_list_bin_ages.restype  = _ct.c_int
+            lib.itila_sc_list_bin_ages.argtypes = [
+                _ct.c_void_p, _ct.POINTER(_ct.c_int), _ct.c_int]
+        except AttributeError:
+            pass
         lib.itila_sc_drain_env.restype  = _ct.c_int
         lib.itila_sc_drain_env.argtypes = [
             _ct.c_void_p, _ct.c_double,
@@ -6887,7 +6895,13 @@ class SparkGap:
                         env_drops_total = 0
                         bins_total = 0
                         bins_peak = 0
-                        for mgr in self.managers:
+                        per_band = []  # (name, count, [b30,b60,b300,bover])
+                        AGE_30S  =   30 * 12000  # 12 kHz sample units
+                        AGE_60S  =   60 * 12000
+                        AGE_300S =  300 * 12000
+                        ages_buf = (_ct.c_int * 512)()
+                        for i, mgr in enumerate(self.managers):
+                            name = self._band_meta[i][0] if i < len(self._band_meta) else f"b{i}"
                             wrapper = getattr(mgr, '_itila_scanner', None)
                             sc = getattr(wrapper, '_sc', None) if wrapper else None
                             if sc and sc._h:
@@ -6900,10 +6914,36 @@ class SparkGap:
                                     sc._lib.itila_sc_bin_count.argtypes = [_ct.c_void_p]
                                     env_drops_total += sc._lib.itila_sc_env_drops(sc._h)
                                     bins_peak = max(bins_peak, sc._lib.itila_sc_bins_peak(sc._h))
-                                    bins_total += sc._lib.itila_sc_bin_count(sc._h)
+                                    n_band = sc._lib.itila_sc_bin_count(sc._h)
+                                    bins_total += n_band
+                                    # Per-band age histogram if list_bin_ages
+                                    # is available (added 2026-05-25).  Older
+                                    # libitila_scanner.so won't have it.
+                                    age_buckets = None
+                                    if hasattr(sc._lib, 'itila_sc_list_bin_ages'):
+                                        n_ages = sc._lib.itila_sc_list_bin_ages(
+                                            sc._h, ages_buf, 512)
+                                        b30 = b60 = b300 = bover = 0
+                                        for j in range(n_ages):
+                                            a = ages_buf[j]
+                                            if   a < AGE_30S:  b30  += 1
+                                            elif a < AGE_60S:  b60  += 1
+                                            elif a < AGE_300S: b300 += 1
+                                            else:              bover += 1
+                                        age_buckets = (b30, b60, b300, bover)
+                                    per_band.append((name, n_band, age_buckets))
                         log.info("Health: ring_drops=%d/%d (%.4f%%) env_drops=%d bins=%d peak=%d",
                                  rdrop, pkts, 100.0 * rdrop / max(pkts + rdrop, 1),
                                  env_drops_total, bins_total, bins_peak)
+                        # Per-band breakdown.  Format: name:total|<30s,<60s,<300s,300s+
+                        # If list_bin_ages unavailable, just name:total.
+                        if per_band and any(b[2] for b in per_band):
+                            parts = [
+                                f"{n}:{c}|{a[0]},{a[1]},{a[2]},{a[3]}" if a
+                                else f"{n}:{c}"
+                                for n, c, a in per_band
+                            ]
+                            log.info("BinAge: %s", " ".join(parts))
                     except Exception as e:
                         log.warning("Health probe failed: %s", e)
 

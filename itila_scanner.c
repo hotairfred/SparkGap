@@ -727,6 +727,19 @@ int itila_sc_list_bins(ItilaSc *sc, double *f_hz_out, int max_out)
     return count;
 }
 
+int itila_sc_list_bin_ages(ItilaSc *sc, int *ages_out, int max_out)
+{
+    if (!sc) return 0;
+    pthread_mutex_lock(&sc->lock);
+    int count = 0;
+    for (int i = 0; i < SC_MAX_BINS && count < max_out; i++) {
+        if (sc->bins[i].active)
+            ages_out[count++] = sc->total_samples - sc->bins[i].created_sample;
+    }
+    pthread_mutex_unlock(&sc->lock);
+    return count;
+}
+
 /* ---- integrated decode: ready check + drain + itila_feed in C ---- */
 
 void itila_sc_set_decoder(ItilaSc *sc,

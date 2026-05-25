@@ -80,6 +80,18 @@ int itila_sc_env_n(ItilaSc *sc, double f_hz);
  */
 int itila_sc_list_bins(ItilaSc *sc, double *f_hz_out, int max_out);
 
+/*
+ * Fill ages_out[] with age in 12 kHz sample units of each active bin
+ * (total_samples - created_sample).  Divide by 12000 for seconds.
+ * Returns count written (≤ max_out).
+ *
+ * Use case: discriminate "tighter clustering finds more weak signals
+ * (healthy)" from "eviction broken (pathological)" by checking the
+ * age distribution.  Healthy: roughly exponential around eviction τ.
+ * Pathological: long tail past the eviction threshold.
+ */
+int itila_sc_list_bin_ages(ItilaSc *sc, int *ages_out, int max_out);
+
 #ifdef __cplusplus
 }
 #endif
