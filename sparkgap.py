@@ -265,6 +265,53 @@ BANDS = {
     '10m': 28040000,
 }
 
+# IARU Region 2 CW skimmer windows (kHz).  Each entry:
+#   (cw_lo, cw_hi_excluding_ft4, cw_hi_including_ft4_zone, ft8_freq_khz)
+#
+# cw_hi_excluding_ft4: tight upper edge, stops below FT4 if FT4 is in CW area
+# cw_hi_including_ft4_zone: extended upper edge, includes FT4 zone — useful
+#   on bands where FT4 sits between CW and FT8 (40m), since CW operators
+#   regularly drift into the FT4 zone in contests (FT4 less popular than FT8)
+# ft8_freq_khz: documented for reference; window stops below this when
+#   exclude_ft8_freqs is True (the default)
+#
+# On bands where FT4 > FT8 (20m, 15m, 10m), the FT4 zone is unreachable from
+# the CW segment via a single window; the two _hi values are equal.
+CW_BAND_PLAN_R2 = [
+    # (lo,    hi_no_ft4, hi_with_ft4, ft8)
+    (1810,   1995,      1995,         0),       # 160m — no FT8/FT4 in window
+    (3500,   3570,      3570,         3573),    # 80m
+    (7000,   7045,      7070,         7074),    # 40m   — FT4=7047.5
+    (10100,  10135,     10135,        10136),   # 30m   — no FT4
+    (14000,  14070,     14070,        14074),   # 20m   — FT4=14080 above FT8 (unreachable)
+    (18068,  18095,     18095,        18100),   # 17m   — no FT4
+    (21000,  21070,     21070,        21074),   # 15m   — FT4=21140 above FT8 (unreachable)
+    (24890,  24913,     24913,        24915),   # 12m   — no FT4
+    (28000,  28070,     28070,        28074),   # 10m   — FT4=28180 above FT8 (unreachable)
+]
+
+def _derive_cw_window(center_khz, exclude_ft8=True, exclude_ft4=False):
+    """Look up the CW window for the IARU R2 band containing center_khz.
+
+    Returns (cw_min_khz, cw_max_khz) or None if center_khz doesn't fall
+    near any known band.  The "near" criterion is ±200 kHz of either edge
+    so it works whether the receiver center is above, inside, or below
+    the CW segment.
+
+    Defaults match WF8Z preference (2026-05-25): FT8 zones excluded
+    (phantom bin source on noisy 10m, also general waste), FT4 zones
+    included (CW drift in contests is real).  Override via config flags.
+    """
+    for lo, hi_no_ft4, hi_with_ft4, ft8 in CW_BAND_PLAN_R2:
+        if lo - 200 <= center_khz <= hi_with_ft4 + 200:
+            hi = hi_no_ft4 if exclude_ft4 else hi_with_ft4
+            if not exclude_ft8 and ft8 > 0:
+                # Caller doesn't want FT8 excluded — extend upper edge past
+                # the FT8 freq.  Rare; useful only for FT8-carrier studies.
+                hi = max(hi, ft8 + 5)
+            return float(lo), float(hi)
+    return None
+
 
 def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
                      blacklist_path='blacklist.txt'):
@@ -4113,7 +4160,8 @@ class InstanceManager:
                  use_pfb_scanner=False, valid_calls=None,
                  cw_min_khz=0.0, cw_max_khz=99999.0,
                  enable_caller_spotting=True,
-                 gate_timing_cost=False, timing_cost_max=30.0):
+                 gate_timing_cost=False, timing_cost_max=30.0,
+                 exclude_ft8_freqs=True, exclude_ft4_freqs=False):
         self.valid_calls = valid_calls or set()
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -4136,6 +4184,14 @@ class InstanceManager:
         self.timing_cost_max  = float(timing_cost_max)
         self.cw_min_khz = float(cw_min_khz)
         self.cw_max_khz = float(cw_max_khz)
+        # FT8/FT4 zone filters used when deriving per-band CW windows.
+        # exclude_ft8: default True — FT8 carriers near the CW band are heavy
+        #              and consistently spawn phantom bins that never decode CW.
+        # exclude_ft4: default False per WF8Z — FT4 zones are less busy, CW
+        #              regularly drifts into them during contests, worth
+        #              scanning.  Override either in sk_5band.json.
+        self.exclude_ft8_freqs = bool(exclude_ft8_freqs)
+        self.exclude_ft4_freqs = bool(exclude_ft4_freqs)
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
         self.max_instances = max_instances  # total decoder process cap (legacy)
         # max_channels: max simultaneous signals — decoupled from decoder count
@@ -4196,12 +4252,29 @@ class InstanceManager:
         # Lazily create or re-center the ITILA scanner when center_khz is known.
         if self.use_itila:
             if self._itila_scanner is None:
-                # Derive per-band CW limits from center frequency if global limits
-                # don't make sense for this band (multi-band operation)
+                # Derive per-band CW limits.  Preferred path: IARU R2 band-
+                # plan lookup (gets the right segment whether the receiver
+                # center is above, inside, or below the CW band).  Falls
+                # back to the old "20-100 kHz below center" heuristic if
+                # the band isn't in the table.
                 bmin, bmax = self.cw_min_khz, self.cw_max_khz
                 if bmin == 0 or center_khz < bmin - 100 or center_khz > bmax + 100:
-                    bmin = center_khz - 100
-                    bmax = center_khz - 20
+                    auto = _derive_cw_window(
+                        center_khz,
+                        exclude_ft8=self.exclude_ft8_freqs,
+                        exclude_ft4=self.exclude_ft4_freqs)
+                    if auto:
+                        bmin, bmax = auto
+                        log.info("CW window for %.0f kHz: [%.0f, %.0f] kHz "
+                                 "(ft8_excl=%s ft4_excl=%s)",
+                                 center_khz, bmin, bmax,
+                                 self.exclude_ft8_freqs, self.exclude_ft4_freqs)
+                    else:
+                        bmin = center_khz - 100
+                        bmax = center_khz - 20
+                        log.warning("CW window for %.0f kHz: no band-plan "
+                                    "match, using fallback [%.0f, %.0f] kHz",
+                                    center_khz, bmin, bmax)
                 self._itila_scanner = _ItilaScanner(
                     self.sample_rate, center_khz,
                     ev_thresh=self.itila_ev_thresh,
@@ -6405,6 +6478,8 @@ class SparkGap:
                 enable_caller_spotting=bool(self.cfg.get('enable_caller_spotting', True)),
                 gate_timing_cost=bool(self.cfg.get('gate_timing_cost', False)),
                 timing_cost_max=float(self.cfg.get('timing_cost_max', 30.0)),
+                exclude_ft8_freqs=bool(self.cfg.get('exclude_ft8_freqs', True)),
+                exclude_ft4_freqs=bool(self.cfg.get('exclude_ft4_freqs', False)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
@@ -7407,6 +7482,8 @@ def run_file_mode(args, config):
         cw_min_khz=float(config.get('cw_min_khz', 0)),
         cw_max_khz=float(config.get('cw_max_khz', 99999)),
         enable_caller_spotting=bool(config.get('enable_caller_spotting', True)),
+        exclude_ft8_freqs=bool(config.get('exclude_ft8_freqs', True)),
+        exclude_ft4_freqs=bool(config.get('exclude_ft4_freqs', False)),
     )
 
     center_khz = args.center_khz

@@ -28,6 +28,11 @@
     ],
     "cw_min_khz": 0,
     "cw_max_khz": 99999,
+
+    "_comment_cw_window_derive": "When cw_min_khz=0, per-band CW window is derived from the IARU R2 band-plan lookup (sparkgap.py:_derive_cw_window). FT8 zones excluded by default (carriers spawn phantom bins). FT4 zones included by default — less busy than FT8, and CW operators regularly drift into FT4 sub-bands during contests. Override either with the flags below.",
+    "exclude_ft8_freqs": true,
+    "exclude_ft4_freqs": false,
+
     "telnet_port": 7300,
     "scp_bypass_threshold": 2,
     "max_bins": 300,
