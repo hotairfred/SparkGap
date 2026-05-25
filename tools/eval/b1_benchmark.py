@@ -85,11 +85,24 @@ def parse_decoded_calls(log_path):
 # Run + score one recording
 
 def find_cq_key(wav_path):
-    """Look for a sibling <stem>_cq_key*.txt next to the recording."""
+    """Look for a cq_key file matching the recording.
+
+    Search order:
+    1. tools/eval/keys/<base>_cq_key*.txt — RBN-derived keys generated
+       by rbn_key_gen.py (full worldwide ground truth).
+    2. <recording_dir>/<base>_cq_key*.txt — legacy / curated keys (e.g.
+       SkimSrv-output).  Used if no RBN key exists.
+
+    base = "B1_seg2" extracted from "B1_seg2_15-30min_7090kHz.wav".
+    """
     p = Path(wav_path)
     base = p.stem
     if '_' in base:
-        base = base.split('_')[0] + '_' + base.split('_')[1]  # e.g. B1_seg1
+        base = '_'.join(base.split('_')[:2])  # e.g. B1_seg1
+
+    repo_keys = Path(__file__).resolve().parent / 'keys'
+    for cand in sorted(repo_keys.glob(f'{base}_cq_key*.txt')):
+        return cand
     parent = p.parent
     for cand in sorted(parent.glob(f'{base}_cq_key*.txt')):
         return cand
