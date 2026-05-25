@@ -12,20 +12,34 @@ spot output via telnet.
 > via Aggregator, and PSKReporter directly via the built-in
 > `pskr_feeder.py`.
 >
-> **Reference comparisons:**
+> **Reference comparisons** (single 15-min recording: B1_seg2, 40m,
+> 2026-03-19 03:15–03:30 UTC, scored two ways for the local-vs-global
+> distinction operators care about):
 >
-> - **File replay** against a 15-min CW contest recording (B1_seg2,
->   40m, 2026-03-19 03:15–03:30 UTC) scored against RBN historical
->   data as the third-party validator:
->   - SparkGap recall vs RBN-consensus (≥2 worldwide skimmers
->     confirming): **49.7%** (76 of 153 calls).
->   - CW Skimmer offline mode on the same audio: **22.9%** (35 of 153).
->   - **47 RBN-validated calls SparkGap found that CW Skimmer missed**;
->     CW Skimmer found 6 we missed.
->   - Of 274 unique SparkGap spots, 96 (35%) are independently
->     validated by RBN or CW Skimmer; 178 are unverified — mix of
->     real local stations (RBN missed) and false positives (we don't
->     have a per-file SDC tee to disambiguate the file-replay mode).
+> - **`recall_local` — vs the same-antenna decoder ceiling**: against
+>   the SkimSrv-curated 56-call CQ key (what CW Skimmer's offline
+>   mode caught on the same audio, hand-filtered to runner CQs):
+>   **92.9%** (52 of 56, slash-tolerant). This is the fair
+>   decoder-quality metric — it controls for "what our antenna could
+>   even theoretically hear at this site that night."
+>
+> - **`recall_global` — vs RBN worldwide consensus**: against the
+>   RBN historical CSV (≥2 distinct skimmers confirming, 153 unique
+>   calls after slash-normalization): **49.7%** (76 of 153). Lower
+>   bounded by propagation/antenna — RBN's distributed nodes hear
+>   stations our single 40m loop physically could not.
+>
+> - **Vs CW Skimmer's own RBN recall**: CW Skimmer offline mode on
+>   the same audio caught **22.9%** of the RBN-153 set (35 calls).
+>   On `recall_global`, SparkGap is roughly **2× CW Skimmer** on
+>   this recording. **47 RBN-validated calls** SparkGap caught that
+>   CW Skimmer missed; **6** CW Skimmer caught that SparkGap missed.
+>
+> - **Precision side**: 274 unique SparkGap spots, 96 (35%)
+>   independently validated by RBN or CW Skimmer; 178 are
+>   unverified — mix of real local stations (RBN missed) and false
+>   positives.  Live mode disambiguates these via SDC tee; the file
+>   replay does not.
 >
 > - **Live deployment** alongside UT4LW's SDC-Connectors (actively-
 >   maintained closed-source alternative) on a shared antenna split:
@@ -35,9 +49,8 @@ spot output via telnet.
 >
 > SDC-Connectors has years of contest tuning we don't yet match. We
 > have features it doesn't (open source, multi-mode in one process,
-> packet-loss telemetry). The CW Skimmer file-replay comparison
-> measures recall on the same RF, not precision; we don't claim
-> overall superiority on a single recording.  Methodology in
+> packet-loss telemetry). One recording is one recording — these
+> numbers are calibration, not a contest result. Methodology in
 > `tools/eval/b1_benchmark.py` and `eval_rbn_validated.py`.
 >
 > A Linux-native RBN feeder is in development.  In the meantime,
