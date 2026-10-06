@@ -6523,6 +6523,14 @@ class SparkGap:
         spot_log_path = self.cfg.get('spot_log')
         self._spot_log = open(spot_log_path, 'a', buffering=1) if spot_log_path else None
 
+        # All-band IQ recorder for the C receiver path (see iq_recorder.py):
+        # record_wav below only works on the Python receiver path.
+        self._iq_rec = None
+        if self.cfg.get('record_iq_dir'):
+            from iq_recorder import BandRecorder
+            self._iq_rec = BandRecorder(self.cfg['record_iq_dir'],
+                                        bits=int(self.cfg.get('record_iq_bits', 24)))
+
         self._wav_record = None
         record_wav = self.cfg.get('record_wav')
         if record_wav:
@@ -6832,6 +6840,8 @@ class SparkGap:
         if self._wav_record:
             self._wav_record.close()
             self._wav_record = None
+        if getattr(self, '_iq_rec', None) is not None:
+            self._iq_rec.close()
         elapsed = time.time() - self.start_time if self.start_time else 0
         log.info("Stopped: %d spots in %.0fs", self.spot_count, elapsed)
 
@@ -6964,7 +6974,7 @@ class SparkGap:
                     enable_rtty = bool(self.cfg.get('enable_rtty', True))
                     if enable_ft8 and not os.path.exists('/home/sparkgap/decode_ft8'):
                         log.warning("enable_ft8 is on but /home/sparkgap/decode_ft8 is missing; FT8 decode will fail")
-                    if enable_ft8 or enable_rtty:
+                    if enable_ft8 or enable_rtty or self._iq_rec is not None:
                         FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
                                      14090: 14074, 18083: 18100,
                                      21090: 21074, 24902: 24915,
@@ -6972,6 +6982,8 @@ class SparkGap:
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
                             ft8_khz = FT8_FREQS.get(int(ck))
+                            if not ft8_khz and self._iq_rec is not None:
+                                ft8_khz = ck      # recorder only: capture every band
                             if ft8_khz:
                                 self.receiver.lib.hpsdr_enable_ft8(
                                     self.receiver._h, ri,
@@ -7417,7 +7429,8 @@ class SparkGap:
             # individually below.
             if use_c and getattr(self, '_worker_started', False) \
                     and (self.cfg.get('enable_ft8', True)
-                         or self.cfg.get('enable_rtty', True)):
+                         or self.cfg.get('enable_rtty', True)
+                         or self._iq_rec is not None):
                 ft8_now = time.time()
                 ft8_sec = ft8_now % 60
                 ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
@@ -7448,7 +7461,7 @@ class SparkGap:
                     for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                         ck = ch / 1000
                         ft8_khz = FT8_FREQS.get(int(ck))
-                        if not ft8_khz:
+                        if not ft8_khz and self._iq_rec is None:
                             continue
                         fi = np.empty(buf_cap, dtype=np.float32)
                         fq = np.empty(buf_cap, dtype=np.float32)
@@ -7460,6 +7473,12 @@ class SparkGap:
                             buf_cap, _ct.byref(t_first))
                         log.info("FT8 %s rx%d: swap n=%d (%.2f s) t_first=%.3f",
                                  bn, ri, n, n / 192000.0, t_first.value)
+                        if self._iq_rec is not None and n > 0:
+                            # fi/fq are fresh per swap and only sliced+copied
+                            # below, so the recorder can keep the references.
+                            self._iq_rec.submit(int(ck), t_first.value, fi, fq, n)
+                        if not ft8_khz:
+                            continue
                         # Allow up to 1 sec slack — swap-to-swap timing can
                         # land the snapshot just under 60 sec depending on
                         # where Python triggers within the second.
