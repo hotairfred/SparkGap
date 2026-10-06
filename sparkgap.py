@@ -2419,6 +2419,193 @@ class _ItilaChannel:
 # _ItilaScanner — band-wide ITILA channelizer (FFT energy scan)
 # ---------------------------------------------------------------------------
 
+DF_STALE_WINDOWS = 10   # second pass: re-check an identified bin after this many windows without a new call
+DF_CQ_LOOKBACK = 2      # "cq" mode: CQ evidence within this many windows qualifies a bin
+DF_SELECT_SEC = 5.0     # budget: rank candidates gathered over this much audio, then submit the best
+# CQ evidence for the second-pass trigger: looks inside tokens too, so merged
+# copy like "CQCWTWJ9B" or "TESTDK4A" counts (CQ_PATTERNS needs word boundaries).
+_DF_CQ_EVIDENCE = re.compile(r'CQ|TEST|CWT|SST|MST|QRZ')
+
+
+def _df_priority(job):
+    """Rank second-pass candidates under a budget. Fitted on B1 + DK3QN job
+    logs (2026-10-06): a win is likelier with CQ evidence (class), with more
+    ITILA text (a keyed signal is there), with SNR; it is unlikely when
+    ITILA decoded cleanly (cost < 0.06) but still found no call, or when
+    ITILA's text is nearly all 1-2 char noise tokens. At 75% of jobs this
+    kept 47/48 (B1) and 18/18 (DK3QN) winning jobs vs 42 and 16 for
+    (class, SNR)."""
+    _f, _win, cls, snr, cost, noise, ilen = job[:7]
+    return (cls + float(np.log1p(ilen)) + 0.05 * snr
+            - (1.0 if 0.0 <= cost < 0.06 else 0.0)
+            - (0.5 if noise > 0.79 else 0.0))
+
+
+class _SecondPass:
+    """One second-pass decoder pool per process, shared by every band's
+    scanner: one worker (threads / remote link), one candidate pool ranked
+    across bands, one CPU budget. Results are routed back to the scanner that
+    owns the bin's state. Replay (_decode_bin) and live (C result loop) both
+    call consider(), so the trigger/budget logic is one code path.
+
+    Budget clock: audio time in file mode (sync; advanced by one scanner
+    only), wall time live (the C path never calls feed_iq, and 8 scanners
+    each advancing an audio clock would run it 8x fast)."""
+    _pools = {}
+
+    @classmethod
+    def get(cls, sp, window_samples):
+        key = json.dumps(sp, sort_keys=True, default=str)
+        if key not in cls._pools:
+            cls._pools[key] = cls(sp, window_samples)
+        return cls._pools[key]
+
+    def __init__(self, sp, window_samples):
+        from second_pass import load_decoder, SecondPassWorker
+        self.worker = SecondPassWorker(load_decoder(sp), workers=int(sp.get('workers', 1)),
+                                       nice=int(sp.get('nice', 10)))
+        self.name = self.worker.name
+        self.tag = self.name.upper()
+        self.mode = sp.get('mode', 'cq')
+        self.probe = int(sp.get('probe_every', 5))            # cq mode; 0 = no probes
+        self.first_look = bool(sp.get('probe_first_look', False))  # measured: loses gains
+        self.min_ilen = int(sp.get('min_itila_len', 0))       # prefilter, 0 = off
+        self.sync = bool(sp.get('sync', False))
+        self.n_iq = window_samples * 5                        # 1 kHz IQ per 200 Hz env sample
+        self.max_bins = int(sp.get('max_bins', 50))
+        # CPU budget: full-window jobs per minute (~0.6 s CPU per job -> ~100
+        # jobs/min per core); 0 = unlimited. Skimmer-wide, not per band.
+        self.budget = float(sp.get('jobs_per_min', 0))
+        # ranking horizon: candidates gathered over this long are ranked together
+        self.select_sec = float(sp.get('select_sec', DF_SELECT_SEC))
+        self.audio_t = 0.0
+        self.sel_t = None
+        self.tokens = 0.0
+        self.cands = []
+        self.over_budget = self.submitted = self.looks = 0
+        self._owner = {}          # (f_hz, win) -> scanner that owns the bin state
+        self._clock = None
+        self._final = False
+        log.info("second_pass: %s %s, max_bins=%d, jobs_per_min=%g (shared pool)",
+                 self.name, self.mode, self.max_bins, self.budget)
+
+    def now(self):
+        return self.audio_t if self.sync else time.time()
+
+    def advance(self, scanner, seconds):
+        if self._clock is None:
+            self._clock = scanner
+        if scanner is self._clock:
+            self.audio_t += seconds
+
+    def _submit(self, owner, job, iq, first_look):
+        self._owner[(job[0], job[1])] = owner
+        self.worker.submit(job, iq, first_look=first_look)
+        self.submitted += 1
+        self.looks += first_look
+
+    def maybe_select(self, force=False):
+        if self.budget <= 0 or not self.cands:
+            return
+        if self.sel_t is None:
+            self.sel_t = self.now()
+        if force or self.now() - self.sel_t >= self.select_sec:
+            self.select()
+
+    def select(self):
+        """Tokens accrue at budget per minute (burst capped at one minute);
+        the best-ranked candidates get them, the rest are dropped -- a stale
+        window isn't worth decoding."""
+        t = self.now()
+        dt = t - (self.sel_t if self.sel_t is not None else t)
+        self.sel_t = t
+        self.tokens = min(self.tokens + self.budget * dt / 60.0, self.budget)
+        cands, self.cands = self.cands, []
+        cands.sort(key=lambda c: c[0], reverse=True)
+        for _pri, owner, job, iq, first_look in cands:
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                self._submit(owner, job, iq, first_look)
+            else:
+                self.over_budget += 1
+
+    def consider(self, owner, f_hz, st, df_iq, spotted_before_set, win_costs, win_raw):
+        """Once per decoded window per bin: update the bin's trigger state and
+        submit / queue a second-pass job if it qualifies.
+        rescue = bins ITILA hasn't identified (never spotted, or no new call
+        for DF_STALE_WINDOWS windows, counted in windows so file mode measures
+        the same rule)."""
+        if len(st['spotted']) > len(spotted_before_set):
+            st['windows_since_call'] = 0
+        else:
+            st['windows_since_call'] = st.get('windows_since_call', 0) + 1
+        unidentified = (not st['spotted']
+                        or st['windows_since_call'] >= DF_STALE_WINDOWS)
+        win = st.get('df_win', 0)
+        cq_recent = look = False
+        if self.mode == 'all':
+            go = True
+        elif self.mode == 'rescue':
+            go = unidentified
+        else:   # 'cq': full decode where ITILA or the decoder saw CQ recently,
+                # plus a probe on a bin's first window and every probe_every
+                # windows. Measured (B1/DK3QN, 2026-10-06): the gains come from
+                # the FULL first-window decode; sampling one chunk or dropping
+                # the window-0 probe lost K1GU and most confirmed spots.
+            cq_recent = win - st.get('df_cq_win', -10**9) <= DF_CQ_LOOKBACK
+            probe = self.probe > 0 and win % self.probe == 0
+            go = unidentified and (cq_recent or probe)
+            look = self.first_look and unidentified and probe and not cq_recent
+        if df_iq is not None and go:
+            cls = 2 if (self.mode == 'cq' and cq_recent) else (1 if win == 0 else 0)
+            toks = ' '.join(win_raw).split()
+            noise = (sum(1 for t in toks if len(t) <= 2) / len(toks)) if toks else 1.0
+            ilen = len(' '.join(win_raw))
+            cost = min(win_costs) if win_costs else -1.0
+            new_calls = st['spotted'] - spotted_before_set     # ITILA's new call(s) this window
+            job = (f_hz, win, cls, st.get('snr', 0.0), cost, noise, ilen,
+                   ','.join(sorted(new_calls)) or '-')
+            # Optional prefilter: ITILA heard almost nothing and no CQ evidence
+            if not (cls < 2 and ilen < self.min_ilen):
+                first_look = self.mode == 'cq' and look
+                if self.budget > 0:
+                    self.cands.append((_df_priority(job), owner, job, df_iq, first_look))
+                else:
+                    self._submit(owner, job, df_iq, first_look)
+        st['df_win'] = win + 1
+
+    def apply(self):
+        """Route finished decodes to their owning scanners."""
+        if self.sync:
+            self.maybe_select()          # honour the horizon (collect() runs often)
+        done = self.worker.flush() if self.sync else self.worker.drain()
+        for job, text, err in done:
+            owner = self._owner.pop((job[0], job[1]), None)
+            if err:
+                log.warning("second_pass error %.1f kHz: %s", job[0] / 1000.0, err)
+            elif owner is not None:
+                owner._df_apply_result(job, text)
+
+    def log_job(self, job, text, spot, df_call=''):
+        """One line per second-pass job, for finding what predicts a win."""
+        f_hz, win, cls, snr, cost, noise, ilen = job[:7]
+        itila_call = job[7] if len(job) > 7 else '-'
+        log.info("SECONDPASS job f=%.1f win=%d cls=%d snr=%.1f itila_cost=%.2f "
+                 "itila_noise=%.2f itila_len=%d df_len=%d spot=%s df_call=%s itila_call=%s",
+                 f_hz / 1000.0, win, cls, snr, cost, noise, ilen, len(text or ''), spot or '-',
+                 df_call or '-', itila_call)
+
+    def final(self):
+        if self._final:
+            return
+        self._final = True
+        self.maybe_select(force=True)       # last partial horizon (file mode end)
+        log.info("second_pass stats: submitted=%d (first looks %d) decoded=%d dropped=%d "
+                 "over_budget=%d budget=%g/min audio=%.0fs",
+                 self.submitted, self.looks, self.worker.decoded, self.worker.dropped,
+                 self.over_budget, self.budget, self.audio_t)
+
+
 class _ItilaScanner:
     """Band-wide ITILA channelizer — thin Python wrapper over libitila_scanner.so.
 
@@ -2438,7 +2625,7 @@ class _ItilaScanner:
                  band_min_khz=0.0, band_max_khz=99999.0,
                  max_bins=80, use_pfb=False, valid_calls=None,
                  enable_caller_spotting=True,
-                 gate_timing_cost=False, timing_cost_max=30.0):
+                 gate_timing_cost=False, timing_cost_max=30.0, second_pass=None):
         self.valid_calls = valid_calls or set()
         self.enable_caller_spotting = bool(enable_caller_spotting)
         # ggmorse-inspired confidence gate on segmentation quality
@@ -2505,6 +2692,42 @@ class _ItilaScanner:
         else:
             self._c_decode = False
 
+        # Optional neural second pass (issue #5, PR #7).  Config:
+        #   "second_pass": {"decoder": "deepfist", "mode": "cq"|"rescue"|"all",
+        #                   "probe_every": 5, "max_bins": 50,
+        #                   "model": "models/deepfist.onnx",
+        #                   "threads": 1}
+        # cq (default) = bins ITILA hasn't identified that show CQ evidence
+        # (ITILA's or DeepFist's text) in the last DF_CQ_LOOKBACK windows,
+        # plus one probe every probe_every windows (default 5, 0 = off);
+        # rescue = every unidentified bin; all = every window.  max_bins caps scanner slots with baseband capture (memory
+        # ~0.6 MB each).  Decodes run on a background thread; results are
+        # applied in collect().  No "decoder" -> off.  Decoders plug in via
+        # second_pass.py (registry name or "module:Class").
+        self._df = None
+        sp = second_pass or {}
+        if (sp.get('decoder') and sp.get('mode', 'cq') in ('cq', 'rescue', 'all')
+                and self._sc and hasattr(self._sc._lib, 'itila_sc_peek_iq')):
+            lib = self._sc._lib
+            lib.itila_sc_enable_iq_capture.restype = None
+            lib.itila_sc_enable_iq_capture.argtypes = [_ct.c_void_p, _ct.c_int]
+            lib.itila_sc_peek_iq.restype = _ct.c_int
+            lib.itila_sc_peek_iq.argtypes = [_ct.c_void_p, _ct.c_double,
+                                             _ct.POINTER(_ct.c_float), _ct.c_int]
+            if hasattr(lib, 'itila_sc_peek_lastwin'):
+                lib.itila_sc_peek_lastwin.restype = _ct.c_int
+                lib.itila_sc_peek_lastwin.argtypes = [_ct.c_void_p, _ct.c_double,
+                                                      _ct.POINTER(_ct.c_float), _ct.c_int,
+                                                      _ct.POINTER(_ct.c_uint)]
+            try:
+                self._df = _SecondPass.get(sp, self._window_samples)
+            except Exception as e:
+                log.error("second_pass: decoder %r unavailable (%s) -- staying off",
+                          sp.get('decoder'), e)
+            if self._df:
+                lib.itila_sc_enable_iq_capture(self._sc._h, self._df.max_bins)
+                self._df_rate = float(sample_rate)
+
     def _ensure_bin_handles(self, f_hz):
         """Create itila decoder handles for a C-spawned bin if not yet tracked."""
         if f_hz in self._bins:
@@ -2531,7 +2754,11 @@ class _ItilaScanner:
         i_c = np.ascontiguousarray(i_arr, dtype=np.float64)
         q_c = np.ascontiguousarray(q_arr, dtype=np.float64)
         self._sc.feed_iq(i_c, q_c)
+        if self._df:
+            self._df.advance(self, len(i_c) / self._df_rate)
         self._process_ready()
+        if self._df:
+            self._df.maybe_select()
 
     def _process_ready(self):
         """Sync bin handles with C scanner and decode any ready windows."""
@@ -2568,6 +2795,20 @@ class _ItilaScanner:
         if not lib or not self._sc:
             return
 
+        # Second pass: copy this window's baseband before the drain
+        # below shifts it out (the C side shifts IQ in lockstep with env).
+        df_iq = None
+        if self._df:
+            iq = np.empty(2 * self._df.n_iq, dtype=np.float32)
+            got = self._sc._lib.itila_sc_peek_iq(
+                self._sc._h, _ct.c_double(f_hz),
+                iq.ctypes.data_as(_ct.POINTER(_ct.c_float)), self._df.n_iq)
+            if got >= int(0.9 * self._df.n_iq):
+                df_iq = iq[:2 * got]
+        spotted_before = len(st['spotted'])
+        spotted_before_set = set(st['spotted'])
+        win_costs, win_raw = [], []          # ITILA features for second-pass job logging
+
         env100 = np.empty(self._window_samples, dtype=np.float64)
         env200 = np.empty(self._window_samples, dtype=np.float64)
         n_drained = self._sc.drain_env(f_hz, env100, env200, self._window_samples)
@@ -2593,6 +2834,13 @@ class _ItilaScanner:
                 continue
             cost = lib.itila_get_last_cost(h)
             log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
+            if self._df:
+                win_costs.append(cost)
+                win_raw.append(raw)
+            # Second-pass trigger evidence -- before the cost gate, since a
+            # garbled CQ is exactly what tends to fail it.
+            if self._df and _DF_CQ_EVIDENCE.search(raw):
+                st['df_cq_win'] = st.get('df_win', 0)
             # Timing-cost gate (off by default).  Drops the whole decode
             # window's call extraction when segmentation quality is too low;
             # logs the suppression with cost so we can tune the threshold
@@ -2652,6 +2900,9 @@ class _ItilaScanner:
                             self._sc._lib.itila_sc_mark_evidence(
                                 self._sc._h, _ct.c_double(f_hz))
 
+        if self._df:
+            self._df.consider(self, f_hz, st, df_iq, spotted_before_set, win_costs, win_raw)
+
     def _process_ready_c(self):
         """C decode loop — all bin iteration + decode happens in C."""
         import ctypes as _ct
@@ -2662,6 +2913,7 @@ class _ItilaScanner:
         max_results = 128
         result_size = 8 + 8 + 4 + 4 + 256 + 8  # 288 bytes
         buf = _ct.create_string_buffer(result_size * max_results)
+
         n = self._sc._lib.itila_sc_decode_ready(
             self._sc._h, _ct.c_int(self._window_samples),
             buf, _ct.c_int(max_results))
@@ -2736,6 +2988,40 @@ class _ItilaScanner:
                             self._sc._lib.itila_sc_mark_evidence(
                                 self._sc._h, _ct.c_double(f_hz))
 
+    def _apply_second_pass(self):
+        if self._df:
+            self._df.apply()
+
+    def _df_apply_result(self, job, text):
+        """Apply one finished second-pass decode to this scanner's bin state.
+        Same runner-only extraction as ITILA: CQ-adjacent call in this text,
+        else in the bin's second-pass buffer if it saw CQ in the last 120 s."""
+        f_hz = job[0]
+        tag = self._df.tag
+        st = self._bins.get(f_hz)
+        if st is None or not text:
+            self._df.log_job(job, text, '')
+            return                  # bin evicted while decoding, or squelched
+        now = time.time()
+        f_khz = f_hz / 1000.0
+        log.info("%s raw %.1f kHz: %r", tag, f_khz, text[:400])
+        st['df_buf'] = (st.get('df_buf', '') + ' ' + text)[-512:]
+        if CQ_PATTERNS.search(text):
+            st['df_last_cq'] = now
+        if _DF_CQ_EVIDENCE.search(text):
+            st['df_cq_win'] = st.get('df_win', 0)
+        call = _itila_extract_cq_call(text, self.valid_calls)
+        if not call and now - st.get('df_last_cq', 0.0) < 120.0:
+            call = _itila_extract_cq_call(st['df_buf'], self.valid_calls)
+        emitted = ''
+        if call and call not in st['spotted']:
+            st['spotted'].add(call)
+            _emit_intent(st, f_khz, call, st['wpm'], is_runner=True,
+                         raw_text=tag + ': ' + text)
+            log.info("%s scan %.1f kHz: %s (raw: %s)", tag, f_khz, call, text[:60])
+            emitted = call
+        self._df.log_job(job, text, emitted, call or '')
+
     def collect(self):
         """Returns list of SpotIntent records, one per ready window-extraction.
 
@@ -2748,6 +3034,7 @@ class _ItilaScanner:
         Caller (InstanceManager.collect_all) is responsible for dispatching
         these to tracker.process_intent() rather than tracker.process().
         """
+        self._apply_second_pass()
         results = []
         for f_hz, st in self._bins.items():
             if not st['pending']:
@@ -2768,6 +3055,8 @@ class _ItilaScanner:
                     lib.itila_free(h)
 
     def kill(self):
+        if self._df:
+            self._df.final()
         for f_hz in list(self._bins.keys()):
             self._free_bin_handles(f_hz)
         if self._sc:
@@ -4287,7 +4576,7 @@ class InstanceManager:
                  ml_max_channels=20, use_dispatcher=False,
                  use_pfb_dispatcher=False, use_itila=False,
                  itila_ev_thresh=2.0, itila_window_sec=60.0,
-                 itila_min_snr=8.0, itila_max_bins=200,
+                 itila_min_snr=8.0, itila_max_bins=200, second_pass=None,
                  use_pfb_scanner=False, valid_calls=None,
                  cw_min_khz=0.0, cw_max_khz=99999.0,
                  enable_caller_spotting=True,
@@ -4307,6 +4596,7 @@ class InstanceManager:
         self.itila_window_sec = float(itila_window_sec)
         self.itila_min_snr = float(itila_min_snr)
         self.itila_max_bins = int(itila_max_bins)
+        self.second_pass = second_pass
         self.use_pfb_scanner = bool(use_pfb_scanner)
         self.enable_caller_spotting = bool(enable_caller_spotting)
         # Plumbed through to _ItilaScanner; defaults gate-off, threshold 30.
@@ -4418,7 +4708,8 @@ class InstanceManager:
                     valid_calls=getattr(self, 'valid_calls', None),
                     enable_caller_spotting=self.enable_caller_spotting,
                     gate_timing_cost=getattr(self, 'gate_timing_cost', False),
-                    timing_cost_max=getattr(self, 'timing_cost_max', 30.0))
+                    timing_cost_max=getattr(self, 'timing_cost_max', 30.0),
+                    second_pass=getattr(self, 'second_pass', None))
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -6719,6 +7010,7 @@ class SparkGap:
                 itila_window_sec=float(self.cfg.get('itila_window_sec', 60.0)),
                 itila_min_snr=min_snr_here,
                 itila_max_bins=int(self.cfg.get('itila_max_bins', 200)),
+                second_pass=self.cfg.get('second_pass'),
                 use_pfb_scanner=use_pfb_here,
                 valid_calls=calls,
                 cw_min_khz=float(self.cfg.get('cw_min_khz', 0)),
@@ -6855,6 +7147,37 @@ class SparkGap:
                 self._wav_record.writeframes(pcm.tobytes())
         except Exception:
             pass  # Don't let errors kill the receiver thread
+
+    def _df_live(self, owner, f_hz, st, raw, cost, spotted_before_set):
+        """Second pass on the live C path: the C worker already decoded this
+        window and shifted it out, so fetch the copy it kept (lastwin) from
+        the band scanner that owns f_hz, once per window (each window yields
+        two results, one per ITILA LPF path), and hand it to the shared
+        pool's consider(). `owner` holds the bin state (the C result loop
+        keeps every band's bins in the first scanner)."""
+        import ctypes as _ct
+        pool = owner._df
+        half = self.cfg.get('sample_rate', 192000) / 2.0
+        band_sc = None
+        for (_bn, ch, _ri), mgr in zip(self._band_meta, self.managers):
+            sc = mgr._itila_scanner
+            if sc and sc._sc and abs(f_hz - ch) < half:
+                band_sc = sc
+                break
+        if band_sc is None or not hasattr(band_sc._sc._lib, 'itila_sc_peek_lastwin'):
+            return
+        iq = np.empty(2 * pool.n_iq, dtype=np.float32)
+        seq = _ct.c_uint(0)
+        got = band_sc._sc._lib.itila_sc_peek_lastwin(
+            band_sc._sc._h, _ct.c_double(f_hz),
+            iq.ctypes.data_as(_ct.POINTER(_ct.c_float)), pool.n_iq, _ct.byref(seq))
+        if got < int(0.9 * pool.n_iq):
+            return                       # no capture slot for this bin, or short window
+        key = (id(band_sc), seq.value)
+        if st.get('df_seq') == key:
+            return                       # second result of the same window
+        st['df_seq'] = key
+        pool.consider(owner, f_hz, st, iq[:2 * got], spotted_before_set, [cost], [raw])
 
     async def run(self):
         use_c = getattr(self, '_use_c_receiver', False)
@@ -7047,6 +7370,9 @@ class SparkGap:
                     st['snr'] = snr
                     if wpm > 0:
                         st['wpm'] = wpm
+                    spotted_before_set = set(st['spotted'])
+                    if scanner._df and _DF_CQ_EVIDENCE.search(raw):
+                        st['df_cq_win'] = st.get('df_win', 0)
                     st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
                     if CQ_PATTERNS.search(raw):
                         st['last_cq_time'] = now
@@ -7064,6 +7390,14 @@ class SparkGap:
                             _emit_intent(st, f_khz, call, wpm, is_runner=True, raw_text=raw)
                             log.info("ITILA context %.1f kHz: %s %d WPM",
                                      f_khz, call, wpm)
+                    if scanner._df:
+                        self._df_live(scanner, f_hz, st, raw, cost, spotted_before_set)
+                # live: wall-clock ranking horizon (runs even when no results
+                # arrived this poll; `scanner` is only bound inside the loop)
+                _pool = next((m._itila_scanner._df for m in self.managers
+                              if m._itila_scanner and getattr(m._itila_scanner, '_df', None)), None)
+                if _pool is not None:
+                    _pool.maybe_select()
 
             # ----------------------------------------------------------------
             # Periodic signal scan — one FFT per band
@@ -7776,6 +8110,7 @@ def run_file_mode(args, config):
         # in feedback_file_vs_live_config_divergence.md.
         itila_min_snr=float(config.get('signal_min_snr', 12)),
         itila_max_bins=int(config.get('itila_max_bins', 200)),
+        second_pass=dict(config['second_pass'], sync=True) if isinstance(config.get('second_pass'), dict) else None,
         use_pfb_scanner=bool(config.get('use_pfb_scanner', False)),
         valid_calls=calls,  # required for the SCP-bias path in extractor
         cw_min_khz=float(config.get('cw_min_khz', 0)),
