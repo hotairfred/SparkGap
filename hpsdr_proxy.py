@@ -167,6 +167,65 @@ class HPSDRProxy:
 # WAV replay mode
 # ---------------------------------------------------------------------------
 
+def _decode_frames(raw, sw, ch):
+    """PCM bytes -> float32 (n, 2) I/Q in +-1."""
+    if sw == 3:     # 24-bit PCM — numpy has no native int24
+        arr = np.frombuffer(raw, np.uint8).reshape(-1, 3)
+        smp = (arr[:, 2].astype(np.int32) << 16 |
+               arr[:, 1].astype(np.int32) << 8  |
+               arr[:, 0].astype(np.int32))
+        smp[smp >= 2**23] -= 2**24
+        smp = smp.astype(np.float32) / 8388608.0
+    else:
+        dt = {2: np.int16, 4: np.int32}[sw]
+        smp = np.frombuffer(raw, dt).astype(np.float32) / float(2**(sw*8-1))
+    if ch == 2:
+        return smp.reshape(-1, 2)
+    return np.column_stack([smp, np.zeros_like(smp)])
+
+
+class _WavStream:
+    """Sequential reader over a standard WAV between start_sec and end_sec, so
+    long multi-band replays don't have to fit in memory (31 min x 8 bands at
+    192 kHz is tens of GB as float32)."""
+
+    CHUNK = 192000                     # frames per disk read
+
+    def __init__(self, path, start_sec=0, end_sec=None):
+        self.w = wave.open(path, 'rb')
+        self.rate = self.w.getframerate()
+        self.sw, self.ch = self.w.getsampwidth(), self.w.getnchannels()
+        first = min(int(start_sec * self.rate), self.w.getnframes())
+        self.w.setpos(first)
+        self.left = self.w.getnframes() - first
+        if end_sec:
+            self.left = min(self.left, int((end_sec - start_sec) * self.rate))
+        self.n = self.left                 # frames this stream will deliver
+        self.buf = np.zeros((0, 2), dtype=np.float32)
+
+    def take(self, k):
+        """Next k frames (fewer at the end)."""
+        while len(self.buf) < k and self.left > 0:
+            m = min(max(k, self.CHUNK), self.left)
+            new = _decode_frames(self.w.readframes(m), self.sw, self.ch)
+            self.left -= m
+            self.buf = np.concatenate([self.buf, new]) if len(self.buf) else new
+        out, self.buf = self.buf[:k], self.buf[k:]
+        return out
+
+
+class _ArrayStream:
+    """Same interface over an in-memory array (extensible-WAV fallback)."""
+
+    def __init__(self, smp):
+        self.smp, self.pos, self.n = smp, 0, len(smp)
+
+    def take(self, k):
+        out = self.smp[self.pos:self.pos + k]
+        self.pos += k
+        return out
+
+
 class WAVReplay:
     """Replay a recorded WAV file as Protocol 1 UDP to registered consumers."""
 
@@ -190,51 +249,22 @@ class WAVReplay:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(('', listen_port))
 
-        loaded = [self._load(p, start_sec, end_sec) for p in paths]
-        rates = {r for _s, r in loaded}
+        streams = [self._open(p, start_sec, end_sec) for p in paths]
+        rates = {r for _s, r in streams}
         if len(rates) != 1:
             raise SystemExit(f"WAVs have different sample rates: {sorted(rates)}")
-        n = min(len(smp) for smp, _r in loaded)
+        self.n_frames = min(st.n for st, _r in streams)
         sr = rates.pop()
-        if len(loaded) == 1:
-            smp = loaded[0][0][:n]
-            self._per_rx = [smp] * self.n_rx           # replicate (no copy)
-        else:
-            self._per_rx = [smp[:n] for smp, _r in loaded]
-        smp = self._per_rx[0]
-        self.samples = smp
+        self._streams = [st for st, _r in streams]     # one: replicated to all receivers
         self.rate    = sr
         self.interval = self.SAMPLES_PER_PKT / sr
-        print(f"WAV {wav_path}: {sr} Hz, {smp.shape[1]}ch, {len(smp)} frames",
+        print(f"WAV {wav_path}: {sr} Hz, 2ch, {self.n_frames} frames (streamed)",
               file=sys.stderr)
 
-    def _load(self, wav_path, start_sec, end_sec):
+    def _open(self, wav_path, start_sec, end_sec):
         try:
-            w = wave.open(wav_path, 'rb')
-            sr, sw, ch = w.getframerate(), w.getsampwidth(), w.getnchannels()
-            raw = w.readframes(w.getnframes())
-            w.close()
-
-            if sw == 3:     # 24-bit PCM — numpy has no native int24
-                arr = np.frombuffer(raw, np.uint8).reshape(-1, 3)
-                smp = (arr[:, 2].astype(np.int32) << 16 |
-                       arr[:, 1].astype(np.int32) << 8  |
-                       arr[:, 0].astype(np.int32))
-                smp[smp >= 2**23] -= 2**24
-                smp = smp.astype(np.float32) / 8388608.0
-            else:
-                dt = {2: np.int16, 4: np.int32}[sw]
-                smp = np.frombuffer(raw, dt).astype(np.float32) / float(2**(sw*8-1))
-
-            if ch == 2:
-                smp = smp.reshape(-1, 2)
-            else:
-                smp = np.column_stack([smp, np.zeros_like(smp)])
-            # Apply time window for standard WAV
-            if start_sec > 0:
-                smp = smp[int(start_sec * sr):]
-            if end_sec:
-                smp = smp[:int((end_sec - start_sec) * sr)]
+            st = _WavStream(wav_path, start_sec, end_sec)
+            return st, st.rate
         except wave.Error:
             # Extensible WAV format (0xFFFE) — use our custom reader
             from sparkgap import read_24bit_iq_chunk
@@ -249,9 +279,7 @@ class WAVReplay:
             # Normalize to float (read_24bit_iq_chunk returns raw 24-bit values)
             i_f = np.array(i_arr, dtype=np.float32) / 8388608.0
             q_f = np.array(q_arr, dtype=np.float32) / 8388608.0
-            smp = np.column_stack([i_f, q_f])
-
-        return smp, sr
+            return _ArrayStream(np.column_stack([i_f, q_f])), sr
 
     def _handle_consumer(self, data, addr):
         if len(data) < 3 or data[0:2] != COOKIE:
@@ -276,7 +304,7 @@ class WAVReplay:
                 self._handle_consumer(*self.sock.recvfrom(256))
 
         print("Replaying...", file=sys.stderr)
-        n = len(self.samples)
+        n = self.n_frames
         offset = 0
         nxt = time.time()
 
@@ -292,9 +320,14 @@ class WAVReplay:
             #   Don't negate — parse_iq_packet's negation converts to standard IQ.
             k = self.SAMPLES_PER_PKT
             blk = np.zeros((k, self.n_rx, 2), dtype=np.float32)
-            for r, smp in enumerate(self._per_rx):
-                part = smp[offset:offset + k]
-                blk[:len(part), r, :] = part
+            k = min(k, n - offset)
+            if len(self._streams) == 1:
+                part = self._streams[0].take(k)
+                blk[:len(part), :, :] = part[:, None, :]
+            else:
+                for r, st in enumerate(self._streams):
+                    part = st.take(k)
+                    blk[:len(part), r, :] = part
             if self.negate_q:
                 blk[:, :, 1] *= -1.0
             pkt = _iq_packet_np(self.seq, blk)

@@ -47,3 +47,30 @@ if __name__ == '__main__':
         except Exception as e:
             print('FAIL ', fn.__name__, type(e).__name__, e)
     print(f'\n{ok}/{len(fns)} passed'); sys.exit(0 if ok == len(fns) else 1)
+
+
+def test_wav_stream_matches_whole_file_read():
+    """_WavStream (chunked, windowed) yields exactly the frames a whole-file
+    decode does, across chunk boundaries and for odd take() sizes."""
+    import os
+    import tempfile
+    import wave
+    import hpsdr_proxy as P
+    rng = np.random.default_rng(5)
+    v = rng.integers(-2**23, 2**23, size=(5000, 2)).astype(np.int32)
+    raw = v.astype('<i4').view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 't.wav')
+        w = wave.open(path, 'wb'); w.setnchannels(2); w.setsampwidth(3); w.setframerate(1000)
+        w.writeframes(raw); w.close()
+        full = P._decode_frames(raw, 3, 2)
+        st = P._WavStream(path, start_sec=0.5, end_sec=4.2)     # frames 500 .. 4200
+        st.CHUNK = 333
+        got, k = [], 0
+        while True:
+            part = st.take(72 + (k % 5))
+            if not len(part):
+                break
+            got.append(part); k += 1
+        got = np.concatenate(got)
+        assert st.n == 3700 and np.array_equal(got, full[500:4200])
