@@ -7268,8 +7268,15 @@ class SparkGap:
                                             else:              bover += 1
                                         age_buckets = (b30, b60, b300, bover)
                                     per_band.append((name, n_band, age_buckets))
-                        log.info("Health: ring_drops=%d/%d (%.4f%%) env_drops=%d bins=%d peak=%d",
-                                 rdrop, pkts, 100.0 * rdrop / max(pkts + rdrop, 1),
+                        # drop_count counts samples (per receiver) that found
+                        # the ring full; pkt_count counts UDP packets. Each
+                        # packet holds two 504-byte frames of (6*n_rx + 2)-byte
+                        # sample groups, so convert packets to samples before
+                        # taking a percentage (8 rx: 20 samples/rx/packet).
+                        n_rx = max(1, int(getattr(self.receiver, 'n_receivers', 1)))
+                        samples = pkts * 2 * (504 // (6 * n_rx + 2)) * n_rx
+                        log.info("Health: ring_drops=%d/%d samples (%.4f%%) env_drops=%d bins=%d peak=%d",
+                                 rdrop, samples, 100.0 * rdrop / max(samples, 1),
                                  env_drops_total, bins_total, bins_peak)
                         # Per-band breakdown.  Format: name:total|<30s,<60s,<300s,300s+
                         # If list_bin_ages unavailable, just name:total.
