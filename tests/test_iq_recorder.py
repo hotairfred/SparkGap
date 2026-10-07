@@ -95,6 +95,28 @@ def test_gap_is_logged():
     assert any('gap' in m and '7090' in m for m in seen), seen
 
 
+def test_rotates_before_wav_size_limit():
+    """A band that would pass max_data_bytes continues in _p2/_p3 files; the
+    parts are contiguous and every header is valid."""
+    rng = np.random.default_rng(3)
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, 'RECORD'), 'w').close()
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        rec.max_data_bytes = 2 * 400 * 3 * 2          # room for two 400-sample swaps
+        chunks = [_swap(rng, 400) for _ in range(5)]
+        for k, (i, q) in enumerate(chunks):
+            rec.submit(7090, 100.0 + 0.4 * k, i, q, 400)
+        _wait(rec)
+        rec.close()
+        files = sorted(glob.glob(os.path.join(d, '*_7090kHz_*.wav')))
+        names = [os.path.basename(f) for f in files]
+        assert len(files) == 3 and names[1].endswith('_p2.wav') and names[2].endswith('_p3.wav'), names
+        got = [_read24(f) for f in [files[0], files[1], files[2]]]
+        gi = np.concatenate([g[0] for g in got])
+        assert np.array_equal(gi, np.concatenate([c[0] for c in chunks]).astype(np.int32))
+        assert [len(g[0]) for g in got] == [800, 800, 400]
+
+
 if __name__ == '__main__':
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     ok = 0
