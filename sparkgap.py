@@ -1533,6 +1533,7 @@ def _itila_extract_cq_call(text, valid_calls=None):
             continue
         # 5 tokens after CQ trigger — wide enough for "CQ NA NA E HZ1TT" pattern
         # but narrow enough to block answering stations (6+ tokens out)
+        first = None          # first plain call after this trigger = the runner
         for j in range(i + 1, min(i + 6, len(tokens))):
             t = tokens[j]
 
@@ -1552,14 +1553,22 @@ def _itila_extract_cq_call(text, valid_calls=None):
                         break
                 break
 
-            # Case 2: plain base call — continue scanning (don't break) so we
-            # collect both occurrences when callsign is repeated after garble
+            # Case 2: plain base call — keep scanning for a repeat of the
+            # runner's call (it is often garbled the first time: "A2JD K2JD"),
+            # but STOP at a clearly different call: that is the station
+            # answering the CQ ("CQ CWT LA2US DL2YET DAN 28985" — the caller
+            # follows the runner's call directly). Collecting it too used to tie
+            # with the runner and win on recency.
             if _is_base_call(t):
                 if j + 1 < min(i + 6, len(tokens)):
                     nxt = tokens[j + 1]
                     if _SLASH_SUFFIX_PAT.match(nxt):
                         candidates.append(f'{t}/{nxt}')
                         break  # slash suffix found — unambiguous
+                if first is None:
+                    first = t
+                elif SpotTracker._levenshtein(first, t) > 2:
+                    break      # a different call: the answering station
                 candidates.append(t)
                 continue  # keep scanning for possible second clean copy
 

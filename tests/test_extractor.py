@@ -77,6 +77,23 @@ def test_extract_cq_runner_digit_first_wx7v_cases():
     assert sg._itila_extract_cq_call('CQ 4X4DK 4X4DK', {'4X4DK'}) == '4X4DK'
 
 
+def test_extract_cq_stops_at_answering_caller():
+    # CWT: the caller answers right after the runner's call; both SCP-valid.
+    # Used to tie 2-2 (CQ and CWT both trigger) and pick the caller by recency.
+    scp = {'LA2US', 'DL2YET', 'YE4IFB', 'N4USB'}
+    assert sg._itila_extract_cq_call(
+        'CQ CWT LA2US ? DL2YET DAN 28985 TU BILL 8593 TU LA2US', scp) == 'LA2US'
+    assert sg._itila_extract_cq_call(
+        'CQ CWT YE4IFB S ISHSHESSS N4USB SUE 21531 TU YE4IFB', scp) == 'YE4IFB'
+
+
+def test_extract_cq_keeps_garbled_repeat():
+    # a near-repeat (1-2 chars off) of the runner's call is still collected,
+    # so a garbled first copy loses to the clean repeat
+    assert sg._itila_extract_cq_call('CQ CQ E E A2JD K2JD K', {'K2JD'}) == 'K2JD'
+    assert sg._itila_extract_cq_call('CQ CQ E E A2JD K2JD K') == 'K2JD'
+
+
 def test_extract_cq_none_without_trigger():
     # no CQ/contest token -> no runner
     assert sg._itila_extract_cq_call('W1AW 5NN TU', {'W1AW'}) is None
