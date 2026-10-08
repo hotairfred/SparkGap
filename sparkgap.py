@@ -1533,7 +1533,6 @@ def _itila_extract_cq_call(text, valid_calls=None):
             continue
         # 5 tokens after CQ trigger — wide enough for "CQ NA NA E HZ1TT" pattern
         # but narrow enough to block answering stations (6+ tokens out)
-        first = None          # first plain call after this trigger = the runner
         for j in range(i + 1, min(i + 6, len(tokens))):
             t = tokens[j]
 
@@ -1553,23 +1552,14 @@ def _itila_extract_cq_call(text, valid_calls=None):
                         break
                 break
 
-            # Case 2: plain base call — keep scanning for a repeat of the
-            # runner's call (it is often garbled the first time: "A2JD K2JD"),
-            # but SKIP a clearly different call: that is the station answering
-            # the CQ ("CQ CWT LA2US DL2YET DAN 28985" — the caller follows the
-            # runner's call directly). Collecting it too used to tie with the
-            # runner and win on recency. Skipping (not stopping) still reaches
-            # a clean repeat after it ("TEST RK4FWT UA1AUW RK4FWX").
+            # Case 2: plain base call — continue scanning (don't break) so we
+            # collect both occurrences when callsign is repeated after garble
             if _is_base_call(t):
                 if j + 1 < min(i + 6, len(tokens)):
                     nxt = tokens[j + 1]
                     if _SLASH_SUFFIX_PAT.match(nxt):
                         candidates.append(f'{t}/{nxt}')
                         break  # slash suffix found — unambiguous
-                if first is None:
-                    first = t
-                elif SpotTracker._levenshtein(first, t) > 2:
-                    continue   # a different call: the answering station
                 candidates.append(t)
                 continue  # keep scanning for possible second clean copy
 
@@ -1584,27 +1574,48 @@ def _itila_extract_cq_call(text, valid_calls=None):
     if not candidates:
         return None
 
-    # If we have a callsign DB, strongly prefer SCP-valid candidates over
-    # noise candidates of the same shape.  Necessary now that 3-char calls
-    # are allowed: real call M7Z and noise call M7G both pass the regex,
-    # and old recency-based tie-break was picking M7G half the time.
-    from collections import Counter
-    if valid_calls is not None:
-        scp_cands = [c for c in candidates if c in valid_calls]
-        if scp_cands:
-            counts = Counter(scp_cands)
-            max_count = max(counts.values())
-            for c in reversed(scp_cands):
-                if counts[c] == max_count:
-                    return c
+    return _pick_runner(candidates, valid_calls)
 
-    # Fallback: most frequent candidate; break ties by last occurrence.
+
+def _pick_runner(candidates, valid_calls=None):
+    """Choose the runner among the calls collected after CQ triggers.
+
+    Near-repeats are grouped first (a garbled copy of the runner's call and
+    its clean repeat: "A2JD K2JD", "RK4FWT ... RK4FWX"): within 2 edits, or 1
+    for calls of 4 characters or fewer. A group counts all its members; its
+    representative is its SCP-valid member when there is one (real M7Z beats
+    noise M7G), else its most frequent, latest on a tie.
+
+    Then: groups holding an SCP-valid call beat groups that don't; the most
+    frequent group wins; on a tie the EARLIEST group wins. The runner's call
+    comes right after the CQ and the station answering follows it ("CQ CWT
+    LA2US DL2YET DAN 28985" -> LA2US); ties used to go to the latest
+    candidate, which spotted the caller.
+    """
+    from collections import Counter
     counts = Counter(candidates)
-    max_count = max(counts.values())
-    for c in reversed(candidates):
-        if counts[c] == max_count:
-            return c
-    return candidates[-1]
+    groups = []                                   # in order of first appearance
+    for c in dict.fromkeys(candidates):
+        for g in groups:
+            lim = 1 if min(len(c), len(g[0])) <= 4 else 2
+            if any(SpotTracker._levenshtein(c, m) <= lim for m in g):
+                g.append(c)
+                break
+        else:
+            groups.append([c])
+
+    def rep(g):
+        pool = [m for m in g if valid_calls and m in valid_calls] or g
+        best = max(counts[m] for m in pool)
+        return [m for m in pool if counts[m] == best][-1]
+
+    def has_scp(g):
+        return bool(valid_calls) and any(m in valid_calls for m in g)
+
+    if valid_calls and any(has_scp(g) for g in groups):
+        groups = [g for g in groups if has_scp(g)]
+    total = [sum(counts[m] for m in g) for g in groups]
+    return rep(groups[total.index(max(total))])     # index(): earliest on a tie
 
 
 _itila_lib = None
