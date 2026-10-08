@@ -1555,10 +1555,11 @@ def _itila_extract_cq_call(text, valid_calls=None):
 
             # Case 2: plain base call — keep scanning for a repeat of the
             # runner's call (it is often garbled the first time: "A2JD K2JD"),
-            # but STOP at a clearly different call: that is the station
-            # answering the CQ ("CQ CWT LA2US DL2YET DAN 28985" — the caller
-            # follows the runner's call directly). Collecting it too used to tie
-            # with the runner and win on recency.
+            # but SKIP a clearly different call: that is the station answering
+            # the CQ ("CQ CWT LA2US DL2YET DAN 28985" — the caller follows the
+            # runner's call directly). Collecting it too used to tie with the
+            # runner and win on recency. Skipping (not stopping) still reaches
+            # a clean repeat after it ("TEST RK4FWT UA1AUW RK4FWX").
             if _is_base_call(t):
                 if j + 1 < min(i + 6, len(tokens)):
                     nxt = tokens[j + 1]
@@ -1568,7 +1569,7 @@ def _itila_extract_cq_call(text, valid_calls=None):
                 if first is None:
                     first = t
                 elif SpotTracker._levenshtein(first, t) > 2:
-                    break      # a different call: the answering station
+                    continue   # a different call: the answering station
                 candidates.append(t)
                 continue  # keep scanning for possible second clean copy
 

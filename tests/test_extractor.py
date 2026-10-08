@@ -92,6 +92,8 @@ def test_extract_cq_keeps_garbled_repeat():
     # so a garbled first copy loses to the clean repeat
     assert sg._itila_extract_cq_call('CQ CQ E E A2JD K2JD K', {'K2JD'}) == 'K2JD'
     assert sg._itila_extract_cq_call('CQ CQ E E A2JD K2JD K') == 'K2JD'
+    # the clean repeat after an answering caller is still reached
+    assert sg._itila_extract_cq_call('CQ TEST RK4FWT UA1AUW RK4FWX', {'RK4FWX', 'UA1AUW'}) == 'RK4FWX'
 
 
 def test_extract_cq_none_without_trigger():
