@@ -1600,17 +1600,39 @@ def _itila_extract_cq_call(text, valid_calls=None):
 _itila_lib = None
 _ITILA_LIBS = {'itila': './libitila.so', 'itila2': './libitila2.so'}
 _itila_lib_path = _ITILA_LIBS['itila']
+# Each decoder runs with its own scanner: itila with itila_scanner.c, itila2 with itila2_scanner.c.
+_SCANNER_LIBS = {'itila': './libitila_scanner.so', 'itila2': './libitila2_scanner.so'}
+_scanner_lib_path = _SCANNER_LIBS['itila']
+_scanner_loaded = False
 
 def _select_cw_decoder(name):
-    """Choose the library _get_itila_lib opens (config key cw_decoder)."""
-    global _itila_lib_path
+    """Choose the decoder and scanner libraries (config key cw_decoder)."""
+    global _itila_lib_path, _scanner_lib_path
     if name not in _ITILA_LIBS:
         raise ValueError("cw_decoder must be one of %s, got %r" % (sorted(_ITILA_LIBS), name))
     if _itila_lib and _itila_lib_path != _ITILA_LIBS[name]:
         raise RuntimeError("cw_decoder cannot change after %s is loaded" % _itila_lib_path)
+    if _scanner_loaded and _scanner_lib_path != _SCANNER_LIBS[name]:
+        raise RuntimeError("cw_decoder cannot change after %s is loaded" % _scanner_lib_path)
     _itila_lib_path = _ITILA_LIBS[name]
-    log.info("CW decoder: %s (%s)", name, _itila_lib_path)
+    _scanner_lib_path = _SCANNER_LIBS[name]
+    log.info("CW decoder: %s (%s, %s)", name, _itila_lib_path, _scanner_lib_path)
     return _itila_lib_path
+
+_itila_decode_threads = 1   # config itila_decode_threads: bins decoded in parallel (Python path)
+
+def _select_decode_threads(n):
+    """Config key itila_decode_threads: decode ready ITILA bins on n threads.
+    1 (default) is the serial loop.  itila_feed runs in C with the GIL released and
+    every decoder handle owns its result buffer, so separate bins decode concurrently."""
+    global _itila_decode_threads
+    n = int(n)
+    if n < 1:
+        raise ValueError("itila_decode_threads must be >= 1, got %r" % n)
+    _itila_decode_threads = n
+    if n > 1:
+        log.info("ITILA decode threads: %d", n)
+    return n
 
 def _get_itila_lib():
     global _itila_lib
@@ -2041,8 +2063,10 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
                         band_min_hz, band_max_hz,
                         sos100, sos200):
     import ctypes as _ct
+    global _scanner_loaded
     try:
-        lib = _ct.CDLL('./libitila_scanner.so')
+        lib = _ct.CDLL(_scanner_lib_path)
+        _scanner_loaded = True
         lib.itila_sc_create.restype  = _ct.c_void_p
         lib.itila_sc_create.argtypes = [
             _ct.c_int, _ct.c_double, _ct.c_int, _ct.c_double,
@@ -2118,11 +2142,17 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         if not h:
             log.warning("itila_sc_create returned NULL")
             return None
-        log.info("Loaded libitila_scanner.so (sr=%d center=%.0f Hz bins=%d)",
+        log.info("Loaded %s (sr=%d center=%.0f Hz bins=%d)", _scanner_lib_path,
                  sample_rate, center_hz, max_bins)
+        # itila2 scanner only: split its per-bin DSP over the decode threads too
+        if _itila_decode_threads > 1 and hasattr(lib, 'itila_sc_set_threads'):
+            lib.itila_sc_set_threads.restype = _ct.c_int
+            lib.itila_sc_set_threads.argtypes = [_ct.c_void_p, _ct.c_int]
+            n = lib.itila_sc_set_threads(_ct.c_void_p(h), _itila_decode_threads)
+            log.info("ITILA scanner threads: %d", n)
         return _ItilaSc(lib, _ct.c_void_p(h))
     except OSError:
-        log.warning("libitila_scanner.so not found")
+        log.warning("%s not found", _scanner_lib_path)
         return None
 
 
@@ -2533,8 +2563,10 @@ class _ItilaScanner:
         self._sc.feed_iq(i_c, q_c)
         self._process_ready()
 
-    def _process_ready(self):
-        """Sync bin handles with C scanner and decode any ready windows."""
+    def _process_ready(self, parallel=True):
+        """Sync bin handles with C scanner and decode any ready windows.
+        parallel=False when another thread may feed this scanner meanwhile
+        (drain_env and env_n do not take the scanner lock)."""
         if not self._sc:
             return
         active_hz = self._sc.list_bins()
@@ -2553,6 +2585,18 @@ class _ItilaScanner:
                 self._free_bin_handles(f_hz)
 
         ready = self._sc.ready_bins()
+        if parallel and _itila_decode_threads > 1:
+            # Feed bins in parallel, then post in the serial order so logs and
+            # spots come out the same as the serial loop.
+            ready = [f for f in ready if f in self._bins]
+            if not getattr(self, '_decode_pool', None):
+                import concurrent.futures as _cf
+                self._decode_pool = _cf.ThreadPoolExecutor(max_workers=_itila_decode_threads,
+                                                           thread_name_prefix='itila')
+            for f_hz, wins in zip(ready, self._decode_pool.map(self._decode_bin_windows, ready)):
+                for win in wins:
+                    self._decode_post(f_hz, self._bins[f_hz], win)
+            return
         for f_hz in ready:
             st = self._bins.get(f_hz)
             if st is None:
@@ -2562,24 +2606,43 @@ class _ItilaScanner:
                 self._decode_bin(f_hz, st)
                 n_env = self._sc.env_n(f_hz)
 
+    def _decode_bin_windows(self, f_hz):
+        """Worker task: every ready window of one bin, fed in order."""
+        st = self._bins[f_hz]
+        wins = []
+        try:
+            while self._sc.env_n(f_hz) >= self._window_samples:
+                win = self._decode_feed(f_hz, st)
+                if win is None:
+                    break
+                wins.append(win)
+        except Exception:
+            # Keep what this bin already decoded; other bins post normally.
+            log.exception("ITILA decode %.1f kHz failed", f_hz / 1000.0)
+        return wins
+
     def _decode_bin(self, f_hz, st):
+        win = self._decode_feed(f_hz, st)
+        if win is not None:
+            self._decode_post(f_hz, st, win)
+
+    def _decode_feed(self, f_hz, st):
+        """Drain one window of a bin and run its itila_feed calls.  C work only, so
+        separate bins can run on worker threads (see _select_decode_threads)."""
         import ctypes as _ct
         lib = _get_itila_lib()
         if not lib or not self._sc:
-            return
+            return None
 
         env100 = np.empty(self._window_samples, dtype=np.float64)
         env200 = np.empty(self._window_samples, dtype=np.float64)
         n_drained = self._sc.drain_env(f_hz, env100, env200, self._window_samples)
         if n_drained < self._window_samples:
-            return
+            return None
 
         f_khz = f_hz / 1000.0
         snr = self._sc._lib.itila_sc_get_snr(self._sc._h, _ct.c_double(f_hz))
-        if snr > 0:
-            st['snr'] = snr
-        now = time.time()
-
+        decoded = []
         for h, env in ((st['h100'], env100), (st['h200'], env200)):
             if h is None or h.value is None:
                 continue
@@ -2589,9 +2652,20 @@ class _ItilaScanner:
                                     _ct.c_double(f_khz),
                                     _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
-            if not raw:
-                continue
-            cost = lib.itila_get_last_cost(h)
+            if raw:
+                decoded.append((raw, lib.itila_get_last_cost(h), lib.itila_get_wpm(h)))
+        return snr, decoded
+
+    def _decode_post(self, f_hz, st, win):
+        """Log, extract and queue spots for one decoded window (main thread)."""
+        import ctypes as _ct
+        snr, decoded = win
+        f_khz = f_hz / 1000.0
+        if snr > 0:
+            st['snr'] = snr
+        now = time.time()
+
+        for raw, cost, wpm_est in decoded:
             log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
             # Timing-cost gate (off by default).  Drops the whole decode
             # window's call extraction when segmentation quality is too low;
@@ -2601,7 +2675,7 @@ class _ItilaScanner:
                 log.info("ITILA cost-gate %.1f kHz: dropped raw (cost=%.2f > %.2f)",
                          f_khz, cost, self.timing_cost_max)
                 continue
-            wpm = int(round(lib.itila_get_wpm(h)))
+            wpm = int(round(wpm_est))
             if wpm > 0:
                 st['wpm'] = wpm
 
@@ -2768,6 +2842,9 @@ class _ItilaScanner:
                     lib.itila_free(h)
 
     def kill(self):
+        if getattr(self, '_decode_pool', None):
+            self._decode_pool.shutdown(wait=True)
+            self._decode_pool = None
         for f_hz in list(self._bins.keys()):
             self._free_bin_handles(f_hz)
         if self._sc:
@@ -6553,6 +6630,7 @@ class SparkGap:
                                    scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)),
                                    gate_config=gate_config,
                                    recent_band_config=self.cfg.get('recent_band_floor'))
+        _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
         # If the gate is configured (peers listed), start the peer-tee
         # threads regardless of whether the gate is currently on. The
         # support map is cheap to maintain and we want it warm if the
@@ -6994,7 +7072,7 @@ class SparkGap:
                 for mgr in getattr(self, '_pfb_managers', []):
                     sc = mgr._itila_scanner
                     if sc:
-                        sc._process_ready()
+                        sc._process_ready(parallel=False)   # C worker feeds concurrently
 
             # Process decode results — poll from C worker's result buffer.
             # ScDecodeResult is 288 bytes (text 24..279, cost 280..287); must
@@ -7219,6 +7297,22 @@ class SparkGap:
                          "%d chars, %.0fs",
                          self.spot_count, total_decoders, len(self.managers),
                          self.telnet.client_count, total_chars, elapsed)
+                # "decoders" above counts the per-signal decoder instances; the
+                # ITILA path decodes scanner bins instead, so report those too.
+                itila_bins = 0
+                for mgr in self.managers:
+                    w = getattr(mgr, '_itila_scanner', None)
+                    sc = getattr(w, '_sc', None) if w else None
+                    if sc and sc._h:
+                        itila_bins += sc._lib.itila_sc_bin_count(sc._h)
+                if itila_bins:
+                    rss_mb = 0
+                    try:
+                        with open('/proc/self/statm') as fh:
+                            rss_mb = int(fh.read().split()[1]) * os.sysconf('SC_PAGE_SIZE') // 1048576
+                    except (OSError, ValueError):
+                        pass
+                    log.info("ITILA bins: %d active, memory %d MB", itila_bins, rss_mb)
                 if not use_c and self.receiver:
                     log.info("IQ trimmed before scanner: %.1fs total", self._iq_trimmed / live_rate)
                 # Ring + env-cap drop telemetry (added 2026-04-26 to verify
@@ -7730,6 +7824,7 @@ def run_file_mode(args, config):
     tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls,
                           scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)),
                           gate_config=gate_config)
+    _select_decode_threads(config.get('itila_decode_threads', 1))
 
     # Determine file format and sample rate
     with open(args.file, 'rb') as f:
@@ -7783,6 +7878,8 @@ def run_file_mode(args, config):
         enable_caller_spotting=bool(config.get('enable_caller_spotting', True)),
         exclude_ft8_freqs=bool(config.get('exclude_ft8_freqs', True)),
         exclude_ft4_freqs=bool(config.get('exclude_ft4_freqs', False)),
+        gate_timing_cost=bool(config.get('gate_timing_cost', False)),
+        timing_cost_max=float(config.get('timing_cost_max', 30.0)),
     )
 
     center_khz = args.center_khz
