@@ -7812,8 +7812,8 @@ def read_24bit_iq_chunk(filename, start_sec, duration_sec, rate=192000):
 
 def run_file_mode(args, config):
     """Offline file mode — process a WAV recording and output spots."""
-    log.info("File mode: %s (%.1f-%.1f min)", args.file, args.start_min,
-             args.end_min if args.end_min else 'end')
+    log.info("File mode: %s (%.1f-%s min)", args.file, args.start_min,
+             "%.1f" % args.end_min if args.end_min else 'end')
 
     calls, blacklist, add_calls = load_callsign_db(
         config.get('master_scp', 'MASTER.SCP'),
