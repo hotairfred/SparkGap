@@ -6,6 +6,7 @@ itila2_test_fit_unit / itila2_test_fit_letter_word ctypes hooks (200 Hz
 envelope samples, same units as the dump)."""
 
 import ctypes
+import random
 from pathlib import Path
 
 import pytest
@@ -386,3 +387,44 @@ def test_pitch_wpm_n3qe() -> None:
 
 def test_pitch_wpm_too_few() -> None:
     assert call_pitch_wpm("-100 +8 -6 +8 -6 +22 -100", 14.0, 12.0) == 0.0
+
+
+_lib.itila2_test_gate_segments.argtypes = [
+    ctypes.POINTER(ctypes.c_double),
+    ctypes.POINTER(ctypes.c_int8),
+    ctypes.c_int,
+    ctypes.c_double,
+    ctypes.c_double,
+    ctypes.c_double,
+    ctypes.c_double,
+]
+_lib.itila2_test_gate_segments.restype = ctypes.c_int
+
+GATE_UNIT = 12  # 20 WPM at 200 Hz
+GATE_SIGMA = 0.1
+
+
+def _gate(env: list[float], marks: list[int]) -> list[int]:
+    n = len(env)
+    env_c = (ctypes.c_double * n)(*env)
+    marks_c = (ctypes.c_int8 * n)(*marks)
+    kept = _lib.itila2_test_gate_segments(env_c, marks_c, n, 1.0, 0.0, GATE_SIGMA**2, float(GATE_UNIT))
+    assert kept >= 0
+    return list(marks_c)
+
+
+def test_gate_segments_keeps_keying_and_blanks_noise() -> None:
+    rng = random.Random(1)
+    # "PARIS" at 20 WPM: .--. .- .-. .. ...
+    elements = "1011101110100000101110000010111010000010100000101010"
+    keyed = [int(c) for c in elements for _ in range(GATE_UNIT)]
+    pause = [0] * (12 * GATE_UNIT)
+    # noise: the envelope stays at the noise level, but the marks claim dits
+    blips = ([1] * GATE_UNIT + [0] * GATE_UNIT) * 6
+    marks = keyed + pause + blips + pause
+    env = [float(m) if i < len(keyed) else 0.0 for i, m in enumerate(marks)]
+    env = [x + rng.gauss(0.0, GATE_SIGMA) for x in env]
+
+    out = _gate(env, marks)
+    assert out[: len(keyed)] == keyed
+    assert sum(out[len(keyed):]) == 0

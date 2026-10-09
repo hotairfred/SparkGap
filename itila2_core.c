@@ -73,6 +73,8 @@
 #define GAP_BRANCH    3.0   /* keep a gap class within this many nats of the best */
 #define TOKEN_PRIOR   2.0   /* log bonus for a callsign-shaped token or a common word */
 #define SYM_BAD       2.0   /* log penalty for a symbol that is no character */
+#define SEG_RATE_MIN 300.0  /* log BF per second a keyed segment needs to be decoded: real copy
+                             * >= 1500 at p10, dit noise median 91 (20m h2h 2026-10-08) */
 #define SEP_MIN      1.5    /* mark level this many noise sigmas above the noise, or no CW:
                              * EM fits noise at 0.5 to 1; no confirmed call below 1.5 (A/B 2026-09-22) */
 
@@ -1441,6 +1443,65 @@ static int find_carry_cut(itila_state_t *st, const int8_t *marks, int T, double 
 /* -------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------- */
+/* Decode scratch. Every buffer below is written before it is read within one call, so a
+ * set per thread serves all handles: per-handle memory drops from about 1.6 MB to the
+ * carry. Per-thread, not shared (same reason the statics moved per handle on 2026-04-26).
+ * Bound on entry to each decode call; one set per thread, freed with the process. */
+static int alloc_scratch(itila_state_t *s) {
+    s->log_B      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->log_alpha  = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->log_beta   = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->gamma      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->gamma_marg = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->env_norm   = (double*)malloc(MAX_ENV     * sizeof(double));
+    s->marks      = (int8_t*)malloc(MAX_ENV     * sizeof(int8_t));
+    s->sc_runs      = (run_t*)       malloc(MAX_ENV * sizeof(run_t));
+    s->sc_beamA     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    s->sc_beamB     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    s->sc_dedup     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    s->sc_up        = (char*)        malloc(MAX_TEXT * sizeof(char));
+    s->sc_tokens    = malloc(256 * (MAX_CALL + 4));
+    s->sc_calls     = (callsign_t*)  malloc(MAX_CALLS * sizeof(callsign_t));
+    s->sc_out_texts = malloc(MAX_TEXTS * MAX_TEXT);
+    s->sc_primary   = (char*)        malloc(MAX_TEXT * sizeof(char));
+    s->feed_env     = (double*)      malloc(MAX_ENV * sizeof(double));
+    s->feed_raw     = (double*)      malloc(MAX_ENV * sizeof(double));
+    return s->log_B && s->log_alpha && s->log_beta && s->gamma && s->gamma_marg &&
+           s->env_norm && s->marks && s->sc_runs && s->sc_beamA && s->sc_beamB &&
+           s->sc_dedup && s->sc_up && s->sc_tokens && s->sc_calls && s->sc_out_texts &&
+           s->sc_primary && s->feed_env && s->feed_raw;
+}
+
+static void free_scratch(itila_state_t *s) {
+    free(s->log_B); free(s->log_alpha); free(s->log_beta);
+    free(s->gamma); free(s->gamma_marg); free(s->env_norm); free(s->marks);
+    free(s->sc_runs);
+    free(s->sc_beamA); free(s->sc_beamB); free(s->sc_dedup);
+    free(s->sc_up); free(s->sc_tokens);
+    free(s->sc_calls); free(s->sc_out_texts); free(s->sc_primary);
+    free(s->feed_env); free(s->feed_raw);
+}
+
+static _Thread_local itila_state_t *tl_scratch;
+
+static int bind_scratch(itila_state_t *st) {
+    itila_state_t *s = tl_scratch;
+    if (!s) {
+        s = (itila_state_t*)calloc(1, sizeof(itila_state_t));
+        if (!s) return 0;
+        if (!alloc_scratch(s)) { free_scratch(s); free(s); return 0; }
+        tl_scratch = s;
+    }
+    st->log_B = s->log_B; st->log_alpha = s->log_alpha; st->log_beta = s->log_beta;
+    st->gamma = s->gamma; st->gamma_marg = s->gamma_marg; st->env_norm = s->env_norm;
+    st->marks = s->marks; st->sc_runs = s->sc_runs;
+    st->sc_beamA = s->sc_beamA; st->sc_beamB = s->sc_beamB; st->sc_dedup = s->sc_dedup;
+    st->sc_up = s->sc_up; st->sc_tokens = s->sc_tokens; st->sc_calls = s->sc_calls;
+    st->sc_out_texts = s->sc_out_texts; st->sc_primary = s->sc_primary;
+    st->feed_env = s->feed_env; st->feed_raw = s->feed_raw;
+    return 1;
+}
+
 itila_t itila_create(int sample_rate, double lpf_hz) {
     itila_state_t *st = (itila_state_t*)calloc(1, sizeof(itila_state_t));
     if (!st) return NULL;
@@ -1449,35 +1510,8 @@ itila_t itila_create(int sample_rate, double lpf_hz) {
     st->lpf_hz      = lpf_hz;
     st->last_timing_cost = 999.0;  /* sentinel: no decode yet */
 
-    st->log_B      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->log_alpha  = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->log_beta   = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->gamma      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->gamma_marg = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->env_norm   = (double*)malloc(MAX_ENV     * sizeof(double));
-    st->marks      = (int8_t*)malloc(MAX_ENV     * sizeof(int8_t));
-
-    /* Per-handle scratch, replaces function-local statics for thread safety. */
-    st->sc_runs      = (run_t*)       malloc(MAX_ENV * sizeof(run_t));
-    st->sc_beamA     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
-    st->sc_beamB     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
-    st->sc_dedup     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
-    st->sc_up        = (char*)        malloc(MAX_TEXT * sizeof(char));
-    st->sc_tokens    = malloc(256 * (MAX_CALL + 4));
-    st->sc_calls     = (callsign_t*)  malloc(MAX_CALLS * sizeof(callsign_t));
-    st->sc_out_texts = malloc(MAX_TEXTS * MAX_TEXT);
-    st->sc_primary   = (char*)        malloc(MAX_TEXT * sizeof(char));
     st->carry_env    = (double*)      malloc(CARRY_MAX * sizeof(double));
-    st->feed_env     = (double*)      malloc(MAX_ENV * sizeof(double));
-    st->feed_raw     = (double*)      malloc(MAX_ENV * sizeof(double));
-
-    if (!st->log_B || !st->log_alpha || !st->log_beta ||
-        !st->gamma || !st->gamma_marg || !st->env_norm || !st->marks ||
-        !st->sc_runs || !st->sc_beamA || !st->sc_beamB || !st->sc_dedup ||
-        !st->sc_up || !st->sc_tokens || !st->sc_calls ||
-        !st->sc_out_texts || !st->sc_primary || !st->carry_env || !st->feed_env || !st->feed_raw) {
-        itila_free(st); return NULL;
-    }
+    if (!st->carry_env) { itila_free(st); return NULL; }
 
     /* Speed bins: linspace(WPM_MIN, WPM_MAX, N_SPEED_BINS) */
     for (int i = 0; i < N_SPEED_BINS; i++)
@@ -1516,11 +1550,58 @@ static void level_follow(itila_state_t *st, const double *x, int n, double *y) {
     }
 }
 
+/* Blank the marks of segments that are not CW. A segment is keying between pauses of 5 units
+ * or more of the fastest speed candidate; its log Bayes factor (fresh forward pass, mean over the speed bins, against all
+ * noise) must reach SEG_RATE_MIN per second. Marks at or after n_dec (the carry) are kept. */
+static void gate_segments(itila_state_t *st, const double *env, int n_dec, double A, double nm,
+                          double s2, double unit) {
+    int gap = (int)(5.0 * unit), pad = (int)unit;
+    double lc = -0.5 * log(2.0 * M_PI * s2);
+    int t = 0;
+    while (t < n_dec) {
+        while (t < n_dec && !st->marks[t]) t++;
+        if (t >= n_dec) break;
+        int t0 = t, last = t, sp = 0;
+        for (; t < n_dec; t++) {
+            if (st->marks[t]) { last = t; sp = 0; }
+            else if (++sp >= gap) break;
+        }
+        int a = t0 - pad < 0 ? 0 : t0 - pad;
+        int b = last + 1 + pad > n_dec ? n_dec : last + 1 + pad;
+        int len = b - a;
+        double lbf = -INFINITY;
+        if (len >= 2) {
+            double noise = 0.0;
+            for (int i = 0; i < len; i++) {
+                double x = env[a + i];
+                st->log_B[i*2+0] = lc - 0.5*(x-nm)*(x-nm)/s2;
+                st->log_B[i*2+1] = lc - 0.5*(x-A)*(x-A)/s2;
+                noise += st->log_B[i*2+0];
+            }
+            double lz[N_SPEED_BINS], lmax = -INFINITY;
+            for (int k = 0; k < N_SPEED_BINS; k++) {
+                double p01, p10;
+                transition_probs(st->speed_bins[k], &p01, &p10);
+                double lT[4] = { log(1.0 - p01 + 1e-300), log(p01 + 1e-300),
+                                 log(p10 + 1e-300), log(1.0 - p10 + 1e-300) };
+                fb_core(st->log_B, lT, len, st->log_alpha, st->log_beta, &lz[k]);
+                if (lz[k] > lmax) lmax = lz[k];
+            }
+            double se = 0.0;
+            for (int k = 0; k < N_SPEED_BINS; k++) se += exp(lz[k] - lmax);
+            lbf = lmax + log(se / N_SPEED_BINS) - noise;
+        }
+        if (lbf < SEG_RATE_MIN * len / (double)BAYES_RATE)
+            memset(st->marks + t0, 0, (size_t)(last + 1 - t0));
+    }
+}
+
 const char* itila_feed(itila_t h, const double* envelope, int n,
                        double freq_khz, double ev_thresh)
 {
     itila_state_t *st = (itila_state_t*)h;
     st->result_buf[0] = '\0';
+    if (!bind_scratch(st)) return st->result_buf;
 
     int carry = st->carry_n;
     st->carry_n = 0;
@@ -1537,15 +1618,18 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     double A, noise_mean, sigma2_obs, wpm_em;
     em_estimate(st, envelope, n, st->ws_wpm, &A, &noise_mean, &sigma2_obs, &wpm_em);
 
-    /* Evidence ratio, calls decode_marginal internally */
-    double log_bf = signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
+    /* Separation first: a window under SEP_MIN fails whatever its evidence, so the
+     * 16-speed forward-backward (decode_marginal) runs only when it can matter. */
     double sep = (A - noise_mean) / sqrt(sigma2_obs);
+    double log_bf = sep < SEP_MIN ? -INFINITY
+                  : signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
     if ((log_bf < ev_thresh || sep < SEP_MIN) && carry > 0 && n > carry + FLUSH_MARGIN) {
         /* The signal ended: decode the carried word with a little silence after it. */
         n = carry + FLUSH_MARGIN;
         em_estimate(st, envelope, n, st->ws_wpm, &A, &noise_mean, &sigma2_obs, &wpm_em);
-        log_bf = signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
         sep = (A - noise_mean) / sqrt(sigma2_obs);
+        log_bf = sep < SEP_MIN ? -INFINITY
+               : signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
     }
     if (log_bf < ev_thresh || sep < SEP_MIN) return st->result_buf;
 
@@ -1567,6 +1651,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
     st->carry_n = n - n_dec;
     memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
+    gate_segments(st, envelope, n_dec, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]));
 
     /* Per-handle scratch, was function-local static; live mode races. */
     callsign_t *calls = st->sc_calls;
@@ -1629,6 +1714,7 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
 {
     itila_state_t *st = (itila_state_t*)h;
     st->result_buf[0] = '\0';
+    if (!bind_scratch(st)) return st->result_buf;
     if (n < 10 || n > MAX_ENV) return st->result_buf;
     level_follow(st, envelope, n, st->feed_env);
     envelope = st->feed_env;
@@ -1826,13 +1912,7 @@ double itila_get_last_cost(itila_t h) {
 void itila_free(itila_t h) {
     if (!h) return;
     itila_state_t *st = (itila_state_t*)h;
-    free(st->log_B); free(st->log_alpha); free(st->log_beta);
-    free(st->gamma); free(st->gamma_marg); free(st->env_norm); free(st->marks);
-    free(st->sc_runs);
-    free(st->sc_beamA); free(st->sc_beamB); free(st->sc_dedup);
-    free(st->sc_up); free(st->sc_tokens);
-    free(st->sc_calls); free(st->sc_out_texts); free(st->sc_primary);
-    free(st->carry_env); free(st->feed_env); free(st->feed_raw);
+    free(st->carry_env);
     free(st);
 }
 
@@ -1845,6 +1925,7 @@ double itila_get_wpm(itila_t h) {
 void itila_debug_em(itila_t h, const double* envelope, int n,
                     double *A_out, double *nm_out, double *s2_out, double *wpm_out) {
     itila_state_t *st = (itila_state_t*)h;
+    if (!bind_scratch(st)) return;
     em_estimate(st, envelope, n, 0.0, A_out, nm_out, s2_out, wpm_out);
 }
 
@@ -1867,6 +1948,20 @@ double itila2_test_pitch_wpm(const int *is_mark, const int *dur, int n,
     double wpm = pitch_wpm(runs, n, dit_dah, elem_letter);
     free(runs);
     return wpm;
+}
+
+/* Returns the number of marks gate_segments kept; marks is updated in place. */
+int itila2_test_gate_segments(const double *env, int8_t *marks, int n, double A, double nm,
+                              double s2, double unit) {
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
+    memcpy(st->marks, marks, (size_t)n);
+    gate_segments(st, env, n, A, nm, s2, unit);
+    memcpy(marks, st->marks, (size_t)n);
+    int kept = 0;
+    for (int i = 0; i < n; i++) kept += marks[i];
+    itila_free(st);
+    return kept;
 }
 
 double itila2_test_fit_letter_word(const int *is_mark, const int *dur, int n,
