@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import sparkgap
-from sparkgap import _ITILA_LIBS, _select_cw_decoder
+from sparkgap import _ITILA_LIBS, _SCANNER_LIBS, _select_cw_decoder
 
 
 @pytest.fixture(autouse=True)
@@ -39,3 +39,18 @@ def test_every_listed_library_has_a_build_recipe() -> None:
     for lib_path in _ITILA_LIBS.values():
         basename = Path(lib_path).name
         assert basename in makefile_text
+
+
+def test_each_decoder_selects_its_own_scanner() -> None:
+    """cw_decoder alone picks the scanner: itila with Fred's, itila2 with itila2_scanner."""
+    _select_cw_decoder("itila2")
+    assert sparkgap._scanner_lib_path == "./libitila2_scanner.so"
+    _select_cw_decoder("itila")
+    assert sparkgap._scanner_lib_path == "./libitila_scanner.so"
+
+
+def test_every_scanner_library_has_a_build_recipe() -> None:
+    """Every library in _SCANNER_LIBS has a matching Makefile build recipe."""
+    makefile_text = (Path(sparkgap.__file__).resolve().parent / "Makefile").read_text()
+    for lib_path in _SCANNER_LIBS.values():
+        assert f"{Path(lib_path).name}:" in makefile_text

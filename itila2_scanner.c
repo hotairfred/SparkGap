@@ -1,5 +1,12 @@
 /*
- * itila_scanner.c — full _ItilaScanner in C
+ * itila2_scanner.c: itila_scanner.c plus WX7V's scanner changes (selected with cw_decoder: "itila2").
+ * Same API and symbols as itila_scanner.c; built as libitila2_scanner.so. Changes:
+ *   - 40 ms Hann window on the 100 Hz path I/Q at 2 kHz, before the magnitude
+ *   - a new bin is fed the last 1 s of IQ (pre-roll) so the first characters are not lost
+ *   - one bin per signal: spawn spacing 75 Hz on interpolated frequencies, bin at the mean of its candidate's peaks
+ *   - per-bin DSP split over itila_decode_threads workers (itila_sc_set_threads)
+ *   - fir_dot without the per-tap modulo
+ * Bin keep-alive is the same as itila_scanner.c: spot evidence only (word keep-alive kept noise bins alive, removed 2026-10-06).
  *
  * Implements the complete per-feed pipeline:
  *   IQ residual → FFT energy scan → bin spawn →
@@ -13,7 +20,7 @@
  *
  * Compile:
  *   gcc -O3 -march=native -ffast-math -shared -fPIC \
- *       -o libitila_scanner.so itila_scanner.c -lm
+ *       -o libitila2_scanner.so itila2_scanner.c -lm
  */
 
 #include "itila_scanner.h"
@@ -29,7 +36,7 @@
 #define SC_DEC1       16      /* max stage-1 decimation: 192 kHz → 12 kHz (8 at 96k, 4 at 48k) */
 #define SC_DEC2       6       /* 12 kHz → 2 kHz    (FIR stage 2) */
 #define SC_DEC3       10      /* 2 kHz → 200 Hz    (FIR stage 3) */
-#define SC_ENV_CAP    15000   /* 75s at 200 Hz — 1.25 decode windows */
+#define SC_ENV_CAP    15000   /* 75s at 200 Hz - 1.25 decode windows */
 
 /* Lazy bin spawn: a peak must be detected by ≥SC_CAND_HITS_REQUIRED scans
  * before a bin is allocated for it. Filters single-scan noise crossings
@@ -37,7 +44,7 @@
  * within SC_CAND_CLUSTER_HZ of an existing one are merged. Stale ones
  * (last_seen older than SC_CAND_EXPIRY_SCANS scans) are recycled. At
  * 4096-sample scans / 192k SPS = ~21 ms cadence, 3 hits ≈ 63 ms latency
- * to spawn — negligible vs CW callsign duration. */
+ * to spawn - negligible vs CW callsign duration. */
 #define SC_MAX_CANDIDATES      512
 #define SC_CAND_HITS_REQUIRED  3
 #define SC_CAND_EXPIRY_SCANS   10
@@ -46,15 +53,50 @@
 
 #include "itila_fir_coeffs.h"
 
+#define SC_HANN_MS     40.0  /* Hann window on the 100 Hz path, at 2 kHz */
+#define SC_HANN_LEN    80    /* SC_HANN_MS x 2 taps */
+#define SC_PREROLL_SEC 1.0   /* IQ replayed into a new bin */
+#define SC_MAX_THREADS 16    /* itila_sc_set_threads cap */
+
+/* Stage 1 to 12 kHz: firwin(N, fc, window=('kaiser', beta), fs=rate), as in hotairfred/SparkGap#8.
+ * 192k: 32 taps, fc 5000, beta 3.0; 96k: 17 taps, fc 5000, beta 3.0; 48k: 9 taps, fc 4000, beta 2.5.
+ * 40 dB or more down at every fold band (k x 12 kHz +-300 Hz), < 0.03 dB droop at 300 Hz. */
+#define FIR1W_192K_LEN 32
+static const double FIR1W_192K[32] = {
+    2.722306640689562e-03, 4.627612510154580e-03, 7.153278408679127e-03, 1.031823517842259e-02,
+    1.410480446587604e-02, 1.845556456377926e-02, 2.327290075508940e-02, 2.842146224904661e-02,
+    3.373351832399613e-02, 3.901696734361195e-02, 4.406552492746963e-02, 4.867042232044303e-02,
+    5.263280110495639e-02, 5.577590986242678e-02, 5.795620068993096e-02, 5.907249065542795e-02,
+    5.907249065542795e-02, 5.795620068993096e-02, 5.577590986242678e-02, 5.263280110495639e-02,
+    4.867042232044303e-02, 4.406552492746963e-02, 3.901696734361195e-02, 3.373351832399613e-02,
+    2.842146224904661e-02, 2.327290075508940e-02, 1.845556456377926e-02, 1.410480446587604e-02,
+    1.031823517842259e-02, 7.153278408679127e-03, 4.627612510154580e-03, 2.722306640689562e-03
+};
+#define FIR1W_96K_LEN 17
+static const double FIR1W_96K[17] = {
+    4.548930590877632e-03, 1.251609591700054e-02, 2.526995175929027e-02, 4.240186942651408e-02,
+    6.235816889092164e-02, 8.261251447677263e-02, 1.001325448708302e-01, 1.120342116062826e-01,
+    1.162514249230209e-01, 1.120342116062826e-01, 1.001325448708302e-01, 8.261251447677263e-02,
+    6.235816889092164e-02, 4.240186942651408e-02, 2.526995175929027e-02, 1.251609591700054e-02,
+    4.548930590877632e-03
+};
+#define FIR1W_48K_LEN 9
+static const double FIR1W_48K[9] = {
+    2.494596132197499e-02, 6.950412953992999e-02, 1.278896623047664e-01, 1.784234141254429e-01,
+    1.984736654157714e-01, 1.784234141254429e-01, 1.278896623047664e-01, 6.950412953992999e-02,
+    2.494596132197499e-02
+};
+#define SC_FIR1_MAX FIR1W_192K_LEN
+
 /* ---- per-bin state ---- */
 typedef struct {
     double f_hz;
     int    active;
     double c_phase, s_phase;           /* oscillator state */
 
-    /* FIR stage 1: to 12k (up to 32 taps, complex I/Q) */
-    double dl1_i[FIR_STAGE1_LEN];
-    double dl1_q[FIR_STAGE1_LEN];
+    /* FIR stage 1: to 12k (up to SC_FIR1_MAX taps, complex I/Q) */
+    double dl1_i[SC_FIR1_MAX];
+    double dl1_q[SC_FIR1_MAX];
     int    dl1_count;                  /* samples fed since last output */
 
     /* FIR stage 2: 12k→2k (96 taps, complex I/Q, two paths) */
@@ -64,6 +106,12 @@ typedef struct {
     double dl2_200q[FIR_S2_200_LEN];
     int    dl2_count;
 
+    /* Hann window on the 100 Hz path (2 kHz, complex I/Q) */
+    double dlh_i[SC_HANN_LEN];
+    double dlh_q[SC_HANN_LEN];
+    int    dlh_count;
+    int    need_preroll;               /* feed the pre-roll IQ on the next process_bins */
+
     /* FIR stage 3: 2k→200Hz (60 taps, real envelope, two paths) */
     double dl3_100[FIR_STAGE3_LEN];
     double dl3_200[FIR_STAGE3_LEN];
@@ -72,11 +120,11 @@ typedef struct {
     double env100[SC_ENV_CAP];
     double env200[SC_ENV_CAP];
     int    env_n;
-    int64_t created_sample;            /* 12 kHz units; int64 so long runs never wrap */
+    int64_t created_sample;           /* 12 kHz units; int64 so long runs never wrap */
     int64_t last_evidence;
     double snr_db;
 
-    /* ITILA decoder handles — created lazily, one per LPF path */
+    /* ITILA decoder handles - created lazily, one per LPF path */
     void  *h100;
     void  *h200;
 
@@ -103,7 +151,12 @@ struct ItilaSc {
     double grid_hz;
     double band_min_hz;
     double band_max_hz;
-    /* IIR SOS removed — replaced by per-bin FIR delay lines */
+    double hann[SC_HANN_LEN];
+    double *pre_i;             /* last SC_PREROLL_SEC of IQ fed to the bins */
+    double *pre_q;
+    int     pre_len;
+    int     pre_n;
+    /* IIR SOS removed - replaced by per-bin FIR delay lines */
 
     double iq_res_i[SC_DEC1];
     double iq_res_q[SC_DEC1];
@@ -119,13 +172,28 @@ struct ItilaSc {
 
     pthread_mutex_t lock;  /* protects bins/envelope during concurrent feed+decode */
 
+    /* Worker pool for process_bins (itila_sc_set_threads).  Bin k goes to
+     * stripe k % n_threads; stripe 0 runs on the calling thread. */
+    int      n_threads;
+    pthread_t workers[SC_MAX_THREADS];
+    struct ScWorker { struct ItilaSc *sc; int stripe; uint64_t seen; } worker_arg[SC_MAX_THREADS];
+    pthread_mutex_t pool_lock;
+    pthread_cond_t  pool_go;
+    pthread_cond_t  pool_done;
+    uint64_t pool_gen;
+    int      pool_pending;
+    int      pool_stop;
+    const double *job_i, *job_q;
+    int      job_n;
+    uint64_t job_drops;
+
     /* Diagnostic counters */
     uint64_t env_drops;          /* per-bin envelope cap hits */
     uint64_t bins_at_max;        /* peak active bin count */
     uint64_t spawn_gated;        /* candidates rejected (insufficient hits) */
     uint64_t spawn_promoted;     /* candidates that became bins */
 
-    /* Lazy spawn candidate ring — see SC_MAX_CANDIDATES comment block */
+    /* Lazy spawn candidate ring - see SC_MAX_CANDIDATES comment block */
     int64_t  scan_counter;
     struct {
         double f_hz;
@@ -136,7 +204,7 @@ struct ItilaSc {
         int    in_use;
     } cand[SC_MAX_CANDIDATES];
 
-    /* ITILA decoder function pointers — set via itila_sc_set_decoder */
+    /* ITILA decoder function pointers - set via itila_sc_set_decoder */
     void *(*dec_create)(int sample_rate, double lpf_hz);
     const char *(*dec_feed)(void *h, const double *env, int n,
                              double freq_khz, double ev_thresh);
@@ -186,38 +254,12 @@ static void fft_forward(double *re, double *im, int n)
     }
 }
 
-/* ---- qsort comparators (file scope, not nested) ---- */
-static int cmp_dbl_asc(const void *a, const void *b)
-{
-    double da = *(const double*)a, db = *(const double*)b;
-    return da < db ? -1 : da > db ? 1 : 0;
-}
-
+/* ---- qsort comparator (file scope, not nested) ---- */
 typedef struct { double power; double f_hz; double snr; double f_exact; } ScPeak;
 static int cmp_peak_desc(const void *a, const void *b)
 {
     double da = ((const ScPeak*)a)->power, db = ((const ScPeak*)b)->power;
     return da > db ? -1 : da < db ? 1 : 0;
-}
-
-/* ---- IIR: Direct Form II transposed ---- */
-static void sosfilt(const double sos[][6], int n_sos,
-                    double *x, int n, double z[][2])
-{
-    for (int s = 0; s < n_sos; s++) {
-        double b0=sos[s][0], b1=sos[s][1], b2=sos[s][2];
-        double a1=sos[s][4], a2=sos[s][5];
-        double z0=z[s][0], z1=z[s][1];
-        for (int i = 0; i < n; i++) {
-            double xi = x[i];
-            double yi = b0*xi + z0;
-            z0 = b1*xi - a1*yi + z1;
-            z1 = b2*xi - a2*yi;
-            x[i] = yi;
-        }
-        z[s][0] = z0;
-        z[s][1] = z1;
-    }
 }
 
 /* ---- energy scan ---- */
@@ -243,17 +285,9 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         psd[k] = 10.0 * log10(re[k]*re[k] + im[k]*im[k] + 1e-20);
     free(re); free(im);
 
-    /* Median noise via sort */
-    double *sorted = (double *)malloc(N * sizeof(double));
-    if (!sorted) { free(psd); return; }
-    memcpy(sorted, psd, N * sizeof(double));
-    qsort(sorted, N, sizeof(double), cmp_dbl_asc);
-    double noise = (N & 1) ? sorted[N/2] : 0.5*(sorted[N/2-1]+sorted[N/2]);
-    free(sorted);
-
     double bin_hz  = (double)sc->sample_rate / N;
 
-    /* Collect LOCAL MAXIMA using CFAR detection — local noise estimate per bin.
+    /* Collect LOCAL MAXIMA using CFAR detection - local noise estimate per bin.
      * For each candidate peak, compute median of nearby bins (excluding the peak
      * and its immediate neighbors). Self-calibrates to local QRM conditions. */
     ScPeak *peaks = (ScPeak *)malloc(N * sizeof(ScPeak));
@@ -310,7 +344,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
     }
 
     /* Sweep: evict stale bins regardless of capacity. The capacity-only
-     * eviction below was a leak — under typical operation each band's
+     * eviction below was a leak - under typical operation each band's
      * scanner stays well below max_bins, so the eviction path never ran
      * and bins accumulated forever. After ~1-2 hours bin count drifts
      * up to a few hundred, FFT cost climbs, decoder starves, ring
@@ -320,7 +354,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         int rate_12k = sc->sample_rate / sc->dec1;
         for (int b = 0; b < SC_MAX_BINS; b++) {
             if (!sc->bins[b].active) continue;
-            /* Skip mid-decode bins — see ScBin.in_decode comment. */
+            /* Skip mid-decode bins - see ScBin.in_decode comment. */
             if (sc->bins[b].in_decode) continue;
             int64_t age      = sc->total_samples - sc->bins[b].created_sample;
             int64_t since_ev = sc->total_samples - sc->bins[b].last_evidence;
@@ -335,7 +369,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         }
     }
 
-    /* Cluster (75 Hz), keep strongest per cluster, spawn new bins.
+    /* Cluster (50 Hz), keep strongest per cluster, spawn new bins.
      * History: started at 300 Hz, tightened to 150 Hz on 2026-04-22
      * (commit 45467f1 alongside FIR decimation work).  Tightened again
      * to 50 Hz on 2026-05-24 after RBN cross-reference triage showed
@@ -348,7 +382,8 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
     for (int i = 0; i < np; i++) {
         double f_hz = peaks[i].f_hz;
 
-        /* Skip if within cluster_hz of any active bin — but update its SNR */
+        /* Skip if within cluster_hz of any active bin - but update its SNR.
+         * Bin and peak both at the interpolated frequency, so one signal is one bin. */
         int found = 0;
         for (int b = 0; b < SC_MAX_BINS; b++) {
             if (sc->bins[b].active && fabs(sc->bins[b].f_hz - peaks[i].f_exact) <= cluster_hz) {
@@ -371,7 +406,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
             }
         }
         if (cand_idx < 0) {
-            /* Allocate a slot — first try unused, else oldest in_use */
+            /* Allocate a slot - first try unused, else oldest in_use */
             int64_t oldest_seen = sc->scan_counter + 1;
             int oldest_idx  = -1;
             for (int c = 0; c < SC_MAX_CANDIDATES; c++) {
@@ -397,7 +432,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         sc->cand[cand_idx].last_seen_scan = sc->scan_counter;
         if (sc->cand[cand_idx].hits < SC_CAND_HITS_REQUIRED) {
             sc->spawn_gated++;
-            continue;  /* not enough hits yet — defer spawn */
+            continue;  /* not enough hits yet - defer spawn */
         }
         /* Threshold met: spawn the bin and recycle the candidate slot */
         sc->cand[cand_idx].in_use = 0;
@@ -411,7 +446,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
             for (int b = 0; b < SC_MAX_BINS; b++) {
                 if (!sc->bins[b].active) continue;
                 /* Skip bins that decode_ready is currently using under
-                 * released lock — see ScBin.in_decode comment. */
+                 * released lock - see ScBin.in_decode comment. */
                 if (sc->bins[b].in_decode) continue;
                 int64_t age = sc->total_samples - sc->bins[b].created_sample;
                 int64_t since_ev = sc->total_samples - sc->bins[b].last_evidence;
@@ -433,7 +468,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
                 sc->bins[evicted].active = 0;
                 sc->n_bins--;
             } else {
-                continue;  /* all bins active and producing — can't evict */
+                continue;  /* all bins active and producing - can't evict */
             }
         }
 
@@ -451,6 +486,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         bin->c_phase = 1.0;
         bin->s_phase = 0.0;
         bin->snr_db  = peaks[i].snr;
+        bin->need_preroll = 1;
         sc->n_bins++;
     }
     free(peaks);
@@ -459,20 +495,21 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 /* ---- FIR convolution helper: dot product of delay line with filter ---- */
 static double fir_dot(const double *dl, int pos, const double *h, int len)
 {
+    /* Same taps in the same order as (pos - k + len) % len, without the modulo. */
     double acc = 0.0;
-    for (int k = 0; k < len; k++) {
-        int idx = (pos - k + len) % len;
-        acc += dl[idx] * h[k];
-    }
+    int k = 0;
+    for (; k <= pos; k++)
+        acc += dl[pos - k] * h[k];
+    for (; k < len; k++)
+        acc += dl[pos - k + len] * h[k];
     return acc;
 }
 
 /* ---- per-bin DSP: all-FIR linear-phase chain ---- */
-static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full, int n)
+static int process_bin(ItilaSc *sc, ScBin *b, const double *i_full, const double *q_full, int n)
 {
-    for (int bi = 0; bi < SC_MAX_BINS; bi++) {
-        ScBin *b = &sc->bins[bi];
-        if (!b->active) continue;
+    int drops = 0;
+    {
 
         /* Oscillator for mixing to baseband */
         double step   = -2.0 * M_PI * (b->f_hz - sc->center_hz) / sc->sample_rate;
@@ -515,6 +552,14 @@ static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full
             double s2_200i = fir_dot(b->dl2_200i, pos2_200, FIR_S2_200, FIR_S2_200_LEN);
             double s2_200q = fir_dot(b->dl2_200q, pos2_200, FIR_S2_200, FIR_S2_200_LEN);
 
+            /* Hann window on the 100 Hz path before the magnitude */
+            int ph = b->dlh_count;
+            b->dlh_i[ph] = s2_100i;
+            b->dlh_q[ph] = s2_100q;
+            if (++b->dlh_count == SC_HANN_LEN) b->dlh_count = 0;
+            s2_100i = fir_dot(b->dlh_i, ph, sc->hann, SC_HANN_LEN);
+            s2_100q = fir_dot(b->dlh_q, ph, sc->hann, SC_HANN_LEN);
+
             /* Envelope at 2 kHz */
             double env2_100 = sqrt(s2_100i*s2_100i + s2_100q*s2_100q);
             double env2_200 = sqrt(s2_200i*s2_200i + s2_200q*s2_200q);
@@ -535,7 +580,7 @@ static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full
                 b->env200[b->env_n] = env_200;
                 b->env_n++;
             } else {
-                sc->env_drops++;
+                drops++;
             }
         }
 
@@ -544,6 +589,128 @@ static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full
         b->c_phase = cp * norm;
         b->s_phase = sp * norm;
     }
+    return drops;
+}
+
+/* One stripe of the bins: every n_threads-th bin from `stripe`.  A bin's
+ * DSP touches only that bin, and the scanner fields read here are constant
+ * while process_bins runs, so stripes need no locking. */
+static int process_stripe(ItilaSc *sc, int stripe, const double *i_full, const double *q_full, int n)
+{
+    int drops = 0;
+    int step = sc->n_threads > 1 ? sc->n_threads : 1;
+    for (int bi = stripe; bi < SC_MAX_BINS; bi += step) {
+        ScBin *b = &sc->bins[bi];
+        if (!b->active) continue;
+        if (b->need_preroll) {
+            b->need_preroll = 0;
+            if (sc->pre_n > 0) drops += process_bin(sc, b, sc->pre_i, sc->pre_q, sc->pre_n);
+        }
+        drops += process_bin(sc, b, i_full, q_full, n);
+    }
+    return drops;
+}
+
+static void *scan_worker(void *arg)
+{
+    struct ScWorker *w = (struct ScWorker *)arg;
+    ItilaSc *sc = w->sc;
+    uint64_t seen = w->seen;    /* jobs before this worker started are not its own */
+    for (;;) {
+        pthread_mutex_lock(&sc->pool_lock);
+        while (!sc->pool_stop && sc->pool_gen == seen)
+            pthread_cond_wait(&sc->pool_go, &sc->pool_lock);
+        if (sc->pool_stop) { pthread_mutex_unlock(&sc->pool_lock); return NULL; }
+        seen = sc->pool_gen;
+        const double *ji = sc->job_i, *jq = sc->job_q;
+        int jn = sc->job_n;
+        pthread_mutex_unlock(&sc->pool_lock);
+
+        int drops = process_stripe(sc, w->stripe, ji, jq, jn);
+
+        pthread_mutex_lock(&sc->pool_lock);
+        sc->job_drops += (uint64_t)drops;
+        if (--sc->pool_pending == 0) pthread_cond_signal(&sc->pool_done);
+        pthread_mutex_unlock(&sc->pool_lock);
+    }
+}
+
+static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full, int n)
+{
+    if (sc->n_threads <= 1) {
+        sc->env_drops += (uint64_t)process_stripe(sc, 0, i_full, q_full, n);
+        return;
+    }
+    pthread_mutex_lock(&sc->pool_lock);
+    sc->job_i = i_full; sc->job_q = q_full; sc->job_n = n;
+    sc->job_drops = 0;
+    sc->pool_pending = sc->n_threads - 1;
+    sc->pool_gen++;
+    pthread_cond_broadcast(&sc->pool_go);
+    pthread_mutex_unlock(&sc->pool_lock);
+
+    uint64_t drops = (uint64_t)process_stripe(sc, 0, i_full, q_full, n);
+
+    pthread_mutex_lock(&sc->pool_lock);
+    while (sc->pool_pending > 0)
+        pthread_cond_wait(&sc->pool_done, &sc->pool_lock);
+    drops += sc->job_drops;
+    pthread_mutex_unlock(&sc->pool_lock);
+    sc->env_drops += drops;
+}
+
+static void stop_workers(ItilaSc *sc)
+{
+    if (sc->n_threads <= 1) return;
+    pthread_mutex_lock(&sc->pool_lock);
+    sc->pool_stop = 1;
+    pthread_cond_broadcast(&sc->pool_go);
+    pthread_mutex_unlock(&sc->pool_lock);
+    for (int k = 1; k < sc->n_threads; k++)
+        pthread_join(sc->workers[k], NULL);
+    sc->n_threads = 1;
+    sc->pool_stop = 0;
+}
+
+/* Split the per-bin DSP over n threads (1 = the calling thread only).
+ * Call before feeding, from the thread that feeds.  Returns the count in use. */
+int itila_sc_set_threads(ItilaSc *sc, int n)
+{
+    if (!sc) return 0;
+    if (n < 1) n = 1;
+    if (n > SC_MAX_THREADS) n = SC_MAX_THREADS;
+    pthread_mutex_lock(&sc->lock);
+    stop_workers(sc);
+    int started = 1;
+    for (int k = 1; k < n; k++) {
+        sc->worker_arg[k].sc = sc;
+        sc->worker_arg[k].stripe = k;
+        sc->worker_arg[k].seen = sc->pool_gen;
+        if (pthread_create(&sc->workers[k], NULL, scan_worker, &sc->worker_arg[k]) != 0)
+            break;
+        started++;
+    }
+    sc->n_threads = started;
+    pthread_mutex_unlock(&sc->lock);
+    return started;
+}
+
+/* Keep the last pre_len samples fed to the bins (n and pre_len are multiples of dec1). */
+static void preroll_push(ItilaSc *sc, const double *i_full, const double *q_full, int n)
+{
+    if (n >= sc->pre_len) {
+        memcpy(sc->pre_i, i_full + n - sc->pre_len, sc->pre_len * sizeof(double));
+        memcpy(sc->pre_q, q_full + n - sc->pre_len, sc->pre_len * sizeof(double));
+        sc->pre_n = sc->pre_len;
+        return;
+    }
+    int keep = sc->pre_len - n;
+    if (keep > sc->pre_n) keep = sc->pre_n;
+    memmove(sc->pre_i, sc->pre_i + sc->pre_n - keep, keep * sizeof(double));
+    memmove(sc->pre_q, sc->pre_q + sc->pre_n - keep, keep * sizeof(double));
+    memcpy(sc->pre_i + keep, i_full, n * sizeof(double));
+    memcpy(sc->pre_q + keep, q_full, n * sizeof(double));
+    sc->pre_n = keep + n;
 }
 
 /* ---- public API ---- */
@@ -556,7 +723,7 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
                           const double *sos100_flat, int n_sos,
                           const double *sos200_flat)
 {
-    /* SOS coefficients ignored — FIR chain replaces IIR.
+    /* SOS coefficients ignored - FIR chain replaces IIR.
      * Signature kept for backward compatibility with Python wrapper. */
     (void)sos100_flat; (void)n_sos; (void)sos200_flat;
     if (max_bins > SC_MAX_BINS) max_bins = SC_MAX_BINS;
@@ -564,11 +731,16 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
 
     ItilaSc *sc = (ItilaSc *)calloc(1, sizeof(ItilaSc));
     if (!sc) return NULL;
+    pthread_mutex_init(&sc->lock, NULL);       /* before anything that can fail into itila_sc_free */
+    pthread_mutex_init(&sc->pool_lock, NULL);
+    pthread_cond_init(&sc->pool_go, NULL);
+    pthread_cond_init(&sc->pool_done, NULL);
+    sc->n_threads = 1;
     switch (sample_rate) {
-    case 192000: sc->dec1 = 16; sc->fir1 = FIR_STAGE1;     sc->fir1_len = FIR_STAGE1_LEN;     break;
-    case 96000:  sc->dec1 = 8;  sc->fir1 = FIR_STAGE1_96K; sc->fir1_len = FIR_STAGE1_96K_LEN; break;
-    case 48000:  sc->dec1 = 4;  sc->fir1 = FIR_STAGE1_48K; sc->fir1_len = FIR_STAGE1_48K_LEN; break;
-    default:     free(sc); return NULL;
+    case 192000: sc->dec1 = 16; sc->fir1 = FIR1W_192K; sc->fir1_len = FIR1W_192K_LEN; break;
+    case 96000:  sc->dec1 = 8;  sc->fir1 = FIR1W_96K;  sc->fir1_len = FIR1W_96K_LEN;  break;
+    case 48000:  sc->dec1 = 4;  sc->fir1 = FIR1W_48K;  sc->fir1_len = FIR1W_48K_LEN;  break;
+    default:     itila_sc_free(sc); return NULL;
     }
     /* Scale the scan FFT with the rate: same bin width and scan period as 192 kHz */
     energy_win = energy_win * sc->dec1 / SC_DEC1;
@@ -583,10 +755,16 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     sc->band_min_hz    = band_min_hz;
     sc->band_max_hz    = band_max_hz;
 
+    double sum = 0.0;
+    for (int k = 0; k < SC_HANN_LEN; k++) { sc->hann[k] = 0.5 - 0.5 * cos(2.0 * M_PI * (k + 0.5) / SC_HANN_LEN); sum += sc->hann[k]; }
+    for (int k = 0; k < SC_HANN_LEN; k++) sc->hann[k] /= sum;
+
     sc->scan_i = (double *)calloc(energy_win, sizeof(double));
     sc->scan_q = (double *)calloc(energy_win, sizeof(double));
-    if (!sc->scan_i || !sc->scan_q) { itila_sc_free(sc); return NULL; }
-    pthread_mutex_init(&sc->lock, NULL);
+    sc->pre_len = (int)(SC_PREROLL_SEC * sample_rate) / sc->dec1 * sc->dec1;
+    sc->pre_i = (double *)calloc(sc->pre_len, sizeof(double));
+    sc->pre_q = (double *)calloc(sc->pre_len, sizeof(double));
+    if (!sc->scan_i || !sc->scan_q || !sc->pre_i || !sc->pre_q) { itila_sc_free(sc); return NULL; }
 
     return sc;
 }
@@ -594,11 +772,19 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
 void itila_sc_free(ItilaSc *sc)
 {
     if (!sc) return;
+    pthread_mutex_lock(&sc->lock);             /* wait out an in-flight feed */
+    stop_workers(sc);
     for (int i = 0; i < SC_MAX_BINS; i++)
         if (sc->bins[i].active) bin_free_decoders(sc, &sc->bins[i]);
+    pthread_mutex_unlock(&sc->lock);
     pthread_mutex_destroy(&sc->lock);
+    pthread_mutex_destroy(&sc->pool_lock);
+    pthread_cond_destroy(&sc->pool_go);
+    pthread_cond_destroy(&sc->pool_done);
     free(sc->scan_i);
     free(sc->scan_q);
+    free(sc->pre_i);
+    free(sc->pre_q);
     free(sc);
 }
 
@@ -649,7 +835,7 @@ void itila_sc_feed_iq(ItilaSc *sc,
 
     double *i_full = (double *)malloc(total * sizeof(double));
     double *q_full = (double *)malloc(total * sizeof(double));
-    if (!i_full || !q_full) { free(i_full); free(q_full); return; }
+    if (!i_full || !q_full) { free(i_full); free(q_full); pthread_mutex_unlock(&sc->lock); return; }
 
     memcpy(i_full,                  sc->iq_res_i, sc->iq_res_n * sizeof(double));
     memcpy(q_full,                  sc->iq_res_q, sc->iq_res_n * sizeof(double));
@@ -662,6 +848,8 @@ void itila_sc_feed_iq(ItilaSc *sc,
 
     if (n_dec1 > 0 && sc->n_bins > 0)
         process_bins(sc, i_full, q_full, n_dec1);
+    if (n_dec1 > 0)
+        preroll_push(sc, i_full, q_full, n_dec1);
 
     free(i_full);
     free(q_full);
@@ -764,7 +952,7 @@ void itila_sc_set_decoder(ItilaSc *sc,
     sc->dec_feed    = feed_fn;
     sc->dec_free    = free_fn;
     sc->dec_get_wpm = get_wpm_fn;
-    sc->dec_get_last_cost = NULL;  /* optional — set via itila_sc_set_cost_fn */
+    sc->dec_get_last_cost = NULL;  /* optional - set via itila_sc_set_cost_fn */
     sc->ev_thresh   = ev_thresh;
 }
 
@@ -832,7 +1020,7 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
                 if (!handles[p]) continue;
                 if (n_results >= max_results) break;
 
-                /* Copy env data to local buffer while under lock — drain
+                /* Copy env data to local buffer while under lock - drain
                  * thread will be writing to b->env100/env200 during the
                  * unlock window and we can't have dec_feed see torn data. */
                 double *src = (p == 0) ? b->env100 : b->env200;
@@ -882,11 +1070,11 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
             b->in_decode = 0;
             if (bin_evicted) break;
 
-            /* Shift envelope buffer — drain window_samples.  Drain may
+            /* Shift envelope buffer - drain window_samples.  Drain may
              * have appended more samples during the unlock window, so
              * we use the CURRENT b->env_n, not a pre-unlock cache. */
             int rem = b->env_n - window_samples;
-            if (rem < 0) rem = 0;  /* defensive — shouldn't happen */
+            if (rem < 0) rem = 0;  /* defensive - shouldn't happen */
             memmove(b->env100, b->env100 + window_samples, rem * sizeof(double));
             memmove(b->env200, b->env200 + window_samples, rem * sizeof(double));
             b->env_n = rem;
