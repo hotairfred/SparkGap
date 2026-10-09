@@ -152,10 +152,15 @@ struct ItilaSc {
     double band_min_hz;
     double band_max_hz;
     double hann[SC_HANN_LEN];
-    double *pre_i;             /* last SC_PREROLL_SEC of IQ fed to the bins */
+    double *pre_i;             /* ring: last SC_PREROLL_SEC of IQ fed to the bins */
     double *pre_q;
     int     pre_len;
-    int     pre_n;
+    int     pre_n;             /* samples in the ring (<= pre_len) */
+    int     pre_w;             /* next write position */
+    double *lin_i;             /* the ring in time order, built when a bin needs it */
+    double *lin_q;
+    int     lin_n;
+    int     preroll_pending;   /* a bin was spawned since lin_* was built */
     /* IIR SOS removed - replaced by per-bin FIR delay lines */
 
     double iq_res_i[SC_DEC1];
@@ -487,6 +492,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         bin->s_phase = 0.0;
         bin->snr_db  = peaks[i].snr;
         bin->need_preroll = 1;
+        sc->preroll_pending = 1;
         sc->n_bins++;
     }
     free(peaks);
@@ -604,7 +610,7 @@ static int process_stripe(ItilaSc *sc, int stripe, const double *i_full, const d
         if (!b->active) continue;
         if (b->need_preroll) {
             b->need_preroll = 0;
-            if (sc->pre_n > 0) drops += process_bin(sc, b, sc->pre_i, sc->pre_q, sc->pre_n);
+            if (sc->lin_n > 0) drops += process_bin(sc, b, sc->lin_i, sc->lin_q, sc->lin_n);
         }
         drops += process_bin(sc, b, i_full, q_full, n);
     }
@@ -635,8 +641,25 @@ static void *scan_worker(void *arg)
     }
 }
 
+/* Lay the pre-roll ring out in time order for the bins spawned since the last call. */
+static void preroll_linearize(ItilaSc *sc)
+{
+    /* Until the ring first fills, pre_w == pre_n and the data is already in order. */
+    int head  = sc->pre_n < sc->pre_len ? 0 : sc->pre_w;     /* oldest sample */
+    int first = sc->pre_n - head;                            /* head .. end of data */
+    memcpy(sc->lin_i, sc->pre_i + head, first * sizeof(double));
+    memcpy(sc->lin_q, sc->pre_q + head, first * sizeof(double));
+    memcpy(sc->lin_i + first, sc->pre_i, head * sizeof(double));
+    memcpy(sc->lin_q + first, sc->pre_q, head * sizeof(double));
+    sc->lin_n = sc->pre_n;
+}
+
 static void process_bins(ItilaSc *sc, const double *i_full, const double *q_full, int n)
 {
+    if (sc->preroll_pending) {
+        sc->preroll_pending = 0;
+        preroll_linearize(sc);
+    }
     if (sc->n_threads <= 1) {
         sc->env_drops += (uint64_t)process_stripe(sc, 0, i_full, q_full, n);
         return;
@@ -695,22 +718,24 @@ int itila_sc_set_threads(ItilaSc *sc, int n)
     return started;
 }
 
-/* Keep the last pre_len samples fed to the bins (n and pre_len are multiples of dec1). */
+/* Keep the last pre_len samples fed to the bins in a ring.  Copies only the new
+ * samples: the live C path feeds ~5 ms at a time, and shifting the whole 1 s buffer
+ * on every feed cost a large share of each band's drain thread. */
 static void preroll_push(ItilaSc *sc, const double *i_full, const double *q_full, int n)
 {
-    if (n >= sc->pre_len) {
-        memcpy(sc->pre_i, i_full + n - sc->pre_len, sc->pre_len * sizeof(double));
-        memcpy(sc->pre_q, q_full + n - sc->pre_len, sc->pre_len * sizeof(double));
-        sc->pre_n = sc->pre_len;
-        return;
+    if (n > sc->pre_len) {                 /* only the last pre_len samples matter */
+        i_full += n - sc->pre_len;
+        q_full += n - sc->pre_len;
+        n = sc->pre_len;
     }
-    int keep = sc->pre_len - n;
-    if (keep > sc->pre_n) keep = sc->pre_n;
-    memmove(sc->pre_i, sc->pre_i + sc->pre_n - keep, keep * sizeof(double));
-    memmove(sc->pre_q, sc->pre_q + sc->pre_n - keep, keep * sizeof(double));
-    memcpy(sc->pre_i + keep, i_full, n * sizeof(double));
-    memcpy(sc->pre_q + keep, q_full, n * sizeof(double));
-    sc->pre_n = keep + n;
+    int a = sc->pre_len - sc->pre_w;       /* room before the ring wraps */
+    if (a > n) a = n;
+    memcpy(sc->pre_i + sc->pre_w, i_full, a * sizeof(double));
+    memcpy(sc->pre_q + sc->pre_w, q_full, a * sizeof(double));
+    memcpy(sc->pre_i, i_full + a, (n - a) * sizeof(double));
+    memcpy(sc->pre_q, q_full + a, (n - a) * sizeof(double));
+    sc->pre_w = (sc->pre_w + n) % sc->pre_len;
+    sc->pre_n = sc->pre_n + n > sc->pre_len ? sc->pre_len : sc->pre_n + n;
 }
 
 /* ---- public API ---- */
@@ -764,7 +789,11 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     sc->pre_len = (int)(SC_PREROLL_SEC * sample_rate) / sc->dec1 * sc->dec1;
     sc->pre_i = (double *)calloc(sc->pre_len, sizeof(double));
     sc->pre_q = (double *)calloc(sc->pre_len, sizeof(double));
-    if (!sc->scan_i || !sc->scan_q || !sc->pre_i || !sc->pre_q) { itila_sc_free(sc); return NULL; }
+    sc->lin_i = (double *)calloc(sc->pre_len, sizeof(double));
+    sc->lin_q = (double *)calloc(sc->pre_len, sizeof(double));
+    if (!sc->scan_i || !sc->scan_q || !sc->pre_i || !sc->pre_q || !sc->lin_i || !sc->lin_q) {
+        itila_sc_free(sc); return NULL;
+    }
 
     return sc;
 }
@@ -785,6 +814,8 @@ void itila_sc_free(ItilaSc *sc)
     free(sc->scan_q);
     free(sc->pre_i);
     free(sc->pre_q);
+    free(sc->lin_i);
+    free(sc->lin_q);
     free(sc);
 }
 
