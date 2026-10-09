@@ -42,6 +42,15 @@ _lib.itila2_test_estimate_wpm.argtypes = [
 ]
 _lib.itila2_test_estimate_wpm.restype = ctypes.c_double
 
+_lib.itila2_test_pitch_wpm.argtypes = [
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_double,
+    ctypes.c_double,
+]
+_lib.itila2_test_pitch_wpm.restype = ctypes.c_double
+
 # W6TED, 24 WPM, bin 14059.0, 20m run 2 (2026-09-22): the complete run list of the
 # window that decoded 'W6TED ? DE W6 TE D', captured with ITILA2_DUMP_RUNS. Dits are
 # 11 to 12 samples, dahs 33 to 34; the EM unit that day was 4.00.
@@ -351,3 +360,29 @@ def test_letter_word_farnsworth_10wpm() -> None:
     boundary, fitted = call_fit_letter_word(W1AW_10_RUNS, 18.64)
     assert fitted == 1
     assert 109.0 < boundary < 256.0
+
+
+# N3QE, bin 7032.4, 40m CWT 2026-10-08 03:06Z: the first 60 runs of a window. Per-over
+# measurement from the IQ gives a 33 ms dit (36 WPM, CW Skimmer 34); itila2 marks
+# read 8 and 22 samples with 5 to 6 sample element gaps, so marks alone say 30 WPM.
+N3QE_RUNS = (
+    "-202 +23 -19 +8 -6 +8 -6 +22 -40 +22 -6 +8 -19 +9 -5 +9 -5 +9 -5 +22 -6 +22 "
+    "-19 +22 -6 +22 -5 +9 -5 +23 -19 +8 -756 +23 -5 +8 -6 +22 -19 +9 -5 +22 -6 +22 "
+    "-5 +22 -6 +22 -19 +23 -5 +8 -6 +8 -20 +8 -5 +23 -5 +22"
+)
+
+
+def call_pitch_wpm(spec: str, dit_dah: float, elem_letter: float) -> float:
+    is_mark, dur = runs(spec)
+    n = len(is_mark)
+    return _lib.itila2_test_pitch_wpm(
+        (ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, dit_dah, elem_letter
+    )
+
+
+def test_pitch_wpm_n3qe() -> None:
+    assert 33.0 < call_pitch_wpm(N3QE_RUNS, 14.0, 12.0) < 37.0
+
+
+def test_pitch_wpm_too_few() -> None:
+    assert call_pitch_wpm("-100 +8 -6 +8 -6 +22 -100", 14.0, 12.0) == 0.0
