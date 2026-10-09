@@ -1618,15 +1618,18 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     double A, noise_mean, sigma2_obs, wpm_em;
     em_estimate(st, envelope, n, st->ws_wpm, &A, &noise_mean, &sigma2_obs, &wpm_em);
 
-    /* Evidence ratio, calls decode_marginal internally */
-    double log_bf = signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
+    /* Separation first: a window under SEP_MIN fails whatever its evidence, so the
+     * 16-speed forward-backward (decode_marginal) runs only when it can matter. */
     double sep = (A - noise_mean) / sqrt(sigma2_obs);
+    double log_bf = sep < SEP_MIN ? -INFINITY
+                  : signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
     if ((log_bf < ev_thresh || sep < SEP_MIN) && carry > 0 && n > carry + FLUSH_MARGIN) {
         /* The signal ended: decode the carried word with a little silence after it. */
         n = carry + FLUSH_MARGIN;
         em_estimate(st, envelope, n, st->ws_wpm, &A, &noise_mean, &sigma2_obs, &wpm_em);
-        log_bf = signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
         sep = (A - noise_mean) / sqrt(sigma2_obs);
+        log_bf = sep < SEP_MIN ? -INFINITY
+               : signal_evidence_ratio(st, envelope, n, A, noise_mean, sigma2_obs);
     }
     if (log_bf < ev_thresh || sep < SEP_MIN) return st->result_buf;
 
