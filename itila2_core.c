@@ -1443,6 +1443,65 @@ static int find_carry_cut(itila_state_t *st, const int8_t *marks, int T, double 
 /* -------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------- */
+/* Decode scratch. Every buffer below is written before it is read within one call, so a
+ * set per thread serves all handles: per-handle memory drops from about 1.6 MB to the
+ * carry. Per-thread, not shared (same reason the statics moved per handle on 2026-04-26).
+ * Bound on entry to each decode call; one set per thread, freed with the process. */
+static int alloc_scratch(itila_state_t *s) {
+    s->log_B      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->log_alpha  = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->log_beta   = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->gamma      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->gamma_marg = (double*)malloc(MAX_ENV * 2 * sizeof(double));
+    s->env_norm   = (double*)malloc(MAX_ENV     * sizeof(double));
+    s->marks      = (int8_t*)malloc(MAX_ENV     * sizeof(int8_t));
+    s->sc_runs      = (run_t*)       malloc(MAX_ENV * sizeof(run_t));
+    s->sc_beamA     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    s->sc_beamB     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    s->sc_dedup     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
+    s->sc_up        = (char*)        malloc(MAX_TEXT * sizeof(char));
+    s->sc_tokens    = malloc(256 * (MAX_CALL + 4));
+    s->sc_calls     = (callsign_t*)  malloc(MAX_CALLS * sizeof(callsign_t));
+    s->sc_out_texts = malloc(MAX_TEXTS * MAX_TEXT);
+    s->sc_primary   = (char*)        malloc(MAX_TEXT * sizeof(char));
+    s->feed_env     = (double*)      malloc(MAX_ENV * sizeof(double));
+    s->feed_raw     = (double*)      malloc(MAX_ENV * sizeof(double));
+    return s->log_B && s->log_alpha && s->log_beta && s->gamma && s->gamma_marg &&
+           s->env_norm && s->marks && s->sc_runs && s->sc_beamA && s->sc_beamB &&
+           s->sc_dedup && s->sc_up && s->sc_tokens && s->sc_calls && s->sc_out_texts &&
+           s->sc_primary && s->feed_env && s->feed_raw;
+}
+
+static void free_scratch(itila_state_t *s) {
+    free(s->log_B); free(s->log_alpha); free(s->log_beta);
+    free(s->gamma); free(s->gamma_marg); free(s->env_norm); free(s->marks);
+    free(s->sc_runs);
+    free(s->sc_beamA); free(s->sc_beamB); free(s->sc_dedup);
+    free(s->sc_up); free(s->sc_tokens);
+    free(s->sc_calls); free(s->sc_out_texts); free(s->sc_primary);
+    free(s->feed_env); free(s->feed_raw);
+}
+
+static _Thread_local itila_state_t *tl_scratch;
+
+static int bind_scratch(itila_state_t *st) {
+    itila_state_t *s = tl_scratch;
+    if (!s) {
+        s = (itila_state_t*)calloc(1, sizeof(itila_state_t));
+        if (!s) return 0;
+        if (!alloc_scratch(s)) { free_scratch(s); free(s); return 0; }
+        tl_scratch = s;
+    }
+    st->log_B = s->log_B; st->log_alpha = s->log_alpha; st->log_beta = s->log_beta;
+    st->gamma = s->gamma; st->gamma_marg = s->gamma_marg; st->env_norm = s->env_norm;
+    st->marks = s->marks; st->sc_runs = s->sc_runs;
+    st->sc_beamA = s->sc_beamA; st->sc_beamB = s->sc_beamB; st->sc_dedup = s->sc_dedup;
+    st->sc_up = s->sc_up; st->sc_tokens = s->sc_tokens; st->sc_calls = s->sc_calls;
+    st->sc_out_texts = s->sc_out_texts; st->sc_primary = s->sc_primary;
+    st->feed_env = s->feed_env; st->feed_raw = s->feed_raw;
+    return 1;
+}
+
 itila_t itila_create(int sample_rate, double lpf_hz) {
     itila_state_t *st = (itila_state_t*)calloc(1, sizeof(itila_state_t));
     if (!st) return NULL;
@@ -1451,35 +1510,8 @@ itila_t itila_create(int sample_rate, double lpf_hz) {
     st->lpf_hz      = lpf_hz;
     st->last_timing_cost = 999.0;  /* sentinel: no decode yet */
 
-    st->log_B      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->log_alpha  = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->log_beta   = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->gamma      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->gamma_marg = (double*)malloc(MAX_ENV * 2 * sizeof(double));
-    st->env_norm   = (double*)malloc(MAX_ENV     * sizeof(double));
-    st->marks      = (int8_t*)malloc(MAX_ENV     * sizeof(int8_t));
-
-    /* Per-handle scratch, replaces function-local statics for thread safety. */
-    st->sc_runs      = (run_t*)       malloc(MAX_ENV * sizeof(run_t));
-    st->sc_beamA     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
-    st->sc_beamB     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
-    st->sc_dedup     = (beam_state_t*)malloc(MAX_BEAM * sizeof(beam_state_t));
-    st->sc_up        = (char*)        malloc(MAX_TEXT * sizeof(char));
-    st->sc_tokens    = malloc(256 * (MAX_CALL + 4));
-    st->sc_calls     = (callsign_t*)  malloc(MAX_CALLS * sizeof(callsign_t));
-    st->sc_out_texts = malloc(MAX_TEXTS * MAX_TEXT);
-    st->sc_primary   = (char*)        malloc(MAX_TEXT * sizeof(char));
     st->carry_env    = (double*)      malloc(CARRY_MAX * sizeof(double));
-    st->feed_env     = (double*)      malloc(MAX_ENV * sizeof(double));
-    st->feed_raw     = (double*)      malloc(MAX_ENV * sizeof(double));
-
-    if (!st->log_B || !st->log_alpha || !st->log_beta ||
-        !st->gamma || !st->gamma_marg || !st->env_norm || !st->marks ||
-        !st->sc_runs || !st->sc_beamA || !st->sc_beamB || !st->sc_dedup ||
-        !st->sc_up || !st->sc_tokens || !st->sc_calls ||
-        !st->sc_out_texts || !st->sc_primary || !st->carry_env || !st->feed_env || !st->feed_raw) {
-        itila_free(st); return NULL;
-    }
+    if (!st->carry_env) { itila_free(st); return NULL; }
 
     /* Speed bins: linspace(WPM_MIN, WPM_MAX, N_SPEED_BINS) */
     for (int i = 0; i < N_SPEED_BINS; i++)
@@ -1569,6 +1601,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 {
     itila_state_t *st = (itila_state_t*)h;
     st->result_buf[0] = '\0';
+    if (!bind_scratch(st)) return st->result_buf;
 
     int carry = st->carry_n;
     st->carry_n = 0;
@@ -1678,6 +1711,7 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
 {
     itila_state_t *st = (itila_state_t*)h;
     st->result_buf[0] = '\0';
+    if (!bind_scratch(st)) return st->result_buf;
     if (n < 10 || n > MAX_ENV) return st->result_buf;
     level_follow(st, envelope, n, st->feed_env);
     envelope = st->feed_env;
@@ -1875,13 +1909,7 @@ double itila_get_last_cost(itila_t h) {
 void itila_free(itila_t h) {
     if (!h) return;
     itila_state_t *st = (itila_state_t*)h;
-    free(st->log_B); free(st->log_alpha); free(st->log_beta);
-    free(st->gamma); free(st->gamma_marg); free(st->env_norm); free(st->marks);
-    free(st->sc_runs);
-    free(st->sc_beamA); free(st->sc_beamB); free(st->sc_dedup);
-    free(st->sc_up); free(st->sc_tokens);
-    free(st->sc_calls); free(st->sc_out_texts); free(st->sc_primary);
-    free(st->carry_env); free(st->feed_env); free(st->feed_raw);
+    free(st->carry_env);
     free(st);
 }
 
@@ -1894,6 +1922,7 @@ double itila_get_wpm(itila_t h) {
 void itila_debug_em(itila_t h, const double* envelope, int n,
                     double *A_out, double *nm_out, double *s2_out, double *wpm_out) {
     itila_state_t *st = (itila_state_t*)h;
+    if (!bind_scratch(st)) return;
     em_estimate(st, envelope, n, 0.0, A_out, nm_out, s2_out, wpm_out);
 }
 
@@ -1922,7 +1951,7 @@ double itila2_test_pitch_wpm(const int *is_mark, const int *dur, int n,
 int itila2_test_gate_segments(const double *env, int8_t *marks, int n, double A, double nm,
                               double s2, double unit) {
     itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
-    if (!st || n < 1 || n > MAX_ENV) { if (st) itila_free(st); return -1; }
+    if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
     memcpy(st->marks, marks, (size_t)n);
     gate_segments(st, env, n, A, nm, s2, unit);
     memcpy(marks, st->marks, (size_t)n);

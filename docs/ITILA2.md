@@ -57,6 +57,7 @@ Shared with itila: the 200 Hz envelope, a two-state HMM (mark, space) whose para
 | Per-bin memory | none | last fitted dit and dah kept per handle, used when a window has too few marks to fit (DC1) | Short windows no longer fall back to a wrong unit |
 | Reported WPM | EM speed estimate | median of mark plus following element gap (2 units after a dit, 4 after a dah); the EM estimate when a window has fewer than 8 | The level decision lengthens marks and shortens gaps by the same amount, so marks alone read slow: 40m CWT spots were 0.79x CW Skimmer's WPM, now 1.00x, 112 of 129 within 3 WPM. Decoding is unchanged |
 | Noise inside a window | a window that passes the evidence test is decoded whole | keying between pauses of 5 units (fastest speed) is scored alone against noise; segments under `SEG_RATE_MIN` (300 log BF per second) are blanked before the beam | Noise stretches in a passing window decoded as E, I, S, 5 strings. 20m h2h: SparkGap-only call strings 448 to 169, dit noise 200 to 6, calls both CW Skimmers decoded 76 to 77; WX7V/5 calls held on 40m CWT (77), 20m 10-06 (8), 20m CWT 09-23 (49); W1AW unchanged; log -30 to -60%; CPU +6 to +9% |
+| Decode buffers | per handle, about 1.6 MB each (two handles per bin) | one set per decode thread; a handle keeps only its carry and fitted values | Memory grew with every bin on a busy band. 200 handles 325 MB to 8.5 MB; replay peak 2,055 to 1,202 MB on the 40m CWT; every decoded line identical on the 20m hour, 40m CWT and W1AW |
 
 ## Spot rule
 
