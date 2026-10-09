@@ -73,6 +73,8 @@
 #define GAP_BRANCH    3.0   /* keep a gap class within this many nats of the best */
 #define TOKEN_PRIOR   2.0   /* log bonus for a callsign-shaped token or a common word */
 #define SYM_BAD       2.0   /* log penalty for a symbol that is no character */
+#define SEG_RATE_MIN 300.0  /* log BF per second a keyed segment needs to be decoded: real copy
+                             * >= 1500 at p10, dit noise median 91 (20m h2h 2026-10-08) */
 #define SEP_MIN      1.5    /* mark level this many noise sigmas above the noise, or no CW:
                              * EM fits noise at 0.5 to 1; no confirmed call below 1.5 (A/B 2026-09-22) */
 
@@ -1516,6 +1518,52 @@ static void level_follow(itila_state_t *st, const double *x, int n, double *y) {
     }
 }
 
+/* Blank the marks of segments that are not CW. A segment is keying between pauses of 5 units
+ * or more of the fastest speed candidate; its log Bayes factor (fresh forward pass, mean over the speed bins, against all
+ * noise) must reach SEG_RATE_MIN per second. Marks at or after n_dec (the carry) are kept. */
+static void gate_segments(itila_state_t *st, const double *env, int n_dec, double A, double nm,
+                          double s2, double unit) {
+    int gap = (int)(5.0 * unit), pad = (int)unit;
+    double lc = -0.5 * log(2.0 * M_PI * s2);
+    int t = 0;
+    while (t < n_dec) {
+        while (t < n_dec && !st->marks[t]) t++;
+        if (t >= n_dec) break;
+        int t0 = t, last = t, sp = 0;
+        for (; t < n_dec; t++) {
+            if (st->marks[t]) { last = t; sp = 0; }
+            else if (++sp >= gap) break;
+        }
+        int a = t0 - pad < 0 ? 0 : t0 - pad;
+        int b = last + 1 + pad > n_dec ? n_dec : last + 1 + pad;
+        int len = b - a;
+        double lbf = -INFINITY;
+        if (len >= 2) {
+            double noise = 0.0;
+            for (int i = 0; i < len; i++) {
+                double x = env[a + i];
+                st->log_B[i*2+0] = lc - 0.5*(x-nm)*(x-nm)/s2;
+                st->log_B[i*2+1] = lc - 0.5*(x-A)*(x-A)/s2;
+                noise += st->log_B[i*2+0];
+            }
+            double lz[N_SPEED_BINS], lmax = -INFINITY;
+            for (int k = 0; k < N_SPEED_BINS; k++) {
+                double p01, p10;
+                transition_probs(st->speed_bins[k], &p01, &p10);
+                double lT[4] = { log(1.0 - p01 + 1e-300), log(p01 + 1e-300),
+                                 log(p10 + 1e-300), log(1.0 - p10 + 1e-300) };
+                fb_core(st->log_B, lT, len, st->log_alpha, st->log_beta, &lz[k]);
+                if (lz[k] > lmax) lmax = lz[k];
+            }
+            double se = 0.0;
+            for (int k = 0; k < N_SPEED_BINS; k++) se += exp(lz[k] - lmax);
+            lbf = lmax + log(se / N_SPEED_BINS) - noise;
+        }
+        if (lbf < SEG_RATE_MIN * len / (double)BAYES_RATE)
+            memset(st->marks + t0, 0, (size_t)(last + 1 - t0));
+    }
+}
+
 const char* itila_feed(itila_t h, const double* envelope, int n,
                        double freq_khz, double ev_thresh)
 {
@@ -1567,6 +1615,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
     st->carry_n = n - n_dec;
     memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
+    gate_segments(st, envelope, n_dec, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]));
 
     /* Per-handle scratch, was function-local static; live mode races. */
     callsign_t *calls = st->sc_calls;
@@ -1867,6 +1916,20 @@ double itila2_test_pitch_wpm(const int *is_mark, const int *dur, int n,
     double wpm = pitch_wpm(runs, n, dit_dah, elem_letter);
     free(runs);
     return wpm;
+}
+
+/* Returns the number of marks gate_segments kept; marks is updated in place. */
+int itila2_test_gate_segments(const double *env, int8_t *marks, int n, double A, double nm,
+                              double s2, double unit) {
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    if (!st || n < 1 || n > MAX_ENV) { if (st) itila_free(st); return -1; }
+    memcpy(st->marks, marks, (size_t)n);
+    gate_segments(st, env, n, A, nm, s2, unit);
+    memcpy(marks, st->marks, (size_t)n);
+    int kept = 0;
+    for (int i = 0; i < n; i++) kept += marks[i];
+    itila_free(st);
+    return kept;
 }
 
 double itila2_test_fit_letter_word(const int *is_mark, const int *dur, int n,
