@@ -60,12 +60,19 @@
 #define UNIT_FIT_MIN_MARKS   8     /* fewer interior marks: keep the passed unit */
 #define UNIT_FIT_ITERS       10    /* fixed 2-means iterations, deterministic */
 #define UNIT_FIT_RATIO_MIN   2.0   /* dah/dit outside this range: not two mark classes */
-#define UNIT_FIT_RATIO_MAX   4.5
+#define UNIT_FIT_RATIO_MAX   6.0   /* bugs and weighted keyers send dahs up to 6 dits (KZ8R 4.6) */
 #define UNIT_FIT_NOISE_FRAC  0.5   /* marks shorter than this fraction of the median are noise */
 #define UNIT_FIT_SOLO_LO     0.7   /* one-cluster case: accept only if near the passed unit */
 #define UNIT_FIT_SOLO_HI     1.4
+#define PITCH_MIN_N          8     /* fewer element pitches: report the WPM estimate */
 #define CARRY_MAX    4000   /* 20 s: longest unfinished word carried into the next window */
 #define FLUSH_MARGIN 1000   /* 5 s decoded after a carried word when the signal ends */
+#define GAP_SD_ELEM   0.45  /* log-normal spread of element, letter and word gaps */
+#define GAP_SD_LETTER 0.30
+#define GAP_SD_WORD   0.35
+#define GAP_BRANCH    3.0   /* keep a gap class within this many nats of the best */
+#define TOKEN_PRIOR   2.0   /* log bonus for a callsign-shaped token or a common word */
+#define SYM_BAD       2.0   /* log penalty for a symbol that is no character */
 #define SEP_MIN      1.5    /* mark level this many noise sigmas above the noise, or no CW:
                              * EM fits noise at 0.5 to 1; no confirmed call below 1.5 (A/B 2026-09-22) */
 
@@ -124,8 +131,10 @@ typedef struct {
      * the next one so nothing sent across a window edge is split. */
     double       *carry_env;        /* CARRY_MAX */
     int           carry_n;
-    double       *feed_env;         /* MAX_ENV, carry + new window */
+    double       *feed_env;         /* MAX_ENV, carry + new window, level-normalised */
+    double       *feed_raw;         /* MAX_ENV, carry + new window as received */
     double        lw_units_prev;    /* last fitted letter/word boundary, in units */
+    double        dit_prev, dah_prev; /* last two-class mark fit on this handle, samples */
 
     /* Speed bins */
     double speed_bins[N_SPEED_BINS];
@@ -158,6 +167,7 @@ typedef struct {
     /* Output */
     char result_buf[RESULT_BUF];
     double last_wpm;          /* WPM from most recent successful decode */
+    double pitch_wpm;         /* WPM from mark + element gap pitch, 0 if too few */
     double last_timing_cost;  /* ggmorse-inspired confidence score: sum of
                                * squared deviations from canonical Morse
                                * timing on the most recent decode's run list.
@@ -830,6 +840,22 @@ static double compute_timing_cost(const int8_t *marks, int T, double wpm,
  * decode_runs_beam: M7b score-guided beam search
  * (beam_state_t typedef hoisted to top of file, see itila_state_t)
  * ---------------------------------------------------------------------- */
+/* WPM from each mark plus the element gap after it (2 units after a dit, 4 after a
+ * dah).  The level decision lengthens marks and shortens gaps by the same amount,
+ * so the pitch keeps the sender's speed where mark lengths alone read slow.
+ * Returns 0 when fewer than PITCH_MIN_N pitches. */
+static double pitch_wpm(const run_t *runs, int n_runs, double dit_dah, double elem_letter) {
+    double p[2048];
+    int np = 0;
+    for (int i = 1; i + 2 < n_runs && np < 2048; i++) {
+        if (!runs[i].is_mark || runs[i + 1].dur >= elem_letter) continue;
+        p[np++] = (runs[i].dur + runs[i + 1].dur) / (runs[i].dur < dit_dah ? 2.0 : 4.0);
+    }
+    if (np < PITCH_MIN_N) return 0.0;
+    qsort(p, np, sizeof(double), cmp_double);
+    return 1.2 * BAYES_RATE / p[np / 2];
+}
+
 /* Dit length in samples fitted from this window's own mark runs.  Used only for
  * the space thresholds; the dit/dah boundary and the beam likelihoods keep the
  * unit derived from the WPM estimate.  Returns unit_in when the marks do not
@@ -866,10 +892,7 @@ static double fit_unit(const run_t *runs, int n_runs, double unit_in, int *fitte
             x[n_surv++] = log(d[i]);
         }
 
-        if (n_surv < UNIT_FIT_MIN_MARKS) {
-            if (pass == 0) { *fitted = 0; *dah_out = 0.0; return unit_in; }
-            continue;
-        }
+        if (n_surv < UNIT_FIT_MIN_MARKS) continue;
 
         qsort(x, n_surv, sizeof(double), cmp_double);
         double median_log = (n_surv % 2)
@@ -974,6 +997,58 @@ static double letter_word_boundary(itila_state_t *st, const run_t *runs, int n_r
     return b;
 }
 
+static int is_callsign(const char *s);
+
+/* Most legal marks of the window lie within 1.5x of the given dit or dah. */
+static int marks_match(const run_t *runs, int n_runs, double dit, double dah) {
+    int n = 0, near = 0;
+    double lim = log(1.5);
+    for (int i = 1; i < n_runs - 1; i++) {
+        if (!runs[i].is_mark || runs[i].dur < MIN_MARK_RUN) continue;
+        double x = log((double)runs[i].dur);
+        n++;
+        if (fabs(x - log(dit)) < lim || fabs(x - log(dah)) < lim) near++;
+    }
+    return n >= 2 && near * 4 >= n * 3;
+}
+
+static double ln_ll(double x, double mu, double sd) {
+    double z = (log(x) - log(mu)) / sd;
+    return -0.5 * z * z;
+}
+
+static const char *COMMON_WORDS[] = {
+    "CQ", "DE", "TU", "5NN", "599", "RST", "UR", "BK", "TEST", "QRZ", "AGN", "ES",
+    "GM", "GA", "GE", "OP", "NAME", "QTH", "HR", "FB", "73", "NR", "TNX", "PSE", "SKCC", NULL
+};
+
+/* Prior on the last token of txt: callsigns and common words are likely. */
+static double token_prior(const char *txt) {
+    const char *t = strrchr(txt, ' ');
+    t = t ? t + 1 : txt;
+    if (!*t || strchr(t, '?')) return 0.0;
+    if (is_callsign(t)) return TOKEN_PRIOR;
+    for (int i = 0; COMMON_WORDS[i]; i++)
+        if (strcmp(t, COMMON_WORDS[i]) == 0) return TOKEN_PRIOR;
+    return 0.0;
+}
+
+/* Close the pending symbol of a hypothesis, with its prior. */
+static void close_sym(beam_state_t *s) {
+    if (!s->sym[0]) return;
+    if (morse_lookup(s->sym) == '?') s->score -= SYM_BAD;
+    append_sym(s->txt, strlen(s->txt), s->sym);
+    s->sym[0] = '\0';
+}
+
+static void close_word(beam_state_t *s) {
+    close_sym(s);
+    int tl = strlen(s->txt);
+    if (tl == 0 || s->txt[tl - 1] == ' ') return;
+    s->score += token_prior(s->txt);
+    if (tl < MAX_TEXT - 1) { s->txt[tl] = ' '; s->txt[tl + 1] = '\0'; }
+}
+
 static int beam_score_cmp(const void *a, const void *b) {
     double sa = ((const beam_state_t*)a)->score;
     double sb = ((const beam_state_t*)b)->score;
@@ -983,6 +1058,9 @@ static int beam_score_cmp(const void *a, const void *b) {
 /* Returns number of texts written into out_texts (each MAX_TEXT chars).
  * st provides per-handle scratch buffers (sc_runs, sc_beamA, sc_beamB,
  * sc_dedup) that used to be function-local statics. */
+#define DESPECKLE_UNITS 0.4   /* runs shorter than this many units (rounded) are absorbed;
+                                 * rounding up instead cost 3 confirmed CWT spots */
+
 static int decode_runs_beam(
     itila_state_t *st,
     const int8_t *marks, int T,
@@ -1009,9 +1087,38 @@ static int decode_runs_beam(
     }
     if (n_runs < MAX_ENV) { runs[n_runs].is_mark=val; runs[n_runs].dur=cnt; n_runs++; }
 
+    {   /* A run shorter than DESPECKLE_UNITS is not an element or a gap: absorb it into
+         * its neighbours, shortest first.  One linear pass per length. */
+        int minlen = (int)(DESPECKLE_UNITS * unit + 0.5);
+        for (int len = 1; len < minlen && n_runs >= 2; len++) {
+            int w = 0;
+            for (int i = 0; i < n_runs; i++) {
+                run_t r = runs[i];
+                if (r.dur == len && w > 0 && i + 1 < n_runs) {
+                    /* internal: previous run absorbs this one and the next */
+                    runs[w - 1].dur += r.dur + runs[i + 1].dur; i++; continue;
+                }
+                if (r.dur == len && (w == 0 || i + 1 == n_runs)) {
+                    /* edge: becomes part of its only neighbour */
+                    if (w > 0) { runs[w - 1].dur += r.dur; continue; }
+                    if (i + 1 < n_runs) { runs[i + 1].dur += r.dur; continue; }
+                }
+                if (w > 0 && runs[w - 1].is_mark == r.is_mark) runs[w - 1].dur += r.dur;
+                else runs[w++] = r;
+            }
+            n_runs = w;
+        }
+    }
+
     int unit_fitted = 0;
     double dah_sp = 0.0;
     double unit_sp = fit_unit(runs, n_runs, unit, &unit_fitted, &dah_sp);   /* space thresholds only */
+    if (unit_fitted && dah_sp > 0.0) {
+        st->dit_prev = unit_sp; st->dah_prev = dah_sp;
+    } else if (st->dit_prev > 0.0 && marks_match(runs, n_runs, st->dit_prev, st->dah_prev)) {
+        /* Too few marks to fit, but they are this bin's last fitted dits and dahs. */
+        unit_sp = st->dit_prev; dah_sp = st->dah_prev; unit_fitted = 1;
+    }
     if (unit_sp_out) *unit_sp_out = unit_sp;
 
     int lw_fitted = 0;
@@ -1026,6 +1133,26 @@ static int decode_runs_beam(
         zone_lo  = boundary * 0.75;
         zone_hi  = boundary * 1.25;
     }
+
+    /* Letter and word gap centres from this window's gaps (idle time excluded),
+     * standard 3 and 7 units when there are too few. */
+    double gap_l = 3.0 * unit_sp, gap_w = 7.0 * unit_sp;
+    {
+        double *g = st->log_B;  /* scratch, free in the beam stage */
+        int ng = 0;
+        for (int i = 1; i < n_runs - 1 && ng < MAX_ENV; i++)
+            if (!runs[i].is_mark && runs[i].dur >= 2.0 * unit_sp) g[ng++] = runs[i].dur;
+        if (ng >= GAP_FIT_MIN_GAPS) {
+            qsort(g, ng, sizeof(double), cmp_double);
+            double idle = g[(ng - 1) / 4] * GAP_FIT_IDLE_X;
+            while (ng > 0 && g[ng - 1] > idle) ng--;
+        }
+        if (ng >= GAP_FIT_MIN_GAPS) {
+            gap_l = g[(ng - 1) * 2 / 5];
+            gap_w = fmax(gap_l * 7.0 / 3.0, g[(ng - 1) * 9 / 10]);
+        }
+    }
+    st->pitch_wpm = pitch_wpm(runs, n_runs, boundary, sqrt(unit_sp * gap_l));
 
     if (getenv("ITILA2_DUMP_RUNS")) {
         fprintf(stderr, "ITILA2 runs %.1f kHz wpm=%.1f unit=%.2f usp=%.2f%s dah=%.2f lw=%.1f%s n=%d:",
@@ -1098,38 +1225,55 @@ static int decode_runs_beam(
                 }
             }
         } else {
-            /* Space */
-            if ((double)dur < 2.0*unit_sp) {
-                /* element space, no change */
-            } else if ((double)dur < letter_word) {
-                /* letter space: emit symbol */
+            /* Space: element, letter or word gap by duration likelihood,
+             * both kept when close so the character and token priors decide. */
+            double d = (double)dur;
+            double ll[3] = { ln_ll(d, unit_sp, GAP_SD_ELEM), ln_ll(d, gap_l, GAP_SD_LETTER),
+                             d >= gap_w ? 0.0 : ln_ll(d, gap_w, GAP_SD_WORD) };
+            (void)letter_word;
+            int kbest = 0;
+            for (int k = 1; k < 3; k++) if (ll[k] > ll[kbest]) kbest = k;
+            int n_keep = 0;
+            for (int k = 0; k < 3; k++) if (ll[k] >= ll[kbest] - GAP_BRANCH) n_keep++;
+            if (n_keep == 1) {
                 for (int i = 0; i < beam_sz; i++) {
-                    if (beam[i].sym[0]) {
-                        append_sym(beam[i].txt, strlen(beam[i].txt), beam[i].sym);
-                        beam[i].sym[0] = '\0';
-                    }
+                    if (kbest == 1) close_sym(&beam[i]);
+                    else if (kbest == 2) close_word(&beam[i]);
                 }
             } else {
-                /* word space */
-                for (int i = 0; i < beam_sz; i++) {
-                    int tl = strlen(beam[i].txt);
-                    if (beam[i].sym[0]) {
-                        tl = append_sym(beam[i].txt, tl, beam[i].sym);
-                        beam[i].sym[0] = '\0';
+                int next_sz = 0;
+                for (int i = 0; i < beam_sz; i++)
+                    for (int k = 0; k < 3 && next_sz < MAX_BEAM; k++) {
+                        if (ll[k] < ll[kbest] - GAP_BRANCH) continue;
+                        beam_state_t *s1 = &next[next_sz++];
+                        *s1 = beam[i];
+                        s1->score += ll[k] - ll[kbest];
+                        if (k == 1) close_sym(s1);
+                        else if (k == 2) close_word(s1);
                     }
-                    if (tl < MAX_TEXT-1) { beam[i].txt[tl]=' '; beam[i].txt[tl+1]='\0'; }
+                qsort(next, next_sz, sizeof(beam_state_t), beam_score_cmp);
+                if (next_sz > MAX_TEXTS) next_sz = MAX_TEXTS;
+                int dedup_sz = 0;
+                beam_state_t *dedup_buf = st->sc_dedup;
+                for (int i = 0; i < next_sz; i++) {
+                    int dup = 0;
+                    for (int j = 0; j < dedup_sz; j++)
+                        if (strcmp(next[i].sym, dedup_buf[j].sym)==0 &&
+                            strcmp(next[i].txt, dedup_buf[j].txt)==0) { dup=1; break; }
+                    if (!dup && dedup_sz < MAX_BEAM) dedup_buf[dedup_sz++] = next[i];
                 }
+                beam_sz = dedup_sz;
+                memcpy(beam, dedup_buf, beam_sz * sizeof(beam_state_t));
             }
         }
     }
 
-    /* Flush remaining symbols */
+    /* Flush remaining symbols and score the last token */
     for (int i = 0; i < beam_sz; i++) {
-        if (beam[i].sym[0]) {
-            append_sym(beam[i].txt, strlen(beam[i].txt), beam[i].sym);
-            beam[i].sym[0] = '\0';
-        }
+        close_sym(&beam[i]);
+        beam[i].score += token_prior(beam[i].txt);
     }
+    qsort(beam, beam_sz, sizeof(beam_state_t), beam_score_cmp);
 
     /* Deduplicate final texts */
     int n_out = 0;
@@ -1325,12 +1469,13 @@ itila_t itila_create(int sample_rate, double lpf_hz) {
     st->sc_primary   = (char*)        malloc(MAX_TEXT * sizeof(char));
     st->carry_env    = (double*)      malloc(CARRY_MAX * sizeof(double));
     st->feed_env     = (double*)      malloc(MAX_ENV * sizeof(double));
+    st->feed_raw     = (double*)      malloc(MAX_ENV * sizeof(double));
 
     if (!st->log_B || !st->log_alpha || !st->log_beta ||
         !st->gamma || !st->gamma_marg || !st->env_norm || !st->marks ||
         !st->sc_runs || !st->sc_beamA || !st->sc_beamB || !st->sc_dedup ||
         !st->sc_up || !st->sc_tokens || !st->sc_calls ||
-        !st->sc_out_texts || !st->sc_primary || !st->carry_env || !st->feed_env) {
+        !st->sc_out_texts || !st->sc_primary || !st->carry_env || !st->feed_env || !st->feed_raw) {
         itila_free(st); return NULL;
     }
 
@@ -1339,6 +1484,36 @@ itila_t itila_create(int sample_rate, double lpf_hz) {
         st->speed_bins[i] = WPM_MIN + (WPM_MAX - WPM_MIN) * i / (N_SPEED_BINS - 1);
 
     return (itila_t)st;
+}
+
+/* Level reference that follows the element level: a peak follower run both ways
+ * (0.2 s decay, floor 10% of the block's range and at least 8x its noise), so each
+ * element is judged against its own neighbourhood instead of one level per window
+ * (W1AW's element level moves 3-4x within seconds).  Scaled so 55% of the local peak
+ * sits at full mark level. */
+#define LEVEL_TAU_S  0.2
+#define LEVEL_FLOOR  0.10
+#define LEVEL_SCALE  0.55
+#define LEVEL_NOISE_X 8.0   /* floor at least 8x the noise (18 dB): noise is never stretched up */
+static void level_follow(itila_state_t *st, const double *x, int n, double *y) {
+    double nz  = percentile(x, n, 20.0, st->env_norm);
+    double top = percentile(x, n, 97.0, st->env_norm);
+    if (top - nz < 1e-30) { memcpy(y, x, (size_t)n * sizeof(double)); return; }
+    double fl = fmax(nz + LEVEL_FLOOR * (top - nz), LEVEL_NOISE_X * nz);
+    double a = exp(-1.0 / (LEVEL_TAU_S * st->sample_rate));
+    double *fw = st->log_B;   /* scratch: EM has not run yet */
+    double p = fl;
+    for (int i = 0; i < n; i++) {
+        double xi = isfinite(x[i]) ? x[i] : nz;
+        p = xi > p ? xi : fmax(fl, p * a); fw[i] = p;
+    }
+    p = fl;
+    for (int i = n - 1; i >= 0; i--) {
+        double xi = isfinite(x[i]) ? x[i] : nz;
+        p = xi > p ? xi : fmax(fl, p * a);
+        double v = (xi - nz) / (fmax(fw[i], p) - nz) / LEVEL_SCALE;
+        y[i] = v < 0.0 ? 0.0 : (v > 1.2 ? 1.2 : v);
+    }
 }
 
 const char* itila_feed(itila_t h, const double* envelope, int n,
@@ -1351,10 +1526,12 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     st->carry_n = 0;
     if (n < st->sample_rate || n > MAX_ENV) return st->result_buf;
     if (carry + n > MAX_ENV) carry = 0;
-    memcpy(st->feed_env, st->carry_env, (size_t)carry * sizeof(double));
-    memcpy(st->feed_env + carry, envelope, (size_t)n * sizeof(double));
-    envelope = st->feed_env;
+    /* carry_env holds raw samples: normalise carry and new block together (no seam) */
+    memcpy(st->feed_raw, st->carry_env, (size_t)carry * sizeof(double));
+    memcpy(st->feed_raw + carry, envelope, (size_t)n * sizeof(double));
     n += carry;
+    level_follow(st, st->feed_raw, n, st->feed_env);
+    envelope = st->feed_env;
 
     /* EM estimation, warm-start from previous call if available */
     double A, noise_mean, sigma2_obs, wpm_em;
@@ -1389,7 +1566,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 
     int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
     st->carry_n = n - n_dec;
-    memcpy(st->carry_env, envelope + n_dec, (size_t)st->carry_n * sizeof(double));
+    memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
 
     /* Per-handle scratch, was function-local static; live mode races. */
     callsign_t *calls = st->sc_calls;
@@ -1404,11 +1581,13 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
         fprintf(stderr, "\n");
     }
 
+    double pitch = 0.0;
     double prev_usp = -1.0;
     for (int ci = 0; ci < n_cands; ci++) {
         double usp;
         int n_texts = decode_runs_beam(st, st->marks, n_dec, wpm_cands[ci], freq_khz,
                                        out_texts, MAX_TEXTS, &usp);
+        if (ci == 0) pitch = st->pitch_wpm;
         int dup_cand = (ci > 0 && fabs(usp - prev_usp) < 1e-9);
         prev_usp = usp;
         if (dup_cand) continue;
@@ -1424,7 +1603,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 
     if (!primary_text[0] && n_calls == 0) return st->result_buf;
 
-    st->last_wpm = wpm_cands[0];
+    st->last_wpm = pitch > 0.0 ? pitch : wpm_cands[0];
 
     if (primary_text[0]) {
         strncpy(st->result_buf, primary_text, RESULT_BUF-1);
@@ -1451,6 +1630,8 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
     itila_state_t *st = (itila_state_t*)h;
     st->result_buf[0] = '\0';
     if (n < 10 || n > MAX_ENV) return st->result_buf;
+    level_follow(st, envelope, n, st->feed_env);
+    envelope = st->feed_env;
 
     /* Normalize to [0,1] via p99, keeps FB numerics stable */
     double env_scale = percentile(envelope, n, 99.0, st->env_norm);
@@ -1651,7 +1832,7 @@ void itila_free(itila_t h) {
     free(st->sc_beamA); free(st->sc_beamB); free(st->sc_dedup);
     free(st->sc_up); free(st->sc_tokens);
     free(st->sc_calls); free(st->sc_out_texts); free(st->sc_primary);
-    free(st->carry_env); free(st->feed_env);
+    free(st->carry_env); free(st->feed_env); free(st->feed_raw);
     free(st);
 }
 
@@ -1676,6 +1857,16 @@ double itila2_test_fit_unit(const int *is_mark, const int *dur, int n,
     double unit = fit_unit(runs, n, unit_in, fitted, dah_out);
     free(runs);
     return unit;
+}
+
+double itila2_test_pitch_wpm(const int *is_mark, const int *dur, int n,
+                             double dit_dah, double elem_letter) {
+    run_t *runs = malloc(n * sizeof(run_t));
+    if (!runs) return 0.0;
+    for (int i = 0; i < n; i++) { runs[i].is_mark = is_mark[i]; runs[i].dur = dur[i]; }
+    double wpm = pitch_wpm(runs, n, dit_dah, elem_letter);
+    free(runs);
+    return wpm;
 }
 
 double itila2_test_fit_letter_word(const int *is_mark, const int *dur, int n,
