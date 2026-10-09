@@ -344,6 +344,15 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
     return h;
 }
 
+/* C0 of a receiver's NCO frequency register (HPSDR Protocol 1, C0 =
+ * address << 1). RX1..RX7 are addresses 2..8 (C0 0x04..0x10), but RX8 is
+ * address 0x12 (C0 0x24): address 9 (C0 0x12) is drive level / Alex
+ * filters. The Red Pitaya HPSDR receiver (sdr-receiver-hpsdr.c) maps C0
+ * 36/37 to rx_freq[7] and leaves every receiver at 600 kHz until told. */
+static uint8_t rx_freq_c0(int rx_index) {
+    return rx_index == 7 ? 0x24 : (uint8_t)((rx_index + 2) * 2);
+}
+
 void hpsdr_set_freq(HpsdrFast *h, int rx_index, uint32_t freq_hz) {
     if (rx_index >= 0 && rx_index < MAX_RX) {
         /* -3.9 ppm frequency calibration for Red Pitaya STEMlab 125-14 */
@@ -393,7 +402,7 @@ void hpsdr_start(HpsdrFast *h) {
     /* Set frequencies — send each twice with delay for reliability */
     for (int i = 0; i < h->n_receivers; i++) {
         uint8_t freq[5];
-        freq[0] = (uint8_t)((i + 2) * 2);
+        freq[0] = rx_freq_c0(i);
         uint32_t f = h->frequencies[i];
         freq[1] = (f >> 24) & 0xFF;
         freq[2] = (f >> 16) & 0xFF;
