@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential libfftw3-dev
+
+      - name: Python packages
+        run: pip install -r requirements.txt pytest
+
+      # Undefined names and redefinitions only: main is clean on these, so a
+      # failure means a real break (often from merging two PRs).
+      - name: Lint
+        run: pip install ruff==0.16.10 && ruff check --select F821,F811,F822,F823 .
+
+      # -B: rebuild even though prebuilt .so files are checked in, so tests run
+      # against this commit's C sources, not stale binaries.
+      - name: Build native libraries
+        run: make -B native
+
+      - name: Every native library loads
+        run: |
+          python - <<'EOF'
+          import ctypes, re
+          libs = re.search(r"^NATIVE_LIBS\s*:=\s*(.*?)(?:\n\S|\Z)", open("Makefile").read(), re.S | re.M).group(1)
+          for name in libs.replace("\\", " ").split():
+              ctypes.CDLL("./" + name)
+              print("loaded", name)
+          EOF
+
+      - name: Tests
+        run: python -m pytest -v   # -m puts the repo root on sys.path (tests import sparkgap)
