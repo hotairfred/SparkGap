@@ -158,6 +158,17 @@ def test_spot_rule_key_values() -> None:
         sparkgap._select_spot_rule("off")
 
 
+def test_itila2_defaults_to_the_repeat_rule() -> None:
+    import sparkgap
+
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila2"}) == "repeat"
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila"}) == "off"
+    assert sparkgap._spot_rule_name({}) == "off"
+    # an explicit setting wins either way, for comparing the two rules on one decoder
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila2", "spot_rule": "off"}) == "off"
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila", "spot_rule": "repeat"}) == "repeat"
+
+
 def test_tracker_spots_window_records() -> None:
     import sparkgap
 

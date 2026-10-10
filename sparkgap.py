@@ -1648,6 +1648,11 @@ def _select_spot_rule(name):
     log.info("Spot rule: %s", name)
     return _spot_rule_on
 
+def _spot_rule_name(config):
+    """spot_rule from the config. Not set: "repeat" with cw_decoder itila2 (measured as one
+    chain), "off" with itila."""
+    return config.get('spot_rule') or ('repeat' if config.get('cw_decoder', 'itila') == 'itila2' else 'off')
+
 def _get_itila_lib():
     global _itila_lib
     if _itila_lib is None:
@@ -6678,7 +6683,7 @@ class SparkGap:
                                    gate_config=gate_config,
                                    recent_band_config=self.cfg.get('recent_band_floor'))
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
-        if _select_spot_rule(self.cfg.get('spot_rule', 'off')):
+        if _select_spot_rule(_spot_rule_name(self.cfg)):
             from spot_rule import RepeatSpotRule
             _trk = self.tracker
             _trk.spot_rule = RepeatSpotRule(
@@ -7881,7 +7886,7 @@ def run_file_mode(args, config):
                           scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)),
                           gate_config=gate_config)
     _select_decode_threads(config.get('itila_decode_threads', 1))
-    if _select_spot_rule(config.get('spot_rule', 'off')):
+    if _select_spot_rule(_spot_rule_name(config)):
         from spot_rule import RepeatSpotRule
         _trk = tracker
         _trk.spot_rule = RepeatSpotRule(
