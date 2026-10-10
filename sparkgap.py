@@ -6016,9 +6016,9 @@ class SpotTracker:
         re-parsing step.  Deferred until this wrapper proves stable.
         """
         if intent.window_text:
-            # Same safety floor as process(): over-speed windows are not evidence,
-            # blacklisted calls never spot.
-            if not self.spot_rule or intent.wpm > self.MAX_WPM:
+            # Blacklisted calls never spot. No MAX_WPM check here: the rule never renames
+            # a call, and CWT runners read 42-48 WPM (WG3J, NJ3K, N3AD, NT6Q, W8FJ).
+            if not self.spot_rule:
                 return []
             now = self.clock()
             w = self.spot_rule.window_id(intent.bin_id, intent.window_id, now)
