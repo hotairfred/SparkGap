@@ -14,6 +14,17 @@ is renamed, so near-identical real calls (N4VI next to N4ZZ) are not merged.
 The spot goes out on the strongest window (bin SNR) among the copies, once per call per
 REPEAT_S unless it moves more than MOVE_KHZ. A window is one decode window of one bin;
 both LPF paths of a window count once.
+
+Lock-on (config spot_rule_lockon: true, off by default): a call named by a CQ group owns the
+frequency it was copied on. While it owns it, two things change near that frequency:
+  - the owner's own later copies outside an exchange (TU W6YH, W6YH TEST, a bare W6YH) count
+    as copies of W6YH, so a runner who CQs once and then signs with TU W6YH still repeats;
+  - a bare TEST right after the owner's call (TU W6YH TEST EI4KF) names nobody: it is the
+    owner signing, and EI4KF is the next caller, even when its exchange is garbled or in cut
+    numbers (5NN AT) the exchange test does not read.
+Ownership lapses after LOCK_IDLE_S without a copy of the owner's call there, and passes to
+another call when a CQ group names that call there. A call never named by a CQ group never
+owns a frequency, so TU <caller> cannot promote a caller.
 """
 
 import re
@@ -27,6 +38,7 @@ DE_LOOKBACK = 6               # tokens before DE searched for CQ or TEST
 NEAR_KHZ = 0.5                # copies within this of each other are one frequency
 REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call per 10 minutes
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
+LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
 
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:[A-Z]{1,2}|[0-9][A-Z])[0-9]{1,4}[A-Z]{1,6}"
@@ -122,8 +134,23 @@ def runner_calls(text: str) -> list[str]:
     CWT 10-08 and 20m CWT 09-23 they promoted callers (+28 and +18 calls CW Skimmer did not
     send, for 3 more runners). The TEST of a bare W6YH TEST still opens a group on the call
     after it; only the exchange test keeps that caller out."""
+    return [call for call, _after in runner_groups(text)]
+
+
+def _call_before(toks: list[str], i: int) -> str | None:
+    """The callsign right before toks[i] (1-character and '?' tokens skipped), else None."""
+    k = i - 1
+    while k >= 0 and (len(toks[k]) <= 1 or "?" in toks[k]):
+        k -= 1
+    return toks[k] if k >= 0 and CALL_RE.match(toks[k]) else None
+
+
+def runner_groups(text: str) -> list[tuple[str, str | None]]:
+    """runner_calls() with, for each call, the callsign right before a bare TEST that opened
+    its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
+    owns the frequency, that TEST is W6YH signing and EI4KF is a caller."""
     toks = tokens(text)
-    out: list[str] = []
+    out: list[tuple[str, str | None]] = []
     i, n = 0, len(toks)
     while i < n:
         t = toks[i]
@@ -135,8 +162,8 @@ def runner_calls(text: str) -> list[str]:
         if j is None or (de and toks.count(toks[j]) < 2):
             i += 1
             continue
-        if not is_exchange(toks, j) and toks[j] not in out:
-            out.append(toks[j])
+        if not is_exchange(toks, j) and all(toks[j] != c for c, _ in out):
+            out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
         i = j + 1
         while i < n and toks[i] == toks[j]:       # call sent twice before the closing keyword
             i += 1
@@ -167,8 +194,10 @@ class _Copy:
 class RepeatSpotRule:
     """Feed every decode window; returns the spots the window completes."""
 
-    def __init__(self, tier: Callable[[str], int]) -> None:
+    def __init__(self, tier: Callable[[str], int], lockon: bool = False) -> None:
         self.tier = tier
+        self.lockon = lockon
+        self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str]] = set()                # (window, call) in _copies
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
@@ -189,7 +218,7 @@ class RepeatSpotRule:
         """Record one decoded text of a window; return [(call, freq_khz)] to spot now."""
         self._expire(now)
         spots = []
-        for call in runner_calls(text):
+        for call in (self._lockon_calls(freq_khz, text, now) if self.lockon else runner_calls(text)):
             if (window, call) not in self._seen:
                 self._seen.add((window, call))
                 self._copies.append(_Copy(now, window, call, freq_khz,
@@ -206,6 +235,33 @@ class RepeatSpotRule:
                 self._last_spot[call] = (now, spot_f)
                 spots.append((call, spot_f))
         return spots
+
+    def owner(self, freq_khz: float, now: float) -> str | None:
+        """Lock-on: the call owning the frequency nearest freq_khz (within NEAR_KHZ), else None."""
+        live = [o for o in self._owners
+                if abs(o[1] - freq_khz) <= NEAR_KHZ and now - o[2] <= LOCK_IDLE_S]
+        return min(live, key=lambda o: abs(o[1] - freq_khz))[0] if live else None
+
+    def _own(self, call: str, freq_khz: float, now: float) -> None:
+        self._owners = [o for o in self._owners
+                        if abs(o[1] - freq_khz) > NEAR_KHZ and now - o[2] <= LOCK_IDLE_S]
+        self._owners.append([call, freq_khz, now])
+
+    def _lockon_calls(self, freq_khz: float, text: str, now: float) -> list[str]:
+        """Calls one decoded text counts as copies of, with lock-on (see the module docstring)."""
+        calls: list[str] = []
+        for call, after in runner_groups(text):
+            if after is not None and after != call and self.owner(freq_khz, now) == after:
+                continue                          # the owner signing (W6YH TEST): call is a caller
+            calls.append(call)
+            self._own(call, freq_khz, now)
+        owner = self.owner(freq_khz, now)
+        if owner is not None and owner not in calls:
+            toks = tokens(text)
+            if any(tk == owner and not is_exchange(toks, k) for k, tk in enumerate(toks)):
+                calls.append(owner)               # TU W6YH, W6YH TEST: the owner signing
+                self._own(owner, freq_khz, now)
+        return calls
 
     def _expire(self, now: float) -> None:
         cutoff = now - REPEAT_S

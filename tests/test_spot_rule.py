@@ -1,6 +1,6 @@
 """Repeat-evidence spot rule (spot_rule.py). Text cases are decodes from the 2026-09-23 replays."""
 
-from spot_rule import REPEAT_S, RepeatSpotRule, runner_calls
+from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, runner_calls, runner_groups
 
 SCP = {"K0TQ", "WX7V", "W1AW", "VE7KW", "K3JT", "K1ABC", "K1AJ", "AA3B", "NA2U"}
 
@@ -275,3 +275,78 @@ def test_portable_calls_stay_whole() -> None:
     assert runner_calls("CQ W1AW/5") == ["W1AW/5"]
     assert runner_calls("CQ CWT N5AW/ T") == ["N5AW"]
     assert runner_calls("CQ CWT EE/E") == []
+
+
+# Lock-on (spot_rule_lockon). Texts are itila2 decodes of the MRCE DX cells (simulated CQ WW
+# band, 2026-10-10): runners sign with TU <call> TEST, and the caller's zone is in cut numbers.
+
+def _lockon() -> RepeatSpotRule:
+    return RepeatSpotRule(_tier2, lockon=True)
+
+
+def _feed(rule: RepeatSpotRule, texts: list[str], freq: float = 7019.3, t0: float = 0.0,
+          step: float = 60.0) -> list[tuple[str, float]]:
+    spots = []
+    for k, text in enumerate(texts):
+        spots += rule.feed(rule.window_id(1, k + int(t0), t0 + k * step), freq, text, t0 + k * step)
+    return spots
+
+
+def test_runner_groups_name_the_call_before_a_bare_test() -> None:
+    assert runner_groups("TU OA4EFA TEST SN3A 5NN AT TU") == [("SN3A", "OA4EFA")]
+    assert runner_groups("CQ OA4EFA TEST W1ZT 5NN AT TU") == [("OA4EFA", None)]   # TEST closes the CQ
+    assert runner_groups("TU E 4X1MK TEST LY2A 5C2T") == [("LY2A", "4X1MK")]
+    assert runner_groups("CQ TEST 4X1MK") == [("4X1MK", None)]
+
+
+def test_without_lockon_the_caller_after_the_owner_signing_spots() -> None:
+    texts = ["CQ OA4EFA TEST UA3KW 5NN 10", "TU OA4EFA TEST SN3A 5NN AT TU",
+             "TU OA4EFA TEST SN3A 5NN AT TU"]
+    assert ("SN3A", 7019.3) in _feed(_rule(), texts)
+
+
+def test_lockon_caller_after_the_owner_signing_does_not_spot() -> None:
+    texts = ["CQ OA4EFA TEST UA3KW 5NN 10", "TU OA4EFA TEST SN3A 5NN AT TU",
+             "TU OA4EFA TEST SN3A 5NN AT TU"]
+    spots = _feed(_lockon(), texts)
+    assert [c for c, _ in spots] == ["OA4EFA"]        # the owner's TU OA4EFA TEST counts instead
+
+
+def test_lockon_owner_signing_with_tu_counts() -> None:
+    # one CQ, then only TU <call>: two copies within REPEAT_S spot at tier 2
+    spots = _feed(_lockon(), ["CQ TEST N1DE", "TU N1DE K4FN 5NN 5 TU N1DE"])
+    assert spots == [("N1DE", 7019.3)]
+    assert _feed(_rule(), ["CQ TEST N1DE", "TU N1DE K4FN 5NN 5 TU N1DE"]) == []
+
+
+def test_lockon_tu_caller_never_promotes_a_caller() -> None:
+    # K4FN is only ever thanked; it never sends CQ, so it never owns the frequency
+    rule = _lockon()
+    assert _feed(rule, ["TU K4FN", "TU K4FN", "TU K4FN"], freq=7034.6) == []
+    assert rule.owner(7034.6, 120.0) is None
+
+
+def test_lockon_owner_in_an_exchange_does_not_count() -> None:
+    rule = _lockon()
+    _feed(rule, ["CQ TEST W6YH"])
+    assert _feed(rule, ["W6YH 5NN 3"], t0=60.0) == []
+
+
+def test_lockon_lapses_when_idle() -> None:
+    rule = _lockon()
+    _feed(rule, ["CQ TEST W6YH"])
+    assert rule.owner(7019.3, LOCK_IDLE_S) == "W6YH"
+    assert rule.owner(7019.3, LOCK_IDLE_S + 1) is None
+    assert _feed(rule, ["TU W6YH"], t0=LOCK_IDLE_S + 1) == []
+
+
+def test_lockon_passes_to_a_new_cq_and_only_near_its_frequency() -> None:
+    rule = _lockon()
+    _feed(rule, ["CQ TEST W6YH"])
+    _feed(rule, ["CQ TEST EI4KF"], t0=60.0)
+    assert rule.owner(7019.3, 61.0) == "EI4KF"
+    assert rule.owner(7020.3, 61.0) is None
+    # a call just signed by the old owner is not suppressed once ownership moved
+    assert runner_groups("TU W6YH TEST K1ABC") == [("K1ABC", "W6YH")]
+    _feed(rule, ["TU W6YH TEST K1ABC", "TU W6YH TEST K1ABC"], t0=120.0)
+    assert rule.owner(7019.3, 181.0) == "K1ABC"
