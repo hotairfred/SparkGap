@@ -30,3 +30,11 @@ score_truth.py run.log scene40.truth.json --list
 Or replay it through the C path: `hpsdr_proxy.py --wav scene40_7030kHz_192000_24bit.wav --negate-q`.
 
 Tune on scenes, confirm on real recordings: a simulator has its own quirks.
+
+## Scenes: one copy of a call per receiver
+
+Put each cell in a scene **once**. Several copies of the same cell in one receiver (for
+example the same cell at three levels, 18 kHz apart) put the same calls on several
+frequencies at once, and SparkGap's handling of one call on several frequencies then
+decides which copies get spotted. That showed up as a false regression once. To test
+levels, use one scene per level.
