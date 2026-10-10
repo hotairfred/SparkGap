@@ -350,3 +350,11 @@ def test_lockon_passes_to_a_new_cq_and_only_near_its_frequency() -> None:
     assert runner_groups("TU W6YH TEST K1ABC") == [("K1ABC", "W6YH")]
     _feed(rule, ["TU W6YH TEST K1ABC", "TU W6YH TEST K1ABC"], t0=120.0)
     assert rule.owner(7019.3, 181.0) == "K1ABC"
+
+
+def test_lockon_bare_repeat_of_the_owner_does_not_count() -> None:
+    # a fragment named once after a garbled TEST must not confirm itself by repeating bare
+    # (cdub89 on #27: W0P on a non-contest 20m hour); TU / DE / before a trigger word do count
+    assert _feed(_lockon(), ["TEST W0P", "W0P W0P"]) == []
+    assert _feed(_lockon(), ["TEST W0P", "DE W0P K"]) == [("W0P", 7019.3)]
+    assert _feed(_lockon(), ["TEST W0P", "W0P CQ"]) == [("W0P", 7019.3)]

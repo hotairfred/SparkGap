@@ -17,8 +17,8 @@ both LPF paths of a window count once.
 
 Lock-on (config spot_rule_lockon: true, off by default): a call named by a CQ group owns the
 frequency it was copied on. While it owns it, two things change near that frequency:
-  - the owner's own later copies outside an exchange (TU W6YH, W6YH TEST, a bare W6YH) count
-    as copies of W6YH, so a runner who CQs once and then signs with TU W6YH still repeats;
+  - the owner's own later sign-offs (TU W6YH, DE W6YH, W6YH TEST) count as copies of W6YH,
+    so a runner who CQs once and then signs with TU W6YH still repeats; a bare W6YH does not;
   - a bare TEST right after the owner's call (TU W6YH TEST EI4KF) names nobody: it is the
     owner signing, and EI4KF is the next caller, even when its exchange is garbled or in cut
     numbers (5NN AT) the exchange test does not read.
@@ -145,6 +145,22 @@ def _call_before(toks: list[str], i: int) -> str | None:
     return toks[k] if k >= 0 and CALL_RE.match(toks[k]) else None
 
 
+def _signing(toks: list[str], k: int) -> bool:
+    """toks[k] is a call in a sign-off: after TU or DE, or before CQ, TEST or another trigger
+    word (1-character and '?' tokens skipped), and not being sent the exchange. A bare repeat
+    of the call does not count: a fragment picked once can repeat on its own."""
+    if is_exchange(toks, k):
+        return False
+    p = k - 1
+    while p >= 0 and (len(toks[p]) <= 1 or "?" in toks[p]):
+        p -= 1
+    n = k + 1
+    while n < len(toks) and (len(toks[n]) <= 1 or "?" in toks[n]):
+        n += 1
+    return ((p >= 0 and toks[p] in ("TU", "DE"))
+            or (n < len(toks) and toks[n] in _TRIGGER_WORDS))
+
+
 def runner_groups(text: str) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
@@ -258,7 +274,7 @@ class RepeatSpotRule:
         owner = self.owner(freq_khz, now)
         if owner is not None and owner not in calls:
             toks = tokens(text)
-            if any(tk == owner and not is_exchange(toks, k) for k, tk in enumerate(toks)):
+            if any(tk == owner and _signing(toks, k) for k, tk in enumerate(toks)):
                 calls.append(owner)               # TU W6YH, W6YH TEST: the owner signing
                 self._own(owner, freq_khz, now)
         return calls
