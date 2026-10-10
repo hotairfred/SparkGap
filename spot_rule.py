@@ -117,9 +117,11 @@ def runner_calls(text: str) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
-    after them: CQ TEST W6YH, CQ W6YH TEST, TEST W6YH, CQ TEST W6YH TEST. TU W6YH and a bare
-    W6YH TEST open no group: on the 40m CWT 10-08 and 20m CWT 09-23 they promoted callers
-    (+28 and +18 calls CW Skimmer did not send, for 3 more runners)."""
+    after them: CQ TEST W6YH, CQ W6YH TEST, TEST W6YH, CQ TEST W6YH TEST, and the call sent
+    twice (CQ TEST W6YH W6YH TEST). TU W6YH and a bare W6YH TEST do not name W6YH: on the 40m
+    CWT 10-08 and 20m CWT 09-23 they promoted callers (+28 and +18 calls CW Skimmer did not
+    send, for 3 more runners). The TEST of a bare W6YH TEST still opens a group on the call
+    after it; only the exchange test keeps that caller out."""
     toks = tokens(text)
     out: list[str] = []
     i, n = 0, len(toks)
@@ -136,6 +138,8 @@ def runner_calls(text: str) -> list[str]:
         if not is_exchange(toks, j) and toks[j] not in out:
             out.append(toks[j])
         i = j + 1
+        while i < n and toks[i] == toks[j]:       # call sent twice before the closing keyword
+            i += 1
         while i < n and toks[i] in KEYWORDS:      # closing keywords end the group
             i += 1
     return out

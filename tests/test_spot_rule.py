@@ -46,10 +46,24 @@ def test_every_cq_form_names_the_runner() -> None:
         assert runner_calls(form) == ["W6YH"], form
 
 
-def test_tu_and_a_bare_trailing_test_open_no_group() -> None:
+def test_call_sent_twice_before_the_closing_keyword() -> None:
+    assert runner_calls("CQ TEST W6YH W6YH TEST EI4KF") == ["W6YH"]
+    assert runner_calls("CQ W6YH W6YH TEST EI4KF") == ["W6YH"]
+    assert runner_calls("CQ TEST W6YH W6YH") == ["W6YH"]
+
+
+def test_tu_and_a_bare_trailing_test_do_not_name_the_call() -> None:
     # measured on two CWTs: TU <call> is mostly said to callers
     assert runner_calls("TU W6YH") == []
     assert runner_calls("W6YH TEST") == []
+    assert runner_calls("TU W6YH TEST") == []
+
+
+def test_test_after_an_unnamed_call_opens_a_group_on_the_next_call() -> None:
+    # known limit: TU W6YH TEST EI4KF (caller) reads like TU K1ABC TEST W6YH (runner signs)
+    assert runner_calls("TU W6YH TEST EI4KF") == ["EI4KF"]
+    assert runner_calls("TU W6YH TEST EI4KF 5NN 4") == []
+    assert runner_calls("TU K1ABC TEST W6YH") == ["W6YH"]
 
 
 def test_a_call_after_the_closing_keyword_is_the_next_transmission() -> None:
