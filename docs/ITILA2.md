@@ -13,6 +13,7 @@ Status: the decoder, scanner and spot rule (`spot_rule: repeat`, off by default)
 | | `itila2` | `itila2_core.c` + `itila2_scanner.c` (`libitila2.so`, `libitila2_scanner.so`) |
 | `spot_rule` | `off` (default) | the original spot path (`_itila_extract_cq_call`, `SpotTracker.process`) |
 | | `repeat` | `spot_rule.py`: whole decode windows go to `RepeatSpotRule` |
+| `spot_rule_lockon` | `false` (default) | with `spot_rule: repeat`, lock-on (rule 6 below) |
 | `itila_decode_threads` | 1 (default) | number of bins decoded in parallel, and scanner DSP worker threads |
 
 Decoder and scanner are selected together: an itila2 decoder on itila's scanner (or the reverse) is never run. The spot rule is independent of the decoder, so both chains can be scored under either rule.
@@ -72,6 +73,7 @@ The reference is WX7V/5: CW Skimmer at validation Normal with no Master.dta, fee
 3. One vote on garbled decodes: a call does not spot while a call one edit from it has as many copies or more near the same frequency; a tie waits for the next window. Nothing is renamed and no copies are pooled, so near-identical real calls on one frequency (N4VI next to N4ZZ, K3WW next to K2TW) both spot.
 4. A call followed by a name and a number (a caller being sent the exchange) does not count.
 5. The spot goes out on the strongest copy (bin SNR), once per call per 10 minutes unless it moves 1 kHz or more (CW Skimmer re-sent runners after 1 kHz moves on the 40m CWT).
+6. Lock-on (`spot_rule_lockon: true`, off by default). A call named by a CQ group owns the frequency it was copied on, within 0.5 kHz. While it owns it, the owner's later sign-offs (`TU W6YH`, `DE W6YH`, `W6YH TEST`; not a bare `W6YH`) count toward rule 2, and a bare TEST right after the owner's call names nobody: in `TU W6YH TEST EI4KF 5NN AT` the TEST is W6YH signing and EI4KF is the next caller, even when the exchange is garbled or in cut numbers (`5NN AT` is zone 10), which rule 4 does not read. Ownership lapses after 3 minutes without the owner's call there and passes to a call a CQ group names there. A call never named by a CQ group never owns a frequency, so `TU <caller>` cannot promote a caller.
 
 Rules 2 and 3 replaced six near-miss special cases (truncation, glued K, glued greeting, lost letter, copy wait, 2:1 merge) and their word lists. Those interacted: one garbled "CQ CWT K8BZTRQ" held back K8BZ's 26 clean CQ windows. On audio-time replays against WX7V/5 the simple rule shares as many calls (40m CWT 75 of 91 against 76, 20m CWT 49 of 57 against 48) with fewer it never sent (33 against 40) and fewer busts of nearby runners (18 against 26). Our decoder repeats some busts exactly (W6AYK for W6AYC, AD4E for AD4EB), which is why exact repeats alone are not enough here; CW Skimmer's own output lists near-identical real calls on one frequency (62 pairs on the 40m CWT), which is why the vote never merges.
 
