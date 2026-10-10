@@ -75,6 +75,8 @@
 #define SYM_BAD       2.0   /* log penalty for a symbol that is no character */
 #define SEG_RATE_MIN 300.0  /* log BF per second a keyed segment needs to be decoded: real copy
                              * >= 1500 at p10, dit noise median 91 (20m h2h 2026-10-08) */
+#define GATE_SPEED_SPAN 0.20  /* segment gate scores speed bins within 20% of a window's candidates */
+#define GATE_SPEED_MIN  3     /* ...and at least this many */
 #define SEP_MIN      1.5    /* mark level this many noise sigmas above the noise, or no CW:
                              * EM fits noise at 0.5 to 1; no confirmed call below 1.5 (A/B 2026-09-22) */
 
@@ -1446,7 +1448,8 @@ static int find_carry_cut(itila_state_t *st, const int8_t *marks, int T, double 
 /* Decode scratch. Every buffer below is written before it is read within one call, so a
  * set per thread serves all handles: per-handle memory drops from about 1.6 MB to the
  * carry. Per-thread, not shared (same reason the statics moved per handle on 2026-04-26).
- * Bound on entry to each decode call; one set per thread, freed with the process. */
+ * Bound on entry to each decode call; one set per thread, freed with the process. A caller that
+ * decodes from many short-lived threads leaks one set (about 1.6 MB) per thread. */
 static int alloc_scratch(itila_state_t *s) {
     s->log_B      = (double*)malloc(MAX_ENV * 2 * sizeof(double));
     s->log_alpha  = (double*)malloc(MAX_ENV * 2 * sizeof(double));
@@ -1554,9 +1557,30 @@ static void level_follow(itila_state_t *st, const double *x, int n, double *y) {
  * or more of the fastest speed candidate; its log Bayes factor (fresh forward pass, mean over the speed bins, against all
  * noise) must reach SEG_RATE_MIN per second. Marks at or after n_dec (the carry) are kept. */
 static void gate_segments(itila_state_t *st, const double *env, int n_dec, double A, double nm,
-                          double s2, double unit) {
+                          double s2, double unit, const double *cands, int n_cands) {
     int gap = (int)(5.0 * unit), pad = (int)unit;
     double lc = -0.5 * log(2.0 * M_PI * s2);
+    /* Speed bins near the window's candidates (all bins when none): the keyed case is the
+     * expensive one, and the other bins add nothing to a segment at a known speed. */
+    int use[N_SPEED_BINS], n_use = 0;
+    for (int k = 0; k < N_SPEED_BINS; k++) {
+        int near = n_cands <= 0;
+        for (int c = 0; c < n_cands; c++)
+            if (fabs(st->speed_bins[k] - cands[c]) <= GATE_SPEED_SPAN * cands[c]) near = 1;
+        if (near) use[n_use++] = k;
+    }
+    if (n_use < GATE_SPEED_MIN) {          /* too few: the GATE_SPEED_MIN bins nearest the first candidate */
+        n_use = 0;
+        int done[N_SPEED_BINS] = {0};
+        for (int m = 0; m < GATE_SPEED_MIN; m++) {
+            int best = -1;
+            for (int k = 0; k < N_SPEED_BINS; k++)
+                if (!done[k] && (best < 0 || fabs(st->speed_bins[k] - cands[0]) < fabs(st->speed_bins[best] - cands[0])))
+                    best = k;
+            done[best] = 1;
+            use[n_use++] = best;
+        }
+    }
     int t = 0;
     while (t < n_dec) {
         while (t < n_dec && !st->marks[t]) t++;
@@ -1579,17 +1603,17 @@ static void gate_segments(itila_state_t *st, const double *env, int n_dec, doubl
                 noise += st->log_B[i*2+0];
             }
             double lz[N_SPEED_BINS], lmax = -INFINITY;
-            for (int k = 0; k < N_SPEED_BINS; k++) {
+            for (int u = 0; u < n_use; u++) {
                 double p01, p10;
-                transition_probs(st->speed_bins[k], &p01, &p10);
+                transition_probs(st->speed_bins[use[u]], &p01, &p10);
                 double lT[4] = { log(1.0 - p01 + 1e-300), log(p01 + 1e-300),
                                  log(p10 + 1e-300), log(1.0 - p10 + 1e-300) };
-                fb_core(st->log_B, lT, len, st->log_alpha, st->log_beta, &lz[k]);
-                if (lz[k] > lmax) lmax = lz[k];
+                fb_core(st->log_B, lT, len, st->log_alpha, st->log_beta, &lz[u]);
+                if (lz[u] > lmax) lmax = lz[u];
             }
             double se = 0.0;
-            for (int k = 0; k < N_SPEED_BINS; k++) se += exp(lz[k] - lmax);
-            lbf = lmax + log(se / N_SPEED_BINS) - noise;
+            for (int u = 0; u < n_use; u++) se += exp(lz[u] - lmax);
+            lbf = lmax + log(se / n_use) - noise;
         }
         if (lbf < SEG_RATE_MIN * len / (double)BAYES_RATE)
             memset(st->marks + t0, 0, (size_t)(last + 1 - t0));
@@ -1651,7 +1675,8 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
     st->carry_n = n - n_dec;
     memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
-    gate_segments(st, envelope, n_dec, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]));
+    gate_segments(st, envelope, n_dec, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]),
+                  wpm_cands, n_cands);
 
     /* Per-handle scratch, was function-local static; live mode races. */
     callsign_t *calls = st->sc_calls;
@@ -1956,7 +1981,7 @@ int itila2_test_gate_segments(const double *env, int8_t *marks, int n, double A,
     itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
     if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
     memcpy(st->marks, marks, (size_t)n);
-    gate_segments(st, env, n, A, nm, s2, unit);
+    gate_segments(st, env, n, A, nm, s2, unit, NULL, 0);
     memcpy(marks, st->marks, (size_t)n);
     int kept = 0;
     for (int i = 0; i < n; i++) kept += marks[i];
