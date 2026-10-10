@@ -3,7 +3,7 @@
 
 itila2 is a second CW decoder chain for SparkGap, kept beside the original itila chain so the two can be compared on the same audio. It shares itila's architecture (wideband IQ, a scanner that spawns one channel per signal, an HMM decoder per channel) and changes the parts that measurement showed to be limiting. This note describes how itila2 works, what differs from itila, and the evidence behind each difference.
 
-Status: the decoder, scanner and spot rule (`spot_rule: repeat`, off by default) are in this repository. Development is tracked in `cdub89/SparkGap#8`.
+Status: the decoder, scanner and spot rule (`spot_rule: repeat`, the default with itila2) are in this repository. Development is tracked in `cdub89/SparkGap#8`.
 
 ## Selecting it
 
@@ -11,11 +11,11 @@ Status: the decoder, scanner and spot rule (`spot_rule: repeat`, off by default)
 | --- | --- | --- |
 | `cw_decoder` | `itila` (default) | `itila_core.c` + `itila_scanner.c`, Fred's chain, unchanged |
 | | `itila2` | `itila2_core.c` + `itila2_scanner.c` (`libitila2.so`, `libitila2_scanner.so`) |
-| `spot_rule` | `off` (default) | the original spot path (`_itila_extract_cq_call`, `SpotTracker.process`) |
-| | `repeat` | `spot_rule.py`: whole decode windows go to `RepeatSpotRule` |
+| `spot_rule` | `off` (default with `itila`) | the original spot path (`_itila_extract_cq_call`, `SpotTracker.process`) |
+| | `repeat` (default with `itila2`) | `spot_rule.py`: whole decode windows go to `RepeatSpotRule` |
 | `itila_decode_threads` | 1 (default) | number of bins decoded in parallel, and scanner DSP worker threads |
 
-Decoder and scanner are selected together: an itila2 decoder on itila's scanner (or the reverse) is never run. The spot rule is independent of the decoder, so both chains can be scored under either rule.
+Decoder and scanner are selected together: an itila2 decoder on itila's scanner (or the reverse) is never run. The spot rule follows the decoder unless `spot_rule` is set (`repeat` with itila2, `off` with itila); setting it scores either chain under the other rule.
 
 ## Signal chain
 
@@ -72,6 +72,8 @@ The reference is WX7V/5: CW Skimmer at validation Normal with no Master.dta, fee
 3. One vote on garbled decodes: a call does not spot while a call one edit from it has as many copies or more near the same frequency; a tie waits for the next window. Nothing is renamed and no copies are pooled, so near-identical real calls on one frequency (N4VI next to N4ZZ, K3WW next to K2TW) both spot.
 4. A call followed by a name and a number (a caller being sent the exchange) does not count.
 5. The spot goes out on the strongest copy (bin SNR), once per call per 10 minutes unless it moves 1 kHz or more (CW Skimmer re-sent runners after 1 kHz moves on the 40m CWT).
+
+No speed limit applies on this path. The original spot path drops windows above `MAX_WPM` (40) because it can rename a fast, garbled fragment to an SCP call; this rule never renames and needs the exact call after a CQ in several windows. CWT runners read 42 to 48 WPM here: without the limit the two CWT replays gain 6 calls, all confirmed by RBN (WG3J, NJ3K, N3AD on 40m; NT6Q, W8FJ, WG3J on 20m), lose none, and nothing extra spots on a 20m non-contest hour, a 17m dead band or 40m noise.
 
 Rules 2 and 3 replaced six near-miss special cases (truncation, glued K, glued greeting, lost letter, copy wait, 2:1 merge) and their word lists. Those interacted: one garbled "CQ CWT K8BZTRQ" held back K8BZ's 26 clean CQ windows. On audio-time replays against WX7V/5 the simple rule shares as many calls (40m CWT 75 of 91 against 76, 20m CWT 49 of 57 against 48) with fewer it never sent (33 against 40) and fewer busts of nearby runners (18 against 26). Our decoder repeats some busts exactly (W6AYK for W6AYC, AD4E for AD4EB), which is why exact repeats alone are not enough here; CW Skimmer's own output lists near-identical real calls on one frequency (62 pairs on the 40m CWT), which is why the vote never merges.
 
