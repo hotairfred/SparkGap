@@ -3,7 +3,7 @@
 
 itila2 is a second CW decoder chain for SparkGap, kept beside the original itila chain so the two can be compared on the same audio. It shares itila's architecture (wideband IQ, a scanner that spawns one channel per signal, an HMM decoder per channel) and changes the parts that measurement showed to be limiting. This note describes how itila2 works, what differs from itila, and the evidence behind each difference.
 
-Status: the decoder and scanner are in this repository; the spot rule (`spot_rule: repeat`) is a separate pull request. Development is tracked in `cdub89/SparkGap#8`.
+Status: the decoder, scanner and spot rule (`spot_rule: repeat`, off by default) are in this repository. Development is tracked in `cdub89/SparkGap#8`.
 
 ## Selecting it
 
@@ -11,9 +11,11 @@ Status: the decoder and scanner are in this repository; the spot rule (`spot_rul
 | --- | --- | --- |
 | `cw_decoder` | `itila` (default) | `itila_core.c` + `itila_scanner.c`, Fred's chain, unchanged |
 | | `itila2` | `itila2_core.c` + `itila2_scanner.c` (`libitila2.so`, `libitila2_scanner.so`) |
+| `spot_rule` | `off` (default) | the original spot path (`_itila_extract_cq_call`, `SpotTracker.process`) |
+| | `repeat` | `spot_rule.py`: whole decode windows go to `RepeatSpotRule` |
 | `itila_decode_threads` | 1 (default) | number of bins decoded in parallel, and scanner DSP worker threads |
 
-Decoder and scanner are selected together: an itila2 decoder on itila's scanner (or the reverse) is never run. Both chains use the same spot path.
+Decoder and scanner are selected together: an itila2 decoder on itila's scanner (or the reverse) is never run. The spot rule is independent of the decoder, so both chains can be scored under either rule.
 
 ## Signal chain
 
@@ -26,7 +28,7 @@ SDR IQ (Flex DAX-IQ 48/96 kHz, HPSDR, or a WAV)
      level reference, EM-fitted two-state HMM, forward-backward posterior,
      marks and spaces, despeckle, timing fit, beam search over Morse
   -> decoded text per window
-  -> spot path -> telnet DX spots
+  -> spot rule (CQ/TEST, exact repeats, one-edit vote) -> telnet DX spots
 ```
 
 ## Scanner (`itila2_scanner.c` against `itila_scanner.c`)
@@ -61,9 +63,21 @@ Shared with itila: the 200 Hz envelope, a two-state HMM (mark, space) whose para
 | Decode buffers | per handle, about 1.6 MB each (two handles per bin) | one set per decode thread; a handle keeps only its carry and fitted values | Memory grew with every bin on a busy band. 200 handles 325 MB to 8.5 MB; replay peak 2,055 to 1,202 MB on the 40m CWT; every decoded line identical on the 20m hour, 40m CWT and W1AW |
 | Window test order | evidence (16-speed forward-backward) then separation | separation first; the forward-backward runs only when separation passes | A window under SEP_MIN fails either way (1,742 of 1,745 failures on the 20m hour). Identical output; CPU -6% on the 20m hour, -8% on a quiet 17m band |
 
-## Spot rule
+## Spot rule (`spot_rule.py`, `spot_rule: repeat`)
 
-The spot rule written for itila2 (`spot_rule.py`, `spot_rule: repeat`: CQ/TEST, repeats by call pattern as CW Skimmer validates, copies merged into the call heard on the frequency) is a separate pull request. Without it both chains use the existing spot path.
+The reference is WX7V/5: CW Skimmer at validation Normal with no Master.dta, feeding the Aggregator, which forwards only CQ-tagged spots. The rule mirrors what that node sends.
+
+1. The call is the sender of a CQ group. A group opens at CQ or TEST, or at DE when CQ or TEST came earlier in the window with no call between and the call is sent twice (`CQ SKCC DE K4DH K4DH`). The sender is the call inside the group or within 3 words after its keywords; keywords right after the sender close the group, and the next transmission (usually a caller) starts after them: `CQ TEST W6YH`, `CQ W6YH TEST`, `TEST W6YH`, `CQ TEST W6YH TEST`. `TU W6YH` and a bare `W6YH TEST` open no group: on two CWTs they promoted callers.
+2. The exact call must be copied in 2, 3 or 4 decode windows, by its pattern (patt3ch.lst), as CW Skimmer validates, within 0.5 kHz and the last 10 minutes. No SCP check: 8 of the 12 calls WX7V/5 sent in a 41-minute sample were not in MASTER.SCP. Portable calls stay whole (HK3/NP4Z, N5AW/0).
+3. One vote on garbled decodes: a call does not spot while a call one edit from it has as many copies or more near the same frequency; a tie waits for the next window. Nothing is renamed and no copies are pooled, so near-identical real calls on one frequency (N4VI next to N4ZZ, K3WW next to K2TW) both spot.
+4. A call followed by a name and a number (a caller being sent the exchange) does not count.
+5. The spot goes out on the strongest copy (bin SNR), once per call per 10 minutes unless it moves 1 kHz or more (CW Skimmer re-sent runners after 1 kHz moves on the 40m CWT).
+
+Rules 2 and 3 replaced six near-miss special cases (truncation, glued K, glued greeting, lost letter, copy wait, 2:1 merge) and their word lists. Those interacted: one garbled "CQ CWT K8BZTRQ" held back K8BZ's 26 clean CQ windows. On audio-time replays against WX7V/5 the simple rule shares as many calls (40m CWT 75 of 91 against 76, 20m CWT 49 of 57 against 48) with fewer it never sent (33 against 40) and fewer busts of nearby runners (18 against 26). Our decoder repeats some busts exactly (W6AYK for W6AYC, AD4E for AD4EB), which is why exact repeats alone are not enough here; CW Skimmer's own output lists near-identical real calls on one frequency (62 pairs on the 40m CWT), which is why the vote never merges.
+
+In file mode the rule counts in audio time (`SpotTracker.clock`), as live; replays run about 3x real time.
+
+Against the original path: the original spots an SCP call on its first CQ sighting or after repeat sightings without CQ (so callers can spot), spots non-SCP calls as `[unverified]`, and substitutes nearby SCP calls (W8HO became W8HOT). Live spots from the repeat rule match its replay scoring.
 
 ## How it is measured
 
@@ -103,6 +117,9 @@ Where both itila2 and CW Skimmer misread W1AW, the received element itself is cu
 | Per-state variances, soft decisions (DC2, DC3) | No gain |
 | Window continuity alone (DC4) | No gain |
 | Word keep-alive (SC6, SC10) | Noise kept bins alive; memory grew |
+| Spot rule: one runner per frequency (plurality tally) | Junk 44 to 7 but 15 real runners lost: runners share frequencies in a CWT (K5SJC and N7US on 7037.5) |
+| Spot rule: family vote over similar calls (edit distance and prefixes) | Renames real stations (N4F inside N4FOX), lets glued text win (AB0CDKN); more junk than it removed |
+| Spot rule: exact repeats only, as CW Skimmer | Best recall, but our decoder repeats its busts exactly: junk 44 to 92 |
 | Peak-prominence mask at spawn | No gain beyond SC11 |
 | Level reference with a range-only floor | Halved 20m recall (noise stretched into text) |
 
@@ -136,4 +153,5 @@ Order: a single band from the Web-888 first, scored the same way as the Flex run
 ## Open
 
 - Hand-keyed fists (bugs, sideswipers, straight keys): dah lengths vary, and a net puts several fists in one 60 s window. Next candidate: fit the timing per transmission instead of per window.
+- A CQ at the end of one window with `DE call` at the start of the next is not linked by the spot rule (NV4H on 40m).
 - `itila_feed_online` has the level reference but is not used by SparkGap.
