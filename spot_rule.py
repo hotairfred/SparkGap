@@ -22,9 +22,12 @@ frequency it was copied on. While it owns it, two things change near that freque
   - a bare TEST right after the owner's call (TU W6YH TEST EI4KF) names nobody: it is the
     owner signing, and EI4KF is the next caller, even when its exchange is garbled or in cut
     numbers (5NN AT) the exchange test does not read.
-Ownership lapses after LOCK_IDLE_S without a copy of the owner's call there, and passes to
-another call when a CQ group names that call there. A call never named by a CQ group never
-owns a frequency, so TU <caller> cannot promote a caller.
+  - a CQ group naming another call does not count while the owner's call is in the same
+    window: CQ AZQP K6NR decoded as CQ A6QP K6NR, or TU K6NR ... CQ K6T, is the owner garbled.
+    In windows without the owner it counts as usual, and the frequency passes to that call
+    once it has tier(call) copies there.
+Ownership lapses after LOCK_IDLE_S without a copy of the owner's call there. A call never
+named by a CQ group never owns a frequency, so TU <caller> cannot promote a caller.
 """
 
 import re
@@ -266,14 +269,24 @@ class RepeatSpotRule:
     def _lockon_calls(self, freq_khz: float, text: str, now: float) -> list[str]:
         """Calls one decoded text counts as copies of, with lock-on (see the module docstring)."""
         calls: list[str] = []
+        toks = tokens(text)
         for call, after in runner_groups(text):
-            if after is not None and after != call and self.owner(freq_khz, now) == after:
+            owner = self.owner(freq_khz, now)
+            if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
+            if owner is not None and call != owner:
+                if owner in toks:
+                    continue                      # the owner is still here: CQ A6QP K6NR is a garble
+                held = sum(1 for c in self._copies if c.call == call
+                           and abs(c.freq_khz - freq_khz) <= NEAR_KHZ)
+                calls.append(call)                # a challenger copy, in a window without the owner
+                if held + 1 >= self.tier(call):
+                    self._own(call, freq_khz, now)
+                continue
             calls.append(call)
             self._own(call, freq_khz, now)
         owner = self.owner(freq_khz, now)
         if owner is not None and owner not in calls:
-            toks = tokens(text)
             if any(tk == owner and _signing(toks, k) for k, tk in enumerate(toks)):
                 calls.append(owner)               # TU W6YH, W6YH TEST: the owner signing
                 self._own(owner, freq_khz, now)

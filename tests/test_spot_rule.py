@@ -344,8 +344,10 @@ def test_lockon_passes_to_a_new_cq_and_only_near_its_frequency() -> None:
     rule = _lockon()
     _feed(rule, ["CQ TEST W6YH"])
     _feed(rule, ["CQ TEST EI4KF"], t0=60.0)
-    assert rule.owner(7019.3, 61.0) == "EI4KF"
-    assert rule.owner(7020.3, 61.0) is None
+    assert rule.owner(7019.3, 61.0) == "W6YH"           # one copy does not take it
+    _feed(rule, ["CQ TEST EI4KF"], t0=61.0)
+    assert rule.owner(7019.3, 62.0) == "EI4KF"          # tier(call) copies do
+    assert rule.owner(7020.3, 62.0) is None
     # a call just signed by the old owner is not suppressed once ownership moved
     assert runner_groups("TU W6YH TEST K1ABC") == [("K1ABC", "W6YH")]
     _feed(rule, ["TU W6YH TEST K1ABC", "TU W6YH TEST K1ABC"], t0=120.0)
@@ -358,3 +360,21 @@ def test_lockon_bare_repeat_of_the_owner_does_not_count() -> None:
     assert _feed(_lockon(), ["TEST W0P", "W0P W0P"]) == []
     assert _feed(_lockon(), ["TEST W0P", "DE W0P K"]) == [("W0P", 7019.3)]
     assert _feed(_lockon(), ["TEST W0P", "W0P CQ"]) == [("W0P", 7019.3)]
+
+
+def test_lockon_owner_keeps_the_frequency_against_its_own_garbles() -> None:
+    # 7046.5 kHz, AZ QSO Party 10-11 00Z: K6NR's CQ AZQP decoded twice as CQ A6QP K6NR
+    rule = _lockon()
+    spots = _feed(rule, ["CQ AZQP K6NR CNO", "TU K6NR CQ AZQP K6NR CNO",
+                         "TU K6NR CQ A6QP K?NR", "CQ AZQP K6NR CNO", "TU K6NR CQ A6QP K6NR CNO"])
+    assert [c for c, _ in spots] == ["K6NR"]
+    assert rule.owner(7019.3, 300.0) == "K6NR"
+
+
+def test_lockon_new_runner_takes_over_once_the_owner_is_gone() -> None:
+    # W7QP takes the frequency after K6NR leaves; a call ending in QP is still a call
+    rule = _lockon()
+    _feed(rule, ["CQ AZQP K6NR CNO", "CQ AZQP K6NR CNO"])
+    spots = _feed(rule, ["TU K6NR CQ W7QP W7QP", "CQ W7QP W7QP", "CQ W7QP W7QP"], t0=120.0)
+    assert [c for c, _ in spots] == ["W7QP"]
+    assert rule.owner(7019.3, 241.0) == "W7QP"
