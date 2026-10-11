@@ -158,6 +158,17 @@ def test_spot_rule_key_values() -> None:
         sparkgap._select_spot_rule("off")
 
 
+def test_itila2_defaults_to_the_repeat_rule() -> None:
+    import sparkgap
+
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila2"}) == "repeat"
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila"}) == "off"
+    assert sparkgap._spot_rule_name({}) == "off"
+    # an explicit setting wins either way, for comparing the two rules on one decoder
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila2", "spot_rule": "off"}) == "off"
+    assert sparkgap._spot_rule_name({"cw_decoder": "itila", "spot_rule": "repeat"}) == "repeat"
+
+
 def test_tracker_spots_window_records() -> None:
     import sparkgap
 
@@ -175,7 +186,7 @@ def test_tracker_spots_window_records() -> None:
     assert [(s["call"], s["freq_khz"], s["method"]) for s in spots] == [("K0TQ", 14030.0, "repeat")]
 
 
-def test_tracker_drops_blacklisted_and_overspeed() -> None:
+def test_tracker_drops_blacklisted_and_spots_fast_runners() -> None:
     import sparkgap
 
     tracker = sparkgap.SpotTracker(set(SCP), {"K0TQ"})
@@ -188,8 +199,9 @@ def test_tracker_drops_blacklisted_and_overspeed() -> None:
 
     assert tracker.process_intent(window(1, "CQ K0TQ")) == []
     assert tracker.process_intent(window(2, "CQ K0TQ")) == []
-    assert tracker.process_intent(window(3, "CQ W1AW", wpm=55)) == []
-    assert tracker.process_intent(window(4, "CQ W1AW", wpm=55)) == []
+    # no speed limit on this path: WG3J reads 42-44 WPM on the 40m CWT 2026-10-08
+    assert tracker.process_intent(window(3, "CQ W1AW", wpm=44)) == []
+    assert [s["call"] for s in tracker.process_intent(window(4, "CQ W1AW", wpm=44))] == ["W1AW"]
 
 
 def test_call_after_de_counts_when_cq_came_first_and_it_is_sent_twice() -> None:
