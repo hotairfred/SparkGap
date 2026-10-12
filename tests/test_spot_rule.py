@@ -1,6 +1,6 @@
 """Repeat-evidence spot rule (spot_rule.py). Text cases are decodes from the 2026-09-23 replays."""
 
-from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, runner_calls, runner_groups
+from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, runner_calls, runner_groups, split_runs
 
 SCP = {"K0TQ", "WX7V", "W1AW", "VE7KW", "K3JT", "K1ABC", "K1AJ", "AA3B", "NA2U"}
 
@@ -26,6 +26,27 @@ def test_words_between_keyword_and_call() -> None:
 
 def test_merged_keyword_is_split() -> None:
     assert runner_calls("CQK1ABC K1ABC") == ["K1ABC"]
+
+
+def test_split_runs_splits_words_run_together() -> None:
+    # hand-sent CW, PA QSO Party 10-10: several words with no gap between them
+    assert split_runs("CQCQDE WA8VTD") == "CQ CQ DE WA8VTD"
+    assert split_runs("CQCQWESDE K4OB K4OB K") == "CQ CQ WES DE K4OB K4OB K"
+    assert split_runs("CQPADEW3RA/I NN") == "CQ PA DE W3RA/I NN"
+    assert split_runs("CQSKCCDEKD3CNH") == "CQ SKCC DE KD3CNH"
+
+
+def test_split_runs_keeps_calls_and_other_words() -> None:
+    for text in ("WA8VTD", "K4OBK", "TEST", "5NN EDMU", "EEEE"):
+        assert split_runs(text) == text
+    assert split_runs("CQPW6KK") == "CQ PW6KK"     # as tokens() reads it: CQP W6KK is ambiguous
+
+
+def test_split_runs_key() -> None:
+    """Off by default: CQCQDE names no sender, as before."""
+    texts = ["CQCQDE WA8VTD WA8VTD K", "CQCQDE WA8VTD WA8VTD K"]
+    assert _feed(_rule(), texts) == []
+    assert _feed(RepeatSpotRule(_tier2, split_runs=True), texts) == [("WA8VTD", 7019.3)]
 
 
 def test_caller_sent_the_exchange_does_not_count() -> None:
