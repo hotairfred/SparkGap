@@ -59,6 +59,30 @@ _STOP_WORDS = frozenset({"TU", "DE", "CQ", "TEST", "CWT", "SST", "MST", "QRZ", "
                          "NR", "TNX", "GL", "BK"})
 
 
+def _split_run_together(rest: str, prev: str | None) -> list[str] | None:
+    """The whole of rest as keywords, an event tag and a call, else None. A tag (2-5
+    letters, no digit, so never a call) only follows CQ or TEST, and only DE or the end
+    of the word follows it: CQCQDE, CQCQWESDE, CQPADEW3RA."""
+    if not rest:
+        return []
+    if prev is not None and CALL_RE.match(rest):
+        return [rest]
+    for pre in sorted(_MERGED_PREFIXES + ("TU",), key=len, reverse=True):
+        if rest.startswith(pre):
+            tail = _split_run_together(rest[len(pre):], pre)
+            if tail is not None:
+                return [pre] + tail
+    if prev in ("CQ", "TEST"):
+        cuts = range(min(5, len(rest)), 1, -1)
+        for n in [n for n in cuts if rest[n:].startswith("DE")] + [n for n in cuts if n == len(rest)]:
+            tag, after = rest[:n], rest[n:]
+            if tag.isalpha():
+                tail = _split_run_together(after, tag)
+                if tail is not None:
+                    return [tag] + tail
+    return None
+
+
 def _split_merged(tok: str) -> list[str]:
     """CQK1ABC -> CQ K1ABC, DEW1AW -> DE W1AW (decoder dropped the word gap)."""
     out: list[str] = []
@@ -74,6 +98,18 @@ def _split_merged(tok: str) -> list[str]:
             out.append(rest)
             rest = ""
     return out
+
+
+def split_runs(text: str) -> str:
+    """Text with words run together split apart (spot_rule_split_runs): hand-sent CW often
+    drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA. A word is split only
+    when the whole of it reads as keywords, an event tag and a call; anything else is kept."""
+    out = []
+    for w in text.split():
+        u = w.upper()
+        parts = None if CALL_RE.match(u) else _split_run_together(u, None)
+        out.extend(parts if parts and len(parts) > 1 else [w])
+    return " ".join(out)
 
 
 def tokens(text: str) -> list[str]:
@@ -221,10 +257,11 @@ class RepeatSpotRule:
     """Feed every decode window; returns the spots the window completes."""
 
     def __init__(self, tier: Callable[[str], int], cq_groups: bool = False,
-                 lockon: bool = False) -> None:
+                 lockon: bool = False, split_runs: bool = False) -> None:
         self.tier = tier
         self.cq_groups = cq_groups
         self.lockon = lockon
+        self.split_runs = split_runs
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
@@ -245,6 +282,8 @@ class RepeatSpotRule:
              snr: float | None = None) -> list[tuple[str, float]]:
         """Record one decoded text of a window; return [(call, freq_khz)] to spot now."""
         self._expire(now)
+        if self.split_runs:
+            text = split_runs(text)
         spots = []
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
                  else runner_calls(text, every=self.cq_groups))
