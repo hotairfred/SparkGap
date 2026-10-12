@@ -95,6 +95,50 @@ def test_both_lpf_paths_of_one_window_count_once() -> None:
     assert r.feed(r.window_id(1, 0, 0.0), 14030.0, "CQ CWT K0TQ", 0.0) == []
 
 
+def test_every_cq_group_is_listed_on_request() -> None:
+    text = "CQ CQ WES WES DE N5QLZ N5QLZ K CQ CQ WES WES DE N5QLZ"
+    assert runner_calls(text) == ["N5QLZ"]
+    assert runner_calls(text, every=True) == ["N5QLZ", "N5QLZ"]
+    assert runner_calls("CQ TEST W6YH W6YH TEST", every=True) == ["W6YH"]
+
+
+def test_cq_groups_spot_in_the_first_window() -> None:
+    """40m WES 2026-10-11: N5QLZ sent two CQs in one window and waited 7 minutes for a second."""
+    text = "CQ CQ WES WES DE N5QLZ N5QLZ K CQ CQ WES WES DE N5QLZ"
+    off, on = _rule(), RepeatSpotRule(_tier2, cq_groups=True)
+    assert off.feed(off.window_id(1, 0, 0.0), 7050.2, text, 0.0) == []
+    assert on.feed(on.window_id(1, 0, 0.0), 7050.2, text, 0.0) == [("N5QLZ", 7050.2)]
+
+
+def test_cq_groups_do_not_add_the_two_lpf_paths() -> None:
+    r = RepeatSpotRule(lambda c: 3, cq_groups=True)
+    text = "CQ WES DE N5QLZ N5QLZ K CQ WES DE N5QLZ"
+    assert r.feed(r.window_id(1, 0, 0.0), 7050.2, text, 0.0) == []
+    assert r.feed(r.window_id(1, 0, 0.0), 7050.2, text, 0.0) == []
+    assert r.feed(r.window_id(1, 1, 60.0), 7050.2, "CQ WES DE N5QLZ N5QLZ", 60.0) == [("N5QLZ", 7050.2)]
+
+
+def test_cq_groups_take_the_larger_count_of_the_two_lpf_paths() -> None:
+    one, three = "CQ WES DE N5QLZ N5QLZ", "CQ N5QLZ K CQ N5QLZ K CQ N5QLZ"
+    for first, second, want in ((one, three, [[], [("N5QLZ", 7050.2)]]), (three, one, [[("N5QLZ", 7050.2)], []])):
+        r = RepeatSpotRule(lambda c: 3, cq_groups=True)
+        w = r.window_id(1, 0, 0.0)
+        assert [r.feed(w, 7050.2, first, 0.0), r.feed(w, 7050.2, second, 0.0)] == want
+
+
+def test_cq_groups_copies_expire() -> None:
+    r = RepeatSpotRule(lambda c: 3, cq_groups=True)
+    text = "CQ WES DE N5QLZ N5QLZ K CQ WES DE N5QLZ"
+    assert r.feed(r.window_id(1, 0, 0.0), 7050.2, text, 0.0) == []
+    late = REPEAT_S + 61.0
+    assert r.feed(r.window_id(1, 9, late), 7050.2, "CQ WES DE N5QLZ N5QLZ", late) == []
+    w = r.window_id(2, 0, 0.0)
+    assert r.feed(w, 7050.2, text, late) == [("N5QLZ", 7050.2)]      # 1 + 2 copies
+    later = late + REPEAT_S + 61.0
+    assert r.feed(w, 7050.2, text, later) == []                       # the same window id counts afresh
+    assert r.feed(r.window_id(3, 0, later), 7050.2, "CQ WES DE N5QLZ N5QLZ", later) == [("N5QLZ", 7050.2)]
+
+
 def test_call_not_in_scp_spots_on_repeats() -> None:
     r = _rule()
     assert r.feed(r.window_id(1, 0, 0.0), 14030.0, "CQ K9ZZZ", 0.0) == []
@@ -390,3 +434,12 @@ def test_lockon_new_runner_takes_over_once_the_owner_is_gone() -> None:
     spots = _feed(rule, ["TU K6NR CQ W7QP W7QP", "CQ W7QP W7QP", "CQ W7QP W7QP"], t0=120.0)
     assert [c for c, _ in spots] == ["W7QP"]
     assert rule.owner(7019.3, 241.0) == "W7QP"
+
+
+def test_lockon_with_cq_groups_counts_each_group() -> None:
+    # both keys on: lock-on picks the calls, cq_groups counts each CQ group of the window
+    text = "CQ CQ WES WES DE N5QLZ N5QLZ K CQ CQ WES WES DE N5QLZ"
+    both = RepeatSpotRule(_tier2, cq_groups=True, lockon=True)
+    assert _feed(_lockon(), [text]) == []
+    assert _feed(both, [text]) == [("N5QLZ", 7019.3)]
+    assert both.owner(7019.3, 0.0) == "N5QLZ"
