@@ -14,6 +14,7 @@ Status: the decoder, scanner and spot rule (`spot_rule: repeat`, the default wit
 | `spot_rule` | `off` (default with `itila`) | the original spot path (`_itila_extract_cq_call`, `SpotTracker.process`) |
 | | `repeat` (default with `itila2`) | `spot_rule.py`: whole decode windows go to `RepeatSpotRule` |
 | `spot_rule_cq_groups` | `false` (default) | with `spot_rule: repeat`, every CQ group in a window counts as a copy (rule 2) |
+| `spot_rule_split_runs` | `false` (default) | with `spot_rule: repeat`, words run together with no gap are split before rule 1 (`CQCQDE` -> `CQ CQ DE`) |
 | `spot_rule_lockon` | `false` (default) | with `spot_rule: repeat`, lock-on (rule 6 below) |
 | `itila_decode_threads` | 1 (default) | number of bins decoded in parallel, and scanner DSP worker threads |
 
@@ -69,7 +70,7 @@ Shared with itila: the 200 Hz envelope, a two-state HMM (mark, space) whose para
 
 The reference is WX7V/5: CW Skimmer at validation Normal with no Master.dta, feeding the Aggregator, which forwards only CQ-tagged spots. The rule mirrors what that node sends.
 
-1. The call is the sender of a CQ group. A group opens at CQ or TEST, or at DE when CQ or TEST came earlier in the window with no call between and the call is sent twice (`CQ SKCC DE K4DH K4DH`). The sender is the call inside the group or within 3 words after its keywords; keywords right after the sender close the group, and the next transmission (usually a caller) starts after them: `CQ TEST W6YH`, `CQ W6YH TEST`, `TEST W6YH`, `CQ TEST W6YH TEST`. `TU W6YH` and a bare `W6YH TEST` open no group: on two CWTs they promoted callers.
+1. The call is the sender of a CQ group. A group opens at CQ or TEST, or at DE when CQ or TEST came earlier in the window with no call between and the call is sent twice (`CQ SKCC DE K4DH K4DH`). The sender is the call inside the group or within 3 words after its keywords; keywords right after the sender close the group, and the next transmission (usually a caller) starts after them: `CQ TEST W6YH`, `CQ W6YH TEST`, `TEST W6YH`, `CQ TEST W6YH TEST`. `TU W6YH` and a bare `W6YH TEST` open no group: on two CWTs they promoted callers. With `spot_rule_split_runs: true` (off by default), words run together with no gap, common in hand-sent CW, are split first when the whole word reads as keywords, an event tag after CQ or TEST, and a call: `CQCQDE`, `CQCQWESDE`, `CQPADEW3RA` (PA QSO Party 10-10: 24 nearby misses had them).
 2. The exact call must be copied in 2, 3 or 4 decode windows, by its pattern (patt3ch.lst), as CW Skimmer validates, within 0.5 kHz and the last 10 minutes. No SCP check: 8 of the 12 calls WX7V/5 sent in a 41-minute sample were not in MASTER.SCP. Portable calls stay whole (HK3/NP4Z, N5AW/0).
 3. One vote on garbled decodes: a call does not spot while a call one edit from it has as many copies or more near the same frequency; a tie waits for the next window. Nothing is renamed and no copies are pooled, so near-identical real calls on one frequency (N4VI next to N4ZZ, K3WW next to K2TW) both spot.
 4. A call followed by a name and a number (a caller being sent the exchange) does not count.
