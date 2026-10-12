@@ -54,6 +54,31 @@ def test_caller_sent_the_exchange_does_not_count() -> None:
     assert runner_calls("TEST VE7KW TEST K3JT K3JT KEITS 2182") == ["VE7KW"]
 
 
+def test_cq_qualifier_is_not_an_exchange() -> None:
+    def q(text: str) -> list[str]:
+        return runner_calls(text, every=True, qualifiers=True)
+    # 20m 2026-10-11, PA QSO Party and WES: the qualifier after the call read as name + state
+    assert q("CQ PA WB3EML PA CQ PA WB3EML PA") == ["WB3EML", "WB3EML"]
+    assert q("CQ FD CQ FD DE WX7V FD CQ FD CQ FD DE WX7V FD") == ["WX7V", "WX7V"]
+    assert q("CQ WES DE WX7V WX7V WES TX CQ WES DE WX7V WX7V WES TX") == ["WX7V", "WX7V"]
+    # qualifier only after the call: the keyword after it is no state
+    assert q("CQ CQ DE WX7V WX7V FD CQ CQ DE WX7V WX7V FD") == ["WX7V", "WX7V"]
+    # a caller sent a real exchange still does not count
+    assert q("CQ CWT W6YH TEST K1ABC BOB MA") == ["W6YH"]
+    assert q("CQ PA W6YH TEST K1ABC BOB 123") == ["W6YH"]
+    # known cost: an exchange whose number was lost before a keyword reads as a CQ group
+    # (1 copy in 32,000 windows on four recordings); the repeat count still has to be met
+    assert q("TEST K1ABC BOB CQ") == ["K1ABC"]
+
+
+def test_cq_qualifiers_key() -> None:
+    """Off by default: PA CQ after the call reads as name and state, one copy per window."""
+    texts = ["CQ PA WB3EML PA CQ PA WB3EML PA"]
+    assert _feed(RepeatSpotRule(_tier2, cq_groups=True), texts) == []
+    assert _feed(RepeatSpotRule(_tier2, cq_groups=True, cq_qualifiers=True),
+                 texts) == [("WB3EML", 7019.3)]
+
+
 def test_contest_report_and_number_is_an_exchange() -> None:
     # Morse Runner CQ WW cells (hotairfred, cdub89/SparkGap#8): the caller follows the CQ
     assert runner_calls("CQ W6YH TEST EI4KF 5NN 4 5NN 4 TU") == ["W6YH"]
