@@ -29,7 +29,7 @@
 /* Baudot/ITA2 tables */
 static const char LTRS[] = "\0E\nA SIU\rDRJNFCKTZLWHYPQOBG\0MXV\0";
 /*                            0 1  2 3 4 5 6 7  8  9 A B  C D E  F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F */
-static const char FIGS[] = {  0,'3','\n','-',' ','\a','8','7','\r', 0,'$','4','\'',',','!',':','(','5','"',')','2','#','6','0','1','9','?','&', 0,'.','/','=', 0 };
+static const char FIGS[] = {  0,'3','\n','-',' ','\a','8','7','\r','$','4','\'',',','!',':','(','5','"',')','2','#','6','0','1','9','?','&', 0,'.','/',';', 0 };
 #define BAUDOT_LTRS 0x1F
 #define BAUDOT_FIGS 0x1B
 #define BAUDOT_SPACE 0x04
