@@ -17,13 +17,20 @@ capture can be started and stopped without restarting the skimmer:
     rm    /home/sparkgap/iqrec/RECORD    # stop  (files close at the next minute)
 Each session writes one stereo (I,Q) WAV per band:
     <dir>/<UTC stamp>_<band kHz>kHz_<rate>_<bits>bit.wav
+The stamp is the time of the session's first sample (the first minute's
+t_first), not the time it was written, so replays can be scored by time.
 A WAV header holds 32-bit sizes (4 GiB of audio, about 62 minutes at
 192 kHz 24-bit stereo), so a band that reaches MAX_DATA_BYTES continues in
 ..._p2.wav, ..._p3.wav: contiguous, nothing dropped.
-Gaps between consecutive swaps (t_first discontinuities) are logged.
+Gaps between consecutive swaps (t_first discontinuities) are logged. The
+capture buffer behind a swap holds 65 s and drops what does not fit, so a
+minute snapshot the skimmer skips (the previous FT8/RTTY cycle still running)
+loses up to 55 s of that band; it shows up here as a logged gap.
 
 Writing happens on a background thread so the decode loop never waits on
-the disk. 8 bands x 192 kHz x 24-bit = ~9 MB/s (~33 GB/hour).
+the disk. 8 bands x 192 kHz x 24-bit = ~9 MB/s (~33 GB/hour). The queue holds
+MAX_QUEUE band-minutes (69 MB each at 24-bit, about two minutes of 8 bands); a
+disk slower than that drops whole minutes (logged) instead of growing memory.
 """
 import datetime
 import logging
@@ -38,6 +45,8 @@ log = logging.getLogger('sparkgap')
 
 GAP_TOL_S = 0.05
 MAX_DATA_BYTES = 4_000_000_000    # under the WAV format's 2**32 - 1 byte limit
+MAX_QUEUE = 16                    # band-minutes waiting for the disk (~1.1 GB at 24-bit)
+CLOSE_TIMEOUT_S = 10.0            # close() gives up waiting on a stalled disk after this
 
 
 def pack_iq(i, q, bits, in_scale=8388608.0):
@@ -57,7 +66,7 @@ def pack_iq(i, q, bits, in_scale=8388608.0):
 
 
 class BandRecorder:
-    def __init__(self, rec_dir, bits=24, rate=192000, max_queue=32, in_scale=8388608.0):
+    def __init__(self, rec_dir, bits=24, rate=192000, max_queue=MAX_QUEUE, in_scale=8388608.0):
         if bits not in (16, 24):
             raise ValueError('record_iq_bits must be 16 or 24')
         self.dir, self.bits, self.rate, self.in_scale = rec_dir, bits, rate, in_scale
@@ -85,9 +94,11 @@ class BandRecorder:
             log.warning("IQ recorder queue full: dropped %s kHz minute (disk too slow?)",
                         band_khz)
 
-    def _open(self, band_khz, part=1):
+    def _open(self, band_khz, t_first, part=1):
         if self._session is None:
-            self._session = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
+            start = (datetime.datetime.fromtimestamp(t_first, datetime.timezone.utc) if t_first > 0
+                     else datetime.datetime.now(datetime.timezone.utc))
+            self._session = start.strftime('%Y%m%d_%H%M%SZ')
             log.info("IQ recording started: session %s in %s", self._session, self.dir)
         path = os.path.join(self.dir, '%s_%skHz_%d_%dbit%s.wav'
                             % (self._session, band_khz, self.rate, self.bits,
@@ -117,7 +128,7 @@ class BandRecorder:
                 w, expect, nbytes, part = self._writers.get(band_khz, (None, None, 0, 1))
                 data = pack_iq(fi[:n], fq[:n], self.bits, self.in_scale)
                 if w is None:
-                    w = self._open(band_khz)
+                    w = self._open(band_khz, t_first)
                 else:
                     if expect is not None and abs(t_first - expect) > GAP_TOL_S:
                         log.warning("IQ recording gap on %s kHz: %.3f s", band_khz, t_first - expect)
@@ -125,7 +136,7 @@ class BandRecorder:
                         w.close()
                         part += 1
                         nbytes = 0
-                        w = self._open(band_khz, part)
+                        w = self._open(band_khz, t_first, part)
                         log.info("IQ recording %s kHz: continuing in part %d", band_khz, part)
                 w.writeframes(data)
                 self._writers[band_khz] = (w, t_first + n / self.rate, nbytes + len(data), part)
@@ -134,8 +145,15 @@ class BandRecorder:
             finally:
                 self._q.task_done()
 
-    def close(self, wait=True):
-        """Close any open files (waits for queued minutes to be written)."""
-        self._q.put(('stop',))
+    def close(self, wait=True, timeout=CLOSE_TIMEOUT_S):
+        """Close any open files, waiting up to timeout seconds for queued minutes to
+        be written; a stalled disk does not block shutdown longer than that."""
+        try:
+            self._q.put(('stop',), timeout=timeout)
+        except queue.Full:
+            log.warning("IQ recorder: queue full at close, files left open")
+            return
         if wait:
-            self._q.join()
+            with self._q.all_tasks_done:
+                if not self._q.all_tasks_done.wait_for(lambda: self._q.unfinished_tasks == 0, timeout):
+                    log.warning("IQ recorder: disk still busy after %.0f s at close", timeout)

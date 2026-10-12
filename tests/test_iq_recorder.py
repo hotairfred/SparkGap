@@ -4,6 +4,7 @@ RECORD-file start/stop, 16-bit path.
 
 Runs under pytest, or standalone:  python3 tests/test_iq_recorder.py
 """
+import threading
 import glob
 import logging
 import os
@@ -126,3 +127,36 @@ if __name__ == '__main__':
         except Exception as e:
             print('FAIL ', fn.__name__, type(e).__name__, e)
     print(f'\n{ok}/{len(fns)} passed'); sys.exit(0 if ok == len(fns) else 1)
+
+
+def test_session_stamp_is_the_first_sample_time():
+    rng = np.random.default_rng(3)
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, 'RECORD'), 'w').close()
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        i1, q1 = _swap(rng, 600)
+        rec.submit(7090, 1791669600.25, i1, q1, 600)      # 2026-10-10 22:00:00.25Z
+        _wait(rec)
+        rec.close()
+        (f,) = glob.glob(os.path.join(d, '*.wav'))
+        assert os.path.basename(f).startswith('20261010_220000Z_7090kHz_')
+
+
+def test_close_does_not_wait_forever_on_a_stalled_disk():
+    rng = np.random.default_rng(4)
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, 'RECORD'), 'w').close()
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        stall = threading.Event()
+        real = R.pack_iq
+        R.pack_iq = lambda *a, **k: (stall.wait(5), real(*a, **k))[1]   # the disk "hangs"
+        try:
+            i1, q1 = _swap(rng, 600)
+            rec.submit(7090, 100.0, i1, q1, 600)
+            t0 = time.monotonic()
+            rec.close(timeout=0.3)
+            assert time.monotonic() - t0 < 2.0
+        finally:
+            stall.set()
+            R.pack_iq = real
+            _wait(rec)
