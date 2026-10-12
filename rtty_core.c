@@ -58,7 +58,6 @@ typedef struct {
     /* Bit recovery */
     double data_lpf;       /* bipolar data signal after LPF */
     double data_alpha;     /* data LPF coefficient */
-    int    bit_counter;    /* sample counter within current bit */
     int    samples_per_bit;/* samples per bit period */
 
     /* Baudot state */
@@ -80,6 +79,9 @@ typedef struct {
     int    result_len;
     double confidence;     /* average bit confidence */
     double prev_data;      /* previous LPF value for transition detection */
+    double spb;            /* samples per bit, fractional */
+    double tc, next_t;     /* samples since the start edge; when the next bit is sampled */
+    int    framing_errors; /* characters dropped for a space stop bit */
 } rtty_state_t;
 
 typedef void *rtty_handle_t;
@@ -125,6 +127,7 @@ rtty_handle_t rtty_create(int sample_rate, double center_freq) {
     st->data_alpha = 1.0 - exp(-1.0 / (data_tc * sample_rate));
 
     st->samples_per_bit = (int)(sample_rate / RTTY_BAUD + 0.5);
+    st->spb = sample_rate / RTTY_BAUD;
     /* ATC: peaks and floors follow a new level in half a bit and release over 64 bits
      * (1.4 s). Tuned on an RTTY contest recording: 0.5/64, 1/256 and 2/256 bits gave
      * 117, 117 and 112 RBN-confirmed calls; 0.5/64 kept the fewest unconfirmed. */
@@ -200,60 +203,62 @@ const char *rtty_feed(rtty_handle_t h, const double *audio, int n,
                        - 0.5 * ((st->mark_max - st->mark_min) - (st->space_max - st->space_min));
         st->data_lpf += st->data_alpha * (bipolar - st->data_lpf);
 
-        /* Bit clock: count samples, detect transitions */
-        st->bit_counter++;
-
-        if ((st->prev_data >= 0 && st->data_lpf < 0) ||
-            (st->prev_data < 0 && st->data_lpf >= 0)) {
-            /* Only resync if we're past 50% of a bit period (avoid mid-bit glitches) */
-            if (st->bit_counter > st->samples_per_bit / 2)
-                st->bit_counter = 0;
-        }
-        st->prev_data = st->data_lpf;
-
-        /* Sample at mid-bit */
-        if (st->bit_counter == st->samples_per_bit / 2) {
-            int bit = (st->data_lpf >= 0) ? 1 : 0;
-            double soft = st->data_lpf;
-
-            if (!st->in_char) {
-                if (bit == 0) {  /* start bit */
-                    st->in_char = 1;
-                    st->bit_count = 0;
-                    st->bit_buf = 0;
-                }
-            } else {
-                st->bit_count++;
-                if (st->bit_count <= 5) {
-                    st->bit_buf |= (bit << (st->bit_count - 1));
-                    st->soft_bits[st->bit_count - 1] = soft;
-                } else if (st->bit_count >= 7) {
-                    int code = st->bit_buf & 0x1F;
-                    if (code == BAUDOT_SPACE) {
-                        st->shift = 0;  /* UOS */
-                        if (st->result_len < RESULT_BUF - 1)
-                            st->result_buf[st->result_len++] = ' ';
-                    }
-                    else if (code == BAUDOT_LTRS) st->shift = 0;
-                    else if (code == BAUDOT_FIGS) st->shift = 1;
-                    else {
-                        char ch = st->shift ? FIGS[code] : LTRS[code];
-                        if (ch > 0 && ch != '\r' && ch != '\a' &&
-                            st->result_len < RESULT_BUF - 1) {
-                            st->result_buf[st->result_len++] = ch;
-                        }
-                    }
-                    double conf = 0;
-                    for (int b = 0; b < 5; b++)
-                        conf += fabs(st->soft_bits[b]);
-                    st->confidence = conf / 5.0;
+        /* Character timing as a UART: a mark-to-space edge while idle starts a
+         * character; the start bit is checked at its centre (half a bit later), the
+         * five data bits are sampled at their centres, and the character is kept only
+         * when the stop bit is mark. Each character re-times from its own start edge,
+         * so clock error cannot build up, and a misread start or a space stop bit
+         * drops the character instead of printing a wrong letter. */
+        double v = st->data_lpf;
+        if (!st->in_char) {
+            if (st->prev_data >= 0 && v < 0) {
+                st->in_char = 1;
+                st->bit_count = -1;            /* -1: start bit, 0..4: data, 5: stop */
+                st->bit_buf = 0;
+                st->tc = 0.0;
+                st->next_t = 0.5 * st->spb;
+            }
+        } else {
+            st->tc += 1.0;
+            if (st->tc >= st->next_t) {
+                int bit = (v >= 0) ? 1 : 0;
+                st->next_t += st->spb;
+                if (st->bit_count == -1) {
+                    if (bit) st->in_char = 0;  /* a glitch, not a start bit */
+                    else st->bit_count = 0;
+                } else if (st->bit_count < 5) {
+                    st->bit_buf |= (bit << st->bit_count);
+                    st->soft_bits[st->bit_count] = v;
+                    st->bit_count++;
+                } else {
                     st->in_char = 0;
+                    if (!bit) {
+                        st->framing_errors++;  /* space stop bit: drop it */
+                    } else {
+                        int code = st->bit_buf & 0x1F;
+                        if (code == BAUDOT_SPACE) {
+                            st->shift = 0;  /* UOS */
+                            if (st->result_len < RESULT_BUF - 1)
+                                st->result_buf[st->result_len++] = ' ';
+                        }
+                        else if (code == BAUDOT_LTRS) st->shift = 0;
+                        else if (code == BAUDOT_FIGS) st->shift = 1;
+                        else {
+                            char ch = st->shift ? FIGS[code] : LTRS[code];
+                            if (ch > 0 && ch != '\r' && ch != '\a' &&
+                                st->result_len < RESULT_BUF - 1) {
+                                st->result_buf[st->result_len++] = ch;
+                            }
+                        }
+                        double conf = 0;
+                        for (int k = 0; k < 5; k++)
+                            conf += fabs(st->soft_bits[k]);
+                        st->confidence = conf / 5.0;
+                    }
                 }
             }
         }
-
-        if (st->bit_counter >= st->samples_per_bit)
-            st->bit_counter = 0;
+        st->prev_data = v;
     }
 
     st->result_buf[st->result_len] = '\0';
