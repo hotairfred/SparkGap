@@ -436,6 +436,32 @@ def test_lockon_new_runner_takes_over_once_the_owner_is_gone() -> None:
     assert rule.owner(7019.3, 241.0) == "W7QP"
 
 
+def test_lockon_garbled_owner_yields_to_the_call_it_garbles() -> None:
+    # 14012.0 kHz, Lakehouse 10-11: BW3IO (a garble, tier 4) took the frequency and confirmed
+    # itself with TU BW3IO; W3IO (tier 2) sat in windows that also held BW3IO and never spotted
+    rule = RepeatSpotRule(lambda c: 4 if c == "BW3IO" else 2, lockon=True)
+    spots = _feed(rule, ["CQ CQ DE BW3IO K", "TU BW3IO CQ DE W3IO W3IO K",
+                         "CQ DE W3IO BW3IO K", "CQ CQ DE W3IO W3IO BW3IO K"])
+    assert [c for c, _ in spots] == ["W3IO"]
+    assert rule.owner(7019.3, 200.0) == "W3IO"
+
+
+def test_lockon_garble_in_the_same_tier_does_not_take_over() -> None:
+    # K3Q inside K3QIA, both tier 2: the owner keeps the frequency, as in the K6NR case
+    rule = _lockon()
+    spots = _feed(rule, ["CQ PQ K3QIA K", "CQ PQ K3QIA K CQ PQ K3Q A", "CQ PQ K3Q K3QIA K"])
+    assert [c for c, _ in spots] == ["K3QIA"]
+
+
+def test_lockon_fragment_of_the_owner_does_not_take_over() -> None:
+    # PA QSO Party 10-10, 7036.5 kHz: W2L, the front of the mobile W2LCQ/NLI, is not one edit
+    # from it, so it stays a garble even though W2LCQ/NLI is in a less trusted tier
+    rule = RepeatSpotRule(lambda c: 4 if "/" in c else 2, lockon=True)
+    spots = _feed(rule, ["CQ PAQP W2LCQ/NLI", "CQ PAQP W2LCQ/NLI", "CQ PAQP W2L RQ/NLI W2LCQ/NLI",
+                         "CQ PAQP W2L W2LCQ/NLI", "CQ PAQP W2LCQ/NLI W2L"])
+    assert "W2L" not in [c for c, _ in spots]
+
+
 def test_lockon_with_cq_groups_counts_each_group() -> None:
     # both keys on: lock-on picks the calls, cq_groups counts each CQ group of the window
     text = "CQ CQ WES WES DE N5QLZ N5QLZ K CQ CQ WES WES DE N5QLZ"

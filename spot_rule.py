@@ -278,6 +278,12 @@ class RepeatSpotRule:
                         if abs(o[1] - freq_khz) > NEAR_KHZ and now - o[2] <= LOCK_IDLE_S]
         self._owners.append([call, freq_khz, now])
 
+    def _truer_call(self, call: str, owner: str) -> bool:
+        """call is what a garbled owner should have read: one edit from it and in a more trusted
+        tier (W3IO, an active call, against BW3IO, unknown). Not a mere part of it: W2L inside
+        W2LCQ/NLI is a fragment of the real call."""
+        return _lev1(call, owner) and self.tier(call) < self.tier(owner)
+
     def _lockon_calls(self, freq_khz: float, text: str, now: float) -> list[str]:
         """Calls one decoded text counts as copies of, with lock-on (see the module docstring)."""
         calls: list[str] = []
@@ -287,7 +293,7 @@ class RepeatSpotRule:
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
             if owner is not None and call != owner:
-                if owner in toks:
+                if owner in toks and not self._truer_call(call, owner):
                     continue                      # the owner is still here: CQ A6QP K6NR is a garble
                 held = sum(1 for c in self._copies if c.call == call
                            and abs(c.freq_khz - freq_khz) <= NEAR_KHZ)
