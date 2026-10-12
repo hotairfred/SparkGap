@@ -1738,6 +1738,116 @@ RTTY_RANGES = {
 }
 
 
+# RTTY ranges for rtty_spot_rule "repeat", offset (Hz) from band center: where RBN's RTTY
+# skimmers spotted a weekend RTTY contest (10-10 22-00Z, 5th to 99th percentile, plus margin).
+# 40m ran 7046 to 7074 kHz, above the 7035-7055 of RTTY_RANGES.
+RTTY_RANGES_REPEAT = {
+    3590:  (-12000, +12000),   # 80m: 3578-3602
+    7090:  (-60000, -10000),   # 40m: 7030-7080
+    14090: (-14000, +16000),   # 20m: 14076-14106
+    21090: (-12000, +12000),   # 15m: 21078-21102
+    28090: (-12000, +12000),   # 10m: 28078-28102
+}
+
+
+def _rtty_candidates(iq, lo_hz, hi_hz):
+    """RTTY candidates in a minute of IQ: [(offset_hz, snr_db)], strongest first. Mark and
+    space peaks ~170 Hz apart in a max-hold of 2 s spectra over the whole minute, so a
+    station that transmits at any time in the minute is found, not only in its first 2 s."""
+    from scipy.signal import find_peaks
+    n = 2 * 192000
+    fr = np.fft.fftshift(np.fft.fftfreq(n, 1.0 / 192000))
+    sel = (fr >= lo_hz) & (fr <= hi_hz)
+    f = fr[sel]
+    hold = None
+    for k in range(0, len(iq) - n + 1, n):
+        s = np.convolve(np.fft.fftshift(np.abs(np.fft.fft(iq[k:k + n])))[sel], np.ones(11) / 11, mode='same')
+        hold = s if hold is None else np.maximum(hold, s)
+    if hold is None or len(hold) < 200:
+        return []
+    noise = float(np.median(hold))
+    if noise <= 0:
+        return []
+    pk, _ = find_peaks(hold, height=noise * 4, distance=max(1, int(60 / (f[1] - f[0]))))
+    out, seen = [], set()
+    for i, a in enumerate(pk):
+        for b in pk[i + 1:]:
+            d = f[b] - f[a]
+            if d > 200:
+                break
+            if abs(d - 170.0) <= 20.0:
+                c = (f[a] + f[b]) / 2.0
+                if round(c / 100) in seen:
+                    continue
+                seen.add(round(c / 100))
+                out.append((c, 10.0 * np.log10(min(hold[a], hold[b]) / noise)))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
+    """rtty_spot_rule "repeat": decode every RTTY candidate of the minute and spot through
+    spot_rule.RepeatSpotRule, as CW: a call spots when a CQ/TEST group names it in
+    tier(call) decodes (minutes) near one frequency. Callers are never spotted. One FFT of
+    the minute; each candidate's 12 kHz audio is cut from it, not mixed from the full IQ."""
+    import ctypes as _ct
+    rng = RTTY_RANGES_REPEAT.get(int(band_center_khz))
+    if rng is None:
+        return 0
+    rule = getattr(skimmer, '_rtty_rule', None)
+    if rule is None:
+        from spot_rule import RepeatSpotRule
+        trk = skimmer.tracker
+        rule = skimmer._rtty_rule = RepeatSpotRule(
+            lambda c: {'active': 2, 'rare': 3}.get(trk._matches_patt3ch(c), 4),
+            cq_groups=bool(skimmer.cfg.get('spot_rule_cq_groups', False)),
+            lockon=bool(skimmer.cfg.get('spot_rule_lockon', False)))
+    iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
+    cands = _rtty_candidates(iq, *rng)[:int(skimmer.cfg.get('rtty_max_candidates', 40))]
+    if not cands:
+        return 0
+    rate, audio_center = 12000, 1000.0
+    z = np.fft.fft(iq)
+    n = len(z)
+    n_out = n * rate // 192000
+    bin_hz = 192000.0 / n
+    now = time.time()
+    n_spots = 0
+    for off_hz, snr_db in cands:
+        k0 = int(round(off_hz / bin_hz))
+        half = int(1500.0 / bin_hz)
+        idx = np.arange(k0 - half, k0 + half + 1)
+        sp = np.zeros(n_out, dtype=np.complex128)
+        sp[(idx - k0 + int(round(audio_center / bin_hz))) % n_out] = z[idx % n]
+        audio = np.fft.ifft(sp).real
+        peak = float(np.max(np.abs(audio)))
+        if peak <= 0:
+            continue
+        audio = np.ascontiguousarray(audio / peak * 0.7, dtype=np.float64)
+        h = rtty_lib.rtty_create(_ct.c_int(rate), _ct.c_double(audio_center))
+        if not h:
+            continue
+        conf = _ct.c_double(0.0)
+        try:
+            p = rtty_lib.rtty_feed(h, audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                   _ct.c_int(len(audio)), _ct.byref(conf))
+            text = p.decode('latin-1', errors='replace').strip() if p else ''
+        finally:
+            rtty_lib.rtty_free(h)
+        if not text:
+            continue
+        rf_khz = (band_center_khz * 1000.0 + off_hz) / 1000.0
+        log.info("RTTY %s @ %.1f kHz (%.0f dB): %s", bn, rf_khz, snr_db, text[:80])
+        w = rule.window_id(int(round(rf_khz * 10)), int(now // 60), now)
+        for call, sf in rule.feed(w, rf_khz, text, now, snr=snr_db):
+            log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***", sf, call, int(snr_db), text[:50])
+            skimmer.telnet.broadcast_spot(freq_khz=skimmer._corrected_freq_khz(sf), dx_call=call,
+                                          snr=int(snr_db), mode='RTTY', comment=text[:60])
+            skimmer.spot_count += 1
+            n_spots += 1
+    return n_spots
+
+
 def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
     """Scan one band's IQ snapshot for RTTY signals; broadcast spots.
 
@@ -7766,7 +7876,10 @@ class SparkGap:
                                     rtty_total = 0
                                     for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
                                         try:
-                                            rtty_total += _rtty_scan_band(
+                                            scan = (_rtty_scan_band_repeat
+                                                    if skimmer.cfg.get('rtty_spot_rule') == 'repeat'
+                                                    else _rtty_scan_band)
+                                            rtty_total += scan(
                                                 skimmer, rtty_lib, bn, ck, fi, fq, n)
                                         except Exception as e:
                                             log.warning("RTTY scan %s: %s", bn, e)
