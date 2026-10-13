@@ -2043,13 +2043,15 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
             skimmer._rtty_emitted[key] = now
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
                      rf_hz / 1000.0, call, int(snr_db), text[:50])
+            # Not tagged CQ: this path spots any call in the text, callers included, and
+            # rbn_feeder uploads only CQ-tagged lines. rtty_spot_rule "repeat" tags CQ.
             skimmer.telnet.broadcast_spot(
                 freq_khz=skimmer._corrected_freq_khz(rf_hz / 1000.0),
                 dx_call=call,
                 snr=int(snr_db),
                 wpm=RTTY_SPOT_BAUD,
                 mode='RTTY',
-                comment='CQ')
+                comment=text[:60])
             skimmer.spot_count += 1
             n_spots += 1
 

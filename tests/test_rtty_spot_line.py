@@ -48,3 +48,22 @@ def test_cw_spot_line_unchanged() -> None:
     rbn._post = lambda path, body: sent.append(body)
     rbn.post_spots([sp])
     assert sent[0]['s'][0][6] == '1'
+
+
+def test_only_cq_tagged_lines_upload() -> None:
+    from rbn_feeder import uploadable
+    cq = parse_spot(_spot_lines(freq_khz=14085.0, dx_call='KA4RRU', snr=26, wpm=45, mode='RTTY',
+                                comment='CQ')[0])
+    assert uploadable(cq)
+    # the older RTTY path (rtty_spot_rule not "repeat") puts the decoded text in the comment;
+    # a caller found there must not reach RBN
+    for text in ('TU K2X', 'K2X', 'DE K2X K2X', 'KA4RRU 599 K2X'):
+        sp = parse_spot(_spot_lines(freq_khz=14085.0, dx_call='K2X', snr=20, wpm=45, mode='RTTY',
+                                    comment=text)[0])
+        assert not uploadable(sp), text
+    de = parse_spot(_spot_lines(freq_khz=7025.5, dx_call='K4U', snr=29, wpm=21, mode='CW',
+                                comment='DE')[0])
+    assert de is not None and not uploadable(de)
+    ft8 = parse_spot(_spot_lines(freq_khz=14075.0, dx_call='N5CVT', snr=-5, mode='FT8',
+                                 comment='CQ')[0])
+    assert not uploadable(ft8)
