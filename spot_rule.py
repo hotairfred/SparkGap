@@ -15,17 +15,17 @@ The spot goes out on the strongest window (bin SNR) among the copies, once per c
 REPEAT_S unless it moves more than MOVE_KHZ. A window is one decode window of one bin;
 both LPF paths of a window count once.
 
-CQ groups (config spot_rule_cq_groups: true, off by default): every CQ group naming the call
+CQ groups (cq_groups; always on in SparkGap): every CQ group naming the call
 counts as a copy, also several in one window (CQ WES DE N5QLZ N5QLZ K CQ WES DE N5QLZ is two),
 so a call sent in two or more CQs of one window does not wait for the next window. The two
 LPF paths of a window are not added: the larger count of the two is used.
 
-CQ qualifiers (config spot_rule_cq_qualifiers: true, off by default): a word of 2 to 5 letters
+CQ qualifiers (cq_qualifiers; always on in SparkGap): a word of 2 to 5 letters
 right after CQ or TEST (CQ PA, CQ FD, CQ WES) is the window's CQ qualifier and is no exchange
 name wherever it appears in that window, and a stop word is no number or state. Without it
 CQ PA WB3EML PA CQ reads PA CQ as name and state, and WB3EML as a caller.
 
-Lock-on (config spot_rule_lockon: true, off by default): a call named by a CQ group owns the
+Lock-on (lockon; always on in SparkGap): a call named by a CQ group owns the
 frequency it was copied on. While it owns it, two things change near that frequency:
   - the owner's own later sign-offs (TU W6YH, DE W6YH, W6YH TEST) count as copies of W6YH,
     so a runner who CQs once and then signs with TU W6YH still repeats; a bare W6YH does not;
