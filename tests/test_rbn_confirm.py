@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "eval"))
 
 from rbn_confirm import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     base_call,
+    load_nodes,
     confirm,
     grid_latlon,
     miles,
@@ -115,3 +116,59 @@ def test_nearby_recall_bands_window_and_min_skimmers() -> None:
     assert rec == {"K0TQ": ({"W8WWV", "WT9U"}, True), "K1AJ": ({"W8WWV"}, False)}
     rec2 = nearby_recall({"K0TQ": {14030.4}}, archive, near, T0, T1, {"20m"}, min_nearby=2)
     assert rec2 == {"K0TQ": ({"W8WWV", "WT9U"}, True)}
+
+
+def test_mode_picks_cw_or_rtty_lines_and_rows() -> None:
+    lines = ["12:00:01 INFO *** SPOT:    7031.2  K0TQ          20 dB  22 WPM  [repeat] ***",
+             "12:00:02 INFO *** SPOT:   14074.3  N2PX  +5 dB  FT8  [CQ N2PX FN20] ***",
+             "12:00:03 INFO *** RTTY SPOT: 14085.0 kHz  KA4RRU      +20 dB  [CQ MAKRO KA4RRU] ***"]
+    assert parse_spots(lines) == {"K0TQ": {7031.2}}
+    assert parse_spots(lines, "RTTY") == {"KA4RRU": {14085.0}}
+    # mode from the line's shape: FT8WW and a call with RTTY in its text are CW spots;
+    # a LOCAL SPOT is the local port's rule, not the RBN stream
+    more = ["12:00:04 INFO *** SPOT:   14025.0  FT8WW         18 dB  26 WPM  [repeat] ***",
+            "12:00:05 INFO *** LOCAL SPOT:    7030.0  K8TLJ         12 dB  20 WPM ***",
+            "DX de WF8Z-#:   21025.00  FT4XYZ       CW   15 dB 24 WPM  CQ                  SG  1200Z",
+            "DX de WF8Z-#:   14080.00  N5CVT        FT8  -5 dB          CQ N5CVT EM12      SG  1200Z",
+            "DX de WF8Z-#:   14085.00  KA4RRU       RTTY 26 dB 45 BPS  CQ                  SG  1200Z"]
+    assert parse_spots(lines + more) == {"K0TQ": {7031.2}, "FT8WW": {14025.0}, "FT4XYZ": {21025.0}}
+    assert parse_spots(lines + more, "RTTY") == {"KA4RRU": {14085.0}}
+    rows = [_row("W8WWV", "K0TQ", "7031.0"), _row("W8WWV", "KA4RRU", "14085.0", mode="RTTY")]
+    assert [s.dx for s in parse_archive(rows)] == ["K0TQ"]
+    assert [s.dx for s in parse_archive(rows, "RTTY")] == ["KA4RRU"]
+
+
+def test_nearby_recall_min_skimmers_drops_one_off_garbles() -> None:
+    # one nearby skimmer's A4RRU (a garble) against KA4RRU heard by three
+    archive = list(parse_archive([
+        _row("W8WWV", "A4RRU", "14085.0"),
+        _row("W8WWV", "KA4RRU", "14085.0"), _row("N6TV", "KA4RRU", "14085.1"), _row("K9LC", "KA4RRU", "14085.0"),
+    ]))
+    rec = nearby_recall({"KA4RRU": {14085.0}}, archive, {"W8WWV"}, T0, T1, {"20m"}, min_skimmers=2)
+    assert rec == {"KA4RRU": ({"W8WWV"}, True)}
+
+
+def test_load_nodes_says_what_went_wrong_without_a_cache(tmp_path, monkeypatch) -> None:
+    import urllib.request
+
+    def down(*_a, **_k):
+        raise OSError("network is unreachable")
+    monkeypatch.setattr(urllib.request, "urlopen", down)
+    try:
+        load_nodes(tmp_path)
+    except SystemExit as e:
+        assert "network is unreachable" in str(e)
+    else:
+        raise AssertionError("expected SystemExit")
+    (tmp_path / "rbn_nodes.json").write_text('{"W8WWV": "EN80"}')
+    import os
+    os.utime(tmp_path / "rbn_nodes.json", (0, 0))                 # stale cache is still used
+    assert load_nodes(tmp_path) == {"W8WWV": "EN80"}
+
+
+def test_nearby_recall_skips_beacons() -> None:
+    rows = [_row("W8WWV", "K0TQ", "14030.0"), dict(_row("W8WWV", "4U1UN", "14100.0"), mode="NCDXF B"),
+            dict(_row("W8WWV", "N7MA", "28240.0"), mode="BEACON")]
+    archive = list(parse_archive([dict(r, mode=r.get("mode", "CQ")) for r in rows]))
+    rec = nearby_recall({}, archive, {"W8WWV"}, T0, T1, {"20m", "10m"})
+    assert set(rec) == {"K0TQ"}

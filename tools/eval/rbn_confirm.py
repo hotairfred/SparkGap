@@ -18,12 +18,22 @@ NEARBY RECALL, the calls that at least --min-nearby nearby skimmers spotted on o
 bands during --start..--end, and how many of them we spotted within --tol-khz.
 RBN only carries calls that passed its spotting rules (CQ/TEST, repeats), so nearby
 recall compares like with like; precision still compares our raw spots with
-filtered ones and reads low.
+filtered ones and reads low. The node list is RBN's current one, so an old
+recording is scored against today's skimmer locations.
+
+--min-skimmers N counts a call toward nearby recall only when at least N RBN
+skimmers (anywhere) spotted it in the window. One distant skimmer's garble (A4RRU
+for KA4RRU) is then not a call we "missed".
+
+--mode RTTY scores RTTY spots (log lines with RTTY, the archive's RTTY rows);
+the default CW skips RTTY and FT8 lines. RBN's RTTY skimmers also spot callers,
+which SparkGap never does, so RTTY nearby recall reads low.
 
 USAGE
   rbn_confirm.py LOG --start 2026-03-19T03:15:00 --end 2026-03-19T03:30:00
   rbn_confirm.py LOG --start ... --end ... --exclude-spotter WF8Z --show-confirmed
   rbn_confirm.py LOG --start ... --end ... --exclude-spotter WF8Z --near EM79SM
+  rbn_confirm.py LOG --start ... --end ... --mode RTTY --near EM79SM --radius-mi 600 --min-skimmers 3
 """
 
 import argparse
@@ -49,6 +59,7 @@ DEFAULT_TOL_KHZ = 1.0
 DEFAULT_SLACK_MIN = 10
 DEFAULT_RADIUS_MI = 300   # Grayline's HF local-spotter radius
 DEFAULT_MIN_NEARBY = 1
+FETCH_TIMEOUT_S = 60
 
 # Amateur band edges (kHz) for restricting nearby recall to the bands we cover.
 BANDS = {"160m": (1800, 2000), "80m": (3500, 4000), "60m": (5330, 5410),
@@ -57,6 +68,8 @@ BANDS = {"160m": (1800, 2000), "80m": (3500, 4000), "60m": (5330, 5410),
          "10m": (28000, 29700), "6m": (50000, 54000)}
 
 _SPOT_RE = re.compile(r"(?:SPOT:|DX de \S+:)\s+([\d.]+)\s+(?:kHz\s+)?([A-Z0-9/]+)", re.I)
+_TELNET_MODE_RE = re.compile(r"DX de \S+:\s+[\d.]+\s+\S+\s+([A-Z0-9]+)\s")   # the mode column
+_LOG_FT8_RE = re.compile(r"dB\s+FT[48]\b")                                   # *** SPOT: ... +9 dB  FT8  [...]
 
 
 @dataclass(frozen=True)
@@ -65,6 +78,7 @@ class RbnSpot:
     dx: str
     freq_khz: float
     time: datetime
+    kind: str = "CQ"     # the archive's spot type: CQ, BEACON, NCDXF B, DX
 
 
 def base_call(call: str) -> str:
@@ -75,29 +89,40 @@ def base_call(call: str) -> str:
     return max(with_digit or parts or [call.upper()], key=len)
 
 
-def parse_spots(lines: Iterable[str]) -> dict[str, set[float]]:
-    """Spotted base call -> frequencies (kHz, 0.1 kHz resolution)."""
+def parse_spots(lines: Iterable[str], mode: str = "CW") -> dict[str, set[float]]:
+    """Spotted base call -> frequencies (kHz, 0.1 kHz resolution). mode CW skips RTTY
+    and FT8 spot lines; mode RTTY keeps only RTTY ones. The mode is read from the line's
+    shape, not from the text anywhere in it (FT8WW is a CW call). LOCAL SPOT lines (the
+    local telnet port's own rule, telnet_local_port) are not the RBN stream and are skipped."""
     spots: dict[str, set[float]] = {}
     for line in lines:
+        if "LOCAL SPOT:" in line:
+            continue
+        is_rtty = "RTTY SPOT:" in line or bool(_TELNET_MODE_RE.search(line) and
+                                                _TELNET_MODE_RE.search(line).group(1) == "RTTY")
+        is_ft8 = bool(_LOG_FT8_RE.search(line)) or bool(
+            _TELNET_MODE_RE.search(line) and _TELNET_MODE_RE.search(line).group(1) in ("FT8", "FT4"))
+        if (mode == "RTTY") != is_rtty or is_ft8:
+            continue
         m = _SPOT_RE.search(line)
         if m:
             spots.setdefault(base_call(m.group(2)), set()).add(round(float(m.group(1)), 1))
     return spots
 
 
-def parse_archive(rows: Iterable[dict[str, str]]) -> Iterator[RbnSpot]:
+def parse_archive(rows: Iterable[dict[str, str]], mode: str = "CW") -> Iterator[RbnSpot]:
     for row in rows:
-        if row.get("tx_mode") != "CW":
+        if row.get("tx_mode") != mode:
             continue
         try:
             t = datetime.strptime(row["date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
             f = float(row["freq"])
         except (KeyError, ValueError):
             continue
-        yield RbnSpot(row["callsign"].upper(), base_call(row["dx"]), f, t)
+        yield RbnSpot(row["callsign"].upper(), base_call(row["dx"]), f, t, row.get("mode") or "CQ")
 
 
-def load_day(day: str, archive_dir: Path) -> list[RbnSpot]:
+def load_day(day: str, archive_dir: Path, mode: str = "CW") -> list[RbnSpot]:
     """One day of the archive, fetched to archive_dir on first use."""
     path = archive_dir / f"{day}.zip"
     if not path.exists():
@@ -105,12 +130,12 @@ def load_day(day: str, archive_dir: Path) -> list[RbnSpot]:
         url = ARCHIVE_URL.format(day=day)
         print(f"fetching {url}", file=sys.stderr)
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
             path.write_bytes(resp.read())
     with zipfile.ZipFile(path) as z:
         with z.open(z.namelist()[0]) as fh:
             text = io.TextIOWrapper(fh, "utf-8", errors="replace")
-            return list(parse_archive(csv.DictReader(text)))
+            return list(parse_archive(csv.DictReader(text), mode))
 
 
 def confirm(spots: dict[str, set[float]], archive: Iterable[RbnSpot],
@@ -177,16 +202,25 @@ def parse_nodes(html: str) -> dict[str, str]:
 
 
 def load_nodes(archive_dir: Path, max_age_s: float = 86400) -> dict[str, str]:
-    """Skimmer grids from RBN's node status page, cached in archive_dir for a day."""
+    """Skimmer grids from RBN's node status page, cached in archive_dir for a day. A
+    failed fetch falls back to an older cache; with none, it says what went wrong."""
     path = archive_dir / "rbn_nodes.json"
     if not path.exists() or time.time() - path.stat().st_mtime > max_age_s:
         archive_dir.mkdir(parents=True, exist_ok=True)
         print(f"fetching {NODES_URL}", file=sys.stderr)
         req = urllib.request.Request(NODES_URL, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req) as resp:
-            nodes = parse_nodes(resp.read().decode("utf-8", errors="replace"))
+        try:
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
+                nodes = parse_nodes(resp.read().decode("utf-8", errors="replace"))
+            problem = "" if nodes else "no skimmer rows found on the page"
+        except OSError as e:
+            nodes, problem = {}, str(e)
         if nodes:
             path.write_text(json.dumps(nodes, sort_keys=True))
+        elif path.exists():
+            print(f"node list not refreshed ({problem}); using the cached one", file=sys.stderr)
+        else:
+            raise SystemExit(f"cannot load RBN skimmer locations from {NODES_URL}: {problem}")
     return json.loads(path.read_text())
 
 
@@ -210,19 +244,27 @@ def nearby_spotters(archive: Iterable[RbnSpot], nodes: dict[str, str], grid: str
 
 def nearby_recall(spots: dict[str, set[float]], archive: Iterable[RbnSpot],
                   near: set[str], start: datetime, end: datetime, bands: set[str],
-                  tol_khz: float = DEFAULT_TOL_KHZ, min_nearby: int = DEFAULT_MIN_NEARBY
-                  ) -> dict[str, tuple[set[str], bool]]:
+                  tol_khz: float = DEFAULT_TOL_KHZ, min_nearby: int = DEFAULT_MIN_NEARBY,
+                  min_skimmers: int = 1) -> dict[str, tuple[set[str], bool]]:
     """Calls spotted on our bands in [start, end] by at least min_nearby nearby
-    skimmers -> (those skimmers, whether we spotted the call within tol_khz of
-    any of their frequencies)."""
+    skimmers (and by at least min_skimmers skimmers in all) -> (those nearby
+    skimmers, whether we spotted the call within tol_khz of any of their frequencies).
+    Only CQ spots count: beacons (BEACON, NCDXF B) never send CQ, so SparkGap never spots
+    them and they are no miss."""
+    everyone: dict[str, set[str]] = {}
+    for s in archive:
+        if start <= s.time <= end:
+            everyone.setdefault(s.dx, set()).add(s.spotter)
     by_call: dict[str, tuple[set[str], set[float]]] = {}
     for s in archive:
-        if s.spotter in near and start <= s.time <= end and band_of(s.freq_khz) in bands:
+        if (s.kind == "CQ" and s.spotter in near and start <= s.time <= end
+                and band_of(s.freq_khz) in bands):
             sk, fs = by_call.setdefault(s.dx, (set(), set()))
             sk.add(s.spotter)
             fs.add(s.freq_khz)
     return {c: (sk, any(abs(f - g) <= tol_khz for f in fs for g in spots.get(c, ())))
-            for c, (sk, fs) in by_call.items() if len(sk) >= min_nearby}
+            for c, (sk, fs) in by_call.items()
+            if len(sk) >= min_nearby and len(everyone.get(c, ())) >= min_skimmers}
 
 
 def _utc(text: str) -> datetime:
@@ -247,14 +289,17 @@ def main() -> int:
     ap.add_argument("--radius-mi", type=float, default=DEFAULT_RADIUS_MI)
     ap.add_argument("--min-nearby", type=int, default=DEFAULT_MIN_NEARBY,
                     help="nearby recall: calls spotted by at least this many nearby skimmers")
+    ap.add_argument("--min-skimmers", type=int, default=1,
+                    help="nearby recall: and by at least this many skimmers in all")
+    ap.add_argument("--mode", choices=("CW", "RTTY"), default="CW")
     a = ap.parse_args()
 
-    spots = parse_spots(a.log.read_text(errors="replace").splitlines())
+    spots = parse_spots(a.log.read_text(errors="replace").splitlines(), a.mode)
     slack = timedelta(minutes=a.slack_min)
     t0, t1 = a.start - slack, a.end + slack
     days = sorted({(t0 + timedelta(days=k)).strftime("%Y%m%d") for k in range((t1 - t0).days + 1)}
                   | {t1.strftime("%Y%m%d")})
-    archive = [s for d in days for s in load_day(d, a.archive_dir)]
+    archive = [s for d in days for s in load_day(d, a.archive_dir, a.mode)]
     heard = confirm(spots, archive, t0, t1, a.tol_khz, tuple(a.exclude_spotter))
 
     confirmed = sorted(c for c, sk in heard.items() if sk)
@@ -280,12 +325,12 @@ def main() -> int:
               "heard by a nearby skimmer")
         bands = {b for fs in spots.values() for f in fs if (b := band_of(f))}
         rec = nearby_recall(spots, archive, set(near), a.start, a.end, bands,
-                            a.tol_khz, a.min_nearby)
+                            a.tol_khz, a.min_nearby, a.min_skimmers)
         got = sorted(c for c, (_sk, ok) in rec.items() if ok)
         missed = sorted(rec, key=lambda c: (-len(rec[c][0]), c))
         missed = [c for c in missed if not rec[c][1]]
         print(f"nearby recall ({', '.join(sorted(bands, key=lambda b: BANDS[b][0]))}; "
-              f">= {a.min_nearby} nearby skimmer(s)): {len(got)} of {len(rec)} "
+              f">= {a.min_nearby} nearby, >= {a.min_skimmers} in all): {len(got)} of {len(rec)} "
               f"({100.0 * len(got) / len(rec) if rec else 0:.0f}%)")
         print("missed: " + " ".join(f"{c}({len(rec[c][0])})" for c in missed))
     return 0
