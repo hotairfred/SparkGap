@@ -155,3 +155,11 @@ def test_load_nodes_says_what_went_wrong_without_a_cache(tmp_path, monkeypatch) 
     import os
     os.utime(tmp_path / "rbn_nodes.json", (0, 0))                 # stale cache is still used
     assert load_nodes(tmp_path) == {"W8WWV": "EN80"}
+
+
+def test_nearby_recall_skips_beacons() -> None:
+    rows = [_row("W8WWV", "K0TQ", "14030.0"), dict(_row("W8WWV", "4U1UN", "14100.0"), mode="NCDXF B"),
+            dict(_row("W8WWV", "N7MA", "28240.0"), mode="BEACON")]
+    archive = list(parse_archive([dict(r, mode=r.get("mode", "CQ")) for r in rows]))
+    rec = nearby_recall({}, archive, {"W8WWV"}, T0, T1, {"20m", "10m"})
+    assert set(rec) == {"K0TQ"}

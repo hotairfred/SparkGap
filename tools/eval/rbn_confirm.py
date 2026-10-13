@@ -76,6 +76,7 @@ class RbnSpot:
     dx: str
     freq_khz: float
     time: datetime
+    kind: str = "CQ"     # the archive's spot type: CQ, BEACON, NCDXF B, DX
 
 
 def base_call(call: str) -> str:
@@ -109,7 +110,7 @@ def parse_archive(rows: Iterable[dict[str, str]], mode: str = "CW") -> Iterator[
             f = float(row["freq"])
         except (KeyError, ValueError):
             continue
-        yield RbnSpot(row["callsign"].upper(), base_call(row["dx"]), f, t)
+        yield RbnSpot(row["callsign"].upper(), base_call(row["dx"]), f, t, row.get("mode") or "CQ")
 
 
 def load_day(day: str, archive_dir: Path, mode: str = "CW") -> list[RbnSpot]:
@@ -238,14 +239,17 @@ def nearby_recall(spots: dict[str, set[float]], archive: Iterable[RbnSpot],
                   min_skimmers: int = 1) -> dict[str, tuple[set[str], bool]]:
     """Calls spotted on our bands in [start, end] by at least min_nearby nearby
     skimmers (and by at least min_skimmers skimmers in all) -> (those nearby
-    skimmers, whether we spotted the call within tol_khz of any of their frequencies)."""
+    skimmers, whether we spotted the call within tol_khz of any of their frequencies).
+    Only CQ spots count: beacons (BEACON, NCDXF B) never send CQ, so SparkGap never spots
+    them and they are no miss."""
     everyone: dict[str, set[str]] = {}
     for s in archive:
         if start <= s.time <= end:
             everyone.setdefault(s.dx, set()).add(s.spotter)
     by_call: dict[str, tuple[set[str], set[float]]] = {}
     for s in archive:
-        if s.spotter in near and start <= s.time <= end and band_of(s.freq_khz) in bands:
+        if (s.kind == "CQ" and s.spotter in near and start <= s.time <= end
+                and band_of(s.freq_khz) in bands):
             sk, fs = by_call.setdefault(s.dx, (set(), set()))
             sk.add(s.spotter)
             fs.add(s.freq_khz)
