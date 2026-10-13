@@ -265,10 +265,13 @@ class SpotTelnetServer:
         # Negative dB (FT8 weak signals) prints with "-" naturally.
         snr_str = f"{int(snr):>3d} dB" if snr else "  0 dB"
         if wpm and mode in ('CW', 'RTTY'):
+            # RTTY speed is in baud, written BPS as RTTY Skimmer Server does: Aggregator
+            # reads " WPM " as CW and " BPS " as RTTY.
+            unit = 'BPS' if mode == 'RTTY' else 'WPM'
             # Single space between dB and WPM number — Aggregator's
             # parser is rigid here. Two spaces causes it to drop both
             # SNR and WPM (every spot uploaded as 0 dB / 18 WPM).
-            snr_str = f"{snr_str} {int(wpm):>2d} WPM"
+            snr_str = f"{snr_str} {int(wpm):>2d} {unit}"
 
         # Body — what was decoded ("CQ" or message). Default to "CQ" if
         # the caller didn't pass a comment.
