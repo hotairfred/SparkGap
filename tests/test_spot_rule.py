@@ -534,3 +534,18 @@ def test_two_band_runner_is_not_respotted_at_each_switch() -> None:
         t = 30.0 * k
         spots += rule.feed(rule.window_id(int(f), k, t), f, "CQ PA AA3B AA3B", t)
     assert sorted(spots) == [("AA3B", 3540.0), ("AA3B", 7040.0)]   # once per band
+
+
+def test_doubled_call_counts_twice_only_when_asked() -> None:
+    """doubled: a call sent twice in one CQ group is two copies (hotairfred/SparkGap#43)."""
+    assert runner_calls("CQ CQ DE K8TLJ K8TLJ K", every=True) == ["K8TLJ"]
+    assert runner_calls("CQ CQ DE K8TLJ K8TLJ K", every=True, doubled=True) == ["K8TLJ", "K8TLJ"]
+    assert runner_calls("CQ TEST W6YH TEST", every=True, doubled=True) == ["W6YH"]
+    # a caller being sent the exchange twice is still no runner
+    assert runner_calls("TEST N2MF N2MF 5NN 05", every=True, doubled=True) == []
+    plain = RepeatSpotRule(_tier2, cq_groups=True)
+    dbl = RepeatSpotRule(_tier2, cq_groups=True, doubled=True)
+    assert plain.feed(1, 7030.0, "CQ CQ DE K8TLJ K8TLJ K", 0.0) == []
+    assert dbl.feed(1, 7030.0, "CQ CQ DE K8TLJ K8TLJ K", 0.0) == [("K8TLJ", 7030.0)]
+    lock = RepeatSpotRule(_tier2, cq_groups=True, lockon=True, doubled=True)
+    assert lock.feed(1, 7030.0, "CQ CQ DE K8TLJ K8TLJ K", 0.0) == [("K8TLJ", 7030.0)]
