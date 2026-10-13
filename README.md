@@ -386,6 +386,11 @@ file retains its original headers and license.
   (Tomi Manninen)**, **VE7IT (Lawrence Glaister)** — the *fldigi* CW
   decoder. `fldigi_cw.cpp` is a standalone port of fldigi's `cw.cxx`,
   GPL-3.0.
+- **Marat Fayzullin (luarvique)** — *csdr-skimmer*, the project
+  SparkGap was forked from (GPL-3.0). Its original CW and RTTY skimmer
+  programs are still here: `cw-skimmer.cpp`, `rtty-skimmer.cpp` and
+  `bufmodule.cpp`, built by `make csdr` and packaged as
+  `csdr-cwskimmer` and `csdr-rttyskimmer`.
 - **HA7ILM (Andras Retzler)** and **Marat Fayzullin (luarvique)** —
   *libcsdr* / *csdr-cwskimmer*. `libcsdr_cw.cpp` derives from this
   work, BSD-licensed.

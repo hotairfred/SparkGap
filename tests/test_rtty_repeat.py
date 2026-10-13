@@ -44,3 +44,15 @@ def test_rtty_cq_spots_after_two_minutes(monkeypatch: pytest.MonkeyPatch) -> Non
             assert spots == []                    # one minute is one copy
     assert [c for _, c in spots] == ["KN0L"]
     assert abs(spots[0][0] - 14095.0) < 0.1
+
+
+@pytest.mark.skipif(not os.path.exists(LIB), reason="librtty.so not built")
+def test_rtty_rule_is_cw_rule_without_qualifiers() -> None:
+    # qualifiers let an RTTY caller through on a contest recording (TU KQ4TNF CQ N4TL N4TL .. 59 N4TL FM06)
+    sk = types.SimpleNamespace(telnet=None, spot_count=0, _corrected_freq_khz=lambda f: f,
+                               cfg={"rtty_spot_rule": "repeat", "spot_rule_cq_qualifiers": True},
+                               tracker=sparkgap.SpotTracker(set(), set()))
+    fi = np.zeros(2 * RATE, dtype=np.float32)
+    sparkgap._rtty_scan_band_repeat(sk, sparkgap._get_rtty_lib(), "20m", 14090, fi, fi.copy(), len(fi))
+    r = sk._rtty_rule
+    assert (r.lockon, r.cq_groups, r.cq_qualifiers, r.split_runs) == (True, True, False, False)

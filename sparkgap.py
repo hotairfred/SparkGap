@@ -1653,6 +1653,16 @@ def _spot_rule_name(config):
     chain), "off" with itila."""
     return config.get('spot_rule') or ('repeat' if config.get('cw_decoder', 'itila') == 'itila2' else 'off')
 
+def _make_spot_rule(config, tracker):
+    """The RepeatSpotRule SparkGap runs with spot_rule "repeat": tiers from patt3ch, lock-on,
+    CQ groups and CQ qualifiers always on (measured on every recording we have), split_runs
+    by config (spot_rule_split_runs, off by default)."""
+    from spot_rule import RepeatSpotRule
+    return RepeatSpotRule(
+        lambda c: {'active': 2, 'rare': 3}.get(tracker._matches_patt3ch(c), 4),
+        cq_groups=True, cq_qualifiers=True, lockon=True,
+        split_runs=bool(config.get('spot_rule_split_runs', False)))
+
 def _get_itila_lib():
     global _itila_lib
     if _itila_lib is None:
@@ -1798,10 +1808,12 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
     if rule is None:
         from spot_rule import RepeatSpotRule
         trk = skimmer.tracker
+        # As CW but without CQ qualifiers: on an RTTY contest recording they let a caller
+        # through (TU KQ4TNF CQ N4TL N4TL .. 59 N4TL FM06), and split_runs gains nothing on
+        # RTTY, which has real spaces.
         rule = skimmer._rtty_rule = RepeatSpotRule(
             lambda c: {'active': 2, 'rare': 3}.get(trk._matches_patt3ch(c), 4),
-            cq_groups=bool(skimmer.cfg.get('spot_rule_cq_groups', False)),
-            lockon=bool(skimmer.cfg.get('spot_rule_lockon', False)))
+            cq_groups=True, lockon=True)
     iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
     cands = _rtty_candidates(iq, *rng)[:int(skimmer.cfg.get('rtty_max_candidates', 40))]
     if not cands:
@@ -6802,16 +6814,9 @@ class SparkGap:
                                    recent_band_config=self.cfg.get('recent_band_floor'))
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
-            from spot_rule import RepeatSpotRule
-            _trk = self.tracker
-            _trk.spot_rule = RepeatSpotRule(
-                lambda c: {'active': 2, 'rare': 3}.get(_trk._matches_patt3ch(c), 4),
-                cq_groups=bool(self.cfg.get('spot_rule_cq_groups', False)),
-                split_runs=bool(self.cfg.get('spot_rule_split_runs', False)),
-                cq_qualifiers=bool(self.cfg.get('spot_rule_cq_qualifiers', False)),
-                lockon=bool(self.cfg.get('spot_rule_lockon', False)))
-            if _trk.spot_rule.lockon:
-                log.info("Spot rule: lock-on")
+            self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
+            log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s",
+                     ", split runs" if self.tracker.spot_rule.split_runs else "")
         # If the gate is configured (peers listed), start the peer-tee
         # threads regardless of whether the gate is currently on. The
         # support map is cheap to maintain and we want it warm if the
@@ -8032,16 +8037,10 @@ def run_file_mode(args, config):
                           gate_config=gate_config)
     _select_decode_threads(config.get('itila_decode_threads', 1))
     if _select_spot_rule(_spot_rule_name(config)):
-        from spot_rule import RepeatSpotRule
         _trk = tracker
-        _trk.spot_rule = RepeatSpotRule(
-            lambda c: {'active': 2, 'rare': 3}.get(_trk._matches_patt3ch(c), 4),
-            cq_groups=bool(config.get('spot_rule_cq_groups', False)),
-            split_runs=bool(config.get('spot_rule_split_runs', False)),
-            cq_qualifiers=bool(config.get('spot_rule_cq_qualifiers', False)),
-            lockon=bool(config.get('spot_rule_lockon', False)))
-        if _trk.spot_rule.lockon:
-            log.info("Spot rule: lock-on")
+        _trk.spot_rule = _make_spot_rule(config, tracker)
+        log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s",
+                 ", split runs" if _trk.spot_rule.split_runs else "")
         audio_now = [args.start_min * 60]
         _trk.clock = lambda: audio_now[0]      # repeats counted in audio time, as live
 
