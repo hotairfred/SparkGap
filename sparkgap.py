@@ -6762,6 +6762,14 @@ class SparkGap:
         spot_log_path = self.cfg.get('spot_log')
         self._spot_log = open(spot_log_path, 'a', buffering=1) if spot_log_path else None
 
+        # All-band IQ recorder for the C receiver path (see iq_recorder.py):
+        # record_wav below only works on the Python receiver path.
+        self._iq_rec = None
+        if self.cfg.get('record_iq_dir'):
+            from iq_recorder import BandRecorder
+            self._iq_rec = BandRecorder(self.cfg['record_iq_dir'],
+                                        bits=int(self.cfg.get('record_iq_bits', 24)))
+
         self._wav_record = None
         record_wav = self.cfg.get('record_wav')
         if record_wav:
@@ -6799,6 +6807,8 @@ class SparkGap:
             _trk.spot_rule = RepeatSpotRule(
                 lambda c: {'active': 2, 'rare': 3}.get(_trk._matches_patt3ch(c), 4),
                 cq_groups=bool(self.cfg.get('spot_rule_cq_groups', False)),
+                split_runs=bool(self.cfg.get('spot_rule_split_runs', False)),
+                cq_qualifiers=bool(self.cfg.get('spot_rule_cq_qualifiers', False)),
                 lockon=bool(self.cfg.get('spot_rule_lockon', False)))
             if _trk.spot_rule.lockon:
                 log.info("Spot rule: lock-on")
@@ -7081,6 +7091,8 @@ class SparkGap:
         if self._wav_record:
             self._wav_record.close()
             self._wav_record = None
+        if getattr(self, '_iq_rec', None) is not None:
+            self._iq_rec.close()
         elapsed = time.time() - self.start_time if self.start_time else 0
         log.info("Stopped: %d spots in %.0fs", self.spot_count, elapsed)
 
@@ -7213,7 +7225,7 @@ class SparkGap:
                     enable_rtty = bool(self.cfg.get('enable_rtty', True))
                     if enable_ft8 and not os.path.exists('/home/sparkgap/decode_ft8'):
                         log.warning("enable_ft8 is on but /home/sparkgap/decode_ft8 is missing; FT8 decode will fail")
-                    if enable_ft8 or enable_rtty:
+                    if enable_ft8 or enable_rtty or self._iq_rec is not None:
                         FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
                                      14090: 14074, 18083: 18100,
                                      21090: 21074, 24902: 24915,
@@ -7221,6 +7233,8 @@ class SparkGap:
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
                             ft8_khz = FT8_FREQS.get(int(ck))
+                            if not ft8_khz and self._iq_rec is not None:
+                                ft8_khz = ck      # recorder only: capture every band
                             if ft8_khz:
                                 self.receiver.lib.hpsdr_enable_ft8(
                                     self.receiver._h, ri,
@@ -7537,8 +7551,15 @@ class SparkGap:
                                             else:              bover += 1
                                         age_buckets = (b30, b60, b300, bover)
                                     per_band.append((name, n_band, age_buckets))
-                        log.info("Health: ring_drops=%d/%d (%.4f%%) env_drops=%d bins=%d peak=%d",
-                                 rdrop, pkts, 100.0 * rdrop / max(pkts + rdrop, 1),
+                        # drop_count counts samples (per receiver) that found
+                        # the ring full; pkt_count counts UDP packets. Each
+                        # packet holds two 504-byte frames of (6*n_rx + 2)-byte
+                        # sample groups, so convert packets to samples before
+                        # taking a percentage (8 rx: 20 samples/rx/packet).
+                        n_rx = max(1, int(getattr(self.receiver, 'n_receivers', 1)))
+                        samples = pkts * 2 * (504 // (6 * n_rx + 2)) * n_rx
+                        log.info("Health: ring_drops=%d/%d samples (%.4f%%) env_drops=%d bins=%d peak=%d",
+                                 rdrop, samples, 100.0 * rdrop / max(samples, 1),
                                  env_drops_total, bins_total, bins_peak)
                         # Per-band breakdown.  Format: name:total|<30s,<60s,<300s,300s+
                         # If list_bin_ages unavailable, just name:total.
@@ -7686,7 +7707,8 @@ class SparkGap:
             # individually below.
             if use_c and getattr(self, '_worker_started', False) \
                     and (self.cfg.get('enable_ft8', True)
-                         or self.cfg.get('enable_rtty', True)):
+                         or self.cfg.get('enable_rtty', True)
+                         or self._iq_rec is not None):
                 ft8_now = time.time()
                 ft8_sec = ft8_now % 60
                 ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
@@ -7717,7 +7739,7 @@ class SparkGap:
                     for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                         ck = ch / 1000
                         ft8_khz = FT8_FREQS.get(int(ck))
-                        if not ft8_khz:
+                        if not ft8_khz and self._iq_rec is None:
                             continue
                         fi = np.empty(buf_cap, dtype=np.float32)
                         fq = np.empty(buf_cap, dtype=np.float32)
@@ -7729,6 +7751,12 @@ class SparkGap:
                             buf_cap, _ct.byref(t_first))
                         log.info("FT8 %s rx%d: swap n=%d (%.2f s) t_first=%.3f",
                                  bn, ri, n, n / 192000.0, t_first.value)
+                        if self._iq_rec is not None and n > 0:
+                            # fi/fq are fresh per swap and only sliced+copied
+                            # below, so the recorder can keep the references.
+                            self._iq_rec.submit(int(ck), t_first.value, fi, fq, n)
+                        if not ft8_khz:
+                            continue
                         # Allow up to 1 sec slack — swap-to-swap timing can
                         # land the snapshot just under 60 sec depending on
                         # where Python triggers within the second.
@@ -7990,8 +8018,8 @@ def read_24bit_iq_chunk(filename, start_sec, duration_sec, rate=192000):
 
 def run_file_mode(args, config):
     """Offline file mode — process a WAV recording and output spots."""
-    log.info("File mode: %s (%.1f-%.1f min)", args.file, args.start_min,
-             args.end_min if args.end_min else 'end')
+    log.info("File mode: %s (%.1f-%s min)", args.file, args.start_min,
+             "%.1f" % args.end_min if args.end_min else 'end')
 
     calls, blacklist, add_calls = load_callsign_db(
         config.get('master_scp', 'MASTER.SCP'),
@@ -8009,6 +8037,8 @@ def run_file_mode(args, config):
         _trk.spot_rule = RepeatSpotRule(
             lambda c: {'active': 2, 'rare': 3}.get(_trk._matches_patt3ch(c), 4),
             cq_groups=bool(config.get('spot_rule_cq_groups', False)),
+            split_runs=bool(config.get('spot_rule_split_runs', False)),
+            cq_qualifiers=bool(config.get('spot_rule_cq_qualifiers', False)),
             lockon=bool(config.get('spot_rule_lockon', False)))
         if _trk.spot_rule.lockon:
             log.info("Spot rule: lock-on")

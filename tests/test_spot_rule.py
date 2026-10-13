@@ -1,6 +1,6 @@
 """Repeat-evidence spot rule (spot_rule.py). Text cases are decodes from the 2026-09-23 replays."""
 
-from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, runner_calls, runner_groups
+from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, runner_calls, runner_groups, split_runs
 
 SCP = {"K0TQ", "WX7V", "W1AW", "VE7KW", "K3JT", "K1ABC", "K1AJ", "AA3B", "NA2U"}
 
@@ -28,9 +28,55 @@ def test_merged_keyword_is_split() -> None:
     assert runner_calls("CQK1ABC K1ABC") == ["K1ABC"]
 
 
+def test_split_runs_splits_words_run_together() -> None:
+    # hand-sent CW, PA QSO Party 10-10: several words with no gap between them
+    assert split_runs("CQCQDE WA8VTD") == "CQ CQ DE WA8VTD"
+    assert split_runs("CQCQWESDE K4OB K4OB K") == "CQ CQ WES DE K4OB K4OB K"
+    assert split_runs("CQPADEW3RA/I NN") == "CQ PA DE W3RA/I NN"
+    assert split_runs("CQSKCCDEKD3CNH") == "CQ SKCC DE KD3CNH"
+
+
+def test_split_runs_keeps_calls_and_other_words() -> None:
+    for text in ("WA8VTD", "K4OBK", "TEST", "5NN EDMU", "EEEE"):
+        assert split_runs(text) == text
+    assert split_runs("CQPW6KK") == "CQ PW6KK"     # as tokens() reads it: CQP W6KK is ambiguous
+
+
+def test_split_runs_key() -> None:
+    """Off by default: CQCQDE names no sender, as before."""
+    texts = ["CQCQDE WA8VTD WA8VTD K", "CQCQDE WA8VTD WA8VTD K"]
+    assert _feed(_rule(), texts) == []
+    assert _feed(RepeatSpotRule(_tier2, split_runs=True), texts) == [("WA8VTD", 7019.3)]
+
+
 def test_caller_sent_the_exchange_does_not_count() -> None:
     assert runner_calls("TEST AA3B FRED 2455") == []
     assert runner_calls("TEST VE7KW TEST K3JT K3JT KEITS 2182") == ["VE7KW"]
+
+
+def test_cq_qualifier_is_not_an_exchange() -> None:
+    def q(text: str) -> list[str]:
+        return runner_calls(text, every=True, qualifiers=True)
+    # 20m 2026-10-11, PA QSO Party and WES: the qualifier after the call read as name + state
+    assert q("CQ PA WB3EML PA CQ PA WB3EML PA") == ["WB3EML", "WB3EML"]
+    assert q("CQ FD CQ FD DE WX7V FD CQ FD CQ FD DE WX7V FD") == ["WX7V", "WX7V"]
+    assert q("CQ WES DE WX7V WX7V WES TX CQ WES DE WX7V WX7V WES TX") == ["WX7V", "WX7V"]
+    # qualifier only after the call: the keyword after it is no state
+    assert q("CQ CQ DE WX7V WX7V FD CQ CQ DE WX7V WX7V FD") == ["WX7V", "WX7V"]
+    # a caller sent a real exchange still does not count
+    assert q("CQ CWT W6YH TEST K1ABC BOB MA") == ["W6YH"]
+    assert q("CQ PA W6YH TEST K1ABC BOB 123") == ["W6YH"]
+    # known cost: an exchange whose number was lost before a keyword reads as a CQ group
+    # (1 copy in 32,000 windows on four recordings); the repeat count still has to be met
+    assert q("TEST K1ABC BOB CQ") == ["K1ABC"]
+
+
+def test_cq_qualifiers_key() -> None:
+    """Off by default: PA CQ after the call reads as name and state, one copy per window."""
+    texts = ["CQ PA WB3EML PA CQ PA WB3EML PA"]
+    assert _feed(RepeatSpotRule(_tier2, cq_groups=True), texts) == []
+    assert _feed(RepeatSpotRule(_tier2, cq_groups=True, cq_qualifiers=True),
+                 texts) == [("WB3EML", 7019.3)]
 
 
 def test_contest_report_and_number_is_an_exchange() -> None:
@@ -443,3 +489,14 @@ def test_lockon_with_cq_groups_counts_each_group() -> None:
     assert _feed(_lockon(), [text]) == []
     assert _feed(both, [text]) == [("N5QLZ", 7019.3)]
     assert both.owner(7019.3, 0.0) == "N5QLZ"
+
+
+def test_two_band_runner_is_not_respotted_at_each_switch() -> None:
+    # PA QSO Party 10-10: AA3B ran 40m and 80m at once and was spotted 103 times in 3 hours
+    rule = _rule()
+    spots = []
+    for k in range(8):                               # alternating bands, two CQs each, 30 s apart
+        f = 7040.0 if (k // 2) % 2 == 0 else 3540.0
+        t = 30.0 * k
+        spots += rule.feed(rule.window_id(int(f), k, t), f, "CQ PA AA3B AA3B", t)
+    assert sorted(spots) == [("AA3B", 3540.0), ("AA3B", 7040.0)]   # once per band
