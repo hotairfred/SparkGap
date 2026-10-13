@@ -68,6 +68,28 @@ def _iq_packet(seq, iq_list, n_rx=1):
     return bytes(hdr) + bytes(frames)
 
 
+def _iq_packet_np(seq, blk):
+    """Vectorized ep6 packet for n_rx receivers.
+
+    blk: float array (2*spf, n_rx, 2) of I,Q at full scale ±1.0, where
+    spf = 504 // (6*n_rx + 2) sample slots per 512-byte USB frame (63 for one
+    receiver, 36 for two, 10 for eight). Same layout as _iq_packet: per slot,
+    each receiver's I then Q as 24-bit big-endian, then 2 mic bytes."""
+    n_rx = blk.shape[1]
+    bpg = n_rx * 6 + 2
+    spf = 504 // bpg
+    v = np.clip(np.trunc(blk.astype(np.float64) * 8388607.0), -8388608, 8388607).astype(">i4")   # int() truncation, as _iq_packet
+    b24 = v.view(np.uint8).reshape(2 * spf, n_rx, 2, 4)[..., 1:]       # drop the sign byte
+    grp = np.zeros((2 * spf, bpg), dtype=np.uint8)
+    grp[:, :6 * n_rx] = b24.reshape(2 * spf, 6 * n_rx)
+    out = bytearray(COOKIE + b'\x01\x06' + struct.pack('>I', seq))
+    for f in range(2):
+        body = np.zeros(504, dtype=np.uint8)
+        body[:spf * bpg] = grp[f * spf:(f + 1) * spf].ravel()
+        out += b'\x7f\x7f\x7f' + bytes(5) + body.tobytes()
+    return bytes(out)
+
+
 # ---------------------------------------------------------------------------
 # Live proxy mode
 # ---------------------------------------------------------------------------
@@ -145,48 +167,104 @@ class HPSDRProxy:
 # WAV replay mode
 # ---------------------------------------------------------------------------
 
+def _decode_frames(raw, sw, ch):
+    """PCM bytes -> float32 (n, 2) I/Q in +-1."""
+    if sw == 3:     # 24-bit PCM — numpy has no native int24
+        arr = np.frombuffer(raw, np.uint8).reshape(-1, 3)
+        smp = (arr[:, 2].astype(np.int32) << 16 |
+               arr[:, 1].astype(np.int32) << 8  |
+               arr[:, 0].astype(np.int32))
+        smp[smp >= 2**23] -= 2**24
+        smp = smp.astype(np.float32) / 8388608.0
+    else:
+        dt = {2: np.int16, 4: np.int32}[sw]
+        smp = np.frombuffer(raw, dt).astype(np.float32) / float(2**(sw*8-1))
+    if ch == 2:
+        return smp.reshape(-1, 2)
+    return np.column_stack([smp, np.zeros_like(smp)])
+
+
+class _WavStream:
+    """Sequential reader over a standard WAV between start_sec and end_sec, so
+    long multi-band replays don't have to fit in memory (31 min x 8 bands at
+    192 kHz is tens of GB as float32)."""
+
+    CHUNK = 192000                     # frames per disk read
+
+    def __init__(self, path, start_sec=0, end_sec=None):
+        self.w = wave.open(path, 'rb')
+        self.rate = self.w.getframerate()
+        self.sw, self.ch = self.w.getsampwidth(), self.w.getnchannels()
+        first = min(int(start_sec * self.rate), self.w.getnframes())
+        self.w.setpos(first)
+        self.left = self.w.getnframes() - first
+        if end_sec:
+            self.left = min(self.left, int((end_sec - start_sec) * self.rate))
+        self.n = self.left                 # frames this stream will deliver
+        self.buf = np.zeros((0, 2), dtype=np.float32)
+
+    def take(self, k):
+        """Next k frames (fewer at the end)."""
+        while len(self.buf) < k and self.left > 0:
+            m = min(max(k, self.CHUNK), self.left)
+            new = _decode_frames(self.w.readframes(m), self.sw, self.ch)
+            self.left -= m
+            self.buf = np.concatenate([self.buf, new]) if len(self.buf) else new
+        out, self.buf = self.buf[:k], self.buf[k:]
+        return out
+
+
+class _ArrayStream:
+    """Same interface over an in-memory array (extensible-WAV fallback)."""
+
+    def __init__(self, smp):
+        self.smp, self.pos, self.n = smp, 0, len(smp)
+
+    def take(self, k):
+        out = self.smp[self.pos:self.pos + k]
+        self.pos += k
+        return out
+
+
 class WAVReplay:
     """Replay a recorded WAV file as Protocol 1 UDP to registered consumers."""
 
-    SAMPLES_PER_PKT = 126   # 63 IQ per frame × 2 frames, n_rx=1
-
     def __init__(self, wav_path, listen_port=HPSDR_PORT, realtime=True,
-                 start_sec=0, end_sec=None, negate_q=False):
+                 start_sec=0, end_sec=None, negate_q=False, n_rx=1):
+        """wav_path: one path, or a list (one per receiver; a single file is
+        replicated to all n_rx receivers)."""
         self.realtime = realtime
         self.negate_q = negate_q
+        self.n_rx = int(n_rx)
+        self.spf = 504 // (6 * self.n_rx + 2)          # sample slots per USB frame
+        self.SAMPLES_PER_PKT = 2 * self.spf
         self.consumers = {}
         self.seq = 0
+        paths = wav_path if isinstance(wav_path, (list, tuple)) else [wav_path]
+        if len(paths) not in (1, self.n_rx):
+            raise SystemExit(f"--wav given {len(paths)} times; need 1 or --n-rx ({self.n_rx})")
+        self._paths = paths
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(('', listen_port))
 
+        streams = [self._open(p, start_sec, end_sec) for p in paths]
+        rates = {r for _s, r in streams}
+        if len(rates) != 1:
+            raise SystemExit(f"WAVs have different sample rates: {sorted(rates)}")
+        self.n_frames = min(st.n for st, _r in streams)
+        sr = rates.pop()
+        self._streams = [st for st, _r in streams]     # one: replicated to all receivers
+        self.rate    = sr
+        self.interval = self.SAMPLES_PER_PKT / sr
+        print(f"WAV {wav_path}: {sr} Hz, 2ch, {self.n_frames} frames (streamed)",
+              file=sys.stderr)
+
+    def _open(self, wav_path, start_sec, end_sec):
         try:
-            w = wave.open(wav_path, 'rb')
-            sr, sw, ch = w.getframerate(), w.getsampwidth(), w.getnchannels()
-            raw = w.readframes(w.getnframes())
-            w.close()
-
-            if sw == 3:     # 24-bit PCM — numpy has no native int24
-                arr = np.frombuffer(raw, np.uint8).reshape(-1, 3)
-                smp = (arr[:, 2].astype(np.int32) << 16 |
-                       arr[:, 1].astype(np.int32) << 8  |
-                       arr[:, 0].astype(np.int32))
-                smp[smp >= 2**23] -= 2**24
-                smp = smp.astype(np.float32) / 8388608.0
-            else:
-                dt = {2: np.int16, 4: np.int32}[sw]
-                smp = np.frombuffer(raw, dt).astype(np.float32) / float(2**(sw*8-1))
-
-            if ch == 2:
-                smp = smp.reshape(-1, 2)
-            else:
-                smp = np.column_stack([smp, np.zeros_like(smp)])
-            # Apply time window for standard WAV
-            if start_sec > 0:
-                smp = smp[int(start_sec * sr):]
-            if end_sec:
-                smp = smp[:int((end_sec - start_sec) * sr)]
+            st = _WavStream(wav_path, start_sec, end_sec)
+            return st, st.rate
         except wave.Error:
             # Extensible WAV format (0xFFFE) — use our custom reader
             from sparkgap import read_24bit_iq_chunk
@@ -201,20 +279,14 @@ class WAVReplay:
             # Normalize to float (read_24bit_iq_chunk returns raw 24-bit values)
             i_f = np.array(i_arr, dtype=np.float32) / 8388608.0
             q_f = np.array(q_arr, dtype=np.float32) / 8388608.0
-            smp = np.column_stack([i_f, q_f])
-
-        self.samples = smp
-        self.rate    = sr
-        self.interval = self.SAMPLES_PER_PKT / sr
-        print(f"WAV {wav_path}: {sr} Hz, {smp.shape[1]}ch, {len(smp)} frames",
-              file=sys.stderr)
+            return _ArrayStream(np.column_stack([i_f, q_f])), sr
 
     def _handle_consumer(self, data, addr):
         if len(data) < 3 or data[0:2] != COOKIE:
             return
         cmd = data[2]
         if cmd == 0x02:
-            _discovery_reply(self.sock, addr, n_rx=1)
+            _discovery_reply(self.sock, addr, n_rx=self.n_rx)
             print(f"  Discovery from {addr[0]}", file=sys.stderr)
         elif cmd == 0x04 and len(data) > 3:
             if data[3] == 0x01:
@@ -232,7 +304,7 @@ class WAVReplay:
                 self._handle_consumer(*self.sock.recvfrom(256))
 
         print("Replaying...", file=sys.stderr)
-        n = len(self.samples)
+        n = self.n_frames
         offset = 0
         nxt = time.time()
 
@@ -241,17 +313,24 @@ class WAVReplay:
             if r:
                 self._handle_consumer(*self.sock.recvfrom(256))
 
-            chunk = self.samples[offset:offset + self.SAMPLES_PER_PKT]
             # Q handling depends on recording source:
             # --negate-q: WAV recorded after hpsdr_receiver Q fix (standard IQ).
             #   Pre-negate so parse_iq_packet's negation produces standard IQ.
             # No flag: WAV recorded before Q fix (conjugate IQ from Pitaya).
             #   Don't negate — parse_iq_packet's negation converts to standard IQ.
-            if self.negate_q:
-                iq = [(float(row[0]), -float(row[1])) for row in chunk]
+            k = self.SAMPLES_PER_PKT
+            blk = np.zeros((k, self.n_rx, 2), dtype=np.float32)
+            k = min(k, n - offset)
+            if len(self._streams) == 1:
+                part = self._streams[0].take(k)
+                blk[:len(part), :, :] = part[:, None, :]
             else:
-                iq = [(float(row[0]), float(row[1])) for row in chunk]
-            pkt = _iq_packet(self.seq, iq)
+                for r, st in enumerate(self._streams):
+                    part = st.take(k)
+                    blk[:len(part), r, :] = part
+            if self.negate_q:
+                blk[:, :, 1] *= -1.0
+            pkt = _iq_packet_np(self.seq, blk)
             self.seq += 1
             offset += self.SAMPLES_PER_PKT
 
@@ -282,7 +361,11 @@ def main():
     ap = argparse.ArgumentParser(description='HPSDR Protocol 1 proxy / multiplexer')
     ap.add_argument('--pitaya',      default='192.168.1.54', help='Pitaya IP (live mode)')
     ap.add_argument('--port',  type=int, default=HPSDR_PORT, help='Listen port')
-    ap.add_argument('--wav',         help='WAV file to replay (instead of live pitaya)')
+    ap.add_argument('--wav', action='append',
+                    help='WAV file to replay (instead of live pitaya); repeat once per '
+                         'receiver, or give one file to replicate to all --n-rx receivers')
+    ap.add_argument('--n-rx', type=int, default=1,
+                    help='Receivers to replay in WAV mode (default 1; up to 8)')
     ap.add_argument('--no-realtime', action='store_true',    help='Replay as fast as possible')
     ap.add_argument('--start', type=float, default=0, help='Start time in seconds (WAV mode)')
     ap.add_argument('--end',   type=float, default=None, help='End time in seconds (WAV mode)')
@@ -292,7 +375,7 @@ def main():
 
     proxy = (WAVReplay(args.wav, args.port, realtime=not args.no_realtime,
                        start_sec=args.start, end_sec=args.end,
-                       negate_q=args.negate_q)
+                       negate_q=args.negate_q, n_rx=args.n_rx)
              if args.wav else
              HPSDRProxy(args.pitaya, HPSDR_PORT, args.port))
     try:
