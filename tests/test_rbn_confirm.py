@@ -9,7 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "eval"))
 from rbn_confirm import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     base_call,
     confirm,
+    grid_latlon,
+    miles,
+    nearby_recall,
+    nearby_spotters,
     parse_archive,
+    parse_nodes,
     parse_spots,
 )
 
@@ -56,3 +61,57 @@ def test_own_node_is_excluded() -> None:
                                   _row("WF8Z-2", "K0TQ", "14030.0")]))
     heard = confirm({"K0TQ": {14030.0}}, archive, T0, T1, exclude=("K1XX", "WF8Z"))
     assert heard == {"K0TQ": set()}
+
+
+_NODES_HTML = """
+<tr class="online"><td><a href="/dxsd1.php?f=0&c=W8WWV&t=de" title="x"> W8WWV </a></td>
+  <td class="right"></td><td>EN91HM</td><td>K</td></tr>
+<tr class="online"><td><a href="/dxsd1.php?f=0&c=KM3T&t=de" title="x"> KM3T </a></td>
+  <td>FN42ET</td></tr>
+<tr class="online"><td><a href="/dxsd1.php?f=0&c=N6TV&t=de" title="x"> N6TV </a></td>
+  <td>CM97CF</td></tr>
+<tr><td><a href="/dxsd1.php?f=0&c=NOGRID&t=de">NOGRID</a></td><td></td></tr>
+"""
+
+
+def test_parse_nodes_reads_callsign_and_grid() -> None:
+    assert parse_nodes(_NODES_HTML) == {"W8WWV": "EN91HM", "KM3T": "FN42ET", "N6TV": "CM97CF"}
+
+
+def test_grid_distance() -> None:
+    home = grid_latlon("EM79SM")
+    assert home is not None and grid_latlon("ZZ00") is None
+    assert 205 < miles(home, grid_latlon("EN91HM")) < 220     # W8WWV, ~213 mi
+    assert miles(home, grid_latlon("CM97CF")) > 1900          # N6TV, California
+
+
+def test_nearby_spotters_radius_and_node_suffix_fallback() -> None:
+    archive = list(parse_archive([_row("W8WWV", "K0TQ", "14030.0"),
+                                  _row("KM3T-5", "K0TQ", "14030.0"),   # falls back to KM3T
+                                  _row("N6TV", "K0TQ", "14030.0"),
+                                  _row("ZZ9ZZ", "K0TQ", "14030.0")]))  # not in the node list
+    nodes = parse_nodes(_NODES_HTML)
+    assert set(nearby_spotters(archive, nodes, "EM79SM", 300)) == {"W8WWV"}
+    assert set(nearby_spotters(archive, nodes, "EM79SM", 800)) == {"W8WWV", "KM3T-5"}  # FN42, ~704 mi
+
+
+def test_confirm_only_counts_listed_spotters() -> None:
+    archive = list(parse_archive([_row("W8WWV", "K0TQ", "14030.0"),
+                                  _row("N6TV", "K1AJ", "14041.0")]))
+    heard = confirm({"K0TQ": {14030.0}, "K1AJ": {14041.0}}, archive, T0, T1, only={"W8WWV"})
+    assert heard == {"K0TQ": {"W8WWV"}, "K1AJ": set()}
+
+
+def test_nearby_recall_bands_window_and_min_skimmers() -> None:
+    archive = list(parse_archive([
+        _row("W8WWV", "K0TQ", "14030.0"), _row("WT9U", "K0TQ", "14030.1"),
+        _row("W8WWV", "K1AJ", "14041.0"),
+        _row("W8WWV", "N2PX", "7030.0"),                                 # band we don't cover
+        _row("W8WWV", "K7WP", "14053.6", date="2026-09-23 21:00:00"),   # outside the window
+        _row("N6TV", "W1AW", "14050.0"),                                 # not nearby
+    ]))
+    near = {"W8WWV", "WT9U"}
+    rec = nearby_recall({"K0TQ": {14030.4}}, archive, near, T0, T1, {"20m"})
+    assert rec == {"K0TQ": ({"W8WWV", "WT9U"}, True), "K1AJ": ({"W8WWV"}, False)}
+    rec2 = nearby_recall({"K0TQ": {14030.4}}, archive, near, T0, T1, {"20m"}, min_nearby=2)
+    assert rec2 == {"K0TQ": ({"W8WWV", "WT9U"}, True)}
