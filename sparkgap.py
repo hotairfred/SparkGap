@@ -7778,6 +7778,15 @@ class SparkGap:
                                          fi_60, fq_60, take))
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
+                            # Whatever goes wrong in a cycle, the next minute must run.
+                            try:
+                                _ft8_cycle(jobs, skimmer)
+                            except Exception:
+                                log.exception("FT8/RTTY cycle failed")
+                            finally:
+                                skimmer._ft8_running = False
+
+                        def _ft8_cycle(jobs, skimmer):
                             # Re-read flags inside the thread so a runtime
                             # config edit could take effect at the next
                             # minute boundary (not currently used but cheap).

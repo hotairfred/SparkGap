@@ -74,9 +74,11 @@ class SpotTelnetServer:
         self.bands = []
         self._clients: Dict[asyncio.StreamWriter, dict] = {}
         self._server = None
+        self._loop = None           # the asyncio loop the server runs on (set in start)
         self._spot_count = 0
 
     async def start(self):
+        self._loop = asyncio.get_running_loop()
         self._server = await asyncio.start_server(
             self._handle_client, self.host, self.port,
             reuse_address=True,
@@ -293,8 +295,23 @@ class SpotTelnetServer:
         cc11_line = (f"CC11^{freq_khz:.1f}^{dx_call}^{date_str}^{time_str}Z^"
                      f"{cc11_comment}^{spotter}^^^{mode_col}^\a\r\n")
 
+        # The FT8/RTTY thread calls this too. asyncio streams and the client table belong
+        # to the loop's thread: from another thread, hand the lines to the loop. Writing
+        # from the FT8 thread while a client logged off raised "dictionary changed size
+        # during iteration" and killed FT8 until restart.
+        try:
+            on_loop = asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            on_loop = False
+        if self._loop is not None and not on_loop:
+            self._loop.call_soon_threadsafe(self._send, std_line, cc11_line)
+        else:
+            self._send(std_line, cc11_line)
+
+    def _send(self, std_line: str, cc11_line: str) -> None:
+        """Write one spot to every client (on the loop's thread)."""
         dead = []
-        for writer, state in self._clients.items():
+        for writer, state in list(self._clients.items()):
             try:
                 pending = writer.transport.get_write_buffer_size()
                 if pending > self.MAX_CLIENT_BUFFER:
