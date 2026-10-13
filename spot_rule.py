@@ -11,7 +11,7 @@ copies or more near the same frequency (a tie waits for the next window). A deco
 repeats its own busts (W6AYK for W6AYC) never lets the bust outrun the real call; nothing
 is renamed, so near-identical real calls (N4VI next to N4ZZ) are not merged.
 
-The spot goes out on the strongest window (bin SNR) among the copies, once per call per
+The spot goes out on the strongest window (bin SNR) among the copies, once per call and band per
 REPEAT_S unless it moves more than MOVE_KHZ. A window is one decode window of one bin;
 both LPF paths of a window count once.
 
@@ -49,7 +49,7 @@ KEYWORDS = frozenset({"CQ", "TEST"})
 LOOKAHEAD = 3                 # tokens after a keyword searched for the sender's call
 DE_LOOKBACK = 6               # tokens before DE searched for CQ or TEST
 NEAR_KHZ = 0.5                # copies within this of each other are one frequency
-REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call per 10 minutes
+REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call and band per 10 minutes
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
 LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
 
@@ -284,7 +284,7 @@ class RepeatSpotRule:
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._next_window = 0
-        self._last_spot: dict[str, tuple[float, float]] = {}    # call -> (time, freq)
+        self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}   # (call, MHz) -> (time, freq)
         self._pruned = 0.0
 
     def window_id(self, bin_id: int, window_key: int, now: float) -> int:
@@ -317,9 +317,10 @@ class RepeatSpotRule:
             if counts[call] < self.tier(call):
                 continue
             spot_f = max((c for c in near if c.call == call), key=lambda c: c.snr).freq_khz
-            last = self._last_spot.get(call)
+            key = (call, int(spot_f // 1000))     # per band: a station running two bands
+            last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
             if last is None or now - last[0] >= REPEAT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
-                self._last_spot[call] = (now, spot_f)
+                self._last_spot[key] = (now, spot_f)
                 spots.append((call, spot_f))
         return spots
 
