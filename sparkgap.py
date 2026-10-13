@@ -6698,6 +6698,7 @@ class SparkGap:
                 lambda c: {'active': 2, 'rare': 3}.get(_trk._matches_patt3ch(c), 4),
                 cq_groups=bool(self.cfg.get('spot_rule_cq_groups', False)),
                 split_runs=bool(self.cfg.get('spot_rule_split_runs', False)),
+                cq_qualifiers=bool(self.cfg.get('spot_rule_cq_qualifiers', False)),
                 lockon=bool(self.cfg.get('spot_rule_lockon', False)))
             if _trk.spot_rule.lockon:
                 log.info("Spot rule: lock-on")
@@ -7917,6 +7918,7 @@ def run_file_mode(args, config):
             lambda c: {'active': 2, 'rare': 3}.get(_trk._matches_patt3ch(c), 4),
             cq_groups=bool(config.get('spot_rule_cq_groups', False)),
             split_runs=bool(config.get('spot_rule_split_runs', False)),
+            cq_qualifiers=bool(config.get('spot_rule_cq_qualifiers', False)),
             lockon=bool(config.get('spot_rule_lockon', False)))
         if _trk.spot_rule.lockon:
             log.info("Spot rule: lock-on")
