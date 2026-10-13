@@ -464,3 +464,14 @@ def test_lockon_with_cq_groups_counts_each_group() -> None:
     assert _feed(_lockon(), [text]) == []
     assert _feed(both, [text]) == [("N5QLZ", 7019.3)]
     assert both.owner(7019.3, 0.0) == "N5QLZ"
+
+
+def test_two_band_runner_is_not_respotted_at_each_switch() -> None:
+    # PA QSO Party 10-10: AA3B ran 40m and 80m at once and was spotted 103 times in 3 hours
+    rule = _rule()
+    spots = []
+    for k in range(8):                               # alternating bands, two CQs each, 30 s apart
+        f = 7040.0 if (k // 2) % 2 == 0 else 3540.0
+        t = 30.0 * k
+        spots += rule.feed(rule.window_id(int(f), k, t), f, "CQ PA AA3B AA3B", t)
+    assert sorted(spots) == [("AA3B", 3540.0), ("AA3B", 7040.0)]   # once per band
