@@ -11,7 +11,7 @@ copies or more near the same frequency (a tie waits for the next window). A deco
 repeats its own busts (W6AYK for W6AYC) never lets the bust outrun the real call; nothing
 is renamed, so near-identical real calls (N4VI next to N4ZZ) are not merged.
 
-The spot goes out on the strongest window (bin SNR) among the copies, once per call per
+The spot goes out on the strongest window (bin SNR) among the copies, once per call and band per
 REPEAT_S unless it moves more than MOVE_KHZ. A window is one decode window of one bin;
 both LPF paths of a window count once.
 
@@ -19,6 +19,11 @@ CQ groups (config spot_rule_cq_groups: true, off by default): every CQ group nam
 counts as a copy, also several in one window (CQ WES DE N5QLZ N5QLZ K CQ WES DE N5QLZ is two),
 so a call sent in two or more CQs of one window does not wait for the next window. The two
 LPF paths of a window are not added: the larger count of the two is used.
+
+CQ qualifiers (config spot_rule_cq_qualifiers: true, off by default): a word of 2 to 5 letters
+right after CQ or TEST (CQ PA, CQ FD, CQ WES) is the window's CQ qualifier and is no exchange
+name wherever it appears in that window, and a stop word is no number or state. Without it
+CQ PA WB3EML PA CQ reads PA CQ as name and state, and WB3EML as a caller.
 
 Lock-on (config spot_rule_lockon: true, off by default): a call named by a CQ group owns the
 frequency it was copied on. While it owns it, two things change near that frequency:
@@ -44,7 +49,7 @@ KEYWORDS = frozenset({"CQ", "TEST"})
 LOOKAHEAD = 3                 # tokens after a keyword searched for the sender's call
 DE_LOOKBACK = 6               # tokens before DE searched for CQ or TEST
 NEAR_KHZ = 0.5                # copies within this of each other are one frequency
-REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call per 10 minutes
+REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call and band per 10 minutes
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
 LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
 
@@ -57,6 +62,30 @@ _MERGED_PREFIXES = ("CQ", "TEST", "CWT", "SST", "MST", "DE")
 _TRIGGER_WORDS = ("CQ", "TEST", "CWT", "SST", "MST")
 _STOP_WORDS = frozenset({"TU", "DE", "CQ", "TEST", "CWT", "SST", "MST", "QRZ", "AGN",
                          "NR", "TNX", "GL", "BK"})
+
+
+def _split_run_together(rest: str, prev: str | None) -> list[str] | None:
+    """The whole of rest as keywords, an event tag and a call, else None. A tag (2-5
+    letters, no digit, so never a call) only follows CQ or TEST, and only DE or the end
+    of the word follows it: CQCQDE, CQCQWESDE, CQPADEW3RA."""
+    if not rest:
+        return []
+    if prev is not None and CALL_RE.match(rest):
+        return [rest]
+    for pre in sorted(_MERGED_PREFIXES + ("TU",), key=len, reverse=True):
+        if rest.startswith(pre):
+            tail = _split_run_together(rest[len(pre):], pre)
+            if tail is not None:
+                return [pre] + tail
+    if prev in ("CQ", "TEST"):
+        cuts = range(min(5, len(rest)), 1, -1)
+        for n in [n for n in cuts if rest[n:].startswith("DE")] + [n for n in cuts if n == len(rest)]:
+            tag, after = rest[:n], rest[n:]
+            if tag.isalpha():
+                tail = _split_run_together(after, tag)
+                if tail is not None:
+                    return [tag] + tail
+    return None
 
 
 def _split_merged(tok: str) -> list[str]:
@@ -74,6 +103,18 @@ def _split_merged(tok: str) -> list[str]:
             out.append(rest)
             rest = ""
     return out
+
+
+def split_runs(text: str) -> str:
+    """Text with words run together split apart (spot_rule_split_runs): hand-sent CW often
+    drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA. A word is split only
+    when the whole of it reads as keywords, an event tag and a call; anything else is kept."""
+    out = []
+    for w in text.split():
+        u = w.upper()
+        parts = None if CALL_RE.match(u) else _split_run_together(u, None)
+        out.extend(parts if parts and len(parts) > 1 else [w])
+    return " ".join(out)
 
 
 def tokens(text: str) -> list[str]:
@@ -94,6 +135,12 @@ def _one_sub_same_kind(a: str, b: str) -> bool:
     return len(diff) == 1 and diff[0][0].isalpha() == diff[0][1].isalpha()
 
 
+def _qualifiers(toks: list[str]) -> set[str]:
+    """CQ qualifiers of a window: 2-5 letters right after CQ or TEST (CQ PA, CQ FD, CQ DX)."""
+    return {b for a, b in zip(toks, toks[1:]) if a in KEYWORDS and b.isalpha()
+            and 2 <= len(b) <= 5 and b not in _STOP_WORDS}
+
+
 def _is_trigger_like(t: str) -> bool:
     return t in _TRIGGER_WORDS or any(_one_sub_same_kind(t, w) for w in ("CWT", "TEST"))
 
@@ -106,10 +153,11 @@ def sender(toks: list[str], i: int) -> int | None:
     return None
 
 
-def is_exchange(toks: list[str], j: int) -> bool:
+def is_exchange(toks: list[str], j: int, qualifiers: bool = False) -> bool:
     """toks[j] is followed by NAME then a number or 2-letter state, or by a report (5NN) then
     a number: a caller being sent the exchange. Repeats of the call and 1-character or '?'
-    tokens before NAME are skipped."""
+    tokens before NAME are skipped. qualifiers (spot_rule_cq_qualifiers): a CQ qualifier of
+    the window is no NAME and a stop word is no number or state (CQ PA WB3EML PA CQ)."""
     k = j + 1
     while k < len(toks) and (toks[k] == toks[j] or len(toks[k]) <= 1 or "?" in toks[k]):
         k += 1
@@ -118,6 +166,8 @@ def is_exchange(toks: list[str], j: int) -> bool:
     name, num = toks[k], toks[k + 1]
     if _RST_RE.match(name):                      # CQ WW, WPX: report then zone or serial
         return any(ch.isdigit() for ch in num)
+    if qualifiers and (name in _qualifiers(toks) or num in _STOP_WORDS):
+        return False
     return (name.isalpha() and 2 <= len(name) <= 6 and name not in _STOP_WORDS
             and not _is_trigger_like(name)
             and (any(ch.isdigit() for ch in num) or (num.isalpha() and len(num) == 2)))
@@ -133,7 +183,7 @@ def _cq_before(toks: list[str], i: int) -> bool:
     return False
 
 
-def runner_calls(text: str, every: bool = False) -> list[str]:
+def runner_calls(text: str, every: bool = False, qualifiers: bool = False) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -143,7 +193,7 @@ def runner_calls(text: str, every: bool = False) -> list[str]:
     send, for 3 more runners). The TEST of a bare W6YH TEST still opens a group on the call
     after it; only the exchange test keeps that caller out. every: one entry per group
     instead of one per call."""
-    return [call for call, _after in runner_groups(text, every)]
+    return [call for call, _after in runner_groups(text, every, qualifiers)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -154,11 +204,11 @@ def _call_before(toks: list[str], i: int) -> str | None:
     return toks[k] if k >= 0 and CALL_RE.match(toks[k]) else None
 
 
-def _signing(toks: list[str], k: int) -> bool:
+def _signing(toks: list[str], k: int, qualifiers: bool = False) -> bool:
     """toks[k] is a call in a sign-off: after TU or DE, or before CQ, TEST or another trigger
     word (1-character and '?' tokens skipped), and not being sent the exchange. A bare repeat
     of the call does not count: a fragment picked once can repeat on its own."""
-    if is_exchange(toks, k):
+    if is_exchange(toks, k, qualifiers):
         return False
     p = k - 1
     while p >= 0 and (len(toks[p]) <= 1 or "?" in toks[p]):
@@ -170,7 +220,8 @@ def _signing(toks: list[str], k: int) -> bool:
             or (n < len(toks) and toks[n] in _TRIGGER_WORDS))
 
 
-def runner_groups(text: str, every: bool = False) -> list[tuple[str, str | None]]:
+def runner_groups(text: str, every: bool = False,
+                  qualifiers: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller."""
@@ -187,7 +238,7 @@ def runner_groups(text: str, every: bool = False) -> list[tuple[str, str | None]
         if j is None or (de and toks.count(toks[j]) < 2):
             i += 1
             continue
-        if not is_exchange(toks, j) and (every or all(toks[j] != c for c, _ in out)):
+        if not is_exchange(toks, j, qualifiers) and (every or all(toks[j] != c for c, _ in out)):
             out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
         i = j + 1
         while i < n and toks[i] == toks[j]:       # call sent twice before the closing keyword
@@ -221,16 +272,19 @@ class RepeatSpotRule:
     """Feed every decode window; returns the spots the window completes."""
 
     def __init__(self, tier: Callable[[str], int], cq_groups: bool = False,
-                 lockon: bool = False) -> None:
+                 lockon: bool = False, split_runs: bool = False,
+                 cq_qualifiers: bool = False) -> None:
         self.tier = tier
         self.cq_groups = cq_groups
         self.lockon = lockon
+        self.split_runs = split_runs
+        self.cq_qualifiers = cq_qualifiers
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._next_window = 0
-        self._last_spot: dict[str, tuple[float, float]] = {}    # call -> (time, freq)
+        self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}   # (call, MHz) -> (time, freq)
         self._pruned = 0.0
 
     def window_id(self, bin_id: int, window_key: int, now: float) -> int:
@@ -245,9 +299,11 @@ class RepeatSpotRule:
              snr: float | None = None) -> list[tuple[str, float]]:
         """Record one decoded text of a window; return [(call, freq_khz)] to spot now."""
         self._expire(now)
+        if self.split_runs:
+            text = split_runs(text)
         spots = []
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
-                 else runner_calls(text, every=self.cq_groups))
+                 else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers))
         for call, n in Counter(calls).items():
             for nth in range(n):
                 if (window, call, nth) not in self._seen:
@@ -261,9 +317,10 @@ class RepeatSpotRule:
             if counts[call] < self.tier(call):
                 continue
             spot_f = max((c for c in near if c.call == call), key=lambda c: c.snr).freq_khz
-            last = self._last_spot.get(call)
+            key = (call, int(spot_f // 1000))     # per band: a station running two bands
+            last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
             if last is None or now - last[0] >= REPEAT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
-                self._last_spot[call] = (now, spot_f)
+                self._last_spot[key] = (now, spot_f)
                 spots.append((call, spot_f))
         return spots
 
@@ -282,7 +339,8 @@ class RepeatSpotRule:
         """Calls one decoded text counts as copies of, with lock-on (see the module docstring)."""
         calls: list[str] = []
         toks = tokens(text)
-        for call, after in runner_groups(text, every=self.cq_groups):
+        for call, after in runner_groups(text, every=self.cq_groups,
+                                         qualifiers=self.cq_qualifiers):
             owner = self.owner(freq_khz, now)
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
@@ -299,7 +357,8 @@ class RepeatSpotRule:
             self._own(call, freq_khz, now)
         owner = self.owner(freq_khz, now)
         if owner is not None and owner not in calls:
-            if any(tk == owner and _signing(toks, k) for k, tk in enumerate(toks)):
+            if any(tk == owner and _signing(toks, k, self.cq_qualifiers)
+                   for k, tk in enumerate(toks)):
                 calls.append(owner)               # TU W6YH, W6YH TEST: the owner signing
                 self._own(owner, freq_khz, now)
         return calls
