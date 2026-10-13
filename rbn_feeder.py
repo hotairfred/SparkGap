@@ -71,7 +71,7 @@ except ImportError:
 #   DX de WF8Z-#:    14025.50  R2HE         CW  15 dB 26 WPM  CQ  OS  1313Z
 SPOT_RE = re.compile(
     r'^DX de (\S+):\s+(\d+\.\d+)\s+(\S+)\s+(\S+)\s+'
-    r'(-?\d+)\s*dB(?:\s+(\d+)\s*WPM)?\s+'
+    r'(-?\d+)\s*dB(?:\s+(\d+)\s*(?:WPM|BPS))?\s+'
     r'(\S+)(?:\s+(\S+))?\s+(\d{4})Z\s*$'
 )
 
@@ -238,7 +238,9 @@ class RBNSession:
         # full position mapping and Batwing's IL analysis at
         # /mnt/atlas/skimmer/agg_re/aggregator_input_parser_bug.md
         # (TODO).
-        _MODE_TO_CODE = {'CW': '1'}  # extend when other modes are wired up
+        # Aggregator 6.7's mode table (its ProcessSkimmerSpots): CW 1, RTTY 11; the speed
+        # column holds WPM for CW and baud for RTTY.
+        _MODE_TO_CODE = {'CW': '1', 'RTTY': '11'}
         _CQ_TO_CODE   = {'CQ': '1', 'DX': '2', 'BCN': '3', 'BEACON': '3'}
         s_array = [
             [
