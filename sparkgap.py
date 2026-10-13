@@ -1942,6 +1942,8 @@ RTTY_RANGES = {
 # RTTY ranges for rtty_spot_rule "repeat", offset (Hz) from band center: where RBN's RTTY
 # skimmers spotted a weekend RTTY contest (10-10 22-00Z, 5th to 99th percentile, plus margin).
 # 40m ran 7046 to 7074 kHz, above the 7035-7055 of RTTY_RANGES.
+RTTY_SPOT_BAUD = 45     # RTTY spots go out as "RTTY 26 dB 45 BPS CQ", as RTTY Skimmer Server sends them
+
 RTTY_RANGES_REPEAT = {
     3590:  (-12000, +12000),   # 80m: 3578-3602
     7090:  (-60000, -10000),   # 40m: 7030-7080
@@ -2047,7 +2049,8 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         for call, sf in rule.feed(w, rf_khz, text, now, snr=snr_db):
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***", sf, call, int(snr_db), text[:50])
             skimmer.broadcast(freq_khz=skimmer._corrected_freq_khz(sf), dx_call=call,
-                                          snr=int(snr_db), mode='RTTY', comment=text[:60])
+                              snr=int(snr_db), wpm=RTTY_SPOT_BAUD, mode='RTTY',
+                              comment='CQ')
             skimmer.spot_count += 1
             n_spots += 1
     return n_spots
@@ -2238,8 +2241,9 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
                 freq_khz=skimmer._corrected_freq_khz(mark_khz),
                 dx_call=call,
                 snr=int(snr_db),
+                wpm=RTTY_SPOT_BAUD,
                 mode='RTTY',
-                comment=text[:60])
+                comment='CQ')
             skimmer.spot_count += 1
             n_spots += 1
 
