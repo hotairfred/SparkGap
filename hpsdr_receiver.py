@@ -123,6 +123,11 @@ def build_c0_packet(receivers=8, duplex=True, speed=0):
     return c0, c1_bytes
 
 
+def rx_freq_c0(rx_index):
+    """C0 of receiver rx_index's NCO frequency register (0-based)."""
+    return 0x24 if rx_index == 7 else (rx_index + 2) * 2
+
+
 def build_freq_packet(rx_index, freq_hz):
     """Build frequency setting packet for receiver rx_index.
 
@@ -131,10 +136,13 @@ def build_freq_packet(rx_index, freq_hz):
       C0=0x02: TX NCO frequency (address 1)  -- NOT RX
       C0=0x04: RX1 NCO frequency (address 2)
       C0=0x06: RX2 NCO frequency (address 3)
+      ...
+      C0=0x10: RX7 NCO frequency (address 8)
+      C0=0x12: drive level / Alex filters (address 9)  -- NOT RX8
+      C0=0x24: RX8 NCO frequency (address 0x12)
     C1-C4 = frequency in Hz (big-endian 32-bit)
     """
-    # RX1=0x04, RX2=0x06, ... (address = rx_index+2, C0 = address<<1)
-    c0 = bytes([(rx_index + 2) * 2])
+    c0 = bytes([rx_freq_c0(rx_index)])
     freq_bytes = struct.pack('>I', int(freq_hz))
     return c0 + freq_bytes
 
