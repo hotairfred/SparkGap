@@ -124,6 +124,15 @@ def test_mode_picks_cw_or_rtty_lines_and_rows() -> None:
              "12:00:03 INFO *** RTTY SPOT: 14085.0 kHz  KA4RRU      +20 dB  [CQ MAKRO KA4RRU] ***"]
     assert parse_spots(lines) == {"K0TQ": {7031.2}}
     assert parse_spots(lines, "RTTY") == {"KA4RRU": {14085.0}}
+    # mode from the line's shape: FT8WW and a call with RTTY in its text are CW spots;
+    # a LOCAL SPOT is the local port's rule, not the RBN stream
+    more = ["12:00:04 INFO *** SPOT:   14025.0  FT8WW         18 dB  26 WPM  [repeat] ***",
+            "12:00:05 INFO *** LOCAL SPOT:    7030.0  K8TLJ         12 dB  20 WPM ***",
+            "DX de WF8Z-#:   21025.00  FT4XYZ       CW   15 dB 24 WPM  CQ                  SG  1200Z",
+            "DX de WF8Z-#:   14080.00  N5CVT        FT8  -5 dB          CQ N5CVT EM12      SG  1200Z",
+            "DX de WF8Z-#:   14085.00  KA4RRU       RTTY 26 dB 45 BPS  CQ                  SG  1200Z"]
+    assert parse_spots(lines + more) == {"K0TQ": {7031.2}, "FT8WW": {14025.0}, "FT4XYZ": {21025.0}}
+    assert parse_spots(lines + more, "RTTY") == {"KA4RRU": {14085.0}}
     rows = [_row("W8WWV", "K0TQ", "7031.0"), _row("W8WWV", "KA4RRU", "14085.0", mode="RTTY")]
     assert [s.dx for s in parse_archive(rows)] == ["K0TQ"]
     assert [s.dx for s in parse_archive(rows, "RTTY")] == ["KA4RRU"]

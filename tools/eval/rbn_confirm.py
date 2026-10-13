@@ -68,6 +68,8 @@ BANDS = {"160m": (1800, 2000), "80m": (3500, 4000), "60m": (5330, 5410),
          "10m": (28000, 29700), "6m": (50000, 54000)}
 
 _SPOT_RE = re.compile(r"(?:SPOT:|DX de \S+:)\s+([\d.]+)\s+(?:kHz\s+)?([A-Z0-9/]+)", re.I)
+_TELNET_MODE_RE = re.compile(r"DX de \S+:\s+[\d.]+\s+\S+\s+([A-Z0-9]+)\s")   # the mode column
+_LOG_FT8_RE = re.compile(r"dB\s+FT[48]\b")                                   # *** SPOT: ... +9 dB  FT8  [...]
 
 
 @dataclass(frozen=True)
@@ -89,10 +91,17 @@ def base_call(call: str) -> str:
 
 def parse_spots(lines: Iterable[str], mode: str = "CW") -> dict[str, set[float]]:
     """Spotted base call -> frequencies (kHz, 0.1 kHz resolution). mode CW skips RTTY
-    and FT8 spot lines; mode RTTY keeps only RTTY ones."""
+    and FT8 spot lines; mode RTTY keeps only RTTY ones. The mode is read from the line's
+    shape, not from the text anywhere in it (FT8WW is a CW call). LOCAL SPOT lines (the
+    local telnet port's own rule, telnet_local_port) are not the RBN stream and are skipped."""
     spots: dict[str, set[float]] = {}
     for line in lines:
-        is_rtty, is_ft8 = "RTTY" in line, "FT8" in line
+        if "LOCAL SPOT:" in line:
+            continue
+        is_rtty = "RTTY SPOT:" in line or bool(_TELNET_MODE_RE.search(line) and
+                                                _TELNET_MODE_RE.search(line).group(1) == "RTTY")
+        is_ft8 = bool(_LOG_FT8_RE.search(line)) or bool(
+            _TELNET_MODE_RE.search(line) and _TELNET_MODE_RE.search(line).group(1) in ("FT8", "FT4"))
         if (mode == "RTTY") != is_rtty or is_ft8:
             continue
         m = _SPOT_RE.search(line)
