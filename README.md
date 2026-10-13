@@ -253,8 +253,9 @@ cluster or logger, add a second port with its own rule:
 "local_spot_rule": {"doubled_calls": true, "fewer_repeats": 0}
 ```
 
-Tweaks to `local_spot_rule` change only port 7301; what goes to RBN
-stays the same. Without `local_spot_rule`, 7301 carries the same spots
+Both port numbers are yours to pick (`--port` and `--local-port` on the
+command line override them). Tweaks to `local_spot_rule` change only the
+local port; what goes to RBN stays the same. Without `local_spot_rule`, 7301 carries the same spots
 as 7300. FT8 and RTTY go to both ports.
 
 ## Quick start (macOS)
