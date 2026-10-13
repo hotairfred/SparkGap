@@ -8695,6 +8695,8 @@ def main():
     parser.add_argument('--ip', help='SDR IP override')
     parser.add_argument('--band', help='Band override (e.g., 20m)')
     parser.add_argument('--port', type=int, help='Telnet port override')
+    parser.add_argument('--local-port', type=int,
+                        help='Local telnet port override (telnet_local_port; turns the port on)')
     parser.add_argument('--file', help='WAV file for offline testing (IQ recording)')
     parser.add_argument('--start-min', type=float, default=0, help='Start minute in file')
     parser.add_argument('--end-min', type=float, default=0, help='End minute in file (0=end)')
@@ -8721,6 +8723,8 @@ def main():
         config['bands'] = [args.band]
     if args.port:
         config['telnet_port'] = args.port
+    if args.local_port:
+        config['telnet_local_port'] = args.local_port
     if config.get('use_itila') and float(config.get('itila_window_sec', 60.0)) > 75:
         sys.exit("itila_window_sec must be <= 75 (ITILA decode buffer); set it in the config")
 
