@@ -74,6 +74,9 @@
 #define PITCH_MIN_N          8     /* fewer element pitches: report the WPM estimate */
 #define CARRY_MAX    4000   /* 20 s: longest unfinished word carried into the next window */
 #define FLUSH_MARGIN 1000   /* 5 s decoded after a carried word when the signal ends */
+#define GAP_ELEM_CUT  1.5   /* gaps under this many dits are element-gap candidates */
+#define GAP_ELEM_MIN  0.5   /* fitted element gap must be within these many dits */
+#define GAP_ELEM_MAX  1.5
 #define GAP_SD_ELEM   0.45  /* log-normal spread of element, letter and word gaps */
 #define GAP_SD_LETTER 0.30
 #define GAP_SD_WORD   0.35
@@ -1031,6 +1034,18 @@ static double letter_word_boundary(itila_state_t *st, const run_t *runs, int n_r
     return b;
 }
 
+/* Element gap centre: median of this window's short gaps, else the dit.  Weighted
+ * keyers send element gaps well under a dit (WA8VTD: dit 11, gap 8 to 9). */
+static double fit_elem_gap(const run_t *runs, int n_runs, double dit, double *scratch) {
+    int ng = 0;
+    for (int i = 1; i < n_runs - 1 && ng < MAX_ENV; i++)
+        if (!runs[i].is_mark && runs[i].dur < GAP_ELEM_CUT * dit) scratch[ng++] = runs[i].dur;
+    if (ng < GAP_FIT_MIN_GAPS) return dit;
+    qsort(scratch, ng, sizeof(double), cmp_double);
+    double m = scratch[(ng - 1) / 2];
+    return (m >= GAP_ELEM_MIN * dit && m <= GAP_ELEM_MAX * dit) ? m : dit;
+}
+
 static int is_callsign(const char *s);
 
 /* Most legal marks of the window lie within 1.5x of the given dit or dah. */
@@ -1239,6 +1254,7 @@ static int decode_runs_beam(
     /* Letter and word gap centres from this window's gaps (idle time excluded),
      * standard 3 and 7 units when there are too few. */
     double gap_l = 3.0 * unit_sp, gap_w = 7.0 * unit_sp;
+    double gap_e = fit_elem_gap(runs, n_runs, unit_sp, st->log_B);
     {
         double *g = st->log_B;  /* scratch, free in the beam stage */
         int ng = 0;
@@ -1330,7 +1346,7 @@ static int decode_runs_beam(
             /* Space: element, letter or word gap by duration likelihood,
              * both kept when close so the character and token priors decide. */
             double d = (double)dur;
-            double ll[3] = { ln_ll(d, unit_sp, GAP_SD_ELEM), ln_ll(d, gap_l, GAP_SD_LETTER),
+            double ll[3] = { ln_ll(d, gap_e, GAP_SD_ELEM), ln_ll(d, gap_l, GAP_SD_LETTER),
                              d >= gap_w ? 0.0 : ln_ll(d, gap_w, GAP_SD_WORD) };
             (void)letter_word;
             int kbest = 0;
@@ -2141,6 +2157,32 @@ double itila2_test_fit_letter_word(const int *is_mark, const int *dur, int n,
     double boundary = fit_letter_word_boundary(runs, n, unit, fitted);
     free(runs);
     return boundary;
+}
+
+double itila2_test_fit_elem_gap(const int *is_mark, const int *dur, int n, double dit) {
+    run_t *runs = malloc(n * sizeof(run_t));
+    double *scratch = malloc(n * sizeof(double));
+    if (!runs || !scratch) { free(runs); free(scratch); return dit; }
+    for (int i = 0; i < n; i++) { runs[i].is_mark = is_mark[i]; runs[i].dur = dur[i]; }
+    double gap = fit_elem_gap(runs, n, dit, scratch);
+    free(runs); free(scratch);
+    return gap;
+}
+
+/* Beam decode of the mark sequence built from runs; best text into out.  Returns the text count or -1. */
+int itila2_test_decode_runs(const int *is_mark, const int *dur, int n, double wpm, char *out, int out_len) {
+    int T = 0;
+    for (int i = 0; i < n; i++) T += dur[i];
+    if (T < 1 || T > MAX_ENV || out_len < 1) return -1;
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    char (*texts)[MAX_TEXT] = malloc(4 * sizeof(*texts));
+    if (!st || !texts || !bind_scratch(st)) { if (st) itila_free(st); free(texts); return -1; }
+    for (int i = 0, t = 0; i < n; i++)
+        for (int k = 0; k < dur[i]; k++) st->marks[t++] = (int8_t)(is_mark[i] != 0);
+    int nt = decode_runs_beam(st, st->marks, T, wpm, 0.0, texts, 4, NULL);
+    snprintf(out, (size_t)out_len, "%s", nt > 0 ? texts[0] : "");
+    itila_free(st); free(texts);
+    return nt;
 }
 
 double itila2_test_estimate_wpm(const int *is_mark, const int *dur, int n) {

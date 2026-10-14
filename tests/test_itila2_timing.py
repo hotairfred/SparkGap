@@ -428,3 +428,101 @@ def test_gate_segments_keeps_keying_and_blanks_noise() -> None:
     out = _gate(env, marks)
     assert out[: len(keyed)] == keyed
     assert sum(out[len(keyed):]) == 0
+
+
+_lib.itila2_test_fit_elem_gap.argtypes = [
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_double,
+]
+_lib.itila2_test_fit_elem_gap.restype = ctypes.c_double
+
+# WA8VTD, bin 10101.8, Fred's 30m PA QSO Party clip (2026-10-10 22:10Z), narrow path:
+# the first 120 runs. Heavy weighting: dits 11 to 12, dahs 29 to 30, element gaps
+# 7 to 8; the T to D gap is 19 (-19 before '+30 -8 +11 -7 +11'), read as Z (WA8VZ).
+WA8VTD_RUNS = (
+    "-214 +30 -8 +29 -8 +30 -8 +29 -8 +30 -7 +30 -8 +29 -82 +30 -8 +11 -8 +30 -7 "
+    "+12 -29 +29 -8 +29 -8 +11 -8 +30 -41 +29 -8 +11 -8 +30 -8 +11 -36 +30 -8 +30 "
+    "-7 +11 -8 +30 -27 +29 -8 +11 -8 +30 -8 +11 -37 +29 -8 +30 -7 +12 -7 +30 -20 "
+    "+30 -7 +12 -8 +11 -34 +11 -94 +12 -8 +29 -8 +29 -19 +12 -8 +29 -37 +29 -8 +30 "
+    "-7 +30 -8 +11 -8 +11 -38 +11 -8 +12 -7 +11 -8 +30 -26 +30 -19 +30 -8 +11 -7 "
+    "+11 -201 +30 -8 +11 -7 +30 -8 +11 -37 +29 -8 +30 -8 +11"
+)
+
+
+def call_fit_elem_gap(spec: str, dit: float) -> float:
+    is_mark, dur = runs(spec)
+    n = len(is_mark)
+    return _lib.itila2_test_fit_elem_gap(
+        (ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, dit
+    )
+
+
+def test_elem_gap_weighted_keyer() -> None:
+    """WA8VTD's element gaps (7 to 8) sit well under his 11.22 dit."""
+    assert 7.0 <= call_fit_elem_gap(WA8VTD_RUNS, 11.22) <= 8.5
+
+
+def test_elem_gap_even_spacing() -> None:
+    """KE4D's element gaps match his dit: the centre stays near the dit."""
+    assert 13.0 <= call_fit_elem_gap(KE4D_RUNS, 12.65) <= 15.0
+
+
+def test_elem_gap_too_few() -> None:
+    assert call_fit_elem_gap("-100 +10 -6 +10 -6 +30 -100", 10.0) == 10.0
+
+
+_lib.itila2_test_decode_runs.argtypes = [
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_double,
+    ctypes.c_char_p,
+    ctypes.c_int,
+]
+_lib.itila2_test_decode_runs.restype = ctypes.c_int
+
+
+def call_decode_runs(spec: str, wpm: float) -> str:
+    is_mark, dur = runs(spec)
+    n = len(is_mark)
+    buf = ctypes.create_string_buffer(2048)
+    nt = _lib.itila2_test_decode_runs(
+        (ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, wpm, buf, len(buf)
+    )
+    assert nt > 0
+    return buf.value.decode()
+
+
+# The same window's first 400 runs (the dump's limit): copy 2 of the call reads ?8VZ on the
+# dit-centred element gap and WA8VTD on the fitted one.
+WA8VTD_WINDOW_RUNS = (
+    "-214 +30 -8 +29 -8 +30 -8 +29 -8 +30 -7 +30 -8 +29 -82 +30 -8 +11 -8 +30 -7 "
+    "+12 -29 +29 -8 +29 -8 +11 -8 +30 -41 +29 -8 +11 -8 +30 -8 +11 -36 +30 -8 +30 "
+    "-7 +11 -8 +30 -27 +29 -8 +11 -8 +30 -8 +11 -37 +29 -8 +30 -7 +12 -7 +30 -20 "
+    "+30 -7 +12 -8 +11 -34 +11 -94 +12 -8 +29 -8 +29 -19 +12 -8 +29 -37 +29 -8 +30 "
+    "-7 +30 -8 +11 -8 +11 -38 +11 -8 +12 -7 +11 -8 +30 -26 +30 -19 +30 -8 +11 -7 "
+    "+11 -201 +30 -8 +11 -7 +30 -8 +11 -37 +29 -8 +30 -8 +11 -8 +29 -21 +30 -8 +11 "
+    "-8 +29 -8 +11 -42 +30 -7 +30 -8 +11 -8 +29 -24 +29 -8 +11 -8 +30 -7 +12 -36 "
+    "+30 -8 +29 -8 +12 -7 +30 -16 +30 -8 +11 -8 +11 -36 +11 -81 +12 -7 +30 -8 +30 "
+    "-15 +11 -8 +30 -33 +30 -7 +30 -8 +30 -7 +12 -8 +11 -41 +12 -7 +12 -7 +12 -7 "
+    "+30 -31 +30 -20 +30 -8 +11 -8 +11 -144 +29 -8 +12 -7 +30 -8 +11 -46 +5 -31 +29 "
+    "-8 +12 -7 +29 -22 +30 -7 +12 -7 +30 -8 +11 -34 +30 -7 +31 -7 +11 -8 +29 -23 "
+    "+31 -8 +11 -7 +30 -8 +11 -34 +30 -8 +29 -8 +11 -8 +30 -18 +30 -8 +11 -8 +10 "
+    "-36 +11 -95 +12 -8 +29 -8 +30 -19 +12 -7 +30 -32 +30 -8 +30 -7 +30 -8 +11 -8 "
+    "+11 -40 +11 -8 +11 -8 +12 -7 +30 -25 +30 -22 +30 -8 +11 -8 +11 -150 +30 -7 +12 "
+    "-7 +30 -8 +11 -42 +30 -7 +30 -8 +11 -8 +29 -25 +29 -8 +11 -8 +29 -8 +11 -33 "
+    "+30 -8 +29 -8 +12 -8 +29 -22 +30 -8 +11 -8 +29 -8 +11 -34 +29 -8 +30 -8 +11 -7 "
+    "+30 -14 +29 -8 +11 -8 +12 -34 +12 -90 +11 -8 +30 -64 +11 -8 +30 -7 +30 -18 +11 "
+    "-8 +30 -28 +30 -8 +29 -8 +30 -8 +11 -7 +12 -35 +12 -7 +12 -7 +12 -7 +30 -25 "
+    "+29 -23 +30 -8 +11 -223 +29 -8 +12 -7 +30 -8 +11 -37 +30 -8 +30 -7 +12 -7 +30"
+)
+
+
+def test_decode_weighted_keyer_letter_gap() -> None:
+    """A 19-sample T to D gap in copy 2 decodes as a letter gap (WA8VTD, not ?8VZ).
+    Copies 1 and 5 still read WA8VZ: the fix is partial, as in the replay."""
+    text = call_decode_runs(WA8VTD_WINDOW_RUNS, 20.5)
+    assert text.count("WA8VTD") >= 2
+    assert "?8VZ" not in text
