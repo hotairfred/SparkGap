@@ -31,7 +31,7 @@ def _iq(text: str, offset_hz: float, seconds: float, seed: int) -> tuple[np.ndar
 def test_rtty_cq_spots_after_two_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
     spots = []
     sk = types.SimpleNamespace(
-        telnet=types.SimpleNamespace(broadcast_spot=lambda **k: spots.append((k["freq_khz"], k["dx_call"]))),
+        broadcast=lambda **k: spots.append((k["freq_khz"], k["dx_call"])),
         spot_count=0, _corrected_freq_khz=lambda f: f, cfg={"rtty_spot_rule": "repeat"},
         _rtty_rule=RepeatSpotRule(lambda c: 2))
     lib = sparkgap._get_rtty_lib()

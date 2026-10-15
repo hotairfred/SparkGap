@@ -243,6 +243,25 @@ Connect to the spot stream:
 telnet localhost 7300
 ```
 
+Port 7300 (`telnet_port`) carries the RBN-grade spots, the same stream
+`rbn_feeder.py` uploads. Anyone can connect to it. If you want your
+own spots filtered differently, for example a looser spot rule for your
+cluster or logger, add a second port with its own rule:
+
+```json
+"telnet_local_port": 7301,
+"local_spot_rule": {"doubled_calls": true, "split_up": true, "fewer_repeats": 0}
+```
+
+`split_up` also spots DX working split from its sign-offs (`TU CY0S UP`),
+which CW Skimmer does not do; it is off on 7300 unless `spot_rule_split_up`
+is set.
+
+Both port numbers are yours to pick (`--port` and `--local-port` on the
+command line override them). Tweaks to `local_spot_rule` change only the
+local port; what goes to RBN stays the same. Without `local_spot_rule`, 7301 carries the same spots
+as 7300. FT8 and RTTY go to both ports.
+
 ## Quick start (macOS)
 
 Should work with light Makefile tweaks ... `-shared` produces `.dylib`
