@@ -250,8 +250,12 @@ cluster or logger, add a second port with its own rule:
 
 ```json
 "telnet_local_port": 7301,
-"local_spot_rule": {"doubled_calls": true, "fewer_repeats": 0}
+"local_spot_rule": {"doubled_calls": true, "split_up": true, "fewer_repeats": 0}
 ```
+
+`split_up` also spots DX working split from its sign-offs (`TU CY0S UP`),
+which CW Skimmer does not do; it is off on 7300 unless `spot_rule_split_up`
+is set.
 
 Both port numbers are yours to pick (`--port` and `--local-port` on the
 command line override them). Tweaks to `local_spot_rule` change only the

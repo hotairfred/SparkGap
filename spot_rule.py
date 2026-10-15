@@ -222,7 +222,7 @@ def _cq_before(toks: list[str], i: int) -> bool:
 
 
 def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
-                 doubled: bool = False) -> list[str]:
+                 doubled: bool = False, split_up: bool = False) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -232,7 +232,7 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
     send, for 3 more runners). The TEST of a bare W6YH TEST still opens a group on the call
     after it; only the exchange test keeps that caller out. every: one entry per group
     instead of one per call."""
-    return [call for call, _after in runner_groups(text, every, qualifiers, doubled)]
+    return [call for call, _after in runner_groups(text, every, qualifiers, doubled, split_up)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -274,8 +274,18 @@ def _stray_letters(toks: list[str], call: str, k: int) -> bool:
     return len(joined) > len(call) and CALL_RE.match(joined) is not None
 
 
+def _split_signoff(toks: list[str], i: int) -> int | None:
+    """toks[i] is TU and the next word is a call followed directly by UP (TU CY0S UP): a station
+    working split signing off. Returns the call's index, else None."""
+    j = i + 1
+    if (toks[i] == "TU" and j + 1 < len(toks) and CALL_RE.match(toks[j]) is not None
+            and toks[j + 1] == "UP"):
+        return j
+    return None
+
+
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
-                  doubled: bool = False) -> list[tuple[str, str | None]]:
+                  doubled: bool = False, split_up: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller."""
@@ -284,6 +294,13 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
     i, n = 0, len(toks)
     while i < n:
         t = toks[i]
+        if split_up:
+            j = _split_signoff(toks, i)
+            if j is not None:
+                if every or all(toks[j] != c for c, _ in out):
+                    out.append((toks[j], None))
+                i = j + 2
+                continue
         de = t == "DE" and _cq_before(toks, i)
         if not (t in KEYWORDS or de):
             i += 1
@@ -345,7 +362,8 @@ class RepeatSpotRule:
 
     def __init__(self, tier: Callable[[str], int], cq_groups: bool = False,
                  lockon: bool = False, split_runs: bool = False,
-                 cq_qualifiers: bool = False, doubled: bool = False, window_s: float = 60.0,
+                 cq_qualifiers: bool = False, doubled: bool = False, split_up: bool = False,
+                 window_s: float = 60.0,
                  validation: str | None = None,
                  listed: Callable[[str], bool] | None = None, listed_by: str = "scp") -> None:
         if validation is not None and validation not in VALIDATION:
@@ -364,6 +382,7 @@ class RepeatSpotRule:
         self.split_runs = split_runs
         self.cq_qualifiers = cq_qualifiers
         self.doubled = doubled and validation is None           # validation scores a doubled call itself
+        self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
@@ -393,7 +412,7 @@ class RepeatSpotRule:
         spots = []
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
                  else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers,
-                                   doubled=self.doubled))
+                                   doubled=self.doubled, split_up=self.split_up))
         for call, n in Counter(calls).items():
             new = 0
             for nth in range(n):
@@ -480,7 +499,8 @@ class RepeatSpotRule:
         calls: list[str] = []
         toks = tokens(text)
         for call, after in runner_groups(text, every=self.cq_groups,
-                                         qualifiers=self.cq_qualifiers, doubled=self.doubled):
+                                         qualifiers=self.cq_qualifiers, doubled=self.doubled,
+                                         split_up=self.split_up):
             owner = self.owner(freq_khz, now)
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
