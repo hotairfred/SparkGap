@@ -549,3 +549,37 @@ def test_doubled_call_counts_twice_only_when_asked() -> None:
     assert dbl.feed(1, 7030.0, "CQ CQ DE K8TLJ K8TLJ K", 0.0) == [("K8TLJ", 7030.0)]
     lock = RepeatSpotRule(_tier2, cq_groups=True, lockon=True, doubled=True)
     assert lock.feed(1, 7030.0, "CQ CQ DE K8TLJ K8TLJ K", 0.0) == [("K8TLJ", 7030.0)]
+
+
+def test_split_up_counts_tu_call_up_only_when_asked() -> None:
+    """split_up: a DX station working split signs TU <call> UP and may never send CQ
+    (CY0S, 40m, 2026-03-19; hotairfred/SparkGap#48). Off by default, as in CW Skimmer."""
+    text = "W5JMW 5NN TU CY0S UP"
+    assert runner_calls(text, every=True) == []
+    assert runner_calls(text, every=True, split_up=True) == ["CY0S"]
+    # only the call right before UP: the callers he works after it are not runners
+    assert runner_calls("TU CY0S UP KD4JG KD4JG KE3JP 5NN TU CY0S UP", every=True,
+                        split_up=True) == ["CY0S", "CY0S"]
+    assert runner_calls("TU CY0S UP XE1CQ", every=True, split_up=True) == ["CY0S"]
+    # a bare <call> UP or a TU without UP is no sign-off (#43: those let contest junk through)
+    assert runner_calls("CY0S UP", every=True, split_up=True) == []
+    assert runner_calls("TU CY0S 5NN", every=True, split_up=True) == []
+    plain = RepeatSpotRule(_tier2, cq_groups=True, lockon=True)
+    split = RepeatSpotRule(_tier2, cq_groups=True, lockon=True, split_up=True)
+    for rule in (plain, split):
+        for k in range(2):
+            spots = rule.feed(k, 7024.0, "W5JMW 5NN TU CY0S UP", 60.0 * k)
+    assert plain.owner(7024.0, 60.0) is None
+    assert spots == [("CY0S", 7024.0)] and split.owner(7024.0, 60.0) == "CY0S"
+
+
+def test_split_up_by_config_and_local_port() -> None:
+    import sparkgap
+    tracker = sparkgap.SpotTracker(set(SCP), set())
+    assert not sparkgap._make_spot_rule({}, tracker).split_up
+    assert sparkgap._make_spot_rule({"spot_rule_split_up": True}, tracker).split_up
+    # the local port's rule has its own key; the RBN port's stays off
+    cfg = {"local_spot_rule": {"split_up": True}}
+    assert not sparkgap._make_spot_rule(cfg, tracker).split_up
+    assert sparkgap._make_spot_rule(cfg, tracker, local=cfg["local_spot_rule"]).split_up
+    assert not sparkgap._make_spot_rule(cfg, tracker, local={}).split_up

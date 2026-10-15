@@ -1657,21 +1657,25 @@ def _make_spot_rule(config, tracker, local=None):
     """The RepeatSpotRule SparkGap runs with spot_rule "repeat": tiers from patt3ch, lock-on,
     CQ groups and CQ qualifiers always on (measured on every recording we have), split_runs
     by config (spot_rule_split_runs, off by default), doubled calls by config
-    (spot_rule_doubled_calls, off by default).
+    (spot_rule_doubled_calls, off by default), split DX sign-offs by config
+    (spot_rule_split_up, off by default: CW Skimmer does not spot TU <call> UP either,
+    hotairfred/SparkGap#48).
 
     local: the local_spot_rule config block for the rule of the local telnet port, which may
     be looser than the rule of telnet_port (the port the RBN feeder reads). Its keys:
-    doubled_calls (bool) and fewer_repeats (int: copies taken off each patt3ch tier, never
-    below 2)."""
+    doubled_calls (bool), split_up (bool) and fewer_repeats (int: copies taken off each
+    patt3ch tier, never below 2)."""
     from spot_rule import RepeatSpotRule
     fewer = int(local.get('fewer_repeats', 0)) if local is not None else 0
     doubled = (local.get('doubled_calls', False) if local is not None
                else config.get('spot_rule_doubled_calls', False))
+    split_up = (local.get('split_up', False) if local is not None
+                else config.get('spot_rule_split_up', False))
     return RepeatSpotRule(
         lambda c: max(2, {'active': 2, 'rare': 3}.get(tracker._matches_patt3ch(c), 4) - fewer),
         cq_groups=True, cq_qualifiers=True, lockon=True,
         split_runs=bool(config.get('spot_rule_split_runs', False)),
-        doubled=bool(doubled))
+        doubled=bool(doubled), split_up=bool(split_up))
 
 def _get_itila_lib():
     global _itila_lib
