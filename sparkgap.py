@@ -1732,6 +1732,26 @@ def _select_cw_decoder(name):
     log.info("CW decoder: %s (%s, %s)", name, _itila_lib_path, _scanner_lib_path)
     return _itila_lib_path
 
+def _set_known_calls(config):
+    """Config itila_known_calls (a file, one call per line) and itila_known_bonus (log units, 0 =
+    off): itila2 favours calls heard on the air lately over callsign-shaped pieces of them."""
+    bonus = float(config.get('itila_known_bonus', 0) or 0)
+    path = config.get('itila_known_calls')
+    if bonus <= 0 or not path:
+        return 0
+    import ctypes as _ct
+    lib = _get_itila_lib()
+    if not lib or not hasattr(lib, 'itila_set_known_calls'):
+        log.warning("itila_known_calls: this decoder has no known-call prior")
+        return 0
+    lib.itila_set_known_calls.restype = _ct.c_int
+    lib.itila_set_known_calls.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_double]
+    calls = sorted({l.strip().upper() for l in open(path) if l.strip() and not l.startswith('#')})
+    buf = '\n'.join(calls).encode()
+    n = lib.itila_set_known_calls(buf, len(buf), bonus)
+    log.info("Known-call prior: %d calls from %s, bonus %.1f", n, path, bonus)
+    return n
+
 _itila_decode_threads = 1   # config itila_decode_threads: bins decoded in parallel (Python path)
 
 def _select_decode_threads(n):
@@ -7020,6 +7040,7 @@ class SparkGap:
             return False
         try:
             _select_cw_decoder(self.cfg.get('cw_decoder', 'itila2'))
+            _set_known_calls(self.cfg)
         except (ValueError, RuntimeError) as e:
             log.error("%s", e)
             return False
@@ -8264,6 +8285,7 @@ def run_file_mode(args, config):
         sys.exit(f"use_itila needs a recording at {rates} Hz, got {file_rate}")
     try:
         _select_cw_decoder(config.get('cw_decoder', 'itila2'))
+        _set_known_calls(config)
     except (ValueError, RuntimeError) as e:
         sys.exit(str(e))
 
