@@ -1904,6 +1904,11 @@ def _get_rtty_lib():
                                              _ct.POINTER(_ct.c_double)]
             _rtty_lib.rtty_free.restype  = None
             _rtty_lib.rtty_free.argtypes = [_ct.c_void_p]
+            try:                                   # older librtty.so has no FSK count
+                _rtty_lib.rtty_fsk_seconds.restype  = _ct.c_int
+                _rtty_lib.rtty_fsk_seconds.argtypes = [_ct.c_void_p]
+            except AttributeError:
+                pass
             log.info("Loaded librtty.so")
         except OSError:
             log.warning("librtty.so not found — RTTY decoder unavailable")
@@ -1954,6 +1959,12 @@ RTTY_RANGES = {
 # RTTY ranges for rtty_spot_rule "repeat", offset (Hz) from band center: where RBN's RTTY
 # skimmers spotted a weekend RTTY contest (10-10 22-00Z, 5th to 99th percentile, plus margin).
 # 40m ran 7046 to 7074 kHz, above the 7035-7055 of RTTY_RANGES.
+# rtty_excludes_cw: CW bins are kept off an RTTY signal (both tones and sidebands, centre +-
+# RTTY_EXCL_HALF_HZ) for RTTY_EXCL_HOLD_S after a minute scan finds it alternating for at
+# least RTTY_EXCL_MIN_FSK_S seconds. Scans run once a minute, so the hold covers two misses.
+RTTY_EXCL_HALF_HZ = 150.0
+RTTY_EXCL_HOLD_S = 150.0
+RTTY_EXCL_MIN_FSK_S = 3
 RTTY_SPOT_BAUD = 45     # RTTY spots go out as "RTTY 26 dB 45 BPS CQ", as RTTY Skimmer Server sends them
 
 RTTY_RANGES_KHZ = {
@@ -2119,15 +2130,25 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         if not h:
             continue
         conf = _ct.c_double(0.0)
+        fsk_s = 0
         try:
             p = rtty_lib.rtty_feed(h, audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
                                    _ct.c_int(len(audio)), _ct.byref(conf))
             text = p.decode('latin-1', errors='replace').strip() if p else ''
+            if hasattr(rtty_lib, 'rtty_fsk_seconds'):
+                fsk_s = rtty_lib.rtty_fsk_seconds(h)
         finally:
             rtty_lib.rtty_free(h)
+        c_hz = band_center_khz * 1000.0 + off_hz                    # centre between the tones
+        rf_khz = (c_hz + RTTY_MARK_HZ) / 1000.0                      # mark tone: what spots give
+        # rtty_excludes_cw: a candidate whose tones clearly alternated for a few seconds is RTTY,
+        # not two CW stations 170 Hz apart; keep CW bins off its tones and sidebands (around the centre).
+        if skimmer.cfg.get('rtty_excludes_cw') and fsk_s >= RTTY_EXCL_MIN_FSK_S:
+            if skimmer._exclude_cw(bn, c_hz - RTTY_EXCL_HALF_HZ, c_hz + RTTY_EXCL_HALF_HZ,
+                                   RTTY_EXCL_HOLD_S):
+                skimmer._rtty_excluded += 1
         if not text:
             continue
-        rf_khz = (band_center_khz * 1000.0 + off_hz + RTTY_MARK_HZ) / 1000.0     # mark tone
         log.info("RTTY %s @ %.1f kHz (%.0f dB): %s", bn, rf_khz, snr_db, text[:80])
         w = rule.window_id(int(round(rf_khz * 10)), int(now // 60), now)
         for call, sf in rule.feed(w, rf_khz, _rtty_split_keywords(text), now, snr=snr_db):
@@ -2431,6 +2452,21 @@ class _ItilaSc:
         qp = q_arr.ctypes.data_as(_ct.POINTER(_ct.c_double))
         self._lib.itila_sc_feed_iq(self._h, ip, qp, _ct.c_int(n))
 
+    def exclude(self, lo_hz, hi_hz, hold_sec):
+        """Keep bins off [lo_hz, hi_hz] for hold_sec; False when the library can't."""
+        import ctypes as _ct
+        if not hasattr(self._lib, 'itila_sc_exclude'):
+            return False
+        self._lib.itila_sc_exclude(self._h, _ct.c_double(lo_hz), _ct.c_double(hi_hz),
+                                   _ct.c_double(hold_sec))
+        return True
+
+    def excl_counts(self):
+        """(bins released, scan peaks blocked) by exclusion zones, or None."""
+        if not hasattr(self._lib, 'itila_sc_excl_released'):
+            return None
+        return (self._lib.itila_sc_excl_released(self._h), self._lib.itila_sc_excl_blocked(self._h))
+
     def ready_bins(self):
         import ctypes as _ct
         buf = np.empty(self._max_bins, dtype=np.float64)
@@ -2545,6 +2581,16 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
         try:
             lib.itila_sc_set_cost_fn.restype  = None
             lib.itila_sc_set_cost_fn.argtypes = [_ct.c_void_p, _ct.c_void_p]
+        except AttributeError:
+            pass
+        # Optional: exclusion zones (itila2 scanner, RTTY tones). Older libraries lack them.
+        try:
+            lib.itila_sc_exclude.restype  = None
+            lib.itila_sc_exclude.argtypes = [_ct.c_void_p, _ct.c_double, _ct.c_double, _ct.c_double]
+            lib.itila_sc_excl_released.restype  = _ct.c_ulonglong
+            lib.itila_sc_excl_released.argtypes = [_ct.c_void_p]
+            lib.itila_sc_excl_blocked.restype  = _ct.c_ulonglong
+            lib.itila_sc_excl_blocked.argtypes = [_ct.c_void_p]
         except AttributeError:
             pass
         lib.itila_sc_decode_ready.restype  = _ct.c_int
@@ -7022,6 +7068,7 @@ class SparkGap:
         self.telnet_local = None   # telnet_local_port, else None
         self.running = False
         self.spot_count = 0
+        self._rtty_excluded = 0     # RTTY signals CW bins were kept off (rtty_excludes_cw)
         self.start_time = None
         self._iq_lock = threading.Lock()
         self._iq_trimmed = 0  # IQ samples discarded by the Python receiver path
@@ -7050,6 +7097,14 @@ class SparkGap:
         if str((self.cfg.get('gui_feed') or {}).get('spots', 'rbn')).lower() != 'local':
             return stream != 'local'
         return stream != 'rbn' or self.tracker.local_rule is None
+
+    def _exclude_cw(self, band_name, lo_hz, hi_hz, hold_sec):
+        """Keep the CW scanner of band_name off [lo_hz, hi_hz] for hold_sec."""
+        for (bn, _c, _rx), mgr in zip(self._band_meta, getattr(self, 'managers', [])):
+            scanner = getattr(mgr, '_itila_scanner', None)
+            if bn == band_name and scanner is not None and getattr(scanner, '_sc', None):
+                return scanner._sc.exclude(lo_hz, hi_hz, hold_sec)
+        return False
 
     def _corrected_freq_khz(self, raw_khz):
         """Apply ppm_offset calibration to a freq emission. No-op when 0."""
@@ -8325,8 +8380,18 @@ class SparkGap:
                                                 skimmer, rtty_lib, bn, ck, fi, fq, n)
                                         except Exception as e:
                                             log.warning("RTTY scan %s: %s", bn, e)
-                                    log.info("RTTY cycle done: %d spots across %d bands",
-                                             rtty_total, len(jobs))
+                                    excl = ''
+                                    if skimmer.cfg.get('rtty_excludes_cw'):
+                                        rel = blk = 0
+                                        for mgr in skimmer.managers:
+                                            sc = getattr(getattr(mgr, '_itila_scanner', None), '_sc', None)
+                                            c = sc.excl_counts() if sc and hasattr(sc, 'excl_counts') else None
+                                            if c:
+                                                rel += c[0]; blk += c[1]
+                                        excl = ("; CW kept off %d RTTY signals (total), %d CW bins released, "
+                                                "%d spawns blocked" % (skimmer._rtty_excluded, rel, blk))
+                                    log.info("RTTY cycle done: %d spots across %d bands%s",
+                                             rtty_total, len(jobs), excl)
                             skimmer._ft8_running = False
                         threading.Thread(target=_ft8_decode,
                                          args=(ft8_jobs, self),

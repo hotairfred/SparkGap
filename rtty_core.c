@@ -79,6 +79,7 @@ typedef struct {
     double spb;            /* samples per bit, fractional */
     double tc, next_t;     /* samples since the start edge; when the next bit is sampled */
     int    framing_errors; /* characters dropped for a space stop bit */
+    int    fsk_seconds;    /* 1 s blocks where mark and space clearly alternate */
 } rtty_state_t;
 
 typedef void *rtty_handle_t;
@@ -180,6 +181,7 @@ const char *rtty_feed(rtty_handle_t h, const double *audio, int n,
             double denom = sqrt((mv > 0 ? mv : 1e-20) * (sv > 0 ? sv : 1e-20));
             double corr = cov / denom;
             st->active = (corr < -0.2) || st->active;  /* latch on */
+            if (corr < -0.3) st->fsk_seconds++;   /* a second of clear FSK: tones alternate */
             st->mark_sum = st->space_sum = 0;
             st->mark_sq = st->space_sq = 0;
             st->corr_sum = 0;
@@ -276,4 +278,11 @@ void rtty_free(rtty_handle_t h) {
 /* For testing */
 int rtty_is_active(rtty_handle_t h) {
     return ((rtty_state_t *)h)->active;
+}
+
+/* Seconds of the audio fed so far in which mark and space clearly alternated (correlation
+ * below -0.3): RTTY keys one tone or the other, never both. Two CW signals 170 Hz apart key
+ * independently and almost never score here. */
+int rtty_fsk_seconds(rtty_handle_t h) {
+    return ((rtty_state_t *)h)->fsk_seconds;
 }

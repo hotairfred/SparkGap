@@ -64,6 +64,11 @@ int itila_sc_drain_env(ItilaSc *sc, double f_hz,
 /* Mark a bin as having produced evidence (call after itila_feed returns non-empty). */
 void itila_sc_mark_evidence(ItilaSc *sc, double f_hz);
 
+/* itila2 scanner only: keep bins off [lo_hz, hi_hz] for hold_sec (RTTY tones). */
+void itila_sc_exclude(ItilaSc *sc, double lo_hz, double hi_hz, double hold_sec);
+unsigned long long itila_sc_excl_released(ItilaSc *sc);
+unsigned long long itila_sc_excl_blocked(ItilaSc *sc);
+
 /* Current number of active bins. */
 int itila_sc_bin_count(ItilaSc *sc);
 

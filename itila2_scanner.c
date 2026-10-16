@@ -87,6 +87,7 @@ static const double WIDE_TAPS[SC_WIDE_LEN] = {
     -2.642351154647633e-05
 };
 #define SC_PREROLL_SEC 1.0   /* IQ replayed into a new bin */
+#define SC_MAX_EXCL    64    /* exclusion zones (RTTY tones) at once */
 #define SC_MAX_THREADS 16    /* itila_sc_set_threads cap */
 
 /* Stage 1 to 12 kHz: firwin(N, fc, window=('kaiser', beta), fs=rate), as in hotairfred/SparkGap#8.
@@ -307,6 +308,12 @@ struct ItilaSc {
     uint64_t spawn_gated;        /* candidates rejected (insufficient hits) */
     uint64_t spawn_promoted;     /* candidates that became bins */
 
+    /* Exclusion zones (itila_sc_exclude): frequencies where no bin may run, e.g. the mark and
+     * space tones of an RTTY signal. A zone lapses at `until` (total_samples units). */
+    struct { double lo_hz, hi_hz; int64_t until; } excl[SC_MAX_EXCL];
+    uint64_t excl_released;      /* bins released because a zone covered them */
+    uint64_t excl_blocked;       /* scan peaks not spawned because a zone covered them */
+
     /* Lazy spawn candidate ring - see SC_MAX_CANDIDATES comment block */
     int64_t  scan_counter;
     struct {
@@ -342,6 +349,16 @@ static int cmp_peak_desc(const void *a, const void *b)
 }
 
 /* ---- energy scan ---- */
+/* Whether f_hz lies in a live exclusion zone. Caller holds sc->lock. */
+static int sc_excluded(const ItilaSc *sc, double f_hz)
+{
+    for (int z = 0; z < SC_MAX_EXCL; z++)
+        if (sc->excl[z].until > sc->total_samples &&
+            f_hz >= sc->excl[z].lo_hz && f_hz <= sc->excl[z].hi_hz)
+            return 1;
+    return 0;
+}
+
 static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
 {
     int N = sc->energy_win;
@@ -399,6 +416,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
         double f_hz_interp = exact * bin_hz;
         double f_abs  = sc->center_hz + f_hz_interp;
         if (f_abs < sc->band_min_hz || f_abs > sc->band_max_hz) continue;
+        if (sc_excluded(sc, f_abs)) { sc->excl_blocked++; continue; }
         double f_grid = round(f_abs / sc->grid_hz) * sc->grid_hz;
         peaks[np].power = psd[k];
         peaks[np].f_hz  = f_grid;
@@ -437,6 +455,7 @@ static void run_scan(ItilaSc *sc, const double *seg_i, const double *seg_q)
             int stale    = 0;
             if (sc->bins[b].last_evidence == 0 && age > 300 * rate_12k) stale = 1;
             else if (sc->bins[b].last_evidence > 0 && since_ev > 300 * rate_12k) stale = 1;
+            if (!stale && sc_excluded(sc, sc->bins[b].f_hz)) { stale = 1; sc->excl_released++; }
             if (stale) {
                 bin_free_decoders(sc, &sc->bins[b]);
                 sc->bins[b].active = 0;
@@ -1057,6 +1076,37 @@ void itila_sc_mark_evidence(ItilaSc *sc, double f_hz)
         }
     }
 }
+
+/* Keep bins off [lo_hz, hi_hz] (absolute RF) for hold_sec: no new bin is spawned there and a
+ * bin already there is released at the next scan. Used for the mark and space tones of an
+ * RTTY signal, which a CW bin can only decode as junk. A zone that matches one already held
+ * (within 10 Hz) is refreshed. */
+void itila_sc_exclude(ItilaSc *sc, double lo_hz, double hi_hz, double hold_sec)
+{
+    if (!sc || hi_hz < lo_hz || hold_sec <= 0) return;
+    pthread_mutex_lock(&sc->lock);
+    int64_t until = sc->total_samples + (int64_t)(hold_sec * (sc->sample_rate / sc->dec1));
+    int slot = -1;
+    for (int z = 0; z < SC_MAX_EXCL; z++)
+        if (sc->excl[z].until > sc->total_samples &&
+            fabs(sc->excl[z].lo_hz - lo_hz) <= 10.0 && fabs(sc->excl[z].hi_hz - hi_hz) <= 10.0) {
+            slot = z; break;
+        }
+    if (slot < 0) {                       /* a lapsed slot, else the one lapsing soonest */
+        int64_t soonest = INT64_MAX;
+        for (int z = 0; z < SC_MAX_EXCL; z++) {
+            if (sc->excl[z].until <= sc->total_samples) { slot = z; break; }
+            if (sc->excl[z].until < soonest) { soonest = sc->excl[z].until; slot = z; }
+        }
+    }
+    sc->excl[slot].lo_hz = lo_hz;
+    sc->excl[slot].hi_hz = hi_hz;
+    sc->excl[slot].until = until;
+    pthread_mutex_unlock(&sc->lock);
+}
+
+unsigned long long itila_sc_excl_released(ItilaSc *sc) { return (unsigned long long)sc->excl_released; }
+unsigned long long itila_sc_excl_blocked(ItilaSc *sc) { return (unsigned long long)sc->excl_blocked; }
 
 void itila_sc_feed_iq(ItilaSc *sc,
                        const double *i_arr, const double *q_arr, int n)
