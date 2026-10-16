@@ -28,6 +28,7 @@ ml_merged.txt
 
 # Binary databases
 MASTER.DTA
+rbn_known/
 
 # FT8 capture binaries (debugging)
 *.c2

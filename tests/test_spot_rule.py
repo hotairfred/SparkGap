@@ -1,6 +1,8 @@
 """Repeat-evidence spot rule (spot_rule.py). Text cases are decodes from the 2026-09-23 replays."""
 
-from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, runner_calls, runner_groups, split_runs
+import pytest
+
+from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, _regap, runner_calls, runner_groups, split_runs
 
 SCP = {"K0TQ", "WX7V", "W1AW", "VE7KW", "K3JT", "K1ABC", "K1AJ", "AA3B", "NA2U"}
 
@@ -124,6 +126,21 @@ def test_keyword_closing_a_cq_opens_no_lookahead() -> None:
     assert runner_calls("CQ TEST K1ABC") == ["K1ABC"]
 
 
+def test_the_station_being_called_is_not_the_runner() -> None:
+    # 20m 2026-10-13: N8EM calling S52Y; S52Y was spotted
+    assert runner_calls("CQ S52Y DE N8EM K") == []
+    assert runner_calls("CQ S52Y S52Y DE N8EM N8EM K") == []      # N8EM is calling, not running
+    assert runner_calls("CQ DE N8EM N8EM K") == ["N8EM"]
+
+
+def test_caller_echoing_the_runner_keeps_the_runners_copy() -> None:
+    # hotairfred/SparkGap#52 review: after TEST or DE the call is the runner's, not one being called
+    assert runner_calls("CQ CQ DE K1ABC K1ABC K1ABC DE N2XX N2XX K") == ["K1ABC"]
+    assert runner_calls("CQ TEST K1ABC DE N2XX") == ["K1ABC"]
+    assert runner_calls("CQ TEST W1AW DE W1AWX") == ["W1AW"]
+    assert runner_calls("CQ K4DH DE K4DH K") == ["K4DH"]
+
+
 def test_no_keyword_no_runner() -> None:
     assert runner_calls("DE K7GUD NICE MEET U RICK") == []
 
@@ -139,6 +156,18 @@ def test_both_lpf_paths_of_one_window_count_once() -> None:
     w = r.window_id(1, 0, 0.0)
     assert r.feed(w, 14030.0, "CQ CWT K0TQ", 0.0) == []
     assert r.feed(r.window_id(1, 0, 0.0), 14030.0, "CQ CWT K0TQ", 0.0) == []
+
+
+def test_a_second_bin_on_the_same_audio_is_no_copy() -> None:
+    # AK4W for AK4JK, 2026-10-13: bins on 14007.1 and 14007.0 gave the same text 36 s apart
+    text = "CQ CQ CQDEAK4W IIAK4JK AN AK4JK"
+    r = RepeatSpotRule(_tier2, split_runs=True)
+    assert r.feed(r.window_id(1, 0, 0.0), 14007.1, text, 0.0) == []
+    assert r.feed(r.window_id(2, 0, 36.0), 14007.0, text, 36.0) == []
+    assert r.feed(r.window_id(1, 1, 60.0), 14007.1, text, 60.0) == [("AK4W", 14007.1)]   # sent again
+    r = RepeatSpotRule(_tier2, split_runs=True, window_s=30.0)
+    assert r.feed(r.window_id(1, 0, 0.0), 14007.1, text, 0.0) == []
+    assert r.feed(r.window_id(2, 0, 36.0), 14007.0, text, 36.0) == [("AK4W", 14007.1)]
 
 
 def test_every_cq_group_is_listed_on_request() -> None:
@@ -178,11 +207,11 @@ def test_cq_groups_copies_expire() -> None:
     assert r.feed(r.window_id(1, 0, 0.0), 7050.2, text, 0.0) == []
     late = REPEAT_S + 61.0
     assert r.feed(r.window_id(1, 9, late), 7050.2, "CQ WES DE N5QLZ N5QLZ", late) == []
-    w = r.window_id(2, 0, 0.0)
+    w = r.window_id(1, 10, 0.0)
     assert r.feed(w, 7050.2, text, late) == [("N5QLZ", 7050.2)]      # 1 + 2 copies
     later = late + REPEAT_S + 61.0
     assert r.feed(w, 7050.2, text, later) == []                       # the same window id counts afresh
-    assert r.feed(r.window_id(3, 0, later), 7050.2, "CQ WES DE N5QLZ N5QLZ", later) == [("N5QLZ", 7050.2)]
+    assert r.feed(r.window_id(1, 20, later), 7050.2, "CQ WES DE N5QLZ N5QLZ", later) == [("N5QLZ", 7050.2)]
 
 
 def test_call_not_in_scp_spots_on_repeats() -> None:
@@ -215,7 +244,8 @@ def test_spot_on_the_strongest_nearby_bin() -> None:
     """N3AD, 40m CWT 2026-10-08: a bin 350 Hz below him decoded his CQs too, weaker."""
     r = _rule()
     r.feed(r.window_id(1, 0, 0.0), 7037.9, "CQ TEST N3AD", 0.0, snr=15.0)
-    assert r.feed(r.window_id(2, 0, 30.0), 7038.25, "CQ TEST N3AD", 30.0, snr=40.0) == [
+    assert r.feed(r.window_id(2, 0, 30.0), 7038.25, "CQ TEST N3AD", 30.0, snr=40.0) == []   # same audio
+    assert r.feed(r.window_id(1, 1, 60.0), 7037.9, "CQ TEST N3AD", 60.0, snr=15.0) == [
         ("N3AD", 7038.25)]
 
 
@@ -297,7 +327,7 @@ def test_tracker_drops_blacklisted_and_spots_fast_runners() -> None:
 def test_call_after_de_counts_when_cq_came_first_and_it_is_sent_twice() -> None:
     assert runner_calls("CQ SKCC CG EKCC DE K4DH K4DH") == ["K4DH"]
     assert runner_calls("NOT E 3KZE CQ I EE DE VE3N") == []
-    assert runner_calls("CQ K4DH DE W1AW W1AW") == ["K4DH"]
+    assert runner_calls("CQ K4DH DE W1AW W1AW") == []             # K4DH is being called
     assert runner_calls("TU DE W1AW W1AW") == []
     assert runner_calls("CQ SKCC CG EKCC DEW1AW W1AW") == ["W1AW"]
     assert runner_calls("CQ K1ABC? FOO BAR BAZ DE W1XYZ W1XYZ") == []
@@ -421,6 +451,14 @@ def test_lockon_owner_signing_with_tu_counts() -> None:
     assert _feed(_rule(), ["CQ TEST N1DE", "TU N1DE K4FN 5NN 5 TU N1DE"]) == []
 
 
+def test_lockon_sign_off_with_stray_letters_does_not_count() -> None:
+    # KF2A for KF2AT, 20m 2026-10-13: the call split at a gap and the sign-off completed the count
+    r = RepeatSpotRule(_tier2, lockon=True)
+    assert r.feed(r.window_id(1, 0, 0.0), 14025.0, "CQ CQ DE KF2A T K", 0.0) == []
+    assert r.feed(r.window_id(1, 1, 60.0), 14025.0, "TU DE KF2A T K", 60.0) == []
+    assert r.feed(r.window_id(1, 2, 120.0), 14025.0, "TU DE KF2A K", 120.0) == [("KF2A", 14025.0)]
+
+
 def test_lockon_tu_caller_never_promotes_a_caller() -> None:
     # K4FN is only ever thanked; it never sends CQ, so it never owns the frequency
     rule = _lockon()
@@ -534,3 +572,56 @@ def test_two_band_runner_is_not_respotted_at_each_switch() -> None:
         t = 30.0 * k
         spots += rule.feed(rule.window_id(int(f), k, t), f, "CQ PA AA3B AA3B", t)
     assert sorted(spots) == [("AA3B", 3540.0), ("AA3B", 7040.0)]   # once per band
+
+
+def test_validation_level_must_be_known() -> None:
+    with pytest.raises(ValueError):
+        RepeatSpotRule(_tier2, validation="strict")
+    with pytest.raises(ValueError):
+        RepeatSpotRule(_tier2, validation="normal", listed_by="dta")
+
+
+def test_regap_is_one_keying_with_the_gaps_moved() -> None:
+    assert _regap("C0TT", "NN0TT")          # -.-. is C, or N N
+    assert _regap("N7HR", "N7HRK/M")        # the call split at a long letter gap
+    assert not _regap("K1ABC", "K1ABC")
+    assert not _regap("W1AW", "K3JT")
+
+
+def _validated(level: str, scp: bool) -> RepeatSpotRule:
+    return RepeatSpotRule(_tier2, cq_groups=True, lockon=True, cq_qualifiers=True, validation=level,
+                          listed=(lambda c: c in SCP) if scp else None)
+
+
+def test_validation_doubled_listed_call_spots_on_its_first_cq() -> None:
+    assert _feed(_validated("normal", True), ["CQ CQ DE K1ABC K1ABC K"]) == [("K1ABC", 7019.3)]
+
+
+def test_validation_without_scp_needs_more_evidence() -> None:
+    assert _feed(_validated("normal", False), ["CQ CQ DE K1ABC K1ABC K"]) == []
+    assert _feed(_validated("permissive", False), ["CQ CQ DE K1ABC K1ABC K"]) == [("K1ABC", 7019.3)]
+
+
+def test_validation_aggressive_waits_for_more_copies() -> None:
+    r = _validated("aggressive", True)
+    assert _feed(r, ["CQ CQ DE K1ABC K1ABC K"]) == []
+    assert _feed(r, ["CQ CQ DE K1ABC K1ABC K"] * 3, t0=60.0) == [("K1ABC", 7019.3)]
+
+
+def test_validation_rbn_list_weighs_more_than_scp() -> None:
+    r = RepeatSpotRule(_tier2, cq_groups=True, lockon=True, cq_qualifiers=True, validation="aggressive",
+                       listed=lambda c: c in SCP, listed_by="rbn")
+    assert _feed(r, ["CQ CQ DE K1ABC K1ABC K"]) == []
+    assert _feed(r, ["CQ CQ DE K1ABC K1ABC K"], t0=60.0) == [("K1ABC", 7019.3)]
+
+
+def test_validation_rival_reading_lowers_confidence() -> None:
+    plain, rival = _validated("normal", True), _validated("normal", True)
+    _feed(rival, ["CQ CQ DE K1ABD", "CQ CQ DE K1ABD"])
+    assert _feed(plain, ["CQ CQ DE K1ABC K1ABC K"], t0=120.0) == [("K1ABC", 7019.3)]
+    assert _feed(rival, ["CQ CQ DE K1ABC K1ABC K"], t0=120.0) == []
+
+
+def test_validation_off_is_accepted() -> None:
+    from sparkgap import _make_spot_rule
+    assert _make_spot_rule({"spot_validation": "off"}, None).threshold is None

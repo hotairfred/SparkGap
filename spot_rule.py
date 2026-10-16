@@ -4,7 +4,8 @@ CW Skimmer's rules: a call is spotted when it is the first callsign within LOOKA
 after CQ or TEST (or after DE when CQ or TEST came earlier and the call is sent twice:
 CQ SKCC DE K4DH K4DH), copied exactly in tier(call) decode windows (2, 3 or 4 by patt3ch.lst)
 near one frequency within the last REPEAT_S. A call followed by a name and a number is a
-caller being sent the exchange and does not count.
+caller being sent the exchange and does not count. A call followed by DE and another call
+(CQ S52Y DE N8EM) is the station being called and does not count either.
 
 One vote on garbled decodes: a call does not spot while a call one edit from it has as many
 copies or more near the same frequency (a tie waits for the next window). A decoder that
@@ -13,7 +14,9 @@ is renamed, so near-identical real calls (N4VI next to N4ZZ) are not merged.
 
 The spot goes out on the strongest window (bin SNR) among the copies, once per call and band per
 REPEAT_S unless it moves more than MOVE_KHZ. A window is one decode window of one bin;
-both LPF paths of a window count once.
+both LPF paths of a window count once. One transmission counts once: when two bins sit on
+one signal (100 Hz apart), a copy of the call from the second bin less than one window length
+after the first is the same audio and is no copy; the stronger of the two gives the frequency.
 
 CQ groups (cq_groups; always on in SparkGap): every CQ group naming the call
 counts as a copy, also several in one window (CQ WES DE N5QLZ N5QLZ K CQ WES DE N5QLZ is two),
@@ -28,7 +31,9 @@ CQ PA WB3EML PA CQ reads PA CQ as name and state, and WB3EML as a caller.
 Lock-on (lockon; always on in SparkGap): a call named by a CQ group owns the
 frequency it was copied on. While it owns it, two things change near that frequency:
   - the owner's own later sign-offs (TU W6YH, DE W6YH, W6YH TEST) count as copies of W6YH,
-    so a runner who CQs once and then signs with TU W6YH still repeats; a bare W6YH does not;
+    so a runner who CQs once and then signs with TU W6YH still repeats; a bare W6YH does not,
+    and nor does a sign-off followed by stray letters that complete a longer call (KF2A T K,
+    DE WA1E CE): the owner may be a fragment of a call the decoder split at a gap;
   - a bare TEST right after the owner's call (TU W6YH TEST EI4KF) names nobody: it is the
     owner signing, and EI4KF is the next caller, even when its exchange is garbled or in cut
     numbers (5NN AT) the exchange test does not read.
@@ -62,6 +67,34 @@ _MERGED_PREFIXES = ("CQ", "TEST", "CWT", "SST", "MST", "DE")
 _TRIGGER_WORDS = ("CQ", "TEST", "CWT", "SST", "MST")
 _STOP_WORDS = frozenset({"TU", "DE", "CQ", "TEST", "CWT", "SST", "MST", "QRZ", "AGN",
                          "NR", "TNX", "GL", "BK"})
+_PROSIGNS = frozenset({"K", "AR", "KN", "BK", "SK", "TU", "EE", "DX", "UP", "NA", "GM", "GE", "GA",
+                       "GN", "ES", "HW", "CL", "OK", "RR", "UR", "OP", "VY", "FB", "HI"})
+STRAY_MAX = 2                 # letters after a call that may be the rest of it
+
+# Validation (spot_validation): a call spots when its confidence score reaches the level's
+# threshold, in place of the tier count. Weights are a logistic fit on the three legs of the
+# 10-12..10-14 dry run (cdub89/SparkGap#10), every spot checked against RBN; thresholds from
+# the curve with each leg scored by weights fitted on the other two.
+VALIDATION = {"permissive": 1.25, "normal": 3.0, "aggressive": 5.0}
+_WEIGHTS = {"bias": 0.74, "single": -1.49, "three": 0.43, "four_plus": 0.42, "windows": 1.68,
+            "tier3": -0.52, "tier4": -1.82, "heard_before": 1.87, "paths_agree": 0.65,
+            "paths_disagree": -0.63, "doubled": 2.48, "rival": -1.64}
+_WEIGHTS_LISTED = {           # per call list (spot_validation_calls): scp, rbn, rbn+skcc
+    "scp": {"bias": 0.29, "single": -1.52, "three": 0.42, "four_plus": 0.28, "windows": 1.58,
+            "tier3": -0.27, "tier4": -1.46, "heard_before": 1.68, "paths_agree": 0.48,
+            "paths_disagree": -0.70, "doubled": 2.25, "rival": -1.62, "listed": 2.48},
+    "rbn": {"bias": -0.22, "single": -1.57, "three": 0.24, "four_plus": 0.50, "windows": 1.30,
+            "tier3": 0.0, "tier4": -1.90, "heard_before": 1.45, "paths_agree": 0.56,
+            "paths_disagree": -0.79, "doubled": 1.90, "rival": -0.88, "listed": 4.18},
+    "rbn+skcc": {"bias": -0.60, "single": -1.58, "three": 0.38, "four_plus": 0.72, "windows": 1.35,
+                 "tier3": -0.05, "tier4": -1.55, "heard_before": 1.44, "paths_agree": 0.28,
+                 "paths_disagree": -0.72, "doubled": 1.77, "rival": -0.89, "listed": 3.92},
+}
+HEARD_KEEP_S = 12 * 3600.0    # validation: a call unheard this long is forgotten
+_MORSE = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/",
+                  (".- -... -.-. -.. . ..-. --. .... .. .--- -.- .-.. -- -. --- .--. --.- .-. ... - "
+                   "..- ...- .-- -..- -.-- --.. ----- .---- ..--- ...-- ....- ..... -.... --... ---.. "
+                   "----. -..-.").split(), strict=True))
 
 
 def _split_run_together(rest: str, prev: str | None) -> list[str] | None:
@@ -220,6 +253,21 @@ def _signing(toks: list[str], k: int, qualifiers: bool = False) -> bool:
             or (n < len(toks) and toks[n] in _TRIGGER_WORDS))
 
 
+def _stray_letters(toks: list[str], call: str, k: int) -> bool:
+    """toks[k:] opens with up to STRAY_MAX stray letters, over one or two tokens, that complete a
+    longer call: W9ME T, K0D CR, W9M E T. A keyword, stop word or prosign (K, AR, TU) ends the
+    call cleanly."""
+    joined, m = call, k
+    while m < len(toks) and len(joined) - len(call) < STRAY_MAX:
+        t = toks[m]
+        if (not t.isalpha() or len(joined) - len(call) + len(t) > STRAY_MAX
+                or t in _PROSIGNS or t in _STOP_WORDS or t in KEYWORDS):
+            break
+        joined += t
+        m += 1
+    return len(joined) > len(call) and CALL_RE.match(joined) is not None
+
+
 def runner_groups(text: str, every: bool = False,
                   qualifiers: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
@@ -238,11 +286,18 @@ def runner_groups(text: str, every: bool = False,
         if j is None or (de and toks.count(toks[j]) < 2):
             i += 1
             continue
+        k = j + 1
+        while k < n and toks[k] == toks[j]:       # call sent twice before the closing keyword
+            k += 1
+        if t == "CQ" and j == i + 1 and k < n and toks[k] == "DE":
+            j2 = sender(toks, k)
+            if j2 is not None and toks[j2] != toks[j]:
+                i = k                             # CQ S52Y DE N8EM: S52Y is being called; after
+                                                  # TEST or DE the call is the runner's
+                continue
         if not is_exchange(toks, j, qualifiers) and (every or all(toks[j] != c for c, _ in out)):
             out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
-        i = j + 1
-        while i < n and toks[i] == toks[j]:       # call sent twice before the closing keyword
-            i += 1
+        i = k
         while i < n and toks[i] in KEYWORDS:      # closing keywords end the group
             i += 1
     return out
@@ -256,6 +311,15 @@ def _lev1(a: str, b: str) -> bool:
         return sum(x != y for x, y in zip(a, b, strict=True)) == 1
     short, long_ = (a, b) if len(a) < len(b) else (b, a)
     return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def _regap(a: str, b: str) -> bool:
+    """a and b are one keying read with the letter gaps in different places (C0TT, NN0TT), or
+    one's Morse elements start the other's (N7HR, N7HRK/M)."""
+    if a == b:
+        return False
+    ea, eb = ("".join(_MORSE.get(ch, "?") for ch in c) for c in (a, b))
+    return ea.startswith(eb) or eb.startswith(ea)
 
 
 @dataclass(frozen=True)
@@ -273,8 +337,20 @@ class RepeatSpotRule:
 
     def __init__(self, tier: Callable[[str], int], cq_groups: bool = False,
                  lockon: bool = False, split_runs: bool = False,
-                 cq_qualifiers: bool = False) -> None:
+                 cq_qualifiers: bool = False, window_s: float = 60.0,
+                 validation: str | None = None,
+                 listed: Callable[[str], bool] | None = None, listed_by: str = "scp") -> None:
+        if validation is not None and validation not in VALIDATION:
+            raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
+        if listed_by not in _WEIGHTS_LISTED:
+            raise ValueError(f"listed_by must be one of {list(_WEIGHTS_LISTED)}, got {listed_by!r}")
         self.tier = tier
+        self.threshold = VALIDATION[validation] if validation else None
+        self.listed = listed                                    # validation: call list lookup, or None
+        self.weights = _WEIGHTS_LISTED[listed_by] if listed else _WEIGHTS
+        self._paths: dict[int, list[Counter]] = {}              # validation: window -> token counts per path
+        self._heard: dict[str, list[float]] = {}                # validation: call -> [first, last copy]
+        self.window_s = window_s                                # decode window length
         self.cq_groups = cq_groups
         self.lockon = lockon
         self.split_runs = split_runs
@@ -283,6 +359,7 @@ class RepeatSpotRule:
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
+        self._bins: dict[int, int] = {}                         # window id -> bin
         self._next_window = 0
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}   # (call, MHz) -> (time, freq)
         self._pruned = 0.0
@@ -292,6 +369,7 @@ class RepeatSpotRule:
         key = (bin_id, window_key)
         if key not in self._window_ids:
             self._window_ids[key] = (self._next_window, now)
+            self._bins[self._next_window] = bin_id
             self._next_window += 1
         return self._window_ids[key][0]
 
@@ -301,20 +379,31 @@ class RepeatSpotRule:
         self._expire(now)
         if self.split_runs:
             text = split_runs(text)
+        if self.threshold is not None:
+            self._paths.setdefault(window, []).append(Counter(tokens(text)))
         spots = []
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
                  else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers))
         for call, n in Counter(calls).items():
+            new = 0
             for nth in range(n):
                 if (window, call, nth) not in self._seen:
+                    if self._same_audio(window, call, freq_khz, now, snr):
+                        continue
                     self._seen.add((window, call, nth))
                     self._copies.append(_Copy(now, window, call, freq_khz,
                                               snr if snr is not None else float("-inf"), nth))
+                    new += 1
             near = [c for c in self._copies if abs(c.freq_khz - freq_khz) <= NEAR_KHZ]
             counts = Counter(c.call for c in near)
-            if any(_lev1(other, call) and n >= counts[call] for other, n in counts.items()):
+            if self.threshold is not None:
+                heard = self._heard.setdefault(call, [now, now])
+                heard[1] = now
+                if not new or self.score(call, near, counts, now - heard[0] >= REPEAT_S) < self.threshold:
+                    continue
+            elif any(_lev1(other, call) and n >= counts[call] for other, n in counts.items()):
                 continue          # a call one edit away has as many copies here: undecided
-            if counts[call] < self.tier(call):
+            elif counts[call] < self.tier(call):
                 continue
             spot_f = max((c for c in near if c.call == call), key=lambda c: c.snr).freq_khz
             key = (call, int(spot_f // 1000))     # per band: a station running two bands
@@ -323,6 +412,41 @@ class RepeatSpotRule:
                 self._last_spot[key] = (now, spot_f)
                 spots.append((call, spot_f))
         return spots
+
+    def score(self, call: str, near: list[_Copy], counts: Counter, heard_before: bool) -> float:
+        """Validation: confidence that call is what was sent, from its copies near one frequency."""
+        w = self.weights
+        n = counts[call]
+        windows = {c.window for c in near if c.call == call}
+        paths = [self._paths.get(win, []) for win in windows]
+        both = [all(p[call] for p in ps) for ps in paths if len(ps) > 1]
+        agree = sum(both) / len(both) if both else None
+        tier = self.tier(call)
+        s = (w["bias"] + w["single"] * (n == 1) + w["three"] * (n == 3) + w["four_plus"] * (n >= 4)
+             + w["windows"] * min(len(windows), 5) / 5
+             + w["tier3"] * (tier == 3) + w["tier4"] * (tier == 4) + w["heard_before"] * heard_before
+             + w["paths_agree"] * (agree == 1.0) + w["paths_disagree"] * (agree is not None and agree < 0.5)
+             + w["doubled"] * any(p[call] >= 2 for ps in paths for p in ps)
+             + w["rival"] * any(k >= 2 and other != call and (_lev1(other, call) or _regap(call, other))
+                                for other, k in counts.items()))
+        if self.listed:
+            s += w["listed"] * self.listed(call)
+        return s
+
+    def _same_audio(self, window: int, call: str, freq_khz: float, now: float,
+                    snr: float | None) -> bool:
+        """Another bin gave this call near freq_khz less than one window length ago. That copy
+        takes this bin's frequency when this bin is the stronger."""
+        mine = self._bins.get(window)
+        if mine is None:
+            return False
+        for i, c in enumerate(self._copies):
+            if (c.call == call and abs(c.freq_khz - freq_khz) <= NEAR_KHZ
+                    and now - c.time < self.window_s and self._bins.get(c.window, mine) != mine):
+                if snr is not None and snr > c.snr:
+                    self._copies[i] = _Copy(c.time, c.window, call, freq_khz, snr, c.nth)
+                return True
+        return False
 
     def owner(self, freq_khz: float, now: float) -> str | None:
         """Lock-on: the call owning the frequency nearest freq_khz (within NEAR_KHZ), else None."""
@@ -364,6 +488,7 @@ class RepeatSpotRule:
         owner = self.owner(freq_khz, now)
         if owner is not None and owner not in calls:
             if any(tk == owner and _signing(toks, k, self.cq_qualifiers)
+                   and not _stray_letters(toks, owner, k + 1)
                    for k, tk in enumerate(toks)):
                 calls.append(owner)               # TU W6YH, W6YH TEST: the owner signing
                 self._own(owner, freq_khz, now)
@@ -378,3 +503,7 @@ class RepeatSpotRule:
             self._pruned = now
             self._last_spot = {k: v for k, v in self._last_spot.items() if v[0] >= cutoff}
             self._window_ids = {k: v for k, v in self._window_ids.items() if v[1] >= cutoff}
+            live = {v[0] for v in self._window_ids.values()}
+            self._bins = {w: b for w, b in self._bins.items() if w in live}
+            self._paths = {w: p for w, p in self._paths.items() if w in live}
+            self._heard = {c: h for c, h in self._heard.items() if now - h[1] <= HEARD_KEEP_S}
