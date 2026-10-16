@@ -74,3 +74,11 @@ def test_unknown_call_unchanged_and_clearing_works() -> None:
     assert _decode(env) == plain
     lib.itila_set_known_calls(b"K1VUT", 5, 0.0)           # bonus 0 clears
     assert _decode(env) == plain
+
+
+def test_short_calls_earn_no_bonus() -> None:
+    """A 1x1 call on the list (K1V here) must not pull K1VUT apart."""
+    env = _env(4.0)                                     # a normal letter gap: K1VUT whole
+    whole = _decode(env)
+    lib.itila_set_known_calls(b"K1V", 3, 4.0)
+    assert _decode(env) == whole

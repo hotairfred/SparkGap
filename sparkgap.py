@@ -1746,7 +1746,9 @@ def _set_known_calls(config):
         return 0
     lib.itila_set_known_calls.restype = _ct.c_int
     lib.itila_set_known_calls.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_double]
-    calls = sorted({l.strip().upper() for l in open(path) if l.strip() and not l.startswith('#')})
+    # 1x1 calls (N3F, W6T) are left out: a pull toward them split longer calls (W6TI as W6T I)
+    calls = sorted({c for c in (l.strip().upper() for l in open(path) if not l.startswith('#'))
+                    if len(c) >= 4})
     buf = '\n'.join(calls).encode()
     n = lib.itila_set_known_calls(buf, len(buf), bonus)
     log.info("Known-call prior: %d calls from %s, bonus %.1f", n, path, bonus)
