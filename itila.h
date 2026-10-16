@@ -43,6 +43,10 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 /* Free handle and all associated memory. */
 void itila_free(itila_t h);
 
+/* itila2: calls heard lately (newline-separated); a known call earns bonus (log units) on top of
+ * the callsign prior while decoding. bonus <= 0 clears. Returns the calls taken, -1 on error. */
+int itila_set_known_calls(const char *calls, int len, double bonus);
+
 /* Return the timing-cost (segmentation-quality confidence) score from the
  * most recent itila_feed / itila_feed_online call.  Lower = cleaner Morse
  * timing.  Returns 999.0 if no decode has been performed yet, or if the
