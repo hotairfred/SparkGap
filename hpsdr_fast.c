@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #define MAX_RX        8
 typedef void (*sc_feed_iq_fn)(void *, const double *, const double *, int);
@@ -51,6 +52,15 @@ typedef struct {
     volatile int write_pos;
     volatile int read_pos;
 } RxRing;
+
+/* Spectrum tap for the GUI feed: the drain worker copies what it feeds the scanner, while a
+ * console watches; Python reads it for the waterfall.  One writer, one reader per receiver. */
+#define TAP_SIZE (1 << 18)            /* 1.4 s at 192 kHz; Python reads every pass of its loop */
+typedef struct {
+    _Atomic float *i;                 /* relaxed atomics: the reader may meet the writer */
+    _Atomic float *q;                 /* allocated by the first hpsdr_tap_enable */
+    _Atomic uint64_t written;         /* samples ever written */
+} Tap;
 
 /* FT8 capture buffer — used in pairs for double-buffering */
 #define FT8_BUF_CAP (192000 * 65)
@@ -177,6 +187,9 @@ typedef struct {
     /* stats */
     volatile uint64_t pkt_count;
     volatile uint64_t drop_count;
+
+    Tap tap[MAX_RX];
+    _Atomic int tap_on;
 } HpsdrFast;
 
 /* ---- ring buffer helpers ---- */
@@ -683,6 +696,8 @@ void hpsdr_destroy(HpsdrFast *h) {
             free(h->ft8_cap[i].bufs[1].q);
             pthread_mutex_destroy(&h->ft8_cap[i].mu);
         }
+        free((void *)h->tap[i].i);
+        free((void *)h->tap[i].q);
     }
     free(h);
 }
@@ -730,6 +745,17 @@ static void *drain_worker(void *arg) {
                 }
                 r->read_pos = rp;
                 h->scanner_feed[rx](h->scanners[rx], i_tmp, q_tmp, n);
+                if (atomic_load_explicit(&h->tap_on, memory_order_acquire)) {
+                    Tap *t = &h->tap[rx];
+                    uint64_t w = atomic_load_explicit(&t->written, memory_order_relaxed);
+                    for (int k = 0; k < n; k++) {
+                        atomic_store_explicit(&t->i[(w + k) & (TAP_SIZE - 1)], (float)i_tmp[k],
+                                              memory_order_relaxed);
+                        atomic_store_explicit(&t->q[(w + k) & (TAP_SIZE - 1)], (float)q_tmp[k],
+                                              memory_order_relaxed);
+                    }
+                    atomic_store_explicit(&t->written, w + n, memory_order_release);
+                }
                 did_work = 1;
                 avail = ring_avail(r);
             }
@@ -919,3 +945,42 @@ uint64_t hpsdr_pkt_count(HpsdrFast *h) { return h->pkt_count; }
 uint64_t hpsdr_drop_count(HpsdrFast *h) { return h->drop_count; }
 uint64_t hpsdr_pkt_lost(HpsdrFast *h) { return h->pkt_lost; }
 int hpsdr_n_receivers(HpsdrFast *h) { return h->n_receivers; }
+
+/* Start (on) or stop copying drained IQ into the spectrum taps.  Buffers are allocated on the
+ * first start and kept until hpsdr_destroy.  Returns 0, or -1 when memory runs out. */
+int hpsdr_tap_enable(HpsdrFast *h, int on) {
+    if (on) {
+        for (int rx = 0; rx < h->n_receivers; rx++) {
+            Tap *t = &h->tap[rx];
+            if (t->i) continue;
+            _Atomic float *i = malloc(TAP_SIZE * sizeof(_Atomic float));
+            _Atomic float *q = malloc(TAP_SIZE * sizeof(_Atomic float));
+            if (!i || !q) { free((void *)i); free((void *)q); return -1; }
+            t->i = i;
+            t->q = q;
+        }
+    }
+    atomic_store_explicit(&h->tap_on, on ? 1 : 0, memory_order_release);
+    return 0;
+}
+
+/* Copy up to max_n tap samples of rx after *pos into i_out/q_out and advance *pos.  A reader
+ * more than half the tap behind skips ahead; a copy the writer lapped meanwhile is dropped. */
+int hpsdr_tap_read(HpsdrFast *h, int rx, uint64_t *pos, float *i_out, float *q_out, int max_n) {
+    if (rx < 0 || rx >= h->n_receivers || !h->tap[rx].i || max_n <= 0) return 0;
+    Tap *t = &h->tap[rx];
+    uint64_t w = atomic_load_explicit(&t->written, memory_order_acquire);
+    uint64_t p = *pos;
+    if (p > w || w - p > TAP_SIZE / 2) p = w - (w < TAP_SIZE / 2 ? w : TAP_SIZE / 2);
+    int n = w - p < (uint64_t)max_n ? (int)(w - p) : max_n;
+    for (int k = 0; k < n; k++) {
+        i_out[k] = atomic_load_explicit(&t->i[(p + k) & (TAP_SIZE - 1)], memory_order_relaxed);
+        q_out[k] = atomic_load_explicit(&t->q[(p + k) & (TAP_SIZE - 1)], memory_order_relaxed);
+    }
+    if (atomic_load_explicit(&t->written, memory_order_acquire) - p > TAP_SIZE) {
+        *pos = atomic_load_explicit(&t->written, memory_order_acquire);  /* overwritten: start fresh */
+        return 0;
+    }
+    *pos = p + n;
+    return n;
+}

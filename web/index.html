@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SparkGap Web</title>
+<link rel="icon" href="icons/sparkgap.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand"><span class="dot"></span>SparkGap</div>
+    <div class="search">
+      <input id="search" type="text" placeholder="Call or kHz" autocomplete="off" spellcheck="false">
+      <div id="matches" class="matches" hidden></div>
+    </div>
+    <div class="grow"></div>
+    <select id="bandSel" class="bandsel" title="Server and band" hidden></select>
+    <div id="station" class="station mono"></div>
+    <div class="state"><span id="stateDot" class="sdot"></span><span id="stateText">No feed</span></div>
+    <button id="gear" class="icon" title="Settings">⚙</button>
+    <button id="theme" class="icon" title="Light or dark"><span class="half"></span></button>
+    <button id="statusBtn" class="icon" title="Status">ⓘ</button>
+  </header>
+
+  <main>
+    <section class="panel spectrum">
+      <div id="ladder" class="ladder">
+        <canvas id="ticks"></canvas>
+        <div id="chips"></div>
+      </div>
+      <div id="wfbox" class="wfbox">
+        <canvas id="wf"></canvas>
+        <div id="wfmsg" class="wfmsg"></div>
+      </div>
+      <div id="fscroll" class="fscroll"><div id="fspace"></div></div>
+    </section>
+
+    <aside class="side">
+      <section class="panel detail">
+        <div class="dhead">
+          <div class="drow">
+            <span id="dTitle" class="dtitle mono">Pick a signal</span>
+            <span id="dPill" class="pill" hidden></span>
+            <span class="grow"></span>
+            <span id="utc" class="label"></span>
+          </div>
+          <div class="stats">
+            <div class="stat"><div class="label">KHZ</div><div id="dKhz" class="mono">-</div></div>
+            <div class="stat"><div class="label">WPM</div><div id="dWpm" class="mono">-</div></div>
+            <div class="stat"><div class="label">SNR</div><div id="dSnr" class="mono">-</div></div>
+          </div>
+        </div>
+        <div class="label dlabel">DECODED WINDOWS</div>
+        <div id="dNote" class="note" hidden></div>
+        <div id="dWins" class="wins"></div>
+      </section>
+      <section class="panel zoom">
+        <div class="zgrid">
+          <span class="zl">Zoom</span>
+          <input id="span" type="range" min="2" max="48" step="any">
+          <button id="full" class="btn small">Full</button>
+          <span class="zl">Span</span>
+          <div id="range" class="mono small muted"></div>
+          <span id="spanText" class="mono small"></span>
+          <span class="zl snr">SNR</span>
+          <div class="zsnr">
+            <div class="legend"></div>
+            <div class="legendText mono"><span>0</span><span>10</span><span>20</span><span>30</span></div>
+          </div>
+          <span class="zunit mono">dB</span>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <footer id="statusbar"></footer>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="dialog" role="dialog" aria-label="Settings">
+    <h2>Settings</h2>
+    <div id="demoHint" class="hint" hidden>Demo mode is on. Turn it off to add or connect to a SparkGap server.</div>
+    <div class="demo">
+      <span class="label">DEMO</span>
+      <div id="demoSeg" class="seg"></div>
+      <span class="small faint">Made-up signals instead of your servers.</span>
+    </div>
+    <div class="demo">
+      <span class="label">DECODED</span>
+      <div id="decSeg" class="seg"></div>
+      <span class="small faint">Readings of each window shown.</span>
+    </div>
+    <div id="connSection" class="setting">
+      <div class="label">CONNECTIONS</div>
+      <div id="conns"></div>
+      <div id="connForm" class="form" hidden>
+        <input id="fAddr" type="text" placeholder="Address: VPN or local IP address" spellcheck="false">
+        <input id="fPort" type="number" placeholder="Port: blank finds every SparkGap on 7320 to 7339" min="1" max="65535">
+        <input id="fCode" type="text" placeholder="Join code, e.g. XXX-XXX" spellcheck="false">
+        <div id="fErr" class="err" hidden></div>
+        <div class="row"><button id="fSave" class="btn">Add</button><button id="fCancel" class="btn">Cancel</button></div>
+      </div>
+      <button id="addConn" class="btn">+ Add server</button>
+    </div>
+    <div class="grid">
+      <span class="label">SPOT RULE</span><div id="sRule" class="seg ro"></div>
+      <span id="lValid" class="label">VALIDATION</span><div id="sValid" class="seg ro"></div>
+      <span id="lCalls" class="label">CALL SOURCE</span><div id="sCalls" class="seg ro"></div>
+      <span></span><span class="small faint">From the selected server's config.</span>
+    </div>
+    <div class="row foot"><span id="build" class="small faint mono"></span><button id="close" class="btn">Close</button></div>
+  </div>
+</div>
+<div id="statusModal" class="modal" hidden>
+  <div class="dialog status" role="dialog" aria-label="Status">
+    <div class="shead"><h2>Status</h2><div id="statusHead"></div></div>
+    <div id="statusBody"></div>
+    <div class="row foot"><span class="small faint">Refreshed every 2 s.</span><button id="statusClose" class="btn">Close</button></div>
+  </div>
+</div>
+</body>
+</html>
