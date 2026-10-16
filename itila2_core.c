@@ -73,6 +73,7 @@
 #define GAP_BRANCH    3.0   /* keep a gap class within this many nats of the best */
 #define TOKEN_PRIOR   2.0   /* log bonus for a callsign-shaped token or a common word */
 #define KNOWN_LEN     12    /* longest known call kept, with its NUL */
+#define KNOWN_MIN_LEN 4     /* shortest known call that earns the bonus */
 #define SYM_BAD       2.0   /* log penalty for a symbol that is no character */
 #define SEG_RATE_MIN 300.0  /* log BF per second a keyed segment needs to be decoded: real copy
                              * >= 1500 at p10, dit noise median 91 (20m h2h 2026-10-08) */
@@ -1097,7 +1098,9 @@ static double token_prior(const char *txt) {
     if (!*t || strchr(t, '?')) return 0.0;
     if (is_callsign(t)) {
         const known_set_t *k = __atomic_load_n(&g_known, __ATOMIC_ACQUIRE);
-        return k && known_has(k, t) ? TOKEN_PRIOR + k->bonus : TOKEN_PRIOR;
+        /* Calls of 3 characters or fewer (1x1 special-event calls: N3F, W6T) get no bonus:
+         * a strong pull toward them split longer calls apart (W6TI as W6T I). */
+        return k && strlen(t) >= KNOWN_MIN_LEN && known_has(k, t) ? TOKEN_PRIOR + k->bonus : TOKEN_PRIOR;
     }
     for (int i = 0; COMMON_WORDS[i]; i++)
         if (strcmp(t, COMMON_WORDS[i]) == 0) return TOKEN_PRIOR;
