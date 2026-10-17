@@ -72,6 +72,8 @@
 #define GAP_SD_WORD   0.35
 #define GAP_BRANCH    3.0   /* keep a gap class within this many nats of the best */
 #define TOKEN_PRIOR   2.0   /* log bonus for a callsign-shaped token or a common word */
+#define KNOWN_LEN     12    /* longest known call kept, with its NUL */
+#define KNOWN_MIN_LEN 4     /* shortest known call that earns the bonus */
 #define SYM_BAD       2.0   /* log penalty for a symbol that is no character */
 #define SEG_RATE_MIN 300.0  /* log BF per second a keyed segment needs to be decoded: real copy
                              * >= 1500 at p10, dit noise median 91 (20m h2h 2026-10-08) */
@@ -1026,12 +1028,80 @@ static const char *COMMON_WORDS[] = {
     "GM", "GA", "GE", "OP", "NAME", "QTH", "HR", "FB", "73", "NR", "TNX", "PSE", "SKCC", NULL
 };
 
+/* Known calls (itila_set_known_calls): calls heard on the air lately, e.g. spotted by other
+ * skimmers. A known call closing a word earns known_bonus on top of TOKEN_PRIOR, so the beam
+ * keeps a known call whole (K1VUT) instead of a callsign-shaped piece of it (K1V) followed by
+ * a stray word. Unknown calls keep TOKEN_PRIOR: a new or rare call is never penalised.
+ * Open-addressing hash set, read-only while decoding; a new set replaces the old one, and the
+ * set before that is freed (decodes take seconds, sets change daily). */
+typedef struct { char (*slot)[KNOWN_LEN]; unsigned mask; double bonus; } known_set_t;
+static known_set_t *volatile g_known;
+static known_set_t *g_known_prev;
+
+static unsigned known_hash(const char *c) {
+    unsigned h = 2166136261u;
+    for (; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+    return h;
+}
+
+static int known_has(const known_set_t *k, const char *c) {
+    if (!k || strlen(c) >= KNOWN_LEN) return 0;
+    for (unsigned i = known_hash(c) & k->mask;; i = (i + 1) & k->mask) {
+        if (!k->slot[i][0]) return 0;
+        if (strcmp(k->slot[i], c) == 0) return 1;
+    }
+}
+
+static void known_free(known_set_t *k) { if (k) { free(k->slot); free(k); } }
+
+/* calls: newline-separated, upper case. bonus <= 0 or n == 0 clears the set.
+ * Returns the number of calls taken. Not thread-safe against itself: call from one thread. */
+int itila_set_known_calls(const char *calls, int len, double bonus) {
+    known_set_t *k = NULL;
+    int n = 0;
+    if (calls && len > 0 && bonus > 0) {
+        int lines = 1;
+        for (int i = 0; i < len; i++) lines += calls[i] == '\n';
+        unsigned size = 1024;
+        while (size < (unsigned)lines * 2) size <<= 1;
+        k = (known_set_t *)calloc(1, sizeof *k);
+        if (!k || !(k->slot = calloc(size, KNOWN_LEN))) { free(k); return -1; }
+        k->mask = size - 1;
+        k->bonus = bonus;
+        for (int i = 0; i < len;) {
+            int j = i;
+            while (j < len && calls[j] != '\n' && calls[j] != '\r') j++;
+            int w = j - i;
+            if (w > 0 && w < KNOWN_LEN) {
+                char c[KNOWN_LEN];
+                memcpy(c, calls + i, w); c[w] = '\0';
+                if (!known_has(k, c)) {
+                    unsigned h = known_hash(c) & k->mask;
+                    while (k->slot[h][0]) h = (h + 1) & k->mask;
+                    memcpy(k->slot[h], c, w + 1);
+                    n++;
+                }
+            }
+            i = j + 1;
+        }
+    }
+    known_free(g_known_prev);
+    g_known_prev = g_known;
+    __atomic_store_n(&g_known, k, __ATOMIC_RELEASE);
+    return n;
+}
+
 /* Prior on the last token of txt: callsigns and common words are likely. */
 static double token_prior(const char *txt) {
     const char *t = strrchr(txt, ' ');
     t = t ? t + 1 : txt;
     if (!*t || strchr(t, '?')) return 0.0;
-    if (is_callsign(t)) return TOKEN_PRIOR;
+    if (is_callsign(t)) {
+        const known_set_t *k = __atomic_load_n(&g_known, __ATOMIC_ACQUIRE);
+        /* Calls of 3 characters or fewer (1x1 special-event calls: N3F, W6T) get no bonus:
+         * a strong pull toward them split longer calls apart (W6TI as W6T I). */
+        return k && strlen(t) >= KNOWN_MIN_LEN && known_has(k, t) ? TOKEN_PRIOR + k->bonus : TOKEN_PRIOR;
+    }
     for (int i = 0; COMMON_WORDS[i]; i++)
         if (strcmp(t, COMMON_WORDS[i]) == 0) return TOKEN_PRIOR;
     return 0.0;
