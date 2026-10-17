@@ -1,17 +1,183 @@
 # SparkGap
 
-*(Formerly OpenSkimmer.  Not affiliated with SparkSDR by M0NNB.)*
+*(Formerly OpenSkimmer. Not affiliated with SparkSDR by M0NNB.)*
 
-Open-source, Linux-native, multi-mode amateur radio skimmer.
-**CW + FT8 + RTTY** on multiple bands simultaneously, feeding RBN-style
-spot output via telnet.
+Open-source, Linux-native, multi-band skimmer for amateur radio: **CW, RTTY and FT8** on
+several bands at once, with DX-cluster spots on telnet and an uploader for the Reverse Beacon
+Network (RBN).
 
-> **Status:** alpha. Actively developed. Running in production on a
-> Red Pitaya STEMlab 125-14 (8 bands: 80m / 40m / 30m / 20m / 17m /
-> 15m / 12m / 10m) feeding the Reverse Beacon Network as `WF8Z-#`
-> via Aggregator, and PSKReporter directly via the built-in
-> `pskr_feeder.py`.
->
+> **Status: beta.** In daily use on a Red Pitaya STEMlab 125-14 at WF8Z skimming 8 bands
+> (80, 40, 30, 20, 17, 15, 12 and 10 m), feeding a local cluster and PSKReporter (FT8).
+> **Not connected to RBN.** The RBN team has given test criteria SparkGap must pass before a
+> node may connect, including identifying itself as SparkGap by name and version; that work
+> is tracked in #49. Until then, keep `rbn_feeder.py` off.
+
+## Where it stands
+
+Measured on our own recordings, replayed through the production receiver path and scored
+against what other RBN skimmers reported at the same time:
+
+- **Precision.** About 95% of the calls SparkGap spots are also spotted by another RBN skimmer
+  within 1 kHz, across 7 recordings (CWTs, an MST, the PA QSO Party, quiet overnights). CW
+  Skimmer nodes nearby run about 95 to 98% on the same measure. The rest are a mix of real stations
+  nobody else heard and busts, mostly calls cut short (K1V for K1VUT), which current decoder
+  work targets.
+- **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings, SparkGap spots
+  1.6 to 1.9 times as many calls and catches about 70% of that node's calls.
+- **Copy on known text.** Character error on three W1AW code-practice clips: 3.1, 3.7 and
+  1.9% (`docs/ITILA2.md`; CW Skimmer copies the same audio nearly perfectly).
+- **Cost.** 8 bands at 192 kHz with FT8 and RTTY take about 2.2 cores of a 35 W i5-9500T with
+  `itila_decode_threads: 4`.
+
+These are calibration on our station, not a contest result. The harness to reproduce them is
+in `tools/eval/` and `tools/sim/`.
+
+## What it does
+
+- **Receivers.** HPSDR protocol 1 radios (a Red Pitaya with Pavel Demin's `sdr_receiver_hpsdr`
+  firmware, up to 8 receivers at 48 to 192 kHz each), and FlexRadio DAX-IQ through `flex_iq.py`
+  (`skimmer_flex.example.json`).
+- **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
+  is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
+  keying (`docs/ITILA2.md`).
+- **Spotting the runner, not the caller.** The repeat spot rule (`spot_rule.py`) follows what
+  RBN asks of a skimmer node: only the station calling CQ or TEST is spotted, after 2, 3 or 4
+  copies by RBN's call pattern file (`patt3ch.lst`), with lock-on (who owns the frequency) and
+  CQ qualifiers (`CQ PA`, `CQ FD`). Callers are never spotted.
+- **RTTY.** RTTY signals are found in each band's RTTY segment and decoded once a minute, with
+  the same repeat rule.
+- **FT8.** Decoded on each band's FT8 frequency and uploaded to PSKReporter
+  (`pskr_feeder.py`).
+- **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format, so loggers,
+  clusters and Aggregator can read them; `rbn_feeder.py` uploads to RBN directly (keep it off
+  until the RBN criteria above are passed).
+- **Tools.** An all-band IQ recorder (`iq_recorder.py`), a proxy that replays recordings as an
+  HPSDR radio (`hpsdr_proxy.py`), file-mode replay, a band simulator with exact ground truth
+  (`tools/sim/`), and scoring against the RBN archive (`tools/eval/rbn_confirm.py`).
+
+### Coming (open pull requests)
+
+- A second telnet port for your own use with a looser spot rule; the RBN port stays as it is
+  (#46).
+- RTTY spots in RTTY Skimmer Server's format and CQ-only uploads to RBN (#44).
+- Split DX signing `TU <call> UP` (#50, off by default).
+- SparkGap Web, a read-only browser console with waterfall and live decode text (#51).
+- A validation score using calls RBN skimmers have heard and the SKCC roster (#52).
+
+## Quick start (Linux, Red Pitaya 125-14)
+
+Dependencies (Debian/Ubuntu):
+
+```
+apt install build-essential gcc python3 python3-numpy python3-scipy \
+            libfftw3-dev pkg-config
+```
+
+PSKReporter and MQTT need `paho-mqtt>=2.0`, which Ubuntu doesn't package; use
+`pip install -r requirements.txt` in a venv.
+
+Build the C libraries (`make native ARCH=native` for `-march=native`):
+
+```
+make native
+```
+
+Pitaya: install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/)
+firmware and make sure it's reachable on your LAN.
+
+Configure: copy `sk_5band.json` and edit at least:
+
+```json
+{
+  "callsign": "YOUR_CALL",
+  "grid": "YOUR_GRID",
+  "sdr_ip": "192.168.X.X",
+  "bands": [3590000, 7090000, 10118000, 14090000,
+            18083000, 21090000, 24902000, 28090000],
+  "cw_decoder": "itila2",
+  "itila_decode_threads": 4,
+  "enable_ft8": true,
+  "enable_rtty": true,
+  "rtty_spot_rule": "repeat"
+}
+```
+
+`cw_decoder: itila2` selects the current decoder and the repeat spot rule; the default is
+still the original `itila` chain (see *History*).
+
+Run:
+
+```
+python3 sparkgap.py --config sk_5band.json
+```
+
+Connect to the spot stream:
+
+```
+telnet localhost 7300
+```
+
+**FlexRadio:** copy `skimmer_flex.example.json`; it uses a DAX-IQ channel, so CW Skimmer can
+keep another channel on the same radio.
+
+**macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
+omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for
+both are welcome contributions.
+
+## Feeding a cluster or RBN
+
+Port 7300 speaks the same telnet format as CW Skimmer Server, so a DX cluster (we use
+GoCluster), a logger or Aggregator can connect to it.
+
+RBN: SparkGap is not yet authorized to connect. The checks a node must make itself before a
+spot reaches RBN (CQ only, repeats, mode codes, beacons, frequency) and what we measured are in
+#49. `docs/rbn-feeding.md` describes `rbn_feeder.py` for when that work is done.
+
+## Replaying and measuring
+
+File mode decodes a recording as fast as the CPU allows:
+
+```
+python3 sparkgap.py --config sk_5band.json --file recording.wav --center-khz 7090 \
+                    --start-min 0 --end-min 15
+```
+
+It reads 16- and 24-bit stereo IQ WAV files at 96 or 192 kHz. Multi-band runs go through the
+production C receiver path when the recording is replayed with `hpsdr_proxy.py` from another
+host (`--negate-q` for skimmer1 captures). Public test recordings are in the repository's
+releases (CY0S working split on 40m, a hand-sent 30m PA QSO Party segment, W1AW clips with
+true text on the contributor fork).
+
+Other tools: `rbn_tee.py` logs the worldwide RBN telnet feed; `SIGUSR1` to a running instance
+dumps each band's IQ buffer to `/tmp`.
+
+## Development
+
+Contributions welcome: open an issue, then a small pull request with measurements. Tests run
+with `pytest` (`tests/`) and in CI on Python 3.10 and 3.12. SparkGap is developed with Claude
+Code as the main tool.
+
+## License
+
+GPLv3. See `LICENSE`.
+
+## Authors
+
+- Fred Krause, **WF8Z** (EM79SM), project owner. Contact info is on QRZ.
+- Chris White, **WX7V**: the itila2 decoder and scanner, the repeat spot rule, the FlexRadio
+  path and the console.
+
+## History
+
+SparkGap grew out of luarvique's csdr-skimmer. From March to September 2026 it ran the
+original ITILA decoder with a configurable set of spot gates; itila2 and the repeat spot rule
+became the recommended chain in October 2026 (`cw_decoder: itila2`); the code and the shipped
+configs still default to the original `itila`. The material below describes
+that earlier chain and the comparisons made with it. It is kept for reference; the numbers
+are not current.
+
+### March 2026 comparison (B1_seg2, original decoder)
+
 > **Reference comparisons** (single 15-min recording: B1_seg2, 40m,
 > 2026-03-19 03:15–03:30 UTC, scored two ways for the local-vs-global
 > distinction operators care about):
@@ -62,59 +228,8 @@ spot output via telnet.
 > numbers are calibration, not a contest result. Methodology in
 > `tools/eval/b1_benchmark.py` and `eval_rbn_validated.py`.
 >
-> A Linux-native RBN feeder is in development.  In the meantime,
-> sparkgap's `:7300` telnet is SkimSrv-format-compatible and
-> bridges cleanly through Aggregator on a Windows box — see
-> *Feeding the RBN* below.
 
-## Why this exists
-
-CW/multi-mode skimming has had no good open-source option.  CW
-Skimmer, Skimmer Server, and Aggregator (the RBN's spot forwarder)
-are Windows-only and closed-source.  UT4LW's **SDC-Connectors** runs
-on Linux, macOS, and Windows and is excellent, but it's also closed-
-source and isn't designed as an RBN feeder.
-
-So radio operators who want auditable software in their spotting
-path, or who want to run an RBN-feeding node from any platform,
-haven't had a native option.  This project is that option.
-
-For benchmarking we compare two ways:
-- **Offline file replay** against historical CW contest recordings
-  with answer keys generated by SkimSrv.  Tells us how we'd have
-  performed against the most established skimmer during past contests.
-- **Live operation** against SDC-Connectors running on a Flex 6700
-  sharing an antenna split with the Pitaya feeding sparkgap.  Same
-  RF, same QTH, same time — apples-to-apples against the actively-
-  maintained closed-source tool we benchmark against.
-
-## What works today
-
-- **Multi-band CW skimming** via Red Pitaya (HPSDR Protocol 1).
-  8 bands simultaneously on a stock Pitaya 125-14, sustained
-  (80 / 40 / 30 / 20 / 17 / 15 / 12 / 10 m).
-- **FT8 decoding** on each band's WSPR/FT8 sub-band, minute-aligned.
-- **PSKReporter feeder** (`pskr_feeder.py`) — pushes FT8 decodes to
-  PSKReporter via IPFIX/UDP. Visible as `WF8Z-1` on the global map.
-- **RTTY skimming** (currently runs alongside FT8; auto-disabled
-  outside RTTY contests).
-- **Bayesian, soft-decision-keystate CW decoder** ("ITILA" in the
-  source — full pipeline below in *How the decoder works*).
-  2-state HMM forward-backward with EM parameter estimation and
-  16-bin WPM marginalization; lazy bin-spawn filters noise-driven
-  candidates before burning decoder cycles on garbage.
-- **Adaptive consensus gates** controlled by config flags — every
-  precision/recall trade-off is a knob the operator can turn for
-  their use case.  Default ("ship-it") mode is permissive emit;
-  cluster filters (VE7CC's 2+ skimmer rule) handle the noise downstream.
-- **Telnet spot output** in standard DX cluster format, locally on
-  port 7300.  This is what Aggregator consumes when bridging from
-  sparkgap to RBN.
-- **Diagnostic infrastructure** for validating against SDC and RBN
-  reference streams (`sdc_tee.py`, `rbn_tee.py`, `score_loop.py`,
-  `score_diff.py`).
-
-## How the decoder works
+### The original ITILA decoder
 
 The CW decoder ("ITILA" in the source — named after MacKay's *Information
 Theory, Inference, and Learning Algorithms* textbook that motivated the
@@ -180,108 +295,7 @@ Source: `itila_core.c` (full implementation, ~1400 lines C),
 channelizer + lazy bin-spawn), and `_ItilaScanner` + `SpotTracker` in
 `sparkgap.py` for the Python orchestration.
 
-## What's not yet there
-
-- **Hardware abstraction** beyond Red Pitaya HPSDR.  RX-888, SDRPlay,
-  Hermes Lite 2 backends would each require a plugin author who owns
-  that hardware.  See the IqSource discussion in the project docs.
-- **Hardened multi-host setup.**  rbn_feeder.py works (see
-  `docs/rbn-feeding.md`) but the production deployment we're running
-  is a single-host install.  Operators who want to split skimmer and
-  feeder onto different boxes should treat their setup as bespoke
-  until we publish a tested multi-host recipe.
-- **Documentation polish.**  This README is the start; expect rough
-  edges in install, config, and operations until the project matures.
-- **Validated multi-recording test suite.**  We have one rigorous
-  comparison run; need many more across band conditions and contest
-  formats before publishing reliability claims.
-
-## Quick start (Linux, Pitaya 125-14)
-
-Dependencies (Debian/Ubuntu):
-
-```
-apt install build-essential gcc python3 python3-numpy python3-scipy \
-            libfftw3-dev pkg-config
-```
-
-PSKReporter/MQTT needs `paho-mqtt>=2.0`, which Ubuntu doesn't package;
-use `pip install -r requirements.txt` in a venv.
-
-Build the C libraries (`make native ARCH=native` for `-march=native`):
-
-```
-make native
-```
-
-Pitaya: install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/) firmware
-and ensure it's reachable on your LAN.  Update `sdr_ip` in your config.
-
-Configure: copy `sk_5band.json` and edit:
-
-```json
-{
-  "callsign": "YOUR_CALL",
-  "grid": "YOUR_GRID",
-  "sdr_ip": "192.168.X.X",
-  "bands": [3590000, 7090000, 10118000, 14090000,
-            18083000, 21090000, 24902000, 28090000],
-  "enable_ft8": true,
-  ...
-}
-```
-
-Run:
-
-```
-python3 sparkgap.py --config sk_5band.json
-```
-
-Connect to the spot stream:
-
-```
-telnet localhost 7300
-```
-
-## Quick start (macOS)
-
-Should work with light Makefile tweaks ... `-shared` produces `.dylib`
-not `.so` on macOS, and `ctypes` needs to know to look for the dylib
-extension. Apple Silicon also handles `-march=native` differently
-(`-mcpu=apple-m1` or just omit the flag and let clang pick).
-
-Dependencies via Homebrew:
-
-```
-brew install python@3 numpy scipy fftw pkg-config
-```
-
-Then either build with `gmake` (substituting `.so` → `.dylib` in the
-build commands above) or run from source after a one-time port pass.
-PRs welcome ... we test on Linux primarily, so Mac users get to be
-the porting authors.
-
-## Quick start (Windows)
-
-WSL2 with Ubuntu, then follow the Linux instructions verbatim. The
-HPSDR firmware on the Pitaya is reachable from WSL2 the same way it
-is from native Linux.
-
-## Feeding the RBN
-
-SparkGap emits standard DX-cluster spots locally on telnet :7300
-in SkimSrv-compatible wire format.
-
-**Recommended path today:** bridge through Aggregator on a Windows
-box pointed at sparkgap's `:7300` telnet.  That setup still works
-for operators who already have Aggregator licensed and don't want to
-change.
-
-For an all-Linux native path, `rbn_feeder.py` reads sparkgap's local
-`:7300` telnet and posts spots directly to RBN — no Windows / no
-Aggregator required.  See `docs/rbn-feeding.md` for setup.
-
-## Configuration: gate flags
+### Gate flags (`cw_decoder: itila`, `spot_rule: off`)
 
 The decoder behavior is fully configurable.  Defaults are "ship-it"
 mode (permissive emit, trust cluster filtering).  Each gate can be
@@ -308,45 +322,6 @@ Plus the standard knobs:
 - `scp_bypass_threshold` — sightings required for non-SCP-validated calls
 - `enable_ft8` — runs FT8 + RTTY pipelines (RTTY currently piggy-backs)
 
-## File-mode replay
-
-Useful for offline analysis and gate-flag tuning:
-
-```
-python3 sparkgap.py --file recording.wav --center-khz 7090 \
-                       --start-min 0 --end-min 15 --config sk_5band.json
-```
-
-Accepts 16-bit and 24-bit stereo IQ WAV files at 192 kHz.
-
-## Diagnostic tools
-
-- `sdc_tee.py` — connects to a local SDC/SkimSrv telnet server and
-  appends timestamped spots to `/tmp/sdc_stream.log`.
-- `rbn_tee.py` — same for the worldwide RBN at
-  `telnet.reversebeacon.net:7000`.
-- `SIGUSR1` to a running `sparkgap.py` instance dumps the current
-  per-band IQ buffer to `/tmp/diag_<band>_<HHMMSS>.wav` for offline
-  replay (requires `enable_ft8: true` — taps the FT8 capture buffer).
-
-## Development
-
-SparkGap is developed using Claude Code as the primary development tool.
-Contributors are encouraged to use Claude Code for consistency.
-
-## License
-
-GPLv3.  See `LICENSE`.
-
-## Author
-
-Fred Krause, **WF8Z** (EM79SM).  Contact info is on QRZ.
-
-## Status of this README
-
-This is a working README.  Expect it to evolve as the project matures.
-Bug reports and pull requests welcome.
-
 ## Acknowledgments
 
 This project stands on a lot of prior work — both software and theory.
@@ -354,8 +329,8 @@ Where source files are derived from another project, the original
 copyright headers and license remain in those files; the list below is
 the high-level acknowledgment.
 
-The current production pipeline uses the **ITILA** decoder (original to
-this project, named after MacKay's textbook). Several other decoders
+The current decoder is **itila2** (Chris White, WX7V), built on the original **ITILA**
+decoder (original to this project, named after MacKay's textbook). Several other decoders
 ship in this tree as alternative paths and as research baselines —
 they are not currently in the live spotting pipeline, but they are
 included in the source distribution and their authors deserve credit
