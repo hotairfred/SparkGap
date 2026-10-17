@@ -224,7 +224,8 @@ def _cq_before(toks: list[str], i: int) -> bool:
 
 def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
                  doubled: bool = False, split_up: bool = False,
-                 contest_words: bool = False, cq_repeats: bool = False) -> list[str]:
+                 contest_words: bool = False, cq_repeats: bool = False,
+                 stray: bool = False) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -235,7 +236,7 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
     after it; only the exchange test keeps that caller out. every: one entry per group
     instead of one per call."""
     return [call for call, _after in runner_groups(text, every, qualifiers, doubled, split_up,
-                                                   contest_words, cq_repeats)]
+                                                   contest_words, cq_repeats, stray)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -289,7 +290,7 @@ def _split_signoff(toks: list[str], i: int) -> int | None:
 
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
-                  cq_repeats: bool = False) -> list[tuple[str, str | None]]:
+                  cq_repeats: bool = False, stray: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller.
@@ -328,7 +329,8 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                 i = k                             # CQ S52Y DE N8EM: S52Y is being called; after
                                                   # TEST or DE the call is the runner's
                 continue
-        if not is_exchange(toks, j, qualifiers) and (every or all(toks[j] != c for c, _ in out)):
+        if (not is_exchange(toks, j, qualifiers) and not (stray and _stray_after(toks, j))
+                and (every or all(toks[j] != c for c, _ in out))):
             out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
             if doubled and every:
                 out.extend([out[-1]] * (k - j - 1))   # doubled: each copy counts
@@ -348,6 +350,34 @@ def _lev1(a: str, b: str) -> bool:
         return sum(x != y for x, y in zip(a, b, strict=True)) == 1
     short, long_ = (a, b) if len(a) < len(b) else (b, a)
     return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def _stray_after(toks: list[str], j: int) -> bool:
+    """The call toks[j] is followed (past repeats of it) by one or two single letters that
+    complete a longer call: TEST K1V U T is K1VUT split at a gap. K is a prosign, not a letter,
+    and the first letter is no E or T (CQ TEST K4TZ E E is K4TZ and noise). Only calls of 3
+    characters are checked: longer ones are followed by their own pieces (W0UI W 0 UI)."""
+    if len(toks[j]) > 3:
+        return False
+    k = j + 1
+    while k < len(toks) and toks[k] == toks[j]:
+        k += 1
+    joined = toks[j]
+    for m, t in enumerate(toks[k:k + 2]):
+        if len(t) != 1 or not t.isalpha() or t == "K" or (m == 0 and t in "ET"):
+            break
+        joined += t
+        if CALL_RE.match(joined) and len(joined) <= 7:
+            return True
+    return False
+
+
+def _fragment(short: str, long_: str) -> bool:
+    """short is a piece of the longer call long_: its start, its end, or inside it, 2 to 4
+    characters shorter (K1V of K1VUT, N6T of N6TQS). One character shorter is the one-edit
+    vote's and the rival term's case already."""
+    d = len(long_) - len(short)
+    return 2 <= d <= 4 and len(short) >= 2 and short in long_ and CALL_RE.match(long_) is not None
 
 
 def _regap(a: str, b: str) -> bool:
@@ -378,7 +408,8 @@ class RepeatSpotRule:
                  window_s: float = 60.0,
                  validation: str | None = None,
                  listed: Callable[[str], bool] | None = None, listed_by: str = "scp",
-                 contest_words: bool = False, cq_repeats: bool = False) -> None:
+                 contest_words: bool = False, cq_repeats: bool = False,
+                 fragments: str | None = None) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -398,6 +429,11 @@ class RepeatSpotRule:
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
         self.contest_words = contest_words      # CWT K5AX opens a group as CQ CWT K5AX does
         self.cq_repeats = cq_repeats            # CQ CWT N1DC CQ CWT N1DC is two copies
+        opts = set((fragments or '').split(',')) - {''}
+        if not opts <= {'even', 'any', 'stray'} or {'even', 'any'} <= opts:
+            raise ValueError(f"fragments takes 'even' or 'any', and/or 'stray', got {fragments!r}")
+        self.fragments = 'even' if 'even' in opts else 'any' if 'any' in opts else None
+        self.stray = 'stray' in opts                            # TEST K1V U T: no copy of K1V
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
@@ -428,7 +464,8 @@ class RepeatSpotRule:
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
                  else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers,
                                    doubled=self.doubled, split_up=self.split_up,
-                                   contest_words=self.contest_words, cq_repeats=self.cq_repeats))
+                                   contest_words=self.contest_words, cq_repeats=self.cq_repeats,
+                                   stray=self.stray))
         for call, n in Counter(calls).items():
             new = 0
             for nth in range(n):
@@ -450,6 +487,10 @@ class RepeatSpotRule:
                 continue          # a call one edit away has as many copies here: undecided
             elif counts[call] < self.tier(call):
                 continue
+            if self.fragments and any(_fragment(call, other)
+                                      and k >= (counts[call] if self.fragments == 'even' else 1)
+                                      for other, k in counts.items()):
+                continue          # a piece of a longer call heard here (K1V of K1VUT): wait
             spot_f = max((c for c in near if c.call == call), key=lambda c: c.snr).freq_khz
             key = (call, int(spot_f // 1000))     # per band: a station running two bands
             last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
@@ -517,7 +558,7 @@ class RepeatSpotRule:
         for call, after in runner_groups(text, every=self.cq_groups,
                                          qualifiers=self.cq_qualifiers, doubled=self.doubled,
                                          split_up=self.split_up, contest_words=self.contest_words,
-                                         cq_repeats=self.cq_repeats):
+                                         cq_repeats=self.cq_repeats, stray=self.stray):
             owner = self.owner(freq_khz, now)
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller

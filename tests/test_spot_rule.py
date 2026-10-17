@@ -739,3 +739,36 @@ def test_contest_words_and_cq_repeats_local_port() -> None:
     loc = sparkgap._make_spot_rule(cfg, tracker, local=cfg["local_spot_rule"])
     assert rbn.cq_repeats and not rbn.contest_words
     assert loc.cq_repeats and loc.contest_words
+
+
+def test_fragments_piece_of_a_longer_call_waits() -> None:
+    """fragments 'any': K1V does not spot while K1VUT is heard near the same frequency;
+    'stray': TEST K1V U T gives no copy of K1V (K1VUT split at a letter gap)."""
+    from spot_rule import _fragment, _stray_after, tokens
+    assert _fragment("K1V", "K1VUT") and _fragment("N6T", "N6TQS")
+    assert not _fragment("K1VU", "K1VUT")            # one shorter: the one-edit vote's case
+    assert not _fragment("W1AW", "K1VUT")
+    t = tokens("CQ TEST K1V U T")
+    assert _stray_after(t, 2)
+    assert not _stray_after(tokens("CQ TEST K4TZ E E"), 2)   # noise after a full call
+    assert not _stray_after(tokens("CQ TEST W0UI W 0 UI"), 2)
+    plain = RepeatSpotRule(_tier2, cq_groups=True, lockon=True)
+    frag = RepeatSpotRule(_tier2, cq_groups=True, lockon=True, fragments="any,stray")
+    texts = ["CQ TEST K1VUT K1VUT", "CQ TEST K1V UT", "CQ TEST K1V U T", "CQ TEST K1V UT"]
+    got_plain, got_frag = [], []
+    for k, tx in enumerate(texts):
+        got_plain += plain.feed(k, 14024.0, tx, 60.0 * k)
+        got_frag += frag.feed(k, 14024.0, tx, 60.0 * k)
+    assert ("K1V", 14024.0) in got_plain
+    assert ("K1V", 14024.0) not in got_frag
+    import pytest
+    with pytest.raises(ValueError):
+        RepeatSpotRule(_tier2, fragments="even,any")
+
+
+def test_fragments_by_config() -> None:
+    import sparkgap
+    tracker = sparkgap.SpotTracker(set(SCP), set())
+    assert sparkgap._make_spot_rule({}, tracker).fragments is None
+    r = sparkgap._make_spot_rule({"spot_rule_fragments": "any,stray"}, tracker)
+    assert r.fragments == "any" and r.stray
