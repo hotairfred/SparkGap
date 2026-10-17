@@ -404,17 +404,11 @@ class FlexIQReceiver:
                     log.debug("[Flex] Packet gap: %d missed", gap)
             last_counter = counter
 
-            # Parse float32 I/Q pairs
-            fmt = f"{endian_char}{2 * n_samples}f"
-            try:
-                samples = struct.unpack(fmt, data[VITA_HEADER_SIZE:
-                                                  VITA_HEADER_SIZE + n_samples * 8])
-            except struct.error:
-                continue
-
-            iq_pairs = [(i / DAXIQ_FULL_SCALE, q / DAXIQ_FULL_SCALE)
-                        for i, q in zip(samples[0::2], samples[1::2])]
-            callback(0, iq_pairs)
+            # Parse float32 I/Q pairs into one (n, 2) float64 array (cdub89/SparkGap#16)
+            iq_rows = np.frombuffer(data, dtype=f"{endian_char}f4", count=2 * n_samples,
+                                    offset=VITA_HEADER_SIZE).astype(np.float64).reshape(-1, 2)
+            iq_rows /= DAXIQ_FULL_SCALE
+            callback(0, iq_rows)
 
             if not pkt_count:
                 log.info("[Flex] OK first DAX-IQ packet after %.1f s (%d samples, stream 0x%08x)",

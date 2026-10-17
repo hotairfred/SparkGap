@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 import itertools
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import numpy as np
@@ -347,6 +347,7 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
 CW_TONE = 700       # Hz — matches natural tone placement from channelizer
 DECODER_RATE = 12000  # UHSDR decoder sample rate
 BMORSE_RATE = 4000    # bmorse input sample rate
+PEAK_SCAN_SAMPLES = 8192    # live peak scan FFT; the Python receive path keeps only this much IQ
 
 
 class DecoderInstance:
@@ -6728,7 +6729,7 @@ class SparkGap:
         self._iq_trimmed = 0  # IQ samples discarded by the Python receiver path
         # Per-band IQ buffers keyed by rx_index.  For single-band configs
         # rx_index=0 is the only key (same as before).
-        self._band_bufs = {}   # rx_index → {'iq': deque, 'i': [], 'q': []}
+        self._band_bufs = {}   # rx_index → {'iq': (n, 2) array, 'i': [], 'q': []}
         # Software frequency calibration. ppm_offset > 0 means our
         # uncorrected reports run high; we subtract it before emitting.
         # Replaces a hardware GPSDO until/unless we add the R25/R26
@@ -6850,8 +6851,8 @@ class SparkGap:
             rx_idx = entry.get('rx_index', idx) if isinstance(entry, dict) else idx
             self._band_meta.append((name, center_hz, rx_idx))
             self._band_bufs[rx_idx] = {
-                'iq': deque(),
-                'raw': [],   # raw iq_samples lists from receiver thread (no numpy)
+                'iq': np.empty((0, 2)),   # the peak scan's last PEAK_SCAN_SAMPLES (cdub89/SparkGap#16)
+                'raw': [],   # iq_samples per packet from the receiver thread, unconverted
                 'i': [],
                 'q': [],
             }
@@ -7112,7 +7113,7 @@ class SparkGap:
             if buf is None:
                 return
             # Minimal GIL work: just stash the raw sample list.
-            # Numpy conversion and deque update happen in the async loop.
+            # Numpy conversion and the peak-scan tail happen in the async loop.
             with self._iq_lock:
                 buf['raw'].append(iq_samples)
             if self._wav_record and rx_index == 0:
@@ -7175,20 +7176,10 @@ class SparkGap:
                         if len(raw_chunks) > max_chunks:
                             self._iq_trimmed += sum(len(c) for c in raw_chunks[:-max_chunks])
                             raw_chunks = raw_chunks[-max_chunks:]
-                        feed_i = []
-                        feed_q = []
-                        for chunk in raw_chunks:
-                            iq_arr = np.asarray(chunk, dtype=np.float64)
-                            feed_i.append(iq_arr[:, 0] * 8388608.0)
-                            feed_q.append(iq_arr[:, 1] * 8388608.0)
-                        max_iq_buf = live_rate * 10
-                        iq_deq = buf['iq']
-                        for chunk in raw_chunks:
-                            iq_deq.extend(chunk)
-                        while len(iq_deq) > max_iq_buf:
-                            iq_deq.popleft()
-                        i_cat = np.concatenate(feed_i)
-                        q_cat = np.concatenate(feed_q)
+                        iq_new = np.concatenate([np.asarray(c, dtype=np.float64).reshape(-1, 2) for c in raw_chunks])
+                        buf['iq'] = np.concatenate([buf['iq'], iq_new])[-PEAK_SCAN_SAMPLES:]
+                        i_cat = iq_new[:, 0] * 8388608.0
+                        q_cat = iq_new[:, 1] * 8388608.0
                         mgr.feed_all_iq(i_cat, q_cat)
             if use_c and not getattr(self, '_worker_started', False):
                 scanners_ready = sum(1 for mgr in self.managers
@@ -7366,7 +7357,7 @@ class SparkGap:
 
                 # In C receiver mode, scanner has its own FFT scan — skip Python FFT
                 if not use_c:
-                    fft_size = 8192
+                    fft_size = PEAK_SCAN_SAMPLES
                     min_snr = self.cfg.get('signal_min_snr', 12)
                     cw_min  = self.cfg.get('cw_min_khz', 0)
                     cw_max  = self.cfg.get('cw_max_khz', 99999)
@@ -7374,18 +7365,13 @@ class SparkGap:
                     for (band_name, center_hz, rx_idx), mgr in zip(self._band_meta, self.managers):
                         center_khz = center_hz / 1000
                         with self._iq_lock:
-                            iq_deque = self._band_bufs[rx_idx]['iq']
-                            if len(iq_deque) >= fft_size:
-                                raw = list(itertools.islice(iq_deque,
-                                                            len(iq_deque) - fft_size,
-                                                            None))
-                            else:
-                                raw = None
+                            iq_tail = self._band_bufs[rx_idx]['iq']
+                            raw = iq_tail if len(iq_tail) >= fft_size else None
 
                         if raw is None:
                             continue
 
-                        iq_arr = np.array([complex(i, q) for i, q in raw])
+                        iq_arr = raw[:, 0] + 1j * raw[:, 1]
                         window  = np.blackman(fft_size)
                         psd     = np.abs(np.fft.fft(iq_arr * window)) ** 2
                         psd_db  = 10 * np.log10(psd + 1e-20)
@@ -7412,7 +7398,7 @@ class SparkGap:
                                 clustered[-1] = (freq, snr)
 
                         log.info("[%s] noise=%.1f dB  thresh=%.1f dB  buf=%d samples",
-                                 band_name, noise, noise + min_snr, len(iq_deque))
+                                 band_name, noise, noise + min_snr, len(iq_tail))
                         top = sorted(signals, key=lambda x: -x[1])[:10]
                         for f, s in top:
                             log.info("  [%s] PEAK %.3f kHz %.1f dB",
