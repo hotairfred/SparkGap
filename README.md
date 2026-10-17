@@ -171,7 +171,8 @@ GPLv3. See `LICENSE`.
 
 SparkGap grew out of luarvique's csdr-skimmer. From March to September 2026 it ran the
 original ITILA decoder with a configurable set of spot gates; itila2 and the repeat spot rule
-replaced them as the default for new setups in October 2026. The material below describes
+became the recommended chain in October 2026 (`cw_decoder: itila2`); the code and the shipped
+configs still default to the original `itila`. The material below describes
 that earlier chain and the comparisons made with it. It is kept for reference; the numbers
 are not current.
 
