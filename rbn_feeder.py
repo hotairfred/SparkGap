@@ -71,7 +71,7 @@ except ImportError:
 #   DX de WF8Z-#:    14025.50  R2HE         CW  15 dB 26 WPM  CQ  OS  1313Z
 SPOT_RE = re.compile(
     r'^DX de (\S+):\s+(\d+\.\d+)\s+(\S+)\s+(\S+)\s+'
-    r'(-?\d+)\s*dB(?:\s+(\d+)\s*WPM)?\s+'
+    r'(-?\d+)\s*dB(?:\s+(\d+)\s*(?:WPM|BPS))?\s+'
     r'(\S+)(?:\s+(\S+))?\s+(\d{4})Z\s*$'
 )
 
@@ -86,6 +86,12 @@ DEFAULT_RBN_URL = 'http://x.reversebeacon.net:88/rx/6'
 # of SparkGap happens via skimName in the id payload.
 AGG_VERSION = '6.7'
 SKIM_VERSION = 'v.1.6.0.145'  # mirrors what we put in the SkimSrv banner
+
+
+def uploadable(spot):
+    """A parsed spot RBN gets: CW or RTTY, tagged CQ. Aggregator likewise sends on only the
+    CQ-tagged lines of a Skimmer and drops DE and untagged ones (hotairfred/SparkGap#43)."""
+    return spot is not None and spot['mode'] in RBN_MODES and spot['cq_flag'] == 'CQ'
 
 
 def parse_spot(line):
@@ -238,7 +244,9 @@ class RBNSession:
         # full position mapping and Batwing's IL analysis at
         # /mnt/atlas/skimmer/agg_re/aggregator_input_parser_bug.md
         # (TODO).
-        _MODE_TO_CODE = {'CW': '1'}  # extend when other modes are wired up
+        # Aggregator 6.7's mode table (its ProcessSkimmerSpots): CW 1, RTTY 11; the speed
+        # column holds WPM for CW and baud for RTTY.
+        _MODE_TO_CODE = {'CW': '1', 'RTTY': '11'}
         _CQ_TO_CODE   = {'CQ': '1', 'DX': '2', 'BCN': '3', 'BEACON': '3'}
         s_array = [
             [
@@ -299,7 +307,7 @@ def read_local(local_host, local_port, skim_call, spot_q, shutdown):
                         continue
                     log.debug('parse: %r', text[:120])
                     spot = parse_spot(text)
-                    if spot and spot['mode'] in RBN_MODES:
+                    if uploadable(spot):
                         spot_q.put(spot)
                         log.debug('queued: %s @ %.1f', spot['call'], spot['freq'])
         except (socket.error, OSError) as e:

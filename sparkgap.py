@@ -1751,13 +1751,54 @@ RTTY_RANGES = {
 # RTTY ranges for rtty_spot_rule "repeat", offset (Hz) from band center: where RBN's RTTY
 # skimmers spotted a weekend RTTY contest (10-10 22-00Z, 5th to 99th percentile, plus margin).
 # 40m ran 7046 to 7074 kHz, above the 7035-7055 of RTTY_RANGES.
+RTTY_SPOT_BAUD = 45     # RTTY spots go out as "RTTY 26 dB 45 BPS CQ", as RTTY Skimmer Server sends them
+
 RTTY_RANGES_REPEAT = {
-    3590:  (-12000, +12000),   # 80m: 3578-3602
-    7090:  (-60000, -10000),   # 40m: 7030-7080
-    14090: (-14000, +16000),   # 20m: 14076-14106
-    21090: (-12000, +12000),   # 15m: 21078-21102
-    28090: (-12000, +12000),   # 10m: 28078-28102
+    # Widened 2026-10-17: on the PA recording (10-10 22:00-22:30Z) RBN's RTTY skimmers spotted
+    # 165 calls within our 40m and 20m spans; the narrow ranges caught 32 and the cap of 40
+    # candidates cut 11 of 58 scans. These ranges and a cap of 100 caught 36, CPU unchanged.
+    3590:  (-15000, +15000),   # 80m: 3575-3605
+    7090:  (-65000, +35000),   # 40m: 7025-7125
+    14090: (-30000, +60000),   # 20m: 14060-14150
+    21090: (-30000, +60000),   # 15m: 21060-21150
+    28090: (-30000, +60000),   # 10m: 28060-28150
 }
+RTTY_MAX_CANDIDATES = 100      # per band per minute (config rtty_max_candidates)
+# FT8, FT4 and JS8 dials (kHz): each dial and 3 kHz above it is no RTTY, so no candidate there.
+DIGITAL_DIALS_KHZ = (3573.0, 3575.5, 7047.5, 7074.0, 7078.0, 14074.0, 14078.0, 14080.0,
+                     21074.0, 21078.0, 21140.0, 28074.0, 28078.0, 28180.0)
+
+
+def _rtty_range(cfg, band_center_khz):
+    """(lo, hi) Hz from the band centre where RTTY is looked for: config rtty_ranges_repeat
+    ({"7090": [-65000, 35000], ...}) first, else RTTY_RANGES_REPEAT; None when neither has it."""
+    over = cfg.get('rtty_ranges_repeat') or {}
+    key = str(int(band_center_khz))
+    if key in over:
+        return tuple(float(x) for x in over[key])
+    return RTTY_RANGES_REPEAT.get(int(band_center_khz))
+
+
+def _in_digital_window(rf_khz):
+    return any(d <= rf_khz <= d + 3.0 for d in DIGITAL_DIALS_KHZ)
+
+
+_RTTY_KEYWORD = re.compile(r'(CQ|TEST|DE)')
+
+
+def _rtty_split_keywords(text):
+    """RTTY prints line noise between transmissions with no spaces, so a keyword runs into
+    junk: EFXTEST AI4WW, CQPDE KQ4TNF. Cut CQ, TEST and DE out of any token that is not itself
+    a call, so the spot rule sees the CQ group. On the PA recording: +2 to 3 calls, all
+    confirmed, none lost."""
+    from spot_rule import CALL_RE
+    out = []
+    for tok in text.split():
+        if CALL_RE.fullmatch(tok) or _RTTY_KEYWORD.fullmatch(tok) or not _RTTY_KEYWORD.search(tok):
+            out.append(tok)
+        else:
+            out.extend(p for p in _RTTY_KEYWORD.split(tok) if p)
+    return ' '.join(out)
 
 
 def _rtty_candidates(iq, lo_hz, hi_hz):
@@ -1801,7 +1842,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
     tier(call) decodes (minutes) near one frequency. Callers are never spotted. One FFT of
     the minute; each candidate's 12 kHz audio is cut from it, not mixed from the full IQ."""
     import ctypes as _ct
-    rng = RTTY_RANGES_REPEAT.get(int(band_center_khz))
+    rng = _rtty_range(skimmer.cfg, band_center_khz)
     if rng is None:
         return 0
     rule = getattr(skimmer, '_rtty_rule', None)
@@ -1815,7 +1856,13 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
             lambda c: {'active': 2, 'rare': 3}.get(trk._matches_patt3ch(c), 4),
             cq_groups=True, lockon=True)
     iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
-    cands = _rtty_candidates(iq, *rng)[:int(skimmer.cfg.get('rtty_max_candidates', 40))]
+    cands = [c for c in _rtty_candidates(iq, *rng)
+             if not _in_digital_window(band_center_khz + c[0] / 1000.0)]
+    cap = int(skimmer.cfg.get('rtty_max_candidates', RTTY_MAX_CANDIDATES))
+    if len(cands) > cap:
+        log.info("RTTY %s: %d candidates, decoding the strongest %d (rtty_max_candidates)",
+                 bn, len(cands), cap)
+    cands = cands[:cap]
     if not cands:
         return 0
     rate, audio_center = 12000, 1000.0
@@ -1851,10 +1898,11 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         rf_khz = (band_center_khz * 1000.0 + off_hz) / 1000.0
         log.info("RTTY %s @ %.1f kHz (%.0f dB): %s", bn, rf_khz, snr_db, text[:80])
         w = rule.window_id(int(round(rf_khz * 10)), int(now // 60), now)
-        for call, sf in rule.feed(w, rf_khz, text, now, snr=snr_db):
+        for call, sf in rule.feed(w, rf_khz, _rtty_split_keywords(text), now, snr=snr_db):
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***", sf, call, int(snr_db), text[:50])
             skimmer.telnet.broadcast_spot(freq_khz=skimmer._corrected_freq_khz(sf), dx_call=call,
-                                          snr=int(snr_db), mode='RTTY', comment=text[:60])
+                                          snr=int(snr_db), wpm=RTTY_SPOT_BAUD, mode='RTTY',
+                                          comment='CQ')
             skimmer.spot_count += 1
             n_spots += 1
     return n_spots
@@ -2040,10 +2088,13 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
             skimmer._rtty_emitted[key] = now
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
                      rf_hz / 1000.0, call, int(snr_db), text[:50])
+            # Not tagged CQ: this path spots any call in the text, callers included, and
+            # rbn_feeder uploads only CQ-tagged lines. rtty_spot_rule "repeat" tags CQ.
             skimmer.telnet.broadcast_spot(
                 freq_khz=skimmer._corrected_freq_khz(rf_hz / 1000.0),
                 dx_call=call,
                 snr=int(snr_db),
+                wpm=RTTY_SPOT_BAUD,
                 mode='RTTY',
                 comment=text[:60])
             skimmer.spot_count += 1
