@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
@@ -301,8 +302,8 @@ static void *recv_thread(void *arg) {
     HpsdrFast *h = (HpsdrFast *)arg;
     uint8_t buf[2048];
 
-    while (h->running) {
-        int len = recv(h->sock, buf, sizeof(buf), 0);
+    while (__atomic_load_n(&h->running, __ATOMIC_ACQUIRE)) {
+        int len = recv(h->sock, buf, sizeof(buf), 0);   /* -1 on the 200 ms timeout */
         if (len < PKT_SIZE) continue;
         if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
             buf[2] != 0x01 || buf[3] != 0x06) continue;
@@ -351,7 +352,11 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
         return NULL;
     }
 
-    /* No socket timeout — recvmmsg uses its own timeout */
+    /* Receive timeout: with no packets arriving (radio off, cable out, IP moved) recv() would
+     * block forever and hpsdr_stop() could never join the receive thread. 200 ms lets the loop
+     * see running = 0; a live radio sends hundreds of packets a second, so it costs nothing. */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+    setsockopt(h->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     pthread_mutex_init(&h->lock, NULL);
     return h;
@@ -667,8 +672,8 @@ void hpsdr_stop_worker(HpsdrFast *h) {
 
 void hpsdr_stop(HpsdrFast *h) {
     hpsdr_stop_worker(h);
-    h->running = 0;
-    pthread_join(h->thread, NULL);
+    __atomic_store_n(&h->running, 0, __ATOMIC_RELEASE);
+    pthread_join(h->thread, NULL);   /* returns within the 200 ms receive timeout */
 
     /* Send stop */
     uint8_t stop_pkt[64];
