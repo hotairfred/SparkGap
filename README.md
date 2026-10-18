@@ -256,7 +256,9 @@ cluster or logger, add a second port with its own rule:
 Both port numbers are yours to pick (`--port` and `--local-port` on the
 command line override them). Tweaks to `local_spot_rule` change only the
 local port; what goes to RBN stays the same. Without `local_spot_rule`, 7301 carries the same spots
-as 7300. FT8 and RTTY go to both ports.
+as 7300. FT8 and RTTY go to both ports. The local rule can also have its own
+`validation` and `validation_calls` (as `spot_validation` and `spot_validation_calls`, for the
+local port only); without them it follows the top-level ones.
 
 ## Quick start (macOS)
 

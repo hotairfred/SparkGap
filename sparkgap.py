@@ -1772,6 +1772,31 @@ def _spot_rule_name(config):
     chain), "off" with itila."""
     return config.get('spot_rule') or ('repeat' if config.get('cw_decoder', 'itila2') == 'itila2' else 'off')
 
+def _validation_list(config, tracker, calls):
+    """The call list of spot_validation_calls as a predicate, else None. Built once per list
+    and kept on the tracker, so the RBN port and the local port share one download."""
+    if not calls:
+        return None
+    cache = tracker.__dict__.setdefault('_validation_lists', {})
+    if calls in cache:
+        return cache[calls]
+    if calls == 'scp':
+        listed = lambda c: c in tracker.valid_calls or max(c.split('/'), key=len) in tracker.valid_calls
+    elif calls in ('rbn', 'rbn+skcc'):
+        import rbn_known
+        from pathlib import Path
+        d = Path(config.get('rbn_known_dir', 'rbn_known'))
+        known = rbn_known.refresh(d, config.get('callsign', ''),
+                                  int(config.get('rbn_known_days', rbn_known.DAYS)))
+        if calls == 'rbn+skcc':
+            import skcc_roster
+            known = known | skcc_roster.refresh(d)
+        listed = lambda c: rbn_known.base_call(c) in known
+    else:
+        raise ValueError("spot_validation_calls must be scp, rbn or rbn+skcc, got %r" % calls)
+    cache[calls] = listed
+    return listed
+
 def _make_spot_rule(config, tracker, local=None):
     """The RepeatSpotRule SparkGap runs with spot_rule "repeat": tiers from patt3ch, lock-on,
     CQ groups and CQ qualifiers always on (measured on every recording we have), split_runs
@@ -1780,31 +1805,26 @@ def _make_spot_rule(config, tracker, local=None):
 
     local: the local_spot_rule config block for the rule of the local telnet port, which may
     be looser than the rule of telnet_port (the port the RBN feeder reads). Its keys:
-    doubled_calls (bool) and fewer_repeats (int: copies taken off each patt3ch tier, never
-    below 2)."""
+    doubled_calls (bool), fewer_repeats (int: copies taken off each patt3ch tier, never
+    below 2), validation and validation_calls (as spot_validation and spot_validation_calls,
+    for this port only). doubled_calls has no effect while validation is on: the score
+    already weighs a call sent twice."""
     from spot_rule import RepeatSpotRule
     # spot_validation (off by default): permissive / normal / aggressive confidence score in
     # place of the tier count; spot_validation_calls adds a call list to the score: "scp"
     # (MASTER.SCP), "rbn" (RBN known calls, rbn_known.py, refreshed from the archives here) or
     # "rbn+skcc" (those and SKCC member calls, skcc_roster.py).
-    validation = config.get('spot_validation') or None
-    validation = None if validation == 'off' else validation
-    calls = config.get('spot_validation_calls') if validation else None
-    listed = None
-    if calls == 'scp':
-        listed = lambda c: c in tracker.valid_calls or max(c.split('/'), key=len) in tracker.valid_calls
-    elif calls in ('rbn', 'rbn+skcc'):
-        import rbn_known
-        from pathlib import Path
-        cache = Path(config.get('rbn_known_dir', 'rbn_known'))
-        known = rbn_known.refresh(cache, config.get('callsign', ''),
-                                  int(config.get('rbn_known_days', rbn_known.DAYS)))
-        if calls == 'rbn+skcc':
-            import skcc_roster
-            known = known | skcc_roster.refresh(cache)
-        listed = lambda c: rbn_known.base_call(c) in known
-    elif calls:
-        raise ValueError("spot_validation_calls must be scp, rbn or rbn+skcc, got %r" % calls)
+    # The local port's rule may set its own (validation, validation_calls in local_spot_rule);
+    # otherwise it follows these. "off" and false both mean off.
+    def off(v):
+        return None if v in (None, False, 'off', '') else v
+    validation = off(config.get('spot_validation'))
+    calls = config.get('spot_validation_calls')
+    if local is not None:
+        validation = off(local.get('validation', validation))
+        calls = local.get('validation_calls', calls)
+    calls = calls if validation else None
+    listed = _validation_list(config, tracker, calls)
     fewer = int(local.get('fewer_repeats', 0)) if local is not None else 0
     doubled = (local.get('doubled_calls', False) if local is not None
                else config.get('spot_rule_doubled_calls', False))
