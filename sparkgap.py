@@ -6919,6 +6919,14 @@ class SparkGap:
         if self.telnet_local is not None and (stream != 'rbn' or self.tracker.local_rule is None):
             self.telnet_local.broadcast_spot(**spot)
 
+    def _feed_takes(self, stream):
+        """Whether the GUI feed shows a spot of this stream. gui_feed "spots": "rbn" (default)
+        follows telnet_port, "local" follows telnet_local_port (the RBN spots when the local
+        port has no rule of its own)."""
+        if str((self.cfg.get('gui_feed') or {}).get('spots', 'rbn')).lower() != 'local':
+            return stream != 'local'
+        return stream != 'rbn' or self.tracker.local_rule is None
+
     def _corrected_freq_khz(self, raw_khz):
         """Apply ppm_offset calibration to a freq emission. No-op when 0."""
         if not self.ppm_offset:
@@ -7718,14 +7726,14 @@ class SparkGap:
                         )
                         method   = spot.get('method', 'exact')
                         spot_wpm = spot.get('wpm', 0)
+                        if _gui_feed and self._feed_takes(stream):
+                            _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'], spot_wpm)
                         if stream == 'local':
                             # Not "*** SPOT:": log scorers count those as the RBN stream.
                             log.info("*** LOCAL SPOT: %10.1f  %-12s  %d dB  %d WPM ***",
                                      spot['freq_khz'], spot['call'], spot['snr'], spot_wpm)
                             continue
                         self.spot_count += 1
-                        if _gui_feed:
-                            _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'], spot_wpm)
                         log.info("*** SPOT: %10.1f  %-12s  %d dB  %d WPM  [%s] ***",
                                  spot['freq_khz'], spot['call'], spot['snr'],
                                  spot_wpm, method)

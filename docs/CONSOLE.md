@@ -146,6 +146,9 @@ The feed is off unless the config has a `gui_feed` block:
   missing code is refused but not counted.
 - At most 16 consoles at once; one that stops reading is disconnected.
 - `web`: `true` also serves SparkGap Web on the same port (see below).
+- `spots`: which spots the console shows. `"rbn"` (default) is what `telnet_port`
+  carries, the stream the RBN feeder reads; `"local"` is what `telnet_local_port` carries,
+  with its own `local_spot_rule`.
 - `tls_cert` and `tls_key` (optional) serve `wss://`; without them the feed is
   not encrypted. Settings adds servers as `ws://`, so give a `wss://` server on
   the command line.
