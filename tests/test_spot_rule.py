@@ -708,3 +708,34 @@ def test_split_up_by_config_and_local_port() -> None:
     assert not sparkgap._make_spot_rule(cfg, tracker).split_up
     assert sparkgap._make_spot_rule(cfg, tracker, local=cfg["local_spot_rule"]).split_up
     assert not sparkgap._make_spot_rule(cfg, tracker, local={}).split_up
+
+
+def test_contest_words_open_a_group() -> None:
+    """contest_words: CWT, SST or MST right before a call of 4+ characters opens a CQ group (CWT 10-14
+    19Z: K5AX sent CWT K5AX six times in a window and counted once). 3-character pieces do not."""
+    text = "CWT K5AX CWT K5AX CQ CQDE K5AX CWT K5AX"
+    assert runner_calls(text, every=True) == ["K5AX"]
+    assert runner_calls(text, every=True, contest_words=True) == ["K5AX"] * 3   # the CQ closes a group
+    assert runner_calls(text, every=True, contest_words=True, cq_repeats=True) == ["K5AX"] * 4
+    assert runner_calls("CWT N0K E E", every=True, contest_words=True) == []
+    assert runner_calls("MST W6KK MST W6KK", every=True, contest_words=True) == ["W6KK", "W6KK"]
+
+
+def test_cq_repeats_count_back_to_back_cqs() -> None:
+    """cq_repeats: CQ CWT N1DC CQ CWT N1DC is two copies; the second CQ used to close the first group.
+    A different call after the closing CQ is still the next transmission (a caller), not a runner."""
+    assert runner_calls("CQ FD N1DC CQ FD N1DC", every=True) == ["N1DC"]
+    assert runner_calls("CQ FD N1DC CQ FD N1DC", every=True, cq_repeats=True) == ["N1DC", "N1DC"]
+    assert runner_calls("CQ TEST W6YH TEST K1ABC", every=True, cq_repeats=True) == ["W6YH"]
+
+
+def test_contest_words_and_cq_repeats_local_port() -> None:
+    """Top-level keys set both rules; local_spot_rule's own keys override them (contest_words on the local
+    port only, as skimmer1 runs it)."""
+    import sparkgap
+    tracker = sparkgap.SpotTracker(set(SCP), set())
+    cfg = {"spot_rule_cq_repeats": True, "local_spot_rule": {"contest_words": True}}
+    rbn = sparkgap._make_spot_rule(cfg, tracker)
+    loc = sparkgap._make_spot_rule(cfg, tracker, local=cfg["local_spot_rule"])
+    assert rbn.cq_repeats and not rbn.contest_words
+    assert loc.cq_repeats and loc.contest_words

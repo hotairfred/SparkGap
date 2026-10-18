@@ -1832,13 +1832,20 @@ def _make_spot_rule(config, tracker, local=None):
                else config.get('spot_rule_doubled_calls', False))
     split_up = (local.get('split_up', False) if local is not None
                 else config.get('spot_rule_split_up', False))
+    # cq_repeats / contest_words: the local rule follows the top-level keys unless it sets its own
+    contest_words = config.get('spot_rule_contest_words', False)
+    cq_repeats = config.get('spot_rule_cq_repeats', False)
+    if local is not None:
+        contest_words = local.get('contest_words', contest_words)
+        cq_repeats = local.get('cq_repeats', cq_repeats)
     return RepeatSpotRule(
         lambda c: max(2, {'active': 2, 'rare': 3}.get(tracker._matches_patt3ch(c), 4) - fewer),
         cq_groups=True, cq_qualifiers=True, lockon=True,
         split_runs=bool(config.get('spot_rule_split_runs', False)),
         window_s=float(config.get('itila_window_sec', 60.0)),
         validation=validation, listed=listed, listed_by=calls or 'scp',
-        doubled=bool(doubled), split_up=bool(split_up))
+        doubled=bool(doubled), split_up=bool(split_up),
+        contest_words=bool(contest_words), cq_repeats=bool(cq_repeats))
 
 def _get_itila_lib():
     global _itila_lib
