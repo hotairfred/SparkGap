@@ -43,7 +43,7 @@ def test_rtty_cq_spots_after_two_minutes(monkeypatch: pytest.MonkeyPatch) -> Non
         if minute == 0:
             assert spots == []                    # one minute is one copy
     assert [c for _, c in spots] == ["KN0L"]
-    assert abs(spots[0][0] - 14095.0) < 0.1
+    assert abs(spots[0][0] - 14095.085) < 0.03          # the mark tone, as RBN reports RTTY
 
 
 @pytest.mark.skipif(not os.path.exists(LIB), reason="librtty.so not built")

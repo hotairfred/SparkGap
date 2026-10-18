@@ -1865,6 +1865,12 @@ def _rtty_calls_match(a, b):
     return False
 
 
+# RTTY spots give the mark tone's frequency, as RBN's RTTY skimmers do: the upper of the two
+# tones, 85 Hz above the centre for the standard 170 Hz shift. Candidates are found and tuned
+# by their centre; only the reported frequency moves. (JARTS 10-17/18: our centre frequencies
+# read a median 90 Hz below the RBN skimmers' on 2377 matched spots.)
+RTTY_MARK_HZ = 85.0
+
 # RTTY contest sub-bands per band, as offset (Hz) from band center.
 # Centers in our config are 3590/7090/14090/21090/28090 kHz.
 RTTY_RANGES = {
@@ -1977,7 +1983,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
             rtty_lib.rtty_free(h)
         if not text:
             continue
-        rf_khz = (band_center_khz * 1000.0 + off_hz) / 1000.0
+        rf_khz = (band_center_khz * 1000.0 + off_hz + RTTY_MARK_HZ) / 1000.0     # mark tone
         log.info("RTTY %s @ %.1f kHz (%.0f dB): %s", bn, rf_khz, snr_db, text[:80])
         w = rule.window_id(int(round(rf_khz * 10)), int(now // 60), now)
         for call, sf in rule.feed(w, rf_khz, text, now, snr=snr_db):
@@ -2167,10 +2173,11 @@ def _rtty_scan_band(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
                 continue
 
             skimmer._rtty_emitted[key] = now
+            mark_khz = (rf_hz + RTTY_MARK_HZ) / 1000.0
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***",
-                     rf_hz / 1000.0, call, int(snr_db), text[:50])
+                     mark_khz, call, int(snr_db), text[:50])
             skimmer.telnet.broadcast_spot(
-                freq_khz=skimmer._corrected_freq_khz(rf_hz / 1000.0),
+                freq_khz=skimmer._corrected_freq_khz(mark_khz),
                 dx_call=call,
                 snr=int(snr_db),
                 mode='RTTY',
