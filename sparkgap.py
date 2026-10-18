@@ -2005,7 +2005,8 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         # runner's 100 Hz bin can change between two.
         rule = skimmer._rtty_rule = RepeatSpotRule(
             lambda c: {'active': 2, 'rare': 3}.get(trk._matches_patt3ch(c), 4),
-            cq_groups=True, lockon=True, window_s=30.0)
+            cq_groups=True, lockon=True, window_s=30.0,
+            fragments=skimmer.cfg.get('rtty_spot_rule_fragments') or None)
     iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
     cands = _rtty_candidates(iq, *rng)[:int(skimmer.cfg.get('rtty_max_candidates', 40))]
     if not cands:
