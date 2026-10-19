@@ -766,6 +766,27 @@ def test_fragments_piece_of_a_longer_call_waits() -> None:
         RepeatSpotRule(_tier2, fragments="even,any")
 
 
+def test_fragments_short_call_spots_once_the_longer_one_ages_out() -> None:
+    """The wait lasts only while the longer call has copies near the frequency (REPEAT_S): a real short
+    call there (K1V after K1VUT has gone) spots once those copies age out."""
+    from spot_rule import REPEAT_S
+    for opt in ("any", "even"):
+        r = RepeatSpotRule(_tier2, cq_groups=True, fragments=opt)
+        r.feed(0, 14024.0, "CQ TEST K1VUT K1VUT", 0.0)
+        r.feed(1, 14024.0, "CQ TEST K1VUT K1VUT", 60.0)
+        held = r.feed(2, 14024.0, "CQ TEST K1V", 120.0) + r.feed(3, 14024.0, "CQ TEST K1V", 180.0)
+        assert ("K1V", 14024.0) not in held
+        t = 60.0 + REPEAT_S + 1.0
+        got = r.feed(4, 14024.0, "CQ TEST K1V", t) + r.feed(5, 14024.0, "CQ TEST K1V", t + 60.0)
+        assert ("K1V", 14024.0) in got, opt
+
+
+def test_fragments_option_must_be_text() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="fragments takes"):
+        RepeatSpotRule(_tier2, fragments=True)
+
+
 def test_fragments_by_config() -> None:
     import sparkgap
     tracker = sparkgap.SpotTracker(set(SCP), set())

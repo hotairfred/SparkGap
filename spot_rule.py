@@ -429,6 +429,8 @@ class RepeatSpotRule:
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
         self.contest_words = contest_words      # CWT K5AX opens a group as CQ CWT K5AX does
         self.cq_repeats = cq_repeats            # CQ CWT N1DC CQ CWT N1DC is two copies
+        if fragments is not None and not isinstance(fragments, str):
+            raise ValueError(f"fragments takes 'even' or 'any', and/or 'stray', got {fragments!r}")
         opts = set((fragments or '').split(',')) - {''}
         if not opts <= {'even', 'any', 'stray'} or {'even', 'any'} <= opts:
             raise ValueError(f"fragments takes 'even' or 'any', and/or 'stray', got {fragments!r}")
