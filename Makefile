@@ -84,6 +84,15 @@ dispatcher-test: cw_dispatcher_test cw_dispatcher_pfb_test
 	@echo
 	LD_LIBRARY_PATH=. ./cw_dispatcher_pfb_test
 
+# FT8: decode_ft8 from Karlis Goba's ft8_lib (MIT), fetched and built beside sparkgap.py.
+# sparkgap finds it there; config ft8_decoder points elsewhere.
+FT8_LIB_URL ?= https://github.com/kgoba/ft8_lib
+ft8: ft8_lib/decode_ft8
+
+ft8_lib/decode_ft8:
+	test -d ft8_lib || git clone --depth 1 $(FT8_LIB_URL) ft8_lib
+	$(MAKE) -C ft8_lib decode_ft8
+
 clean:
 	rm -f $(OBJECTS) csdr-cwskimmer csdr-rttyskimmer \
 	      libcw_dispatcher.so \

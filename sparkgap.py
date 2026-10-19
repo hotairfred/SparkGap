@@ -465,6 +465,16 @@ def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
 
 CW_TONE = 700       # Hz — matches natural tone placement from channelizer
 DECODER_RATE = 12000  # UHSDR decoder sample rate
+FT8_DECODER_BUILT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ft8_lib', 'decode_ft8')
+FT8_DECODER_OLD = '/home/sparkgap/decode_ft8'   # where WF8Z's install has it
+
+
+def _ft8_decoder(cfg):
+    """Path of decode_ft8 (Karlis Goba's ft8_lib, MIT): config ft8_decoder, else the copy
+    `make ft8` builds beside sparkgap.py, else the original install path."""
+    if cfg.get('ft8_decoder'):
+        return cfg['ft8_decoder']
+    return FT8_DECODER_BUILT if os.path.exists(FT8_DECODER_BUILT) else FT8_DECODER_OLD
 BMORSE_RATE = 4000    # bmorse input sample rate
 PEAK_SCAN_SAMPLES = 8192    # live peak scan FFT; the Python receive path keeps only this much IQ
 RECORD_WAV_MAX_BYTES = 4_000_000_000    # under the WAV format's 2**32 - 1 byte limit
@@ -7607,8 +7617,9 @@ class SparkGap:
                     # for free), so allocate it if EITHER is enabled.
                     enable_ft8  = bool(self.cfg.get('enable_ft8',  True))
                     enable_rtty = bool(self.cfg.get('enable_rtty', True))
-                    if enable_ft8 and not os.path.exists('/home/sparkgap/decode_ft8'):
-                        log.warning("enable_ft8 is on but /home/sparkgap/decode_ft8 is missing; FT8 decode will fail")
+                    if enable_ft8 and not os.path.exists(_ft8_decoder(self.cfg)):
+                        log.warning("enable_ft8 is on but %s is missing (make ft8, or set ft8_decoder); "
+                                    "FT8 decode will fail", _ft8_decoder(self.cfg))
                     if enable_ft8 or enable_rtty or self._iq_rec is not None:
                         FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
                                      14090: 14074, 18083: 18100,
@@ -8184,7 +8195,7 @@ class SparkGap:
                             import subprocess, wave
                             from scipy.signal import resample_poly
                             from numpy.fft import fft, ifft
-                            ft8_bin = '/home/sparkgap/decode_ft8'
+                            ft8_bin = _ft8_decoder(skimmer.cfg)
                             total = 0
                             seen_msgs = set()  # dedupe across sliding windows
                             for bn, ri, ck, ft8_khz, fi, fq, n in (jobs if enable_ft8 else []):

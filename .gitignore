@@ -57,3 +57,4 @@ comms.md
 # Aggregator on a Win box; the sanctioned Linux path is an open
 # conversation with RBN admins.
 rbn_auth.py
+ft8_lib/
