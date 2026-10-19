@@ -685,7 +685,9 @@ static int process_bin(ItilaSc *sc, ScBin *b, const double *i_full, const double
 }
 
 /* Stage 1 from the shared FFT: one block of a bin.  The fNd FFT bins around the bin, times the
- * mask, inverse FFT; the first fP/dec1 outputs are the overlap and are dropped.  The block FFT
+ * mask, inverse FFT.  The mask is zero-phase, so an output needs input on both sides of it: half
+ * the overlap (fP/2) is dropped at each end of the block, else the last outputs wrap around to
+ * the start of the block (a strong carrier nearby then leaks a burst every block).  The block FFT
  * mixes by k0 FFT bins relative to blk_start, so a phase term makes the mix continuous from
  * block to block; the residual (under half an FFT bin) is mixed out at 12 kHz by the bin's
  * oscillator, after the mask, which is flat far beyond it. */
@@ -712,13 +714,13 @@ static int process_bin_fft(ItilaSc *sc, ScBin *b, int slot, double *yr, double *
     double c_step = cos(step), s_step = sin(step);
     double cp = b->c_phase, sp = b->s_phase;
     int drops = 0;
-    int t0 = sc->fP / sc->dec1;
+    int t0 = sc->fP / sc->dec1 / 2, t1 = Nd - t0;                  /* half the overlap off each end */
     int64_t first = sc->ring_a[slot] + (int64_t)t0 * sc->dec1;     /* input sample of output t0 */
     if (first < b->start_in) {                                     /* pre-roll starts mid-block */
         int64_t skip = (b->start_in - first + sc->dec1 - 1) / sc->dec1;
-        t0 = skip >= Nd - t0 ? Nd : t0 + (int)skip;
+        t0 = skip >= t1 - t0 ? t1 : t0 + (int)skip;
     }
-    for (int t = t0; t < Nd; t++) {
+    for (int t = t0; t < t1; t++) {
         double zr = yr[t], zi = -yi[t];
         double ar = zr*pc - zi*ps, ai = zr*ps + zi*pc;
         double s1_i = ar*cp - ai*sp, s1_q = ar*sp + ai*cp;
@@ -963,7 +965,8 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     sc->fft_front = !(fir1_env && fir1_env[0] == '1');
     if (sc->fft_front) {
         /* 11.7 Hz FFT bins at every rate; 1024 bins = 12 kHz per bin; 64 output samples of overlap
-         * (5.3 ms) hold the mask's impulse response; 960 new 12 kHz samples per block. */
+         * (5.3 ms), 32 dropped at each end, hold the zero-phase mask's impulse response on both
+         * sides; 960 new 12 kHz samples per block, 2.7 ms behind the input. */
         sc->fNd = 1024;
         sc->fN  = sc->fNd * sc->dec1;
         sc->fP  = 64 * sc->dec1;
@@ -995,8 +998,8 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
             double f = fabs((m < sc->fNd / 2 ? m : m - sc->fNd) * df);
             sc->fH[m] = f <= 4800.0 ? 1.0 : f >= 6000.0 ? 0.0 : 0.5 * (1.0 + cos(M_PI * (f - 4800.0) / 1200.0));
         }
-        sc->blk_n = sc->fP;              /* the first block's overlap is silence */
-        sc->blk_start = -sc->fP;
+        sc->blk_n = sc->fP / 2;          /* silence before input sample 0: the first output is sample 0 */
+        sc->blk_start = -sc->fP / 2;
     }
 
     return sc;

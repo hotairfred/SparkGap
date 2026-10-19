@@ -42,7 +42,8 @@ def _scanner(fir1: bool):
     return lib, h
 
 
-def _keyed_iq(seconds: float = 12.0) -> tuple[np.ndarray, np.ndarray]:
+def _keyed_iq(seconds: float = 12.0, carrier_db: float = 0.0, carrier_hz: float = 12000.0,
+              noise: float = 30.0) -> tuple[np.ndarray, np.ndarray]:
     """A keyed CW tone 61.937 kHz below centre (off the FFT grid) plus a steady carrier 12 kHz above it, in noise."""
     rng = np.random.default_rng(1)
     n = int(seconds * FS)
@@ -51,9 +52,9 @@ def _keyed_iq(seconds: float = 12.0) -> tuple[np.ndarray, np.ndarray]:
     pattern = np.array([1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0])
     key = pattern[(t / dit).astype(int) % len(pattern)].astype(float)
     f1 = 14028063.0 - CENTER
-    sig = 3000.0 * key * np.exp(2j * np.pi * f1 * t) + 3000.0 * np.exp(2j * np.pi * (f1 + 12000.0) * t)
-    noise = 30.0 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
-    z = sig + noise
+    carrier = 3000.0 * 10 ** (carrier_db / 20)
+    sig = 3000.0 * key * np.exp(2j * np.pi * f1 * t) + carrier * np.exp(2j * np.pi * (f1 + carrier_hz) * t)
+    z = sig + noise * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
     return np.ascontiguousarray(z.real), np.ascontiguousarray(z.imag)
 
 
@@ -80,8 +81,9 @@ def test_fft_front_matches_fir1_envelopes() -> None:
     assert old and set(old) == set(new)
     keyed = 0
     for f in old:
-        a, b = old[f], new[f]
-        assert a.shape == b.shape
+        n = min(old[f].shape[1], new[f].shape[1])     # the FFT path is 2.7 ms behind: one block fewer may finish
+        assert abs(old[f].shape[1] - new[f].shape[1]) <= 16
+        a, b = old[f][:, :n], new[f][:, :n]
         for path in range(2):
             x, y = a[path][400:], b[path][400:]         # skip the filters' start-up
             if np.percentile(x, 95) < 10 * np.percentile(x, 10) or np.percentile(x, 95) < 1000:
@@ -99,3 +101,18 @@ def test_fft_front_drops_the_12_khz_alias() -> None:
     f = min(old, key=lambda k: abs(k - 14028063.0))
     up_old, up_new = np.percentile(old[f][0][400:], 10), np.percentile(new[f][0][400:], 10)
     assert up_new < up_old
+
+
+@pytest.mark.parametrize("offset_hz", [700.0, 1500.0, 3000.0])
+def test_strong_carrier_does_not_leak_into_key_up_gaps(offset_hz: float) -> None:
+    """A carrier 60 dB above a weak keyed signal and 0.7 to 3 kHz from it: the weak signal's key-up gaps
+    stay at the noise floor on both paths (a zero-phase mask with the overlap dropped at one end only
+    wrapped the carrier into the last outputs of every block, a burst every 80 ms; hotairfred/SparkGap#66)."""
+    i, q = _keyed_iq(carrier_db=60.0, carrier_hz=offset_hz, noise=3.0)
+    old, new = _run(True, i, q), _run(False, i, q)
+    f = min(old, key=lambda k: abs(k - 14028063.0))
+    assert abs(f - 14028063.0) < 50.0 and f in new
+    for env in (old[f][0][400:], new[f][0][400:]):
+        assert np.percentile(env, 95) > 100 * np.percentile(env, 20)   # key-down >= 40 dB above the gaps
+    up_old, up_new = np.percentile(old[f][0][400:], 20), np.percentile(new[f][0][400:], 20)
+    assert up_new < 2.0 * up_old + 1e-9                               # gaps no more than 3 dB above FIR1's
