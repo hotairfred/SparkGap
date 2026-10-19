@@ -409,7 +409,8 @@ class RepeatSpotRule:
                  validation: str | None = None,
                  listed: Callable[[str], bool] | None = None, listed_by: str = "scp",
                  contest_words: bool = False, cq_repeats: bool = False,
-                 fragments: str | None = None) -> None:
+                 fragments: str | None = None, owned_windows: int = 1,
+                 owned_khz: float = NEAR_KHZ) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -436,6 +437,8 @@ class RepeatSpotRule:
             raise ValueError(f"fragments takes 'even' or 'any', and/or 'stray', got {fragments!r}")
         self.fragments = 'even' if 'even' in opts else 'any' if 'any' in opts else None
         self.stray = 'stray' in opts                            # TEST K1V U T: no copy of K1V
+        self.owned_windows = max(1, int(owned_windows))          # another call on an owned frequency: windows needed
+        self.owned_khz = float(owned_khz)                        # ... within this of the owner's frequency
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
@@ -489,6 +492,10 @@ class RepeatSpotRule:
                 continue          # a call one edit away has as many copies here: undecided
             elif counts[call] < self.tier(call):
                 continue
+            if (self.owned_windows > 1 and (own := self.owner(freq_khz, now)) is not None and own != call
+                    and any(o[0] == own and abs(o[1] - freq_khz) <= self.owned_khz for o in self._owners)
+                    and len({c.window for c in near if c.call == call}) < self.owned_windows):
+                continue          # owned by another call: one garbled runner window names a caller (WX7V, MST 10-19)
             if self.fragments and any(_fragment(call, other)
                                       and k >= (counts[call] if self.fragments == 'even' else 1)
                                       for other, k in counts.items()):

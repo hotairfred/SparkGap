@@ -1846,7 +1846,8 @@ def _make_spot_rule(config, tracker, local=None):
         validation=validation, listed=listed, listed_by=calls or 'scp',
         doubled=bool(doubled), split_up=bool(split_up),
         contest_words=bool(contest_words), cq_repeats=bool(cq_repeats),
-        fragments=config.get('spot_rule_fragments') or None)
+        fragments=config.get('spot_rule_fragments') or None,
+        owned_windows=int((local or {}).get('owned_windows', config.get('spot_rule_owned_windows', 1)) or 1))
 
 def _get_itila_lib():
     global _itila_lib

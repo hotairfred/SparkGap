@@ -793,3 +793,20 @@ def test_fragments_by_config() -> None:
     assert sparkgap._make_spot_rule({}, tracker).fragments is None
     r = sparkgap._make_spot_rule({"spot_rule_fragments": "any,stray"}, tracker)
     assert r.fragments == "any" and r.stray
+
+
+def test_owned_windows_holds_a_caller_named_in_one_window() -> None:
+    """owned_windows 2: on a frequency K2JVB owns, one window where its call is garbled and a caller
+    follows CQ (CQ A W5YE W5YE 55N NY) does not spot W5YE; the owner's own copies are unaffected,
+    and a real new operator spots after a second window (WX7V's MST 10-19 case)."""
+    def rule(ow):
+        return RepeatSpotRule(_tier2, cq_groups=True, lockon=True, validation="normal",
+                              listed=lambda c: c in {"W5YE", "K2JVB"}, owned_windows=ow)
+    for ow, expect_one, expect_two in ((1, True, True), (2, False, True)):
+        r = rule(ow)
+        r.feed(r.window_id(1, 0, 0.0), 7053.0, "CQ CQ DE K2JVB K2JVB K", 0.0)
+        r.feed(r.window_id(1, 1, 60.0), 7053.0, "CQ CQ DE K2JVB K2JVB K", 60.0)
+        one = r.feed(r.window_id(1, 2, 120.0), 7053.0, "CQ A W5YE W5YE 55N NY", 120.0)
+        assert (("W5YE", 7053.0) in one) == expect_one, ow
+        two = r.feed(r.window_id(1, 3, 180.0), 7053.0, "CQ CQ DE W5YE W5YE K", 180.0)
+        assert ((("W5YE", 7053.0) in one + two)) == expect_two, ow
