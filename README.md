@@ -86,10 +86,10 @@ Build the C libraries (`make native ARCH=native` for `-march=native`):
 make native
 ```
 
-FT8 needs `decode_ft8` from [ft8_lib](https://github.com/kgoba/ft8_lib): build it
-(`git clone https://github.com/kgoba/ft8_lib && make -C ft8_lib`) and copy the binary to
-`/home/sparkgap/decode_ft8`, or set `"enable_ft8": false`. SparkGap logs a warning at start if
-FT8 is on and the binary is missing.
+FT8 needs `decode_ft8` from [ft8_lib](https://github.com/kgoba/ft8_lib): `make ft8` fetches it
+(pinned to the commit tested) and builds it beside `sparkgap.py`. To use one elsewhere, set
+`"ft8_decoder": "/path/to/decode_ft8"`; or set `"enable_ft8": false`. SparkGap logs a warning
+at start if FT8 is on and the decoder is missing.
 
 Pitaya: install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/)
 firmware and make sure it's reachable on your LAN.
