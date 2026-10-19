@@ -33,6 +33,8 @@ def test_ranges_and_digital_windows() -> None:
     assert sparkgap._rtty_range({}, 7050) == (-25000.0, 75000.0)   # any 40m centre: absolute kHz ranges
     assert sparkgap._in_digital_window(14075.2) and sparkgap._in_digital_window(7076.9)
     assert not sparkgap._in_digital_window(14085.0) and not sparkgap._in_digital_window(7065.0)
+    # FT4 dials are RTTY territory in contests: no exclusion there
+    assert not sparkgap._in_digital_window(14082.0) and not sparkgap._in_digital_window(7048.5)
     assert sparkgap.RTTY_MAX_CANDIDATES == 100
 
 

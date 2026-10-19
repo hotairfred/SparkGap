@@ -1957,9 +1957,10 @@ RTTY_RANGES_KHZ = {
     '10m': (28060.0, 28150.0),
 }
 RTTY_MAX_CANDIDATES = 100      # per band per minute (config rtty_max_candidates)
-# FT8, FT4 and JS8 dials (kHz): each dial and 3 kHz above it is no RTTY, so no candidate there.
-DIGITAL_DIALS_KHZ = (3573.0, 3575.5, 7047.5, 7074.0, 7078.0, 14074.0, 14078.0, 14080.0,
-                     21074.0, 21078.0, 21140.0, 28074.0, 28078.0, 28180.0)
+# FT8 and JS8 dials (kHz): each dial and 3 kHz above it is no RTTY, so no candidate there.
+# FT4 dials are not excluded: RTTY contest stations sit in them (7047.5, 14080), and on the PA
+# and JARTS recordings excluding them lost 2 confirmed calls each and removed no junk.
+DIGITAL_DIALS_KHZ = (3573.0, 7074.0, 7078.0, 14074.0, 14078.0, 21074.0, 21078.0, 28074.0, 28078.0)
 
 
 def _rtty_range(cfg, band_center_khz):
