@@ -70,9 +70,6 @@
     "recent_band_floor": {
         "window_sec":    3600,
         "min_spotters":  2,
-        "peers": [
-            {"label": "SDC", "host": "192.168.1.205",         "port": 7373},
-            {"label": "RBN", "host": "telnet.reversebeacon.net","port": 7000}
-        ]
+        "peers": []
     }
 }

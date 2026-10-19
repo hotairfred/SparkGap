@@ -4,6 +4,11 @@ sparkgap's CW (and FT8/PSKReporter) spots can be relayed directly to
 the Reverse Beacon Network without going through Aggregator on a
 Windows box.  This document describes how.
 
+
+> **Not yet authorized.** SparkGap may not connect to RBN until it passes the test criteria the
+> RBN team has set (#49), including identifying itself by name and version. Until then keep
+> `rbn_feeder.py` off. What follows describes the feeder for when that work is done.
+
 ## Architecture
 
 ```

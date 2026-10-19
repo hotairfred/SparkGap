@@ -18,16 +18,17 @@ Measured on our own recordings, replayed through the production receiver path an
 against what other RBN skimmers reported at the same time:
 
 - **Precision.** About 95% of the calls SparkGap spots are also spotted by another RBN skimmer
-  within 1 kHz, across 7 recordings (CWTs, an MST, the PA QSO Party, quiet overnights). CW
+  within 1 kHz, across 7 recordings (CWTs, an MST, the PA QSO Party, quiet overnights; the
+  tables are in #61 and #67). CW
   Skimmer nodes nearby run about 95 to 98% on the same measure. The rest are a mix of real stations
   nobody else heard and busts, mostly calls cut short (K1V for K1VUT), which current decoder
   work targets.
 - **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings, SparkGap spots
-  1.6 to 1.9 times as many calls and catches about 70% of that node's calls.
+  1.6 to 1.9 times as many calls and catches about 70% of that node's calls (#43).
 - **Copy on known text.** Character error on three W1AW code-practice clips: 3.1, 3.7 and
   1.9% (`docs/ITILA2.md`; CW Skimmer copies the same audio nearly perfectly).
 - **Cost.** 8 bands at 192 kHz with FT8 and RTTY take about 2.2 cores of a 35 W i5-9500T with
-  `itila_decode_threads: 4`.
+  `itila_decode_threads: 4` (profile in #59).
 
 These are calibration on our station, not a contest result. The harness to reproduce them is
 in `tools/eval/` and `tools/sim/`.
@@ -46,23 +47,26 @@ in `tools/eval/` and `tools/sim/`.
   CQ qualifiers (`CQ PA`, `CQ FD`). Callers are never spotted.
 - **RTTY.** RTTY signals are found in each band's RTTY segment and decoded once a minute, with
   the same repeat rule.
-- **FT8.** Decoded on each band's FT8 frequency and uploaded to PSKReporter
+- **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
+  [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`).
-- **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format, so loggers,
-  clusters and Aggregator can read them; `rbn_feeder.py` uploads to RBN directly (keep it off
-  until the RBN criteria above are passed).
+- **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format (RTTY lines as
+  RTTY Skimmer Server writes them), so loggers, clusters and Aggregator can read them; an
+  optional second port for your own use with its own, looser spot rule (see the quick start);
+  `rbn_feeder.py` uploads CQ-tagged spots to RBN directly (keep it off until the RBN criteria
+  above are passed).
+- **Options for the spot rule**, all off by default: a validation score using calls RBN
+  skimmers have heard and the SKCC roster (`spot_validation`, `docs/ITILA2.md`), split DX
+  signing `TU <call> UP` (`spot_rule_split_up`), back-to-back CQs counted each
+  (`spot_rule_cq_repeats`), `CWT <call>` without CQ (`spot_rule_contest_words`), and pieces of
+  longer calls held back (`spot_rule_fragments`).
+- **SparkGap Web**, a read-only browser console with waterfall, call ladder and live decode
+  text (`gui_feed`, `docs/CONSOLE.md`).
 - **Tools.** An all-band IQ recorder (`iq_recorder.py`), a proxy that replays recordings as an
   HPSDR radio (`hpsdr_proxy.py`), file-mode replay, a band simulator with exact ground truth
   (`tools/sim/`), and scoring against the RBN archive (`tools/eval/rbn_confirm.py`).
 
-### Coming (open pull requests)
-
-- A second telnet port for your own use with a looser spot rule; the RBN port stays as it is
-  (#46).
-- RTTY spots in RTTY Skimmer Server's format and CQ-only uploads to RBN (#44).
-- Split DX signing `TU <call> UP` (#50, off by default).
-- SparkGap Web, a read-only browser console with waterfall and live decode text (#51).
-- A validation score using calls RBN skimmers have heard and the SKCC roster (#52).
+Work in progress is in the [open pull requests](https://github.com/hotairfred/SparkGap/pulls).
 
 ## Quick start (Linux, Red Pitaya 125-14)
 
@@ -81,6 +85,11 @@ Build the C libraries (`make native ARCH=native` for `-march=native`):
 ```
 make native
 ```
+
+FT8 needs `decode_ft8` from [ft8_lib](https://github.com/kgoba/ft8_lib): build it
+(`git clone https://github.com/kgoba/ft8_lib && make -C ft8_lib`) and copy the binary to
+`/home/sparkgap/decode_ft8`, or set `"enable_ft8": false`. SparkGap logs a warning at start if
+FT8 is on and the binary is missing.
 
 Pitaya: install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/)
 firmware and make sure it's reachable on your LAN.
@@ -102,6 +111,9 @@ Configure: copy `sk_5band.json` and edit at least:
 }
 ```
 
+`recent_band_floor.peers` ships empty. Any spot source you add there (another cluster on your
+LAN, RBN's telnet) is connected at start even with `gate_recent_band_floor` off.
+
 `cw_decoder: itila2` (the default) is the current decoder with the repeat spot rule;
 `cw_decoder: itila` selects the original chain (see *History*).
 
@@ -116,6 +128,22 @@ Connect to the spot stream:
 ```
 telnet localhost 7300
 ```
+
+Port 7300 (`telnet_port`) carries the RBN-grade spots, the same stream `rbn_feeder.py`
+uploads. If you want your own spots filtered differently, for example a looser rule for your
+cluster or logger, add a second port with its own rule:
+
+```json
+"telnet_local_port": 7301,
+"local_spot_rule": {"doubled_calls": true, "split_up": true, "fewer_repeats": 0}
+```
+
+`split_up` also spots DX working split from its sign-offs (`TU CY0S UP`), which CW Skimmer
+does not do. Both port numbers are yours to pick (`--port` and `--local-port` override them).
+Tweaks to `local_spot_rule` change only the local port; what goes to RBN stays the same.
+Without `local_spot_rule`, 7301 carries the same spots as 7300. FT8 and RTTY go to both ports.
+The local rule can also set its own `validation`, `validation_calls`, `cq_repeats` and
+`contest_words`; without them it follows the top-level keys.
 
 **FlexRadio:** copy `skimmer_flex.example.json`; it uses a DAX-IQ channel, so CW Skimmer can
 keep another channel on the same radio.
@@ -165,7 +193,7 @@ GPLv3. See `LICENSE`.
 
 - Fred Krause, **WF8Z** (EM79SM), project owner. Contact info is on QRZ.
 - Chris White, **WX7V**: the itila2 decoder and scanner, the repeat spot rule, the FlexRadio
-  path and the console.
+  path and SparkGap Web.
 
 ## History
 
