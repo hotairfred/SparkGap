@@ -58,7 +58,8 @@ def _clear():
 def test_borderline_gap_keeps_a_known_call_whole() -> None:
     env = _env(5.0)
     assert "K1V UT" in _decode(env)                       # no list: the fragment bust
-    assert lib.itila_set_known_calls(b"K1VUT\nW1AW\nK1VUT", 17, 2.0) == 2
+    buf = b"K1VUT\nW1AW\nK1VUT"
+    assert lib.itila_set_known_calls(buf, len(buf), 2.0) == 2
     assert "K1VUT K1VUT" in _decode(env)
 
 
@@ -82,3 +83,10 @@ def test_short_calls_earn_no_bonus() -> None:
     whole = _decode(env)
     lib.itila_set_known_calls(b"K1V", 3, 4.0)
     assert _decode(env) == whole
+
+
+def test_missing_known_calls_file_turns_the_prior_off(tmp_path) -> None:
+    """A missing itila_known_calls file logs a warning and leaves the prior off; start goes on."""
+    import sparkgap
+    cfg = {"itila_known_calls": str(tmp_path / "nope.txt"), "itila_known_bonus": 2.0}
+    assert sparkgap._set_known_calls(cfg) == 0
