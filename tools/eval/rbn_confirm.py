@@ -251,6 +251,7 @@ def nearby_recall(spots: dict[str, set[float]], archive: Iterable[RbnSpot],
     skimmers, whether we spotted the call within tol_khz of any of their frequencies).
     Only CQ spots count: beacons (BEACON, NCDXF B) never send CQ, so SparkGap never spots
     them and they are no miss."""
+    archive = list(archive)                       # read twice below: a generator would come back empty
     everyone: dict[str, set[str]] = {}
     for s in archive:
         if start <= s.time <= end:

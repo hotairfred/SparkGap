@@ -172,3 +172,13 @@ def test_nearby_recall_skips_beacons() -> None:
     archive = list(parse_archive([dict(r, mode=r.get("mode", "CQ")) for r in rows]))
     rec = nearby_recall({}, archive, {"W8WWV"}, T0, T1, {"20m", "10m"})
     assert set(rec) == {"K0TQ"}
+
+
+
+def test_nearby_recall_accepts_a_generator() -> None:
+    """nearby_recall reads the archive twice; a generator must give the same result as a list."""
+    rows = [_row("W8WWV", "K0TQ", "14030.0"), _row("WT9U", "K0TQ", "14030.1"), _row("W8WWV", "K1AJ", "14041.0")]
+    near = {"W8WWV", "WT9U"}
+    as_list = nearby_recall({"K0TQ": {14030.4}}, list(parse_archive(rows)), near, T0, T1, {"20m"})
+    as_gen = nearby_recall({"K0TQ": {14030.4}}, (s for s in parse_archive(rows)), near, T0, T1, {"20m"})
+    assert as_gen == as_list and as_list
