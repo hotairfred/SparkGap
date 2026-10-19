@@ -50,6 +50,15 @@ def test_cw_spot_line_unchanged() -> None:
     assert sent[0]['s'][0][6] == '1'
 
 
+def test_cw_spot_line_without_comment_is_tagged_cq_and_uploads() -> None:
+    """The live CW path passes no comment; broadcast_spot then writes CQ, which is what the feeder
+    needs to upload it (only CQ-tagged lines go to RBN)."""
+    from rbn_feeder import uploadable
+    (line,) = _spot_lines(freq_khz=7025.5, dx_call='K4U', snr=29, wpm=21, mode='CW')
+    assert ' 29 dB 21 WPM ' in line and line.split('WPM', 1)[1].split()[0] == 'CQ'
+    assert uploadable(parse_spot(line))
+
+
 def test_only_cq_tagged_lines_upload() -> None:
     from rbn_feeder import uploadable
     cq = parse_spot(_spot_lines(freq_khz=14085.0, dx_call='KA4RRU', snr=26, wpm=45, mode='RTTY',
