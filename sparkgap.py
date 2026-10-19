@@ -1944,15 +1944,17 @@ RTTY_RANGES = {
 # 40m ran 7046 to 7074 kHz, above the 7035-7055 of RTTY_RANGES.
 RTTY_SPOT_BAUD = 45     # RTTY spots go out as "RTTY 26 dB 45 BPS CQ", as RTTY Skimmer Server sends them
 
-RTTY_RANGES_REPEAT = {
-    # Widened 2026-10-17: on the PA recording (10-10 22:00-22:30Z) RBN's RTTY skimmers spotted
-    # 165 calls within our 40m and 20m spans; the narrow ranges caught 32 and the cap of 40
-    # candidates cut 11 of 58 scans. These ranges and a cap of 100 caught 36, CPU unchanged.
-    3590:  (-15000, +15000),   # 80m: 3575-3605
-    7090:  (-65000, +35000),   # 40m: 7025-7125
-    14090: (-30000, +60000),   # 20m: 14060-14150
-    21090: (-30000, +60000),   # 15m: 21060-21150
-    28090: (-30000, +60000),   # 10m: 28060-28150
+RTTY_RANGES_KHZ = {
+    # Where RTTY is looked for, absolute kHz, so any receiver centre works (band names centre
+    # by the sample rate since #63). Widened 2026-10-17: on the PA recording (10-10 22:00-22:30Z)
+    # RBN's RTTY skimmers spotted 165 calls within our 40m and 20m spans; the narrow ranges
+    # caught 32 and the cap of 40 candidates cut 11 of 58 scans. These ranges and a cap of 100
+    # caught 36, CPU unchanged.
+    '80m': (3575.0, 3605.0),
+    '40m': (7025.0, 7125.0),
+    '20m': (14060.0, 14150.0),
+    '15m': (21060.0, 21150.0),
+    '10m': (28060.0, 28150.0),
 }
 RTTY_MAX_CANDIDATES = 100      # per band per minute (config rtty_max_candidates)
 # FT8, FT4 and JS8 dials (kHz): each dial and 3 kHz above it is no RTTY, so no candidate there.
@@ -1961,13 +1963,19 @@ DIGITAL_DIALS_KHZ = (3573.0, 3575.5, 7047.5, 7074.0, 7078.0, 14074.0, 14078.0, 1
 
 
 def _rtty_range(cfg, band_center_khz):
-    """(lo, hi) Hz from the band centre where RTTY is looked for: config rtty_ranges_repeat
-    ({"7090": [-65000, 35000], ...}) first, else RTTY_RANGES_REPEAT; None when neither has it."""
+    """(lo, hi) Hz from the band centre where RTTY is looked for, or None. Config
+    rtty_ranges_repeat overrides by band name ({"40m": [7025, 7125]}, kHz) or, as before, by
+    the receiver centre ({"7090": [-65000, 35000]}, Hz from the centre); else RTTY_RANGES_KHZ
+    for the band the receiver span covers."""
     over = cfg.get('rtty_ranges_repeat') or {}
     key = str(int(band_center_khz))
     if key in over:
         return tuple(float(x) for x in over[key])
-    return RTTY_RANGES_REPEAT.get(int(band_center_khz))
+    for name, (lo, hi) in RTTY_RANGES_KHZ.items():
+        if lo - 200.0 <= band_center_khz <= hi + 200.0:
+            lo, hi = (float(x) for x in over.get(name, (lo, hi)))
+            return ((lo - band_center_khz) * 1000.0, (hi - band_center_khz) * 1000.0)
+    return None
 
 
 def _in_digital_window(rf_khz):
@@ -1981,14 +1989,32 @@ def _rtty_split_keywords(text):
     """RTTY prints line noise between transmissions with no spaces, so a keyword runs into
     junk: EFXTEST AI4WW, CQPDE KQ4TNF. Cut CQ, TEST and DE out of any token that is not itself
     a call, so the spot rule sees the CQ group. On the PA recording: +2 to 3 calls, all
-    confirmed, none lost."""
+    confirmed, none lost. A keyword is left in place when the piece before it is call-shaped
+    and stays call-shaped with it: TESTW1ADE is TEST W1ADE, not TEST W1A DE (WX7V's review)."""
     from spot_rule import CALL_RE
     out = []
     for tok in text.split():
         if CALL_RE.fullmatch(tok) or _RTTY_KEYWORD.fullmatch(tok) or not _RTTY_KEYWORD.search(tok):
             out.append(tok)
-        else:
-            out.extend(p for p in _RTTY_KEYWORD.split(tok) if p)
+            continue
+        parts = [p for p in _RTTY_KEYWORD.split(tok) if p]
+        merged = []
+        i = 0
+        while i < len(parts):
+            p = parts[i]
+            if merged and _RTTY_KEYWORD.fullmatch(p) and CALL_RE.fullmatch(merged[-1]):
+                nxt = parts[i + 1] if i + 1 < len(parts) and not _RTTY_KEYWORD.fullmatch(parts[i + 1]) else ''
+                if nxt and CALL_RE.fullmatch(merged[-1] + p + nxt):
+                    merged[-1] += p + nxt
+                    i += 2
+                    continue
+                if CALL_RE.fullmatch(merged[-1] + p):
+                    merged[-1] += p
+                    i += 1
+                    continue
+            merged.append(p)
+            i += 1
+        out.extend(merged)
     return ' '.join(out)
 
 

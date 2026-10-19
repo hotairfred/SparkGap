@@ -30,7 +30,41 @@ def test_glued_cq_now_spots_and_a_caller_still_does_not() -> None:
 def test_ranges_and_digital_windows() -> None:
     assert sparkgap._rtty_range({}, 7090) == (-65000, 35000)
     assert sparkgap._rtty_range({"rtty_ranges_repeat": {"7090": [-50000, -10000]}}, 7090) == (-50000.0, -10000.0)
-    assert sparkgap._rtty_range({}, 7050) is None
+    assert sparkgap._rtty_range({}, 7050) == (-25000.0, 75000.0)   # any 40m centre: absolute kHz ranges
     assert sparkgap._in_digital_window(14075.2) and sparkgap._in_digital_window(7076.9)
     assert not sparkgap._in_digital_window(14085.0) and not sparkgap._in_digital_window(7065.0)
     assert sparkgap.RTTY_MAX_CANDIDATES == 100
+
+
+def test_keyword_split_keeps_a_call_whole() -> None:
+    """A keyword inside a call stays (TESTW1ADE is TEST W1ADE, not TEST W1A DE); junk still splits."""
+    from sparkgap import _rtty_split_keywords as split
+    assert split("CQ TESTW1ADE") == "CQ TEST W1ADE"
+    assert split("XQCQK1ADE CQ K1ADE") == "XQ CQ K1ADE CQ K1ADE"
+    assert split("TESTK1ABCQ") == "TEST K1ABCQ"
+    assert split("EFXTEST AI4WW") == "EFX TEST AI4WW"
+    assert split("CQPDE KQ4TNF") == "CQ P DE KQ4TNF"
+
+
+def test_keyword_split_spots_no_piece_of_the_call() -> None:
+    """Six windows of XQCQK1ADE CQ K1ADE spot K1ADE, never K1A."""
+    from sparkgap import _rtty_split_keywords as split
+    from spot_rule import RepeatSpotRule
+    r = RepeatSpotRule(lambda c: 2, cq_groups=True, lockon=True)
+    got = []
+    for k in range(6):
+        got += r.feed(k, 14085.0, split("XQCQK1ADE CQ K1ADE"), 60.0 * k)
+    calls = {c for c, f in got}
+    assert "K1A" not in calls and "K1ADE" in calls
+
+
+def test_rtty_range_any_centre() -> None:
+    """Absolute kHz ranges: a band-name centre (7076.8 kHz at 192k since #63) still finds 40m RTTY."""
+    from sparkgap import _rtty_range
+    lo, hi = _rtty_range({}, 7090)
+    assert (lo, hi) == (-65000.0, 35000.0)
+    lo, hi = _rtty_range({}, 7076.8)
+    assert abs(7076.8 + lo / 1000 - 7025.0) < 1e-6 and abs(7076.8 + hi / 1000 - 7125.0) < 1e-6
+    assert _rtty_range({}, 10118) is None
+    assert _rtty_range({"rtty_ranges_repeat": {"40m": [7030, 7100]}}, 7090) == (-60000.0, 10000.0)
+    assert _rtty_range({"rtty_ranges_repeat": {"7090": [-5000, 5000]}}, 7090) == (-5000.0, 5000.0)
