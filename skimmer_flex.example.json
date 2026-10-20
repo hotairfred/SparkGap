@@ -12,6 +12,7 @@
     "sdr_port": 4992,
     "flex_udp_port": 7791,
     "flex_daxiq_channel": 2,
+    "_comment_flex_loop": "Optional: flex_rxant (e.g. \"ANT1\"), flex_loopa / flex_loopb (true/false) are set on SparkGap's pan and slice. Leave them out to keep the radio's band setting. Set them when another receiver hangs on a receive loop: a pan or slice that comes up with the loop off switches it off for everything on that antenna (a second skimmer on RX loop B goes deaf).",
     "sample_rate": 96000,
     "bands": [
         14050000

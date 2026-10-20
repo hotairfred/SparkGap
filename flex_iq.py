@@ -175,7 +175,8 @@ class FlexIQReceiver:
     """
 
     def __init__(self, ip, freq_hz=7040000, sample_rate=192000,
-                 daxiq_channel=1, udp_port=7791, control_port=4992, station=None):
+                 daxiq_channel=1, udp_port=7791, control_port=4992, station=None,
+                 rxant=None, loopa=None, loopb=None):
         if sample_rate not in VALID_RATES:
             raise ValueError(f"sample_rate must be one of {VALID_RATES}")
         self.ip = ip
@@ -184,6 +185,13 @@ class FlexIQReceiver:
         self.sample_rate = sample_rate
         self.channel = daxiq_channel
         self._station_cfg = station  # flex_station; else SparkGap-<radio nickname>, set on connect
+        # flex_rxant / flex_loopa / flex_loopb: set on our pan and slice; None leaves the radio's
+        # (band-persistence) value.  A receive loop is shared by every pan on that antenna, so a
+        # pan that comes up with the loop off turns it off for whatever hangs on the loop.
+        self.rx_path = ''.join(f' {k}={v}' for k, v in (('rxant', rxant),
+                                                       ('loopa', None if loopa is None else int(bool(loopa))),
+                                                       ('loopb', None if loopb is None else int(bool(loopb))))
+                               if v is not None)
         self.station = station or f"{STATION_NAME}-{daxiq_channel}"
         self.client_id = ''
         self.udp_port = udp_port
@@ -426,7 +434,7 @@ class FlexIQReceiver:
                 slices = pan_slices(status, self._pan_id)
         self._report(f"pan 0x{self._pan_id:08x} center {self.freq_mhz:.6f} MHz, bandwidth {bw_mhz:.3f} MHz",
                      self._cmd(f"display pan set 0x{self._pan_id:08x} "
-                               f"center={self.freq_mhz:.6f} bandwidth={bw_mhz:.6f}"))
+                               f"center={self.freq_mhz:.6f} bandwidth={bw_mhz:.6f}{self.rx_path}"))
 
         # One slice keeps the RF path live (without one the Flex streams zeros).
         # dax=0: the default slice comes with a DAX audio channel; we need none.
@@ -454,6 +462,9 @@ class FlexIQReceiver:
                          self._cmd(f"slice set {self._slice_id} audio_mute=1"))
             self._report(f"slice {self._slice_id} not a transmit slice",   # the key must never land on it
                          self._cmd(f"slice set {self._slice_id} tx=0"))
+            if self.rx_path:                  # the slice carries its own copy of the loop settings
+                self._report(f"slice {self._slice_id}{self.rx_path}",
+                             self._cmd(f"slice set {self._slice_id}{self.rx_path}"))
         all_slices, _ = owned_objects(self._cmd("sub slice all", settle=0.3), handle)
         extra = all_slices - {self._slice_id} if self._slice_id is not None else set()
         for n in sorted(extra):

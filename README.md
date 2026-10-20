@@ -146,7 +146,9 @@ The local rule can also set its own `validation`, `validation_calls`, `cq_repeat
 `contest_words`; without them it follows the top-level keys.
 
 **FlexRadio:** copy `skimmer_flex.example.json`; it uses a DAX-IQ channel, so CW Skimmer can
-keep another channel on the same radio.
+keep another channel on the same radio. If another receiver hangs on one of the radio's receive
+loops, set `flex_loopa`/`flex_loopb` (and `flex_rxant`) to match: SparkGap's pan and slice come up
+with the radio's band setting, and a loop switched off there is off for the whole antenna.
 
 **macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
 omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for
