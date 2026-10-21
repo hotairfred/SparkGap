@@ -64,3 +64,13 @@ def test_an_awkward_snapshot_length_is_padded_and_still_right() -> None:
     assert len(new) == sfft.next_fast_len(n) * 12000 // FS   # cut from the padded transform
     spec = np.abs(np.fft.fft(new))
     assert abs(np.fft.fftfreq(len(new), 1 / 12000)[np.argmax(spec)] - 1500.0) < 1.0
+
+
+def test_a_shared_minute_fft_gives_the_same_cut() -> None:
+    # the FT8 cycle makes minute_fft() once and hands it to both FT8's cut and the RTTY scan
+    rng = np.random.default_rng(3)
+    fi, fq = rng.standard_normal((2, N - 1234)).astype(np.float32) * 100
+    z = sparkgap.minute_fft(fi, fq)
+    assert len(z) == sparkgap.band_slice_12k(fi, fq, -16000.0).size * 16
+    assert np.array_equal(sparkgap.band_slice_12k(fi, fq, -16000.0, z=z),
+                          sparkgap.band_slice_12k(fi, fq, -16000.0))

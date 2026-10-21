@@ -531,20 +531,30 @@ class Ft8ClockWatch:
         return med, warn
 
 
-def band_slice_12k(fi, fq, offset_hz, half_hz=6000.0, rate=12000, fs=192000, single=True):
-    """The `rate` complex baseband of [offset_hz - half_hz, offset_hz + half_hz] of a buffer of fs IQ
-    (fi, fq), offset_hz at 0 Hz: one FFT of the buffer and a short inverse FFT of the slice, as the
-    RTTY scan cuts its candidates, instead of mixing the whole buffer and resampling it (0.83 s a
-    band-minute against 0.26 s single precision, i7-9700K). Same scale as resample_poly(mixed, 1, 16)."""
+def minute_fft(fi, fq, single=True):
+    """The FFT of a buffer of IQ (fi, fq), zero-padded to a fast length. FT8's band cut and the
+    RTTY scan both cut from it, so a band-minute needs one."""
     import scipy.fft as sfft
     # A snapshot is rarely exactly 60 s of samples, and an FFT of a length with large prime
     # factors (11,518,900 = 2^2 * 5^2 * 115189) takes 3 to 7 s instead of 0.4 s: pad with zeros
     # to the next fast length (a fraction of a second of silence at the end).
     n = sfft.next_fast_len(len(fi))
-    dt = np.complex64 if single else np.complex128
-    x = np.zeros(n, dtype=dt)
+    x = np.zeros(n, dtype=np.complex64 if single else np.complex128)
     x.real[:len(fi)], x.imag[:len(fq)] = fi, fq
-    z = sfft.fft(x, overwrite_x=True)
+    return sfft.fft(x, overwrite_x=True)
+
+
+def band_slice_12k(fi, fq, offset_hz, half_hz=6000.0, rate=12000, fs=192000, single=True, z=None):
+    """The `rate` complex baseband of [offset_hz - half_hz, offset_hz + half_hz] of a buffer of fs IQ
+    (fi, fq), offset_hz at 0 Hz: one FFT of the buffer and a short inverse FFT of the slice, as the
+    RTTY scan cuts its candidates, instead of mixing the whole buffer and resampling it (0.83 s a
+    band-minute against 0.26 s single precision, i7-9700K). Same scale as resample_poly(mixed, 1, 16).
+    z: minute_fft(fi, fq) if the caller already has it."""
+    import scipy.fft as sfft
+    if z is None:
+        z = minute_fft(fi, fq, single)
+    n = len(z)
+    dt = z.dtype
     n_out = n * rate // fs
     bin_hz = fs / n
     k0 = int(round(offset_hz / bin_hz))
@@ -2191,11 +2201,12 @@ def _rtty_candidates(iq, lo_hz, hi_hz):
     return out
 
 
-def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples):
+def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_samples, z=None):
     """rtty_spot_rule "repeat": decode every RTTY candidate of the minute and spot through
     spot_rule.RepeatSpotRule, as CW: a call spots when a CQ/TEST group names it in
     tier(call) decodes (minutes) near one frequency. Callers are never spotted. One FFT of
-    the minute; each candidate's 12 kHz audio is cut from it, not mixed from the full IQ."""
+    the minute; each candidate's 12 kHz audio is cut from it, not mixed from the full IQ. z: the
+    minute's minute_fft() when FT8 has already made it."""
     import ctypes as _ct
     rng = _rtty_range(skimmer.cfg, band_center_khz)
     if rng is None:
@@ -2224,8 +2235,8 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         return 0
     rate, audio_center = 12000, 1000.0
     import scipy.fft as sfft
-    # padded to a fast length: the minute's sample count is rarely FFT-friendly (see band_slice_12k)
-    z = sfft.fft(iq, n=sfft.next_fast_len(len(iq)))
+    if z is None:
+        z = minute_fft(fi, fq)
     n = len(z)
     n_out = n * rate // 192000
     bin_hz = 192000.0 / n
@@ -8381,11 +8392,29 @@ class SparkGap:
                             seen_msgs = set()  # dedupe across sliding windows
                             aligned = skimmer.cfg.get('ft8_windows', 'aligned') == 'aligned'
                             cycle_dts = []                 # decodes' DT, for the clock watch
+                            rtty_lib = _get_rtty_lib() if enable_rtty else None
+                            rtty_repeat = skimmer.cfg.get('rtty_spot_rule') == 'repeat'
+                            rtty_total, rtty_done = 0, set()
+
+                            def _rtty_band(bn, ck, fi, fq, n, z=None):
+                                nonlocal rtty_total
+                                rtty_done.add(bn)
+                                try:
+                                    if rtty_repeat:
+                                        rtty_total += _rtty_scan_band_repeat(
+                                            skimmer, rtty_lib, bn, ck, fi, fq, n, z=z)
+                                    else:
+                                        rtty_total += _rtty_scan_band(skimmer, rtty_lib, bn, ck, fi, fq, n)
+                                except Exception as e:
+                                    log.warning("RTTY scan %s: %s", bn, e)
+
                             for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 else []):
                                 offset_hz = (ft8_khz - ck) * 1000
+                                z = None
                                 if skimmer.cfg.get('ft8_band_cut', 'fft') == 'fft':
                                     # 12 kHz around the dial, cut from one FFT of the minute
-                                    dec12 = band_slice_12k(fi[:n], fq[:n], offset_hz).astype(np.complex128)
+                                    z = minute_fft(fi[:n], fq[:n])
+                                    dec12 = band_slice_12k(fi[:n], fq[:n], offset_hz, z=z).astype(np.complex128)
                                 else:
                                     iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                     t = np.arange(n) / 192000
@@ -8494,6 +8523,11 @@ class SparkGap:
                                                 pass
                                         log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
                                                  rf_khz, ft8_call, snr, msg)
+                                # this band's RTTY now, from the same FFT, so the minute is
+                                # transformed once and its FFT freed before the next band
+                                if rtty_lib is not None and z is not None:
+                                    _rtty_band(bn, ck, fi, fq, n, z)
+                                del z
                             if enable_ft8:
                                 watch = getattr(skimmer, '_ft8_clock', None)
                                 if watch is None:
@@ -8505,22 +8539,15 @@ class SparkGap:
                                 if warn:
                                     log.warning(warn)
                             # RTTY scan piggybacks on the same minute snapshot.
-                            # Run after FT8 so the FT8 spots flow first.
+                            # Each band was scanned right after its FT8 (sharing its FFT);
+                            # this covers bands that were not (FT8 off, or the resample cut).
                             # Independent of enable_ft8 — controlled by
                             # enable_rtty (default true for backward compat).
                             if enable_rtty:
-                                rtty_lib = _get_rtty_lib()
                                 if rtty_lib is not None:
-                                    rtty_total = 0
                                     for bn, ri, ck, ft8_khz, fi, fq, n, _t0 in jobs:
-                                        try:
-                                            scan = (_rtty_scan_band_repeat
-                                                    if skimmer.cfg.get('rtty_spot_rule') == 'repeat'
-                                                    else _rtty_scan_band)
-                                            rtty_total += scan(
-                                                skimmer, rtty_lib, bn, ck, fi, fq, n)
-                                        except Exception as e:
-                                            log.warning("RTTY scan %s: %s", bn, e)
+                                        if bn not in rtty_done:      # FT8 off, or the resample cut
+                                            _rtty_band(bn, ck, fi, fq, n)
                                     excl = ''
                                     if skimmer.cfg.get('rtty_excludes_cw'):
                                         rel = blk = 0
