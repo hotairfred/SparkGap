@@ -498,10 +498,13 @@ def band_slice_12k(fi, fq, offset_hz, half_hz=6000.0, rate=12000, fs=192000, sin
     RTTY scan cuts its candidates, instead of mixing the whole buffer and resampling it (0.83 s a
     band-minute against 0.26 s single precision, i7-9700K). Same scale as resample_poly(mixed, 1, 16)."""
     import scipy.fft as sfft
-    n = len(fi)
+    # A snapshot is rarely exactly 60 s of samples, and an FFT of a length with large prime
+    # factors (11,518,900 = 2^2 * 5^2 * 115189) takes 3 to 7 s instead of 0.4 s: pad with zeros
+    # to the next fast length (a fraction of a second of silence at the end).
+    n = sfft.next_fast_len(len(fi))
     dt = np.complex64 if single else np.complex128
-    x = np.empty(n, dtype=dt)
-    x.real, x.imag = fi, fq
+    x = np.zeros(n, dtype=dt)
+    x.real[:len(fi)], x.imag[:len(fq)] = fi, fq
     z = sfft.fft(x, overwrite_x=True)
     n_out = n * rate // fs
     bin_hz = fs / n
@@ -2154,7 +2157,9 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
     if not cands:
         return 0
     rate, audio_center = 12000, 1000.0
-    z = np.fft.fft(iq)
+    import scipy.fft as sfft
+    # padded to a fast length: the minute's sample count is rarely FFT-friendly (see band_slice_12k)
+    z = sfft.fft(iq, n=sfft.next_fast_len(len(iq)))
     n = len(z)
     n_out = n * rate // 192000
     bin_hz = 192000.0 / n
