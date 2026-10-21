@@ -110,3 +110,28 @@ def test_align_skips_to_the_recordings_second_within_the_minute():
             assert r._align_skip(6000.0 * 60 + 0.20) == 59950           # just before: wrap, 59.95 s
         finally:
             r.close()
+
+
+def test_drop_loses_bursts_but_keeps_counting_sequence_numbers():
+    import socket
+    import struct
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        # 1 s at 1 kHz, 126 samples a packet: 8 packets, seq 0..7; lose 2 of every 5
+        r = _replay(d, secs=1, realtime=False, drop=(2, 5))
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(('127.0.0.1', 0))
+        rx.settimeout(1.0)
+        try:
+            r._handle_consumer(P.COOKIE + bytes([0x04, 0x01]), rx.getsockname())
+            r.run()
+            seqs = []
+            try:
+                while True:
+                    seqs.append(struct.unpack('>I', rx.recv(2048)[4:8])[0])
+            except socket.timeout:
+                pass
+            assert seqs == [2, 3, 4, 7]
+        finally:
+            rx.close()
+            r.close()

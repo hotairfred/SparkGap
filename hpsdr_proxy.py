@@ -230,11 +230,13 @@ class WAVReplay:
     """Replay a recorded WAV file as Protocol 1 UDP to registered consumers."""
 
     def __init__(self, wav_path, listen_port=HPSDR_PORT, realtime=True,
-                 start_sec=0, end_sec=None, negate_q=False, n_rx=1, align_sec=None):
+                 start_sec=0, end_sec=None, negate_q=False, n_rx=1, align_sec=None,
+                 drop=None):
         """wav_path: one path, or a list (one per receiver; a single file is
         replicated to all n_rx receivers)."""
         self.realtime = realtime
         self.align_sec = align_sec   # recording's second within the minute at start_sec, or None
+        self.drop = drop             # (burst, every): lose `burst` packets out of each `every`, or None
         self.negate_q = negate_q
         self.n_rx = int(n_rx)
         self.spf = 504 // (6 * self.n_rx + 2)          # sample slots per USB frame
@@ -347,10 +349,11 @@ class WAVReplay:
             if self.negate_q:
                 blk[:, :, 1] *= -1.0
             pkt = _iq_packet_np(self.seq, blk)
+            lost = self.drop and self.seq % self.drop[1] < self.drop[0]
             self.seq += 1
             offset += self.SAMPLES_PER_PKT
 
-            for caddr in list(self.consumers):
+            for caddr in ([] if lost else list(self.consumers)):
                 try:
                     self.sock.sendto(pkt, caddr)
                 except OSError:
@@ -390,13 +393,17 @@ def main():
                          "recording that begins on the minute, --start 0); the replay skips up to 60 s "
                          "so the recording's minute lines up with the clock's, as FT8's aligned "
                          "windows need")
+    ap.add_argument('--drop', default=None, metavar='BURST:EVERY',
+                    help='lose BURST packets in a row out of every EVERY (WAV mode), as a lossy link '
+                         'would; the sequence numbers still count them')
     ap.add_argument('--negate-q', action='store_true',
                     help='Negate Q in replay (for WAVs recorded after hpsdr_receiver Q fix)')
     args = ap.parse_args()
 
     proxy = (WAVReplay(args.wav, args.port, realtime=not args.no_realtime,
                        start_sec=args.start, end_sec=args.end,
-                       negate_q=args.negate_q, n_rx=args.n_rx, align_sec=args.align)
+                       negate_q=args.negate_q, n_rx=args.n_rx, align_sec=args.align,
+                       drop=tuple(int(x) for x in args.drop.split(':')) if args.drop else None)
              if args.wav else
              HPSDRProxy(args.pitaya, HPSDR_PORT, args.port))
     try:
