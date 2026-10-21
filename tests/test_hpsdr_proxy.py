@@ -74,3 +74,39 @@ def test_wav_stream_matches_whole_file_read():
             got.append(part); k += 1
         got = np.concatenate(got)
         assert st.n == 3700 and np.array_equal(got, full[500:4200])
+
+
+def _replay(tmpdir, secs=120, rate=1000, **kw):
+    import wave
+    path = os.path.join(tmpdir, 'r.wav')
+    w = wave.open(path, 'wb'); w.setnchannels(2); w.setsampwidth(3); w.setframerate(rate)
+    w.writeframes(bytes(6 * secs * rate)); w.close()
+    return P.WAVReplay(path, listen_port=0, **kw)
+
+
+def test_any_start_code_with_the_iq_bit_starts_a_consumer():
+    """HPSDR protocol 1 start is a bit mask (bit 0 IQ, bit 1 bandscope): 0x03 starts IQ too."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = _replay(d)
+        try:
+            r._handle_consumer(P.COOKIE + bytes([0x04, 0x03]), ('192.0.2.7', 1024))
+            assert ('192.0.2.7', 1024) in r.consumers
+            r._handle_consumer(P.COOKIE + bytes([0x04, 0x00]), ('192.0.2.7', 1024))
+            assert not r.consumers
+            r._handle_consumer(P.COOKIE + bytes([0x04, 0x01]), ('192.0.2.8', 1024))
+            assert ('192.0.2.8', 1024) in r.consumers
+        finally:
+            r.close()
+
+
+def test_align_skips_to_the_recordings_second_within_the_minute():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = _replay(d, align_sec=0.25)
+        try:
+            assert r._align_skip(6000.0 * 60 + 10.25) == 10 * 1000      # clock at :10.25 -> 10 s in
+            assert r._align_skip(6000.0 * 60 + 0.25) == 0
+            assert r._align_skip(6000.0 * 60 + 0.20) == 59950           # just before: wrap, 59.95 s
+        finally:
+            r.close()

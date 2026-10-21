@@ -139,7 +139,7 @@ class HPSDRProxy:
             _discovery_reply(self.dn, addr)
             print(f"  Discovery from {addr[0]}", file=sys.stderr)
         elif cmd == 0x04 and len(data) > 3:
-            if data[3] == 0x01:                     # START
+            if data[3] & 0x01:                      # START: bit 0 = IQ (0x03 adds the bandscope)                     # START
                 self.consumers[addr] = time.time()
                 print(f"  +consumer {addr[0]}  ({len(self.consumers)} total)", file=sys.stderr)
                 self._upstream_start()
@@ -230,10 +230,11 @@ class WAVReplay:
     """Replay a recorded WAV file as Protocol 1 UDP to registered consumers."""
 
     def __init__(self, wav_path, listen_port=HPSDR_PORT, realtime=True,
-                 start_sec=0, end_sec=None, negate_q=False, n_rx=1):
+                 start_sec=0, end_sec=None, negate_q=False, n_rx=1, align_sec=None):
         """wav_path: one path, or a list (one per receiver; a single file is
         replicated to all n_rx receivers)."""
         self.realtime = realtime
+        self.align_sec = align_sec   # recording's second within the minute at start_sec, or None
         self.negate_q = negate_q
         self.n_rx = int(n_rx)
         self.spf = 504 // (6 * self.n_rx + 2)          # sample slots per USB frame
@@ -289,12 +290,16 @@ class WAVReplay:
             _discovery_reply(self.sock, addr, n_rx=self.n_rx)
             print(f"  Discovery from {addr[0]}", file=sys.stderr)
         elif cmd == 0x04 and len(data) > 3:
-            if data[3] == 0x01:
+            if data[3] & 0x01:                      # START: bit 0 = IQ (0x03 adds the bandscope)
                 self.consumers[addr] = time.time()
                 print(f"  +consumer {addr[0]}  ({len(self.consumers)} total)", file=sys.stderr)
             elif data[3] == 0x00:
                 self.consumers.pop(addr, None)
                 print(f"  -consumer {addr[0]}", file=sys.stderr)
+
+    def _align_skip(self, now):
+        """Frames to skip so the recording's second within the minute matches `now`'s."""
+        return int(round(((now % 60) - self.align_sec) % 60 * self.rate))
 
     def run(self):
         print("WAV replay: waiting for consumers...", file=sys.stderr)
@@ -303,9 +308,20 @@ class WAVReplay:
             if r:
                 self._handle_consumer(*self.sock.recvfrom(256))
 
-        print("Replaying...", file=sys.stderr)
         n = self.n_frames
         offset = 0
+        if self.align_sec is not None:
+            # skip into the recording so its second within the minute matches the clock's: FT8
+            # slots then land where a receiver that takes its time from the clock expects them
+            skip = min(self._align_skip(time.time()), max(0, n - 1))
+            for st in self._streams:
+                left = skip
+                while left > 0:
+                    got = len(st.take(min(left, 65536)))
+                    left -= got if got else left
+            offset = skip
+            print(f"Aligned to the clock: skipped {skip / self.rate:.2f} s of the recording", file=sys.stderr)
+        print("Replaying...", file=sys.stderr)
         nxt = time.time()
 
         while running and offset < n:
@@ -369,13 +385,18 @@ def main():
     ap.add_argument('--no-realtime', action='store_true',    help='Replay as fast as possible')
     ap.add_argument('--start', type=float, default=0, help='Start time in seconds (WAV mode)')
     ap.add_argument('--end',   type=float, default=None, help='End time in seconds (WAV mode)')
+    ap.add_argument('--align', type=float, default=None, metavar='SEC',
+                    help="the recording's second within the minute at --start (0.25 for a skimmer1 "
+                         "recording that begins on the minute, --start 0); the replay skips up to 60 s "
+                         "so the recording's minute lines up with the clock's, as FT8's aligned "
+                         "windows need")
     ap.add_argument('--negate-q', action='store_true',
                     help='Negate Q in replay (for WAVs recorded after hpsdr_receiver Q fix)')
     args = ap.parse_args()
 
     proxy = (WAVReplay(args.wav, args.port, realtime=not args.no_realtime,
                        start_sec=args.start, end_sec=args.end,
-                       negate_q=args.negate_q, n_rx=args.n_rx)
+                       negate_q=args.negate_q, n_rx=args.n_rx, align_sec=args.align)
              if args.wav else
              HPSDRProxy(args.pitaya, HPSDR_PORT, args.port))
     try:
