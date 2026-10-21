@@ -351,6 +351,7 @@ Plus the standard knobs:
 - `itila_max_bins` — concurrent bin ceiling per band (`sk_5band.json` ships at 400; 200 is conservative)
 - `scp_bypass_threshold` — sightings required for non-SCP-validated calls
 - `enable_ft8` — runs FT8 + RTTY pipelines (RTTY currently piggy-backs)
+- `ft8_windows` — `aligned` (default): two 15 s windows around each FT8 slot, placed from the snapshot's start time; `sliding`: the original, every second from 0 to 45 s, 46 decodes a band-minute
 
 ## Acknowledgments
 

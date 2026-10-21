@@ -469,6 +469,29 @@ FT8_DECODER_BUILT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ft
 FT8_DECODER_OLD = '/home/sparkgap/decode_ft8'   # where WF8Z's install has it
 
 
+FT8_SLOT_S = 15.0
+FT8_SLOT_OFFSETS_S = (-0.5, 0.5)    # windows per slot, from its start (:00/:15/:30/:45)
+
+
+def ft8_window_starts(t0, n, rate=12000, offsets=FT8_SLOT_OFFSETS_S):
+    """Start samples of the 15 s windows decoded in a buffer of n samples whose first sample was
+    taken at wall time t0: one per offset around each FT8 slot that fits. Two per slot gave 97-99%
+    of the old 1 s sliding windows' decodes for an eighth of the decode_ft8 runs (PA QSO Party
+    recording, 20m and 40m). t0 <= 0 (unknown) keeps the sliding windows, 0 to 45 s in 1 s steps."""
+    win = int(FT8_SLOT_S * rate)
+    if t0 <= 0:
+        return list(range(0, n - win + 1, rate))
+    starts = set()
+    slot = (-t0) % FT8_SLOT_S - FT8_SLOT_S        # the slot that began just before the buffer
+    while slot * rate < n:
+        for d in offsets:
+            k = max(0, int(round((slot + d) * rate)))
+            if k + win <= n:
+                starts.add(k)
+        slot += FT8_SLOT_S
+    return sorted(starts)
+
+
 def _ft8_decoder(cfg):
     """Path of decode_ft8 (Karlis Goba's ft8_lib, MIT): config ft8_decoder, else the copy
     `make ft8` builds beside sparkgap.py, else the original install path."""
@@ -8237,8 +8260,10 @@ class SparkGap:
                         take = min(n, n60)
                         fi_60 = fi[n - take:n].copy()
                         fq_60 = fq[n - take:n].copy()
+                        # wall time of fi_60[0]: the swap's first sample plus what was cut
+                        t0 = t_first.value + (n - take) / 192000.0 if t_first.value > 0 else 0.0
                         ft8_jobs.append((bn, ri, ck, ft8_khz,
-                                         fi_60, fq_60, take))
+                                         fi_60, fq_60, take, t0))
                     if ft8_jobs:
                         def _ft8_decode(jobs, skimmer):
                             # Whatever goes wrong in a cycle, the next minute must run.
@@ -8261,7 +8286,8 @@ class SparkGap:
                             ft8_bin = _ft8_decoder(skimmer.cfg)
                             total = 0
                             seen_msgs = set()  # dedupe across sliding windows
-                            for bn, ri, ck, ft8_khz, fi, fq, n in (jobs if enable_ft8 else []):
+                            aligned = skimmer.cfg.get('ft8_windows', 'aligned') == 'aligned'
+                            for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 else []):
                                 iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                 offset_hz = (ft8_khz - ck) * 1000
                                 t = np.arange(n) / 192000
@@ -8269,11 +8295,10 @@ class SparkGap:
                                 # 192k → 12k complex via polyphase
                                 dec12 = resample_poly(mixed, 1, 16)
                                 slot_n = 15 * 12000
-                                # SLIDING window — slot start every 1 second.
-                                # Fixed sub-periods miss decodes due to FT8 transmission
-                                # offset (~0.5s past minute boundary) — we sweep 0–45s
-                                # in 1s steps to align with whatever the actual TX boundary is.
-                                for start in range(0, len(dec12) - slot_n + 1, 12000):
+                                # Windows from the snapshot's start time: two around each slot
+                                # (ft8_windows "aligned"), or every second from 0 to 45 s
+                                # ("sliding", the original, for a buffer whose time is unknown).
+                                for start in ft8_window_starts(t0 if aligned else 0.0, len(dec12)):
                                     chunk = dec12[start:start+slot_n]
                                     if len(chunk) < slot_n:
                                         continue
@@ -8379,7 +8404,7 @@ class SparkGap:
                                 rtty_lib = _get_rtty_lib()
                                 if rtty_lib is not None:
                                     rtty_total = 0
-                                    for bn, ri, ck, ft8_khz, fi, fq, n in jobs:
+                                    for bn, ri, ck, ft8_khz, fi, fq, n, _t0 in jobs:
                                         try:
                                             scan = (_rtty_scan_band_repeat
                                                     if skimmer.cfg.get('rtty_spot_rule') == 'repeat'
