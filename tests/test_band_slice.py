@@ -54,14 +54,13 @@ def test_single_and_double_precision_agree() -> None:
 
 
 def test_an_awkward_snapshot_length_is_padded_and_still_right() -> None:
-    import time
     n = 1151890                                       # like a live 60 s swap, with a large prime factor (115189)
     t = np.arange(n) / FS
     x = 1000.0 * np.exp(2j * np.pi * (-16000.0 + 1500.0) * t)
     fi, fq = x.real.astype(np.float32), x.imag.astype(np.float32)
-    c = time.process_time()
+    import scipy.fft as sfft
     new = sparkgap.band_slice_12k(fi, fq, -16000.0)
-    assert time.process_time() - c < 2.0
+    assert sfft.next_fast_len(n) != n                 # the case: this length needs padding
+    assert len(new) == sfft.next_fast_len(n) * 12000 // FS   # cut from the padded transform
     spec = np.abs(np.fft.fft(new))
     assert abs(np.fft.fftfreq(len(new), 1 / 12000)[np.argmax(spec)] - 1500.0) < 1.0
-    assert len(new) >= n * 12000 // FS                # the whole snapshot is there, padding after it

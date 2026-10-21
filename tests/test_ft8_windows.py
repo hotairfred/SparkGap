@@ -12,7 +12,8 @@ TX_S = 12.64                          # an FT8 transmission: 79 symbols of 0.16 
 def test_a_snapshot_from_quarter_past_the_minute() -> None:
     # first sample at hh:mm:00.25, as skimmer1's swaps land
     starts = sparkgap.ft8_window_starts(1792551360.25, N)
-    assert starts == [0, 3000, 171000, 183000, 351000, 363000, 531000]
+    # the :00 slot's early window would start 0.25 s before the buffer: skipped, not moved to 0
+    assert starts == [3000, 171000, 183000, 351000, 363000, 531000]
     assert all(k + WIN <= N for k in starts)
 
 
@@ -30,6 +31,12 @@ def test_every_whole_transmission_is_inside_a_window(frac: float) -> None:
         if tx0 >= 0 and tx0 + TX_S <= 60:
             assert any(s <= tx0 and s + 15 >= tx0 + TX_S for s in starts), (frac, slot)
         slot += 15
+
+
+def test_no_window_is_moved_to_the_buffer_start() -> None:
+    # a snapshot from 8 s into a slot: its early windows fall before the buffer and are skipped
+    starts = sparkgap.ft8_window_starts(1792551300.0 + 8.0, N)
+    assert 0 not in starts and all(k > 0 for k in starts)
 
 
 def test_eight_or_fewer_windows_a_minute() -> None:

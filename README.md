@@ -352,7 +352,7 @@ Plus the standard knobs:
 - `scp_bypass_threshold` — sightings required for non-SCP-validated calls
 - `enable_ft8` — runs FT8 + RTTY pipelines (RTTY currently piggy-backs)
 - `ft8_band_cut` — `fft` (default): each band's 12 kHz FT8 audio is cut from one FFT of the minute, single precision; `resample`: the original mix of the whole minute plus `resample_poly`
-- `ft8_windows` — `aligned` (default): two 15 s windows around each FT8 slot, placed from the snapshot's start time; `sliding`: the original, every second from 0 to 45 s, 46 decodes a band-minute
+- `ft8_windows` — `aligned` (default): two 15 s windows around each FT8 slot, placed from the snapshot's start time; `sliding`: the original, every second from 0 to 45 s, 46 decodes a band-minute. Aligned windows take the slots from this PC's clock and cover a transmission from about 1 s early to 2.3 s late, so keep the clock synced (NTP or chrony); a clock a second or more off loses FT8 decodes. Use `sliding` for replays unless `hpsdr_proxy.py --align` lines the recording up with the clock
 
 ## Acknowledgments
 

@@ -485,7 +485,11 @@ def ft8_window_starts(t0, n, rate=12000, offsets=FT8_SLOT_OFFSETS_S):
     slot = (-t0) % FT8_SLOT_S - FT8_SLOT_S        # the slot that began just before the buffer
     while slot * rate < n:
         for d in offsets:
-            k = max(0, int(round((slot + d) * rate)))
+            k = int(round((slot + d) * rate))
+            if k < 0:
+                if slot < 0:                   # the slot began before the buffer: no whole one here
+                    continue
+                k = 0                          # it begins just inside: its early window starts at 0
             if k + win <= n:
                 starts.add(k)
         slot += FT8_SLOT_S
