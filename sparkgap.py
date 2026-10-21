@@ -7820,6 +7820,14 @@ class SparkGap:
                     if enable_ft8 and not os.path.exists(_ft8_decoder(self.cfg)):
                         log.warning("enable_ft8 is on but %s is missing (make ft8, or set ft8_decoder); "
                                     "FT8 decode will fail", _ft8_decoder(self.cfg))
+                    if enable_ft8 and self.cfg.get('ft8_windows', 'aligned') == 'aligned':
+                        # The DT watch only sees a clock 1-2.4 s late: one further off, or early, gives
+                        # no decodes at all (cdub89, #81). Say so at the start if NTP isn't keeping it.
+                        from feed_server import clock_synced
+                        if clock_synced() is False:
+                            log.warning("FT8 windows are aligned to this PC's clock, and timedatectl says "
+                                        "it isn't NTP-synchronised: FT8 needs it within about a second "
+                                        "(enable NTP, or set ft8_windows: sliding)")
                     if enable_ft8 or enable_rtty or self._iq_rec is not None:
                         FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
                                      14090: 14074, 18083: 18100,

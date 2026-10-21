@@ -81,3 +81,24 @@ def test_log_lines_near_the_frequency_and_time_with_their_continuations(tmp_path
     got = cw_clip.log_lines(str(log), 7035.0, t0 + 8 * 60, t0 + 10 * 60)
     assert got == ["13:07:40 INFO ITILA raw 7035.0 kHz cost=0.2: 'CQ CWT W3RJ\nW3RJ'",
                    "13:07:53 INFO *** SPOT:     7035.1  W3RJ          42 dB  28 WPM  [repeat] ***"]
+
+
+def test_any_iq_wav_with_centre_and_start(tmp_path):
+    base = _recording(tmp_path)
+    other = tmp_path / "lake3_7020_20261014_125900Z.wav"          # record_wav's template, not the recorder's
+    os.rename(base, other)
+    out = tmp_path / "c.wav"
+    import pytest
+    with pytest.raises(SystemExit):
+        cw_clip.main([str(other), "--freq", "7031.2", "--time", "+1", "--out", str(out)])
+    cw_clip.main([str(other), "--freq", "7031.2", "--time", "12:59:01", "--dur", "1",
+                  "--centre", "7020", "--start", "2026-10-14 12:59:00", "--out", str(out)])
+    assert abs(_peak_hz(out)[0] - 600) < 2
+
+
+def test_log_times_are_the_logging_pcs_local_time(tmp_path):
+    log = tmp_path / "sparkgap.log"
+    log.write_text("09:07:53 INFO *** SPOT:     7035.1  W3RJ          42 dB  28 WPM  [repeat] ***\n")
+    t0 = cw_clip.parse_name("20261014_125900Z_7090kHz_192000_24bit.wav")[0]     # 12:59Z
+    assert cw_clip.log_lines(str(log), 7035.0, t0 + 8 * 60, t0 + 10 * 60, utc_offset_h=-4)   # EDT log
+    assert not cw_clip.log_lines(str(log), 7035.0, t0 + 8 * 60, t0 + 10 * 60, utc_offset_h=0)

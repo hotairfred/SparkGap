@@ -139,7 +139,7 @@ class HPSDRProxy:
             _discovery_reply(self.dn, addr)
             print(f"  Discovery from {addr[0]}", file=sys.stderr)
         elif cmd == 0x04 and len(data) > 3:
-            if data[3] & 0x01:                      # START: bit 0 = IQ (0x03 adds the bandscope)                     # START
+            if data[3] & 0x01:                      # START: bit 0 = IQ (0x03 adds the bandscope)
                 self.consumers[addr] = time.time()
                 print(f"  +consumer {addr[0]}  ({len(self.consumers)} total)", file=sys.stderr)
                 self._upstream_start()
@@ -299,6 +299,13 @@ class WAVReplay:
                 self.consumers.pop(addr, None)
                 print(f"  -consumer {addr[0]}", file=sys.stderr)
 
+    def _skip_frames(self, k):
+        for st in self._streams:
+            left = k
+            while left > 0:
+                got = len(st.take(min(left, 65536)))
+                left -= got if got else left
+
     def _align_skip(self, now):
         """Frames to skip so the recording's second within the minute matches `now`'s."""
         return int(round(((now % 60) - self.align_sec) % 60 * self.rate))
@@ -315,12 +322,14 @@ class WAVReplay:
         if self.align_sec is not None:
             # skip into the recording so its second within the minute matches the clock's: FT8
             # slots then land where a receiver that takes its time from the clock expects them
-            skip = min(self._align_skip(time.time()), max(0, n - 1))
-            for st in self._streams:
-                left = skip
-                while left > 0:
-                    got = len(st.take(min(left, 65536)))
-                    left -= got if got else left
+            t_skip = time.time()
+            skip = min(self._align_skip(t_skip), max(0, n - 1))
+            self._skip_frames(skip)
+            # the skip decodes every frame it passes (~0.35 s per 192 kHz receiver for 59 s), so skip
+            # once more for the time it took, or an 8-receiver replay starts ~3 s behind (cdub89, #78)
+            more = min(int(round((time.time() - t_skip) * self.rate)), max(0, n - 1 - skip))
+            self._skip_frames(more)
+            skip += more
             offset = skip
             print(f"Aligned to the clock: skipped {skip / self.rate:.2f} s of the recording", file=sys.stderr)
         print("Replaying...", file=sys.stderr)
