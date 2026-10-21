@@ -295,6 +295,47 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
     }
 }
 
+/* Samples per receiver in one EP6 packet (two frames of IQ groups). */
+static int samples_per_pkt(int n_rx) {
+    return 2 * (IQ_DATA_SIZE / (n_rx * 6 + 2));
+}
+
+/* k packets were lost: write k packets' worth of zero samples for every enabled receiver into
+ * the FT8 capture and the ring, so a snapshot's sample count matches the time it spans and the
+ * FT8 windows placed from the clock stay on their slots (hotairfred/SparkGap#80). */
+static void fill_gap(HpsdrFast *h, uint32_t k, int n_rx) {
+    uint64_t n = (uint64_t)k * samples_per_pkt(n_rx);
+    for (int rx = 0; rx < n_rx; rx++) {
+        if (!h->rx_enabled[rx]) continue;
+        if (h->ft8_cap[rx].enabled) {
+            pthread_mutex_lock(&h->ft8_cap[rx].mu);
+            Ft8Buf *b = &h->ft8_cap[rx].bufs[h->ft8_cap[rx].active];
+            if (b->n == 0 && n > 0) {          /* the gap opens a snapshot: it began n samples ago */
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                b->t_first = ts.tv_sec + ts.tv_nsec / 1e9 - (double)n / h->sample_rate;
+            }
+            for (uint64_t j = 0; j < n && b->n < FT8_BUF_CAP; j++) {
+                b->i[b->n] = 0.0f;
+                b->q[b->n] = 0.0f;
+                b->n++;
+            }
+            pthread_mutex_unlock(&h->ft8_cap[rx].mu);
+        }
+        RxRing *r = &h->rx[rx];
+        for (uint64_t j = 0; j < n; j++) {
+            if (ring_free(r) < 1) {
+                h->drop_count += n - j;
+                break;
+            }
+            int wp = r->write_pos;
+            r->i[wp] = 0.0;
+            r->q[wp] = 0.0;
+            r->write_pos = (wp + 1) % RING_SIZE;
+        }
+    }
+}
+
 /* ---- receive thread ---- */
 #define BATCH_SIZE 64
 
@@ -309,6 +350,23 @@ static void *recv_thread(void *arg) {
             buf[2] != 0x01 || buf[3] != 0x06) continue;
 
         h->pkt_count++;
+        /* EP6 sequence number: count lost packets and keep their time (#80).  A duplicate or a
+         * late packet (its time is already filled) is dropped; a jump of more than a second either
+         * way (the radio restarted, a long outage) resyncs without filling. */
+        uint32_t seq = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
+                     | ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
+        if (h->seq_initialized) {
+            uint32_t ahead = seq - h->seq_rx;                 /* 1 in order; wraps at 2^32 */
+            uint32_t max_gap = (uint32_t)(h->sample_rate / samples_per_pkt(h->n_receivers));
+            if (ahead == 0 || h->seq_rx - seq <= max_gap)
+                continue;
+            if (ahead > 1 && ahead - 1 <= max_gap) {
+                h->pkt_lost += ahead - 1;
+                fill_gap(h, ahead - 1, h->n_receivers);
+            }
+        }
+        h->seq_rx = seq;
+        h->seq_initialized = 1;
         parse_frame(h, buf + 16, h->n_receivers);
         parse_frame(h, buf + 528, h->n_receivers);
     }
@@ -392,6 +450,7 @@ void hpsdr_start(HpsdrFast *h) {
      * hpsdr_start_worker() worker_running guard. Freqs are set before the
      * first call (sparkgap.py:6599), so the redundant call is pure no-op. */
     if (h->running) return;
+    h->seq_initialized = 0;       /* a new stream: its first packet sets the sequence */
     /* Speed bits: 0=48k, 1=96k, 2=192k, 3=384k */
     int speed = 0;
     if (h->sample_rate >= 384000) speed = 3;
