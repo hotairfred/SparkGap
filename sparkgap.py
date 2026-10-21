@@ -492,6 +492,41 @@ def ft8_window_starts(t0, n, rate=12000, offsets=FT8_SLOT_OFFSETS_S):
     return sorted(starts)
 
 
+def ft8_slot_dt(window_t, time_sec):
+    """A decode's DT as WSJT-X shows it: when the transmission started (the window's wall time plus
+    decode_ft8's time_sec, which counts from the window start) less its slot's start plus 0.5 s."""
+    return ((window_t + time_sec - 0.5 + FT8_SLOT_S / 2) % FT8_SLOT_S) - FT8_SLOT_S / 2
+
+
+class Ft8ClockWatch:
+    """Warns when FT8 decodes' DT sits far from 0, the sign of a PC clock that is off: aligned
+    windows cover a transmission from about 1 s early to 2.3 s late on the clock (cdub89, #76).
+    Per cycle the median DT of its decodes; over the last `minutes` cycles with enough decodes,
+    the median of those; a warning at most every `every_s`. With the clock right the median sits
+    near +0.3 s (our node, 3,437 decodes: +0.28 s, quartiles +0.20 / +0.36), so 1 s leaves room."""
+
+    def __init__(self, limit_s=1.0, minutes=10, min_decodes=5, every_s=600.0):
+        from collections import deque
+        self.limit_s, self.min_decodes, self.every_s = limit_s, min_decodes, every_s
+        self.cycles = deque(maxlen=minutes)
+        self.last_warn = None
+
+    def add(self, dts, now):
+        """One cycle's DTs; returns the cycle's median (None if too few) and a warning or None."""
+        med = float(np.median(dts)) if len(dts) >= self.min_decodes else None
+        if med is not None:
+            self.cycles.append(med)
+        warn = None
+        if len(self.cycles) >= max(3, self.cycles.maxlen // 2):
+            m = float(np.median(self.cycles))
+            if abs(m) > self.limit_s and (self.last_warn is None or now - self.last_warn >= self.every_s):
+                self.last_warn = now
+                warn = ("FT8 decodes' median DT over the last %d minutes is %+.1f s: this PC's clock may "
+                        "be off. Aligned FT8 windows (ft8_windows) need it within about a second; check "
+                        "NTP or chrony" % (len(self.cycles), m))
+        return med, warn
+
+
 def band_slice_12k(fi, fq, offset_hz, half_hz=6000.0, rate=12000, fs=192000, single=True):
     """The `rate` complex baseband of [offset_hz - half_hz, offset_hz + half_hz] of a buffer of fs IQ
     (fi, fq), offset_hz at 0 Hz: one FFT of the buffer and a short inverse FFT of the slice, as the
@@ -8313,6 +8348,7 @@ class SparkGap:
                             total = 0
                             seen_msgs = set()  # dedupe across sliding windows
                             aligned = skimmer.cfg.get('ft8_windows', 'aligned') == 'aligned'
+                            cycle_dts = []                 # decodes' DT, for the clock watch
                             for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 else []):
                                 offset_hz = (ft8_khz - ck) * 1000
                                 if skimmer.cfg.get('ft8_band_cut', 'fft') == 'fft':
@@ -8362,6 +8398,7 @@ class SparkGap:
                                             continue
                                         try:
                                             snr = int(float(parts_o[1]))
+                                            time_sec = float(parts_o[2])
                                             audio_hz = int(parts_o[3])
                                             msg = parts_o[5]
                                         except (ValueError, IndexError):
@@ -8394,6 +8431,8 @@ class SparkGap:
                                         if dedup_key in seen_msgs:
                                             continue
                                         seen_msgs.add(dedup_key)
+                                        if aligned and t0 > 0:
+                                            cycle_dts.append(ft8_slot_dt(t0 + start / 12000.0, time_sec))
                                         log.info("FT8 %s p%d: %s", bn, part, line)
                                         total += 1
                                         skimmer.spot_count += 1
@@ -8424,8 +8463,15 @@ class SparkGap:
                                         log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
                                                  rf_khz, ft8_call, snr, msg)
                             if enable_ft8:
-                                log.info("FT8 cycle done: %d spots across %d bands",
-                                         total, len(jobs))
+                                watch = getattr(skimmer, '_ft8_clock', None)
+                                if watch is None:
+                                    watch = skimmer._ft8_clock = Ft8ClockWatch()
+                                med, warn = watch.add(cycle_dts, time.time())
+                                log.info("FT8 cycle done: %d spots across %d bands%s",
+                                         total, len(jobs),
+                                         '' if med is None else ', median DT %+.2f s' % med)
+                                if warn:
+                                    log.warning(warn)
                             # RTTY scan piggybacks on the same minute snapshot.
                             # Run after FT8 so the FT8 spots flow first.
                             # Independent of enable_ft8 — controlled by
