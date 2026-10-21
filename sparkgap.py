@@ -2166,19 +2166,31 @@ def _rtty_split_keywords(text):
     return ' '.join(out)
 
 
-def _rtty_candidates(iq, lo_hz, hi_hz):
+def _rtty_hold_spectrum(fi, fq, lo_hz, hi_hz, fs=192000):
+    """(f, hold): the max-hold over the minute of 2 s magnitude spectra in [lo_hz, hi_hz], each
+    smoothed over 11 bins (0.5 Hz bins). One batched single-precision FFT of the whole 2 s blocks,
+    about half the time of a double-precision FFT per block (0.14 s against 0.28 s a band-minute
+    with its complex copy, Arc)."""
+    import scipy.fft as sfft
+    from scipy.ndimage import uniform_filter1d
+    n = 2 * fs
+    nb = len(fi) // n
+    if nb < 1:
+        return None, None
+    x = np.empty(nb * n, dtype=np.complex64)
+    x.real, x.imag = fi[:nb * n], fq[:nb * n]
+    spec = sfft.fft(x.reshape(nb, n), axis=1, overwrite_x=True)
+    k = np.arange(int(np.ceil(lo_hz * n / fs)), int(np.floor(hi_hz * n / fs)) + 1)
+    mag = np.abs(spec[:, k % n])                  # negative frequencies are the top bins
+    return k * fs / n, uniform_filter1d(mag, 11, axis=1, mode='constant').max(axis=0)
+
+
+def _rtty_candidates(fi, fq, lo_hz, hi_hz):
     """RTTY candidates in a minute of IQ: [(offset_hz, snr_db)], strongest first. Mark and
     space peaks ~170 Hz apart in a max-hold of 2 s spectra over the whole minute, so a
     station that transmits at any time in the minute is found, not only in its first 2 s."""
     from scipy.signal import find_peaks
-    n = 2 * 192000
-    fr = np.fft.fftshift(np.fft.fftfreq(n, 1.0 / 192000))
-    sel = (fr >= lo_hz) & (fr <= hi_hz)
-    f = fr[sel]
-    hold = None
-    for k in range(0, len(iq) - n + 1, n):
-        s = np.convolve(np.fft.fftshift(np.abs(np.fft.fft(iq[k:k + n])))[sel], np.ones(11) / 11, mode='same')
-        hold = s if hold is None else np.maximum(hold, s)
+    f, hold = _rtty_hold_spectrum(fi, fq, lo_hz, hi_hz)
     if hold is None or len(hold) < 200:
         return []
     noise = float(np.median(hold))
@@ -2223,8 +2235,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
             lambda c: {'active': 2, 'rare': 3}.get(trk._matches_patt3ch(c), 4),
             cq_groups=True, lockon=True, window_s=30.0,
             fragments=skimmer.cfg.get('rtty_spot_rule_fragments') or None)
-    iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
-    cands = [c for c in _rtty_candidates(iq, *rng)
+    cands = [c for c in _rtty_candidates(fi, fq, *rng)
              if not _in_digital_window(band_center_khz + c[0] / 1000.0)]
     cap = int(skimmer.cfg.get('rtty_max_candidates', RTTY_MAX_CANDIDATES))
     if len(cands) > cap:
@@ -2234,7 +2245,6 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
     if not cands:
         return 0
     rate, audio_center = 12000, 1000.0
-    import scipy.fft as sfft
     if z is None:
         z = minute_fft(fi, fq)
     n = len(z)
