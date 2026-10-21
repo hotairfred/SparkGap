@@ -492,6 +492,27 @@ def ft8_window_starts(t0, n, rate=12000, offsets=FT8_SLOT_OFFSETS_S):
     return sorted(starts)
 
 
+def band_slice_12k(fi, fq, offset_hz, half_hz=6000.0, rate=12000, fs=192000, single=True):
+    """The `rate` complex baseband of [offset_hz - half_hz, offset_hz + half_hz] of a buffer of fs IQ
+    (fi, fq), offset_hz at 0 Hz: one FFT of the buffer and a short inverse FFT of the slice, as the
+    RTTY scan cuts its candidates, instead of mixing the whole buffer and resampling it (0.83 s a
+    band-minute against 0.26 s single precision, i7-9700K). Same scale as resample_poly(mixed, 1, 16)."""
+    import scipy.fft as sfft
+    n = len(fi)
+    dt = np.complex64 if single else np.complex128
+    x = np.empty(n, dtype=dt)
+    x.real, x.imag = fi, fq
+    z = sfft.fft(x, overwrite_x=True)
+    n_out = n * rate // fs
+    bin_hz = fs / n
+    k0 = int(round(offset_hz / bin_hz))
+    half = min(int(half_hz / bin_hz), n_out // 2 - 1)
+    idx = np.arange(k0 - half, k0 + half + 1)
+    sp = np.zeros(n_out, dtype=dt)
+    sp[(idx - k0) % n_out] = z[idx % n]
+    return sfft.ifft(sp) * (n_out / n)
+
+
 def _ft8_decoder(cfg):
     """Path of decode_ft8 (Karlis Goba's ft8_lib, MIT): config ft8_decoder, else the copy
     `make ft8` builds beside sparkgap.py, else the original install path."""
@@ -8288,12 +8309,16 @@ class SparkGap:
                             seen_msgs = set()  # dedupe across sliding windows
                             aligned = skimmer.cfg.get('ft8_windows', 'aligned') == 'aligned'
                             for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 else []):
-                                iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
                                 offset_hz = (ft8_khz - ck) * 1000
-                                t = np.arange(n) / 192000
-                                mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
-                                # 192k → 12k complex via polyphase
-                                dec12 = resample_poly(mixed, 1, 16)
+                                if skimmer.cfg.get('ft8_band_cut', 'fft') == 'fft':
+                                    # 12 kHz around the dial, cut from one FFT of the minute
+                                    dec12 = band_slice_12k(fi[:n], fq[:n], offset_hz).astype(np.complex128)
+                                else:
+                                    iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
+                                    t = np.arange(n) / 192000
+                                    mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
+                                    # 192k → 12k complex via polyphase
+                                    dec12 = resample_poly(mixed, 1, 16)
                                 slot_n = 15 * 12000
                                 # Windows from the snapshot's start time: two around each slot
                                 # (ft8_windows "aligned"), or every second from 0 to 45 s
