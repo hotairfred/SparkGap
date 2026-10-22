@@ -8146,18 +8146,18 @@ class SparkGap:
                             _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'], spot_wpm)
                         if stream == 'local':
                             # Not "*** SPOT:": log scorers count those as the RBN stream.
-                            log.info("*** LOCAL SPOT: %10.1f  %-12s  %d dB  %d WPM ***",
+                            log.info("*** LOCAL SPOT: %10.2f  %-12s  %d dB  %d WPM ***",
                                      spot['freq_khz'], spot['call'], spot['snr'], spot_wpm)
                             continue
                         self.spot_count += 1
-                        log.info("*** SPOT: %10.1f  %-12s  %d dB  %d WPM  [%s] ***",
+                        log.info("*** SPOT: %10.2f  %-12s  %d dB  %d WPM  [%s] ***",
                                  spot['freq_khz'], spot['call'], spot['snr'],
                                  spot_wpm, method)
                         if self._spot_log:
                             import datetime
                             ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
                             self._spot_log.write(
-                                f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.1f} | "
+                                f"{ts} UTC | {spot['call']} | {spot['freq_khz']:.2f} | "
                                 f"{spot['snr']:.0f} | {spot_wpm} WPM\n"
                             )
 
@@ -9094,7 +9094,7 @@ def run_file_mode(args, config):
                     if _gui_feed:
                         _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'],
                                                spot.get('wpm', 0))
-                    log.info("SPOT: %.1f kHz %s %d dB %d WPM [%s]",
+                    log.info("SPOT: %.2f kHz %s %d dB %d WPM [%s]",
                              spot['freq_khz'], spot['call'],
                              spot['snr'], spot.get('wpm', 0), spot['method'])
 
