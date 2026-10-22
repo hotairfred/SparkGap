@@ -11,12 +11,12 @@ WorkingDirectory=/home/sparkgap/csdr-skimmer
 
 # Same broker as sparkgap.service (consumes skimmer/ft8/raw, forwards
 # to report.pskreporter.info:4739 via IPFIX UDP).
-Environment="MQTT_HOST=192.168.1.14"
+Environment="MQTT_HOST=YOUR_BROKER_IP"
 Environment="MQTT_PORT=1883"
-Environment="MQTT_USER=mqttuser"
-Environment="MQTT_PASS=mqttpass"
+Environment="MQTT_USER=YOUR_MQTT_USER"
+Environment="MQTT_PASS=YOUR_MQTT_PASSWORD"
 
-ExecStart=/usr/bin/python3 /home/sparkgap/csdr-skimmer/pskr_feeder.py --call WF8Z --grid EM79SM
+ExecStart=/usr/bin/python3 /home/sparkgap/csdr-skimmer/pskr_feeder.py --call YOUR_CALL --grid YOUR_GRID
 
 StandardOutput=append:/tmp/pskr_feeder.log
 StandardError=append:/tmp/pskr_feeder.log

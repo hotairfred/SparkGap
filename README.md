@@ -25,10 +25,16 @@ against what other RBN skimmers reported at the same time:
   work targets.
 - **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings, SparkGap spots
   1.6 to 1.9 times as many calls and catches about 70% of that node's calls (#43).
+- **RTTY.** One hour of the Makrothen RTTY weekend, five bands, replayed to SparkGap and RTTY
+  Skimmer Server at the same time and judged by at least two RBN skimmers: SparkGap spotted 94
+  stations, all real; RTTY Skimmer Server's CQ-tagged spots were 92 real of 110 on its DX profile
+  and 110 of 116 on its Makrothen profile. Frequencies agreed to a median of 0.00 kHz. Details,
+  both sides' mistakes and what we are doing about the stations only it found are in #91.
 - **Copy on known text.** Character error on three W1AW code-practice clips: 3.1, 3.7 and
   1.9% (`docs/ITILA2.md`; CW Skimmer copies the same audio nearly perfectly).
-- **Cost.** 8 bands at 192 kHz with FT8 and RTTY take about 2.2 cores of a 35 W i5-9500T with
-  `itila_decode_threads: 4` (profile in #59).
+- **Cost.** 8 bands at 192 kHz with CW, FT8 and RTTY use about 1.7 cores of CPU time on a 35 W i5-9500T
+  with `itila_decode_threads: 4` on a weekday afternoon (2.2 before the October CPU work; profile
+  in #59).
 
 These are calibration on our station, not a contest result. The harness to reproduce them is
 in `tools/eval/` and `tools/sim/`.
@@ -37,7 +43,8 @@ in `tools/eval/` and `tools/sim/`.
 
 - **Receivers.** HPSDR protocol 1 radios (a Red Pitaya with Pavel Demin's `sdr_receiver_hpsdr`
   firmware, up to 8 receivers at 48 to 192 kHz each), and FlexRadio DAX-IQ through `flex_iq.py`
-  (`skimmer_flex.example.json`).
+  (`skimmer_flex.example.json`). Lost UDP packets are counted from the sequence number and their
+  time kept as silence, so FT8 slots stay on the clock (`FT8 trigger: ... lost=` in the log).
 - **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
   is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
   keying (`docs/ITILA2.md`).
@@ -49,7 +56,8 @@ in `tools/eval/` and `tools/sim/`.
   the same repeat rule.
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
-  (`pskr_feeder.py`).
+  (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
+  it says the PC clock is off.
 - **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format (RTTY lines as
   RTTY Skimmer Server writes them), so loggers, clusters and Aggregator can read them; an
   optional second port for your own use with its own, looser spot rule (see the quick start);
@@ -63,8 +71,11 @@ in `tools/eval/` and `tools/sim/`.
 - **SparkGap Web**, a read-only browser console with waterfall, call ladder and live decode
   text (`gui_feed`, `docs/CONSOLE.md`).
 - **Tools.** An all-band IQ recorder (`iq_recorder.py`), a proxy that replays recordings as an
-  HPSDR radio (`hpsdr_proxy.py`), file-mode replay, a band simulator with exact ground truth
-  (`tools/sim/`), and scoring against the RBN archive (`tools/eval/rbn_confirm.py`).
+  HPSDR radio to any number of skimmers at once (`hpsdr_proxy.py`, with `--align` to keep FT8
+  slots on the clock and `--drop` to lose packets on purpose), file-mode replay, a band simulator
+  with exact ground truth (`tools/sim/`), scoring against the RBN archive
+  (`tools/eval/rbn_confirm.py`), and a clip cutter to listen to a decode: frequency and time in,
+  CW audio and the decoder's text out (`tools/listen/cw_clip.py`).
 
 Work in progress is in the [open pull requests](https://github.com/hotairfred/SparkGap/pulls).
 
@@ -158,6 +169,21 @@ both are welcome contributions.
 
 Port 7300 speaks the same telnet format as CW Skimmer Server, so a DX cluster (we use
 GoCluster), a logger or Aggregator can connect to it.
+
+### PSKReporter (FT8) and MQTT
+
+FT8 decodes travel from `sparkgap.py` to `pskr_feeder.py` through an MQTT broker (Mosquitto
+or any other): SparkGap publishes one JSON message per decode on topic `skimmer/ft8/raw`, and
+the feeder batches them to PSKReporter under your call and grid (`pskr_feeder.py --call
+YOUR_CALL --grid YOUR_GRID`). The payload is described at the top of `pskr_feeder.py`
+(`call`, `grid`, `freq_hz`, `snr`, `mode`, `msg`, `ts`). Both read the broker from the
+environment: `MQTT_HOST` (default `localhost`), `MQTT_PORT` (1883), `MQTT_USER` and `MQTT_PASS`;
+`deploy/sparkgap.service` and `deploy/pskr_feeder.service` show where to set them. SparkGap
+connects at its first FT8 decode; if the broker can't be reached then, it logs `FT8 MQTT
+publisher init failed (will not retry)` and runs on without FT8 uploads until it is restarted.
+CW and RTTY spots don't use MQTT.
+
+### RBN
 
 RBN: SparkGap is not yet authorized to connect. The checks a node must make itself before a
 spot reaches RBN (CQ only, repeats, mode codes, beacons, frequency) and what we measured are in

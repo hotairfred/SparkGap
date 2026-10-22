@@ -12,10 +12,10 @@ WorkingDirectory=/home/sparkgap/csdr-skimmer
 # MQTT broker for FT8-spot pipeline (sparkgap → pskr_feeder).
 # Without these, the publisher logs "Connection refused" and gives up,
 # so FT8 spots never reach PSKReporter.
-Environment="MQTT_HOST=192.168.1.14"
+Environment="MQTT_HOST=YOUR_BROKER_IP"
 Environment="MQTT_PORT=1883"
-Environment="MQTT_USER=mqttuser"
-Environment="MQTT_PASS=mqttpass"
+Environment="MQTT_USER=YOUR_MQTT_USER"
+Environment="MQTT_PASS=YOUR_MQTT_PASSWORD"
 
 # glibc arena fragmentation guard (see feedback_glibc_arena_fragmentation.md).
 # Required to keep RSS bounded under high bin counts (cluster=50 OOM 2026-05-25).
