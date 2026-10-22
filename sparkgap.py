@@ -2104,6 +2104,14 @@ RTTY_RANGES_KHZ = {
     '10m': (28060.0, 28150.0),
 }
 RTTY_MAX_CANDIDATES = 100      # per band per minute (config rtty_max_candidates)
+# rtty_contest: what one RTTY contest's runners send, from its published rules. words: the contest's
+# name as runners put it in their CQ (CQ MAKRO AC2FA AC2FA, or MAKRO AE1P AE1P when the CQ is lost)
+# opens a CQ group; exchange "grid": a call followed by a grid square is being sent the exchange, so a
+# caller (CQ MAKRO NK2Y NK2Y CQ AA4DD AA4DD FN31). Measured on the 10-10 Makrothen recording against
+# RTTY Skimmer Server on the same replay: 92 -> 93 real stations, none unconfirmed.
+RTTY_CONTESTS = {
+    'makrothen': {'words': ('MAK', 'MAKRO', 'MAKROTHEN', 'MKR'), 'exchange': 'grid'},
+}
 # FT8 and JS8 dials (kHz): each dial and 3 kHz above it is no RTTY, so no candidate there.
 # FT4 dials are not excluded: RTTY contest stations sit in them (7047.5, 14080), and on the PA
 # and JARTS recordings excluding them lost 2 confirmed calls each and removed no junk.
@@ -2131,6 +2139,19 @@ def _in_digital_window(rf_khz):
 
 
 _RTTY_KEYWORD = re.compile(r'(CQ|TEST|DE)')
+
+
+def _rtty_contest(cfg):
+    """The RTTY_CONTESTS entry config rtty_contest names, or None (the general rule)."""
+    name = (cfg.get('rtty_contest') or '').strip().lower()
+    if not name:
+        return None
+    if name not in RTTY_CONTESTS:
+        log.warning("rtty_contest %r is not one of %s: the general RTTY rule is used", name,
+                    ', '.join(sorted(RTTY_CONTESTS)))
+        return None
+    log.info("RTTY spot rule: %s contest words and exchange", name)
+    return RTTY_CONTESTS[name]
 
 
 def _rtty_split_keywords(text):
@@ -2163,7 +2184,16 @@ def _rtty_split_keywords(text):
             merged.append(p)
             i += 1
         out.extend(merged)
-    return ' '.join(out)
+    return ' '.join(_split_doubled(t) for t in out)
+
+
+def _split_doubled(tok):
+    """IV3WMSIV3WMS -> IV3WMS IV3WMS: a call sent twice with the space between them lost."""
+    from spot_rule import CALL_RE
+    h = len(tok) // 2
+    if len(tok) % 2 == 0 and h >= 4 and tok[:h] == tok[h:] and CALL_RE.fullmatch(tok[:h]):
+        return tok[:h] + ' ' + tok[h:]
+    return tok
 
 
 def _rtty_hold_spectrum(fi, fq, lo_hz, hi_hz, fs=192000):
@@ -2231,10 +2261,14 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         # through (TU KQ4TNF CQ N4TL N4TL .. 59 N4TL FM06), and split_runs gains nothing on
         # RTTY, which has real spaces. Same audio within 30 s: scans are a minute apart and a
         # runner's 100 Hz bin can change between two.
+        contest = _rtty_contest(skimmer.cfg)
         rule = skimmer._rtty_rule = RepeatSpotRule(
             lambda c: {'active': 2, 'rare': 3}.get(trk._matches_patt3ch(c), 4),
             cq_groups=True, lockon=True, window_s=30.0,
-            fragments=skimmer.cfg.get('rtty_spot_rule_fragments') or None)
+            fragments=skimmer.cfg.get('rtty_spot_rule_fragments') or None,
+            contest_words=contest is not None,
+            words=frozenset(contest['words']) if contest else None,
+            grid=bool(contest) and contest.get('exchange') == 'grid')
     cands = [c for c in _rtty_candidates(fi, fq, *rng)
              if not _in_digital_window(band_center_khz + c[0] / 1000.0)]
     cap = int(skimmer.cfg.get('rtty_max_candidates', RTTY_MAX_CANDIDATES))

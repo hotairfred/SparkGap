@@ -69,6 +69,7 @@ CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:/[A-Z0-9]{1,3})?$")                          # /0, /P
 _SPLIT_RE = re.compile(r"[^A-Z0-9?/]+")   # keep / for HK3/NP4Z, N5AW/0
 _RST_RE = re.compile(r"^[5E][9N][9N]$")    # 599, 5NN, ENN: contest report before the number
+GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}$")  # a 4-character grid square: the exchange of Makrothen RTTY
 _MERGED_PREFIXES = ("CQ", "TEST", "CWT", "SST", "MST", "DE")
 _TRIGGER_WORDS = ("CQ", "TEST", "CWT", "SST", "MST")
 _STOP_WORDS = frozenset({"TU", "DE", "CQ", "TEST", "CWT", "SST", "MST", "QRZ", "AGN",
@@ -192,14 +193,18 @@ def sender(toks: list[str], i: int) -> int | None:
     return None
 
 
-def is_exchange(toks: list[str], j: int, qualifiers: bool = False) -> bool:
+def is_exchange(toks: list[str], j: int, qualifiers: bool = False, grid: bool = False) -> bool:
     """toks[j] is followed by NAME then a number or 2-letter state, or by a report (5NN) then
     a number: a caller being sent the exchange. Repeats of the call and 1-character or '?'
     tokens before NAME are skipped. qualifiers (spot_rule_cq_qualifiers): a CQ qualifier of
-    the window is no NAME and a stop word is no number or state (CQ PA WB3EML PA CQ)."""
+    the window is no NAME and a stop word is no number or state (CQ PA WB3EML PA CQ).
+    grid (a contest whose exchange is a grid square): the call followed by a grid square is
+    being sent it (CQ MAKRO NK2Y NK2Y CQ AA4DD AA4DD FN31: AA4DD answering NK2Y)."""
     k = j + 1
     while k < len(toks) and (toks[k] == toks[j] or len(toks[k]) <= 1 or "?" in toks[k]):
         k += 1
+    if grid and k < len(toks) and GRID_RE.match(toks[k]):
+        return True
     if k + 1 >= len(toks):
         return False
     name, num = toks[k], toks[k + 1]
@@ -225,7 +230,8 @@ def _cq_before(toks: list[str], i: int) -> bool:
 def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
                  doubled: bool = False, split_up: bool = False,
                  contest_words: bool = False, cq_repeats: bool = False,
-                 stray: bool = False) -> list[str]:
+                 stray: bool = False, words: frozenset[str] | None = None,
+                 grid: bool = False) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -236,7 +242,7 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
     after it; only the exchange test keeps that caller out. every: one entry per group
     instead of one per call."""
     return [call for call, _after in runner_groups(text, every, qualifiers, doubled, split_up,
-                                                   contest_words, cq_repeats, stray)]
+                                                   contest_words, cq_repeats, stray, words, grid)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -247,11 +253,11 @@ def _call_before(toks: list[str], i: int) -> str | None:
     return toks[k] if k >= 0 and CALL_RE.match(toks[k]) else None
 
 
-def _signing(toks: list[str], k: int, qualifiers: bool = False) -> bool:
+def _signing(toks: list[str], k: int, qualifiers: bool = False, grid: bool = False) -> bool:
     """toks[k] is a call in a sign-off: after TU or DE, or before CQ, TEST or another trigger
     word (1-character and '?' tokens skipped), and not being sent the exchange. A bare repeat
     of the call does not count: a fragment picked once can repeat on its own."""
-    if is_exchange(toks, k, qualifiers):
+    if is_exchange(toks, k, qualifiers, grid):
         return False
     p = k - 1
     while p >= 0 and (len(toks[p]) <= 1 or "?" in toks[p]):
@@ -290,15 +296,18 @@ def _split_signoff(toks: list[str], i: int) -> int | None:
 
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
-                  cq_repeats: bool = False, stray: bool = False) -> list[tuple[str, str | None]]:
+                  cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,
+                  grid: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller.
     contest_words: CWT, SST or MST right before a call opens a group as CQ does (CWT K5AX CWT
     K5AX: runners who drop the CQ). cq_repeats: a closing CQ or TEST followed by the same call
     opens the next group instead of closing this one, so CQ CWT N1DC CQ CWT N1DC is two
-    copies, not one."""
+    copies, not one. words: the contest words for contest_words (default CWT, SST, MST); grid:
+    a call followed by a grid square is being sent the exchange (is_exchange)."""
     toks = tokens(text)
+    cwords = CONTEST_WORDS if words is None else words
     out: list[tuple[str, str | None]] = []
     i, n = 0, len(toks)
     while i < n:
@@ -311,7 +320,7 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                 i = j + 2
                 continue
         de = t == "DE" and _cq_before(toks, i)
-        cw = (contest_words and t in CONTEST_WORDS and i + 1 < n and len(toks[i + 1]) >= 4
+        cw = (contest_words and t in cwords and i + 1 < n and len(toks[i + 1]) >= 4
               and CALL_RE.match(toks[i + 1]) is not None)     # not 3-character pieces (N0K, K1S)
         if not (t in KEYWORDS or de or cw):
             i += 1
@@ -329,7 +338,7 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                 i = k                             # CQ S52Y DE N8EM: S52Y is being called; after
                                                   # TEST or DE the call is the runner's
                 continue
-        if (not is_exchange(toks, j, qualifiers) and not (stray and _stray_after(toks, j))
+        if (not is_exchange(toks, j, qualifiers, grid) and not (stray and _stray_after(toks, j))
                 and (every or all(toks[j] != c for c, _ in out))):
             out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
             if doubled and every:
@@ -409,7 +418,8 @@ class RepeatSpotRule:
                  validation: str | None = None,
                  listed: Callable[[str], bool] | None = None, listed_by: str = "scp",
                  contest_words: bool = False, cq_repeats: bool = False,
-                 fragments: str | None = None) -> None:
+                 fragments: str | None = None, words: frozenset[str] | None = None,
+                 grid: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -429,6 +439,8 @@ class RepeatSpotRule:
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
         self.contest_words = contest_words      # CWT K5AX opens a group as CQ CWT K5AX does
         self.cq_repeats = cq_repeats            # CQ CWT N1DC CQ CWT N1DC is two copies
+        self.words = words                      # contest_words: the contest's words (None: CWT, SST, MST)
+        self.grid = grid                        # a call followed by a grid square is a caller
         if fragments is not None and not isinstance(fragments, str):
             raise ValueError(f"fragments takes 'even' or 'any', and/or 'stray', got {fragments!r}")
         opts = set((fragments or '').split(',')) - {''}
@@ -467,7 +479,7 @@ class RepeatSpotRule:
                  else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers,
                                    doubled=self.doubled, split_up=self.split_up,
                                    contest_words=self.contest_words, cq_repeats=self.cq_repeats,
-                                   stray=self.stray))
+                                   stray=self.stray, words=self.words, grid=self.grid))
         for call, n in Counter(calls).items():
             new = 0
             for nth in range(n):
@@ -560,7 +572,8 @@ class RepeatSpotRule:
         for call, after in runner_groups(text, every=self.cq_groups,
                                          qualifiers=self.cq_qualifiers, doubled=self.doubled,
                                          split_up=self.split_up, contest_words=self.contest_words,
-                                         cq_repeats=self.cq_repeats, stray=self.stray):
+                                         cq_repeats=self.cq_repeats, stray=self.stray,
+                                         words=self.words, grid=self.grid):
             owner = self.owner(freq_khz, now)
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
@@ -577,7 +590,7 @@ class RepeatSpotRule:
             self._own(call, freq_khz, now)
         owner = self.owner(freq_khz, now)
         if owner is not None and owner not in calls:
-            if any(tk == owner and _signing(toks, k, self.cq_qualifiers)
+            if any(tk == owner and _signing(toks, k, self.cq_qualifiers, self.grid)
                    and not _stray_letters(toks, owner, k + 1)
                    for k, tk in enumerate(toks)):
                 calls.append(owner)               # TU W6YH, W6YH TEST: the owner signing
