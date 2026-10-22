@@ -84,6 +84,12 @@ typedef struct {
     uint32_t seq_rx;
     int seq_initialized;
     uint64_t pkt_lost;
+    /* Restart on silence: Red Pitaya's HPSDR firmware streams to one client, and any client's STOP
+     * stops it. With no IQ for restart_after_s the receive thread sends the start sequence again
+     * (0 = never). 2026-10-22: another program on the LAN stopped the radio and we heard nothing
+     * for 11 hours. */
+    double restart_after_s;
+    volatile uint64_t restarts;
     uint32_t frequencies[MAX_RX];
     int lna_gain;
 
@@ -339,16 +345,32 @@ static void fill_gap(HpsdrFast *h, uint32_t k, int n_rx) {
 /* ---- receive thread ---- */
 #define BATCH_SIZE 64
 
+static double now_mono(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void send_start(HpsdrFast *h);
+
 static void *recv_thread(void *arg) {
     HpsdrFast *h = (HpsdrFast *)arg;
     uint8_t buf[2048];
+    double last_iq = now_mono();
 
     while (__atomic_load_n(&h->running, __ATOMIC_ACQUIRE)) {
+        if (h->restart_after_s > 0 && now_mono() - last_iq >= h->restart_after_s) {
+            h->restarts++;
+            h->seq_initialized = 0;
+            send_start(h);                 /* the radio went quiet: ask it to stream again (~0.3 s) */
+            last_iq = now_mono();          /* and again after another restart_after_s */
+        }
         int len = recv(h->sock, buf, sizeof(buf), 0);   /* -1 on the 200 ms timeout */
         if (len < PKT_SIZE) continue;
         if (buf[0] != COOKIE_0 || buf[1] != COOKIE_1 ||
             buf[2] != 0x01 || buf[3] != 0x06) continue;
 
+        last_iq = now_mono();
         h->pkt_count++;
         /* EP6 sequence number: count lost packets and keep their time (#80).  A duplicate or a
          * late packet (its time is already filled) is dropped; a jump of more than a second either
@@ -387,6 +409,7 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
     h->sdr_port = port;
     h->listen_port = port;
     h->seq_tx = 0;
+    h->restart_after_s = 30.0;
 
     for (int i = 0; i < MAX_RX; i++)
         h->frequencies[i] = 7000000;
@@ -451,6 +474,16 @@ void hpsdr_start(HpsdrFast *h) {
      * first call (sparkgap.py:6599), so the redundant call is pure no-op. */
     if (h->running) return;
     h->seq_initialized = 0;       /* a new stream: its first packet sets the sequence */
+    send_start(h);
+
+    /* Start receive thread */
+    h->running = 1;
+    pthread_create(&h->thread, NULL, recv_thread, h);
+}
+
+/* Config, every receiver's frequency, the start command, config again. hpsdr_start sends it once;
+ * the receive thread sends it again when the radio goes quiet. */
+static void send_start(HpsdrFast *h) {
     /* Speed bits: 0=48k, 1=96k, 2=192k, 3=384k */
     int speed = 0;
     if (h->sample_rate >= 384000) speed = 3;
@@ -502,11 +535,11 @@ void hpsdr_start(HpsdrFast *h) {
     /* Send config again after start to ensure it takes */
     send_ep2(h, config, lna);
     usleep(10000);
-
-    /* Start receive thread */
-    h->running = 1;
-    pthread_create(&h->thread, NULL, recv_thread, h);
 }
+
+/* Seconds without IQ before the start sequence is sent again; 0 turns it off. */
+void hpsdr_set_restart_after(HpsdrFast *h, double seconds) { h->restart_after_s = seconds; }
+uint64_t hpsdr_restarts(HpsdrFast *h) { return h->restarts; }
 
 static void *drain_worker(void *arg);
 static void *decode_worker(void *arg);

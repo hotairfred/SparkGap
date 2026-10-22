@@ -248,6 +248,12 @@ def _get_hpsdr_fast():
                 lib.hpsdr_pkt_lost.argtypes = [_ct.c_void_p]
             except AttributeError:
                 pass
+            try:
+                lib.hpsdr_set_restart_after.argtypes = [_ct.c_void_p, _ct.c_double]
+                lib.hpsdr_restarts.restype = _ct.c_uint64
+                lib.hpsdr_restarts.argtypes = [_ct.c_void_p]
+            except AttributeError:
+                pass
             _hpsdr_fast_lib = lib
             log.info("Loaded libhpsdr_fast.so (C receiver)")
         except OSError:
@@ -259,10 +265,11 @@ def _get_hpsdr_fast():
 class _CReceiver:
     """Drop-in replacement for HPSDRReceiver using C receive thread."""
 
-    def __init__(self, ip, port, n_receivers, sample_rate, lna_gain=20):
+    def __init__(self, ip, port, n_receivers, sample_rate, lna_gain=20, restart_after_s=30.0):
         import ctypes as _ct
         self.ip = ip
         self._health_pkts = (0, time.time())
+        self._restarts_seen = 0
         self.lib = _get_hpsdr_fast()
         self.n_receivers = n_receivers
         self.sample_rate = sample_rate
@@ -272,6 +279,19 @@ class _CReceiver:
                 ip.encode(), port, n_receivers, sample_rate, lna_gain))
             if not self._h:
                 log.error("hpsdr_create failed")
+            elif hasattr(self.lib, 'hpsdr_set_restart_after'):
+                self.lib.hpsdr_set_restart_after(self._h, float(restart_after_s))
+
+    def restarts(self):
+        """How many times the receive thread re-sent the start sequence after silence; logs new ones."""
+        if not self._h or not self.lib or not hasattr(self.lib, 'hpsdr_restarts'):
+            return 0
+        n = self.lib.hpsdr_restarts(self._h)
+        if n > self._restarts_seen:
+            log.warning("Receiver: no IQ from %s, sent the start sequence again (%d time%s so far)",
+                        self.ip, n, '' if n == 1 else 's')
+            self._restarts_seen = n
+        return n
 
     def set_frequency(self, rx_index, freq_hz):
         if self._h and self.lib:
@@ -318,7 +338,7 @@ class _CReceiver:
         rate = (pkts - last) / (now - t) if now > t else 0.0
         self._health_pkts = (pkts, now)
         return {'type': 'hpsdr', 'address': self.ip, 'state': 'live' if pkts > last else 'waiting',
-                'packets': pkts, 'lost': drops, 'pkt_per_s': round(rate)}
+                'packets': pkts, 'lost': drops, 'pkt_per_s': round(rate), 'restarts': self.restarts()}
 
     def tap_enable(self, on):
         """GUI feed waterfall: have the C worker copy IQ into its spectrum taps. False when the
@@ -7455,8 +7475,11 @@ class SparkGap:
             # Use C receiver for multi-band (handles 9600+ pkt/s)
             self._use_c_receiver = (n_bands > 1 and _get_hpsdr_fast() is not None)
             if self._use_c_receiver:
+                # hpsdr_restart_after_s: seconds without IQ before the start sequence is sent
+                # again (another client stopped the radio); 0 = never
                 self.receiver = _CReceiver(device_ip, sdr_port,
-                                            n_rx, rx_sample_rate, lna_gain)
+                                            n_rx, rx_sample_rate, lna_gain,
+                                            self.cfg.get('hpsdr_restart_after_s', 30.0))
             else:
                 self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
                                               n_receivers=n_rx, sample_rate=rx_sample_rate,
@@ -8169,6 +8192,8 @@ class SparkGap:
                         log.info("Health: ring_drops=%d/%d samples (%.4f%%) env_drops=%d bins=%d peak=%d",
                                  rdrop, samples, 100.0 * rdrop / max(samples, 1),
                                  env_drops_total, bins_total, bins_peak)
+                        if hasattr(self.receiver, 'restarts'):
+                            self.receiver.restarts()     # logs a warning when the radio had to be restarted
                         # Per-band breakdown.  Format: name:total|<30s,<60s,<300s,300s+
                         # If list_bin_ages unavailable, just name:total.
                         if per_band and any(b[2] for b in per_band):
