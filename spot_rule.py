@@ -62,6 +62,7 @@ DE_LOOKBACK = 6               # tokens before DE searched for CQ or TEST
 NEAR_KHZ = 0.5                # copies within this of each other are one frequency
 REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call and band per 10 minutes
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
+OWNER_CELL_KHZ = 0.25         # owner_cell: a new owner replaces only the owner within this
 LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
 
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
@@ -386,6 +387,8 @@ def _fragment(short: str, long_: str) -> bool:
     """short is a piece of the longer call long_: its start, its end, or inside it, 2 to 4
     characters shorter (K1V of K1VUT, N6T of N6TQS). One character shorter is the one-edit
     vote's and the rival term's case already."""
+    if short in long_.split("/") or long_.startswith(short + "/") or long_.endswith("/" + short):
+        return False      # WA2USA is the call of WA2USA/P, HK3/NP4Z of HK3/NP4Z/P: not pieces
     d = len(long_) - len(short)
     return 2 <= d <= 4 and len(short) >= 2 and short in long_ and CALL_RE.match(long_) is not None
 
@@ -420,7 +423,8 @@ class RepeatSpotRule:
                  listed: Callable[[str], bool] | None = None, listed_by: str = "scp",
                  contest_words: bool = False, cq_repeats: bool = False,
                  fragments: str | None = None, words: frozenset[str] | None = None,
-                 grid: bool = False) -> None:
+                 grid: bool = False, owner_cell: bool = False,
+                 owned_two_windows: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -449,6 +453,8 @@ class RepeatSpotRule:
             raise ValueError(f"fragments takes 'even' or 'any', and/or 'stray', got {fragments!r}")
         self.fragments = 'even' if 'even' in opts else 'any' if 'any' in opts else None
         self.stray = 'stray' in opts                            # TEST K1V U T: no copy of K1V
+        self.owner_cell = owner_cell            # a neighbour 0.5 kHz away keeps its frequency
+        self.owned_two_windows = owned_two_windows   # a challenger at an owned frequency needs 2 windows
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
@@ -471,6 +477,7 @@ class RepeatSpotRule:
              snr: float | None = None) -> list[tuple[str, float]]:
         """Record one decoded text of a window; return [(call, freq_khz)] to spot now."""
         self._expire(now)
+        owned = self.owner(freq_khz, now) if self.owned_two_windows else None
         if self.split_runs:
             text = split_runs(text)
         if self.threshold is not None:
@@ -506,6 +513,8 @@ class RepeatSpotRule:
                                       and k >= (counts[call] if self.fragments == 'even' else 1)
                                       for other, k in counts.items()):
                 continue          # a piece of a longer call heard here (K1V of K1VUT): wait
+            if owned is not None and owned != call and len({c.window for c in near if c.call == call}) < 2:
+                continue          # another call owns this frequency: a caller read as the runner waits
             spot_f = max((c for c in near if c.call == call), key=lambda c: c.snr).freq_khz
             key = (call, int(spot_f // 1000))     # per band: a station running two bands
             last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
@@ -556,8 +565,9 @@ class RepeatSpotRule:
         return min(live, key=lambda o: abs(o[1] - freq_khz))[0] if live else None
 
     def _own(self, call: str, freq_khz: float, now: float) -> None:
+        cell = OWNER_CELL_KHZ if self.owner_cell else NEAR_KHZ
         self._owners = [o for o in self._owners
-                        if abs(o[1] - freq_khz) > NEAR_KHZ and now - o[2] <= LOCK_IDLE_S]
+                        if abs(o[1] - freq_khz) > cell and now - o[2] <= LOCK_IDLE_S]
         self._owners.append([call, freq_khz, now])
 
     def _truer_call(self, call: str, owner: str) -> bool:

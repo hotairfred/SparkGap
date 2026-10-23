@@ -793,3 +793,35 @@ def test_fragments_by_config() -> None:
     assert sparkgap._make_spot_rule({}, tracker).fragments is None
     r = sparkgap._make_spot_rule({"spot_rule_fragments": "any,stray"}, tracker)
     assert r.fragments == "any" and r.stray
+
+
+def test_owner_cell_keeps_a_neighbours_frequency() -> None:
+    """CWT 10-21: runners 0.5 kHz apart took each other's ownership on every CQ, so lock-on
+    could not hold a caller back. owner_cell: a new owner replaces only the one in its cell."""
+    for cell, want in ((False, "K1ABC"), (True, "W6YH")):
+        rule = RepeatSpotRule(_tier2, lockon=True, owner_cell=cell)
+        _feed(rule, ["CQ TEST W6YH", "CQ TEST W6YH"])
+        _feed(rule, ["CQ TEST K1ABC", "CQ TEST K1ABC"], freq=7019.8, t0=120.0)
+        assert rule.owner(7019.3, 181.0) == want
+        assert rule.owner(7019.8, 181.0) == "K1ABC"
+
+
+def test_owned_two_windows_a_challenger_waits_for_a_second_window() -> None:
+    """A caller read as the runner at a frequency another call owns spots on one window today."""
+    def rule(on: bool) -> RepeatSpotRule:
+        return RepeatSpotRule(_tier2, cq_groups=True, lockon=True, cq_qualifiers=True,
+                              validation="normal", listed=lambda c: c in SCP, owned_two_windows=on)
+    for on in (False, True):
+        r = rule(on)
+        assert _feed(r, ["CQ CQ DE W1AW W1AW K"]) == [("W1AW", 7019.3)]
+        first = _feed(r, ["CQ CQ DE K1ABC K1ABC K"], t0=60.0)
+        assert first == ([] if on else [("K1ABC", 7019.3)])
+        if on:
+            assert _feed(r, ["CQ CQ DE K1ABC K1ABC K"], t0=120.0) == [("K1ABC", 7019.3)]
+
+
+def test_a_portable_call_is_not_a_fragment_of_itself() -> None:
+    from spot_rule import _fragment
+    assert not _fragment("WA2USA", "WA2USA/P")
+    assert not _fragment("HK3/NP4Z", "HK3/NP4Z/P")
+    assert _fragment("K1V", "K1VUT")
