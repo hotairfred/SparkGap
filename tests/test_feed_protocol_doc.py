@@ -131,3 +131,13 @@ def test_spectrum_layout() -> None:
 def test_names() -> None:
     assert f"Protocol `{PROTOCOL}`, feed version {FEED_VERSION}." in DOC
     assert EXAMPLES["subscribe"] == {"type": "subscribe", "spectrum_hz": 20}
+
+
+def test_control_result_fields(feed: FeedServer) -> None:
+    from tests.test_feed_server import WS
+
+    feed.on_control = lambda change, reply: reply(True, "retuned to 20m")
+    c = WS(feed.port)
+    c.json("snapshot")
+    c.send(feed_server.OP_TEXT, json.dumps(EXAMPLES["control"]).encode())
+    assert c.json("control_result") == EXAMPLES["control_result"]

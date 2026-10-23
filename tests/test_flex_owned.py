@@ -1,6 +1,9 @@
-"""flex_iq.owned_objects: which radio slices and pans belong to SparkGap's own client handle."""
+"""flex_iq parsers and the control connection: owned objects, GUI stations, replies, status reads."""
 
-from flex_iq import FlexIQReceiver, gui_stations, owned_objects, pan_slices
+import pytest
+
+from flex_iq import FlexConnection, FlexIQReceiver, gui_stations, owned_objects, pan_slices, station_for
+from tests.flex_fake_radio import use_fake_radio
 
 STATUS = [
     # SparkGap's default objects (the radio's Slice A on the 40m phone default)
@@ -32,29 +35,17 @@ def test_cmd_returns_at_its_own_reply() -> None:
     import socket
     import time
 
-    from flex_iq import FlexIQReceiver
-
-    rx = FlexIQReceiver("127.0.0.1", freq_hz=7_030_000, sample_rate=96_000)
+    conn = FlexConnection("127.0.0.1")
     ours, radio = socket.socketpair()
-    rx._tcp = ours
+    conn._tcp = ours
     radio.sendall(b"S1|slice 0 in_use=1\nR0|0|\nR1|0|7\nS1|display pan 0x40000000\n")
     t0 = time.time()
-    lines = rx._cmd("slice create", timeout=2.0)
+    lines = conn.cmd("slice create", timeout=2.0)
     assert time.time() - t0 < 0.5
-    assert lines[-1] == "R1|0|7"
-    assert rx._cmd("sub pan all", timeout=0.3, settle=0.1)[-1] == "S1|display pan 0x40000000"
+    assert lines[-1] == "R1|0|7" and conn.hex_id(lines) == 7
+    assert conn.cmd("sub pan all", timeout=0.3, settle=0.1)[-1] == "S1|display pan 0x40000000"
     ours.close()
     radio.close()
-
-
-def test_slice_pans_maps_own_slices_to_their_pan() -> None:
-    from flex_iq import slice_pans
-
-    lines = [
-        "S1|slice 1 in_use=1 pan=0x40000001 client_handle=0x3CBB9746 RF_frequency=14.1",
-        "S1|slice 0 in_use=1 pan=0x40000000 client_handle=0x1A2B3C4D RF_frequency=7.053",
-    ]
-    assert slice_pans(lines, "3CBB9746") == {1: "0x40000001"}
 
 
 CLIENTS = [
@@ -101,61 +92,35 @@ def test_ptt_ours_only_when_a_sparkgap_station_holds_local_ptt() -> None:
     assert ptt_ours(lines + [ours]) == [ours]
 
 
-def test_read_status_empties_the_connection_and_sees_it_close() -> None:
+def test_poll_empties_the_connection_and_sees_it_close() -> None:
     import socket
 
-    from flex_iq import FlexIQReceiver
-
-    rx = FlexIQReceiver("127.0.0.1", freq_hz=7_030_000, sample_rate=96_000)
-    rx._tcp, radio = socket.socketpair()
-    rx._tcp.settimeout(2.0)
+    conn = FlexConnection("127.0.0.1")
+    conn._tcp, radio = socket.socketpair()
+    conn._tcp.settimeout(2.0)
     radio.sendall(b"S1|interlock state=TRANSMITTING\n" * 2_000 + b"S1|slice 0 tx")
-    while rx._buf != b"S1|slice 0 tx":       # every whole line read and dropped, the part line kept
-        assert rx._read_status()
-    assert rx._read_status()                 # nothing waiting: still connected
+    while conn._buf != b"S1|slice 0 tx":     # every whole line read and dropped, the part line kept
+        assert conn.poll() is not None
+    assert conn.poll() == []                 # nothing waiting: still connected
     radio.close()
-    assert not rx._read_status()
-    assert rx._lost == "The radio closed the control connection"
-    rx._close("stopping")
-    assert rx._tcp is None
+    assert conn.poll() is None
+    assert conn.lost == "The radio closed the control connection"
+    conn.close("stopping")
+    assert conn._tcp is None
 
 
-def test_station_name_follows_the_channel_unless_set() -> None:
-    assert FlexIQReceiver("0.0.0.0", daxiq_channel=2).station == "SparkGap-2"
+def test_one_station_per_radio_named_after_its_nickname() -> None:
+    assert station_for("Dallas") == "SparkGap-Dallas"
+    assert station_for("Lake House") == "SparkGap-Lake-House"
+    assert station_for("") == "SparkGap"
+    assert FlexIQReceiver("0.0.0.0", daxiq_channel=2).station == "SparkGap"
     assert FlexIQReceiver("0.0.0.0", daxiq_channel=2, station="SparkGap-1").station == "SparkGap-1"
 
 
-def test_failed_start_removes_what_it_made() -> None:
-    rx = FlexIQReceiver("0.0.0.0", daxiq_channel=3)
-    sent: list[str] = []
-
-    def setup() -> None:
-        rx._pan_id, rx._slice_id = 0x40000001, 1
-        raise RuntimeError("[Flex] Failed to create DAX-IQ stream")
-
-    made = {"sub pan all": ["S0|display pan 0x40000001 client_handle=0x7F19D8AE daxiq_channel=0"],
-            "sub slice all": ["S0|slice 1 in_use=1 pan=0x40000001 client_handle=0x7F19D8AE"]}
-    rx._setup = setup  # type: ignore[method-assign]
-    rx._cmd = lambda cmd, timeout=2.0, settle=0.0: sent.append(cmd) or made.get(cmd, []) + ["R1|0|"]  # type: ignore[method-assign]
-    try:
+def test_a_failed_start_removes_the_pan_and_slice_it_made(monkeypatch: pytest.MonkeyPatch) -> None:
+    radio = use_fake_radio(monkeypatch)
+    radio.refuse["stream create"] = "50000005"
+    rx = FlexIQReceiver("192.0.2.1", freq_hz=7_038_400, sample_rate=96_000, daxiq_channel=3)
+    with pytest.raises(RuntimeError, match="DAX-IQ stream"):
         rx.start()
-    except RuntimeError:
-        pass
-    assert sent == ["sub daxiq all", "sub pan all", "sub slice all", "slice remove 1", "display pan remove 0x40000001"]
-
-
-def test_start_forgets_objects_from_a_dropped_connection() -> None:
-    rx = FlexIQReceiver("0.0.0.0", daxiq_channel=2)
-    rx._stream_id, rx._pan_id, rx._slice_id = 0x20000000, 0x40000000, 0
-    sent: list[str] = []
-
-    def setup() -> None:
-        raise OSError("radio unreachable")
-
-    rx._setup = setup  # type: ignore[method-assign]
-    rx._cmd = lambda cmd, timeout=2.0, settle=0.0: sent.append(cmd) or ["R1|0|"]  # type: ignore[method-assign]
-    try:
-        rx.start()
-    except OSError:
-        pass
-    assert sent == []
+    assert not radio.pans and not radio.slices and rx.conn is None

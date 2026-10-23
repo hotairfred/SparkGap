@@ -21,9 +21,7 @@
     <div id="station" class="station mono"></div>
     <div class="state"><span id="stateDot" class="sdot"></span><span id="stateText">No feed</span></div>
     <div id="rec" class="rec" hidden><span class="rdot"></span>REC</div>
-    <button id="gear" class="icon" title="Settings">⚙</button>
-    <button id="theme" class="icon" title="Light or dark"><span class="half"></span></button>
-    <button id="statusBtn" class="icon" title="Status">ⓘ</button>
+    <button id="gear" class="icon" title="Settings and info">⚙</button>
   </header>
 
   <main>
@@ -81,43 +79,29 @@
 </div>
 
 <div id="modal" class="modal" hidden>
-  <div class="dialog" role="dialog" aria-label="Settings">
-    <h2>Settings</h2>
-    <div class="demo">
-      <span class="label">DEMO</span>
-      <div id="demoSeg" class="seg"></div>
-      <span class="small faint">Made-up signals instead of your servers.</span>
-    </div>
-    <div class="demo">
-      <span class="label">DECODED</span>
-      <div id="decSeg" class="seg"></div>
-      <span class="small faint">Readings of each window shown.</span>
-    </div>
-    <div id="connSection" class="setting">
-      <div class="label">CONNECTIONS</div>
-      <div id="conns"></div>
+  <div class="dialog settings" role="dialog" aria-label="Settings">
+    <div class="shead"><div id="modeSeg" class="seg"></div><div id="setNote" class="small muted"></div></div>
+    <div id="tabs" class="tabs"></div>
+    <div id="infoBody" class="status" hidden></div>
+    <div id="tabServers">
+      <div id="conns" class="scards"></div>
       <div id="connForm" class="form" hidden>
-        <input id="fAddr" type="text" placeholder="Address: VPN or local IP address; finds every SparkGap there" spellcheck="false">
-        <input id="fCode" type="text" placeholder="Join code, e.g. XXX-XXX" spellcheck="false">
+        <input id="fAddr" type="text" placeholder="Address of the SparkGap server (VPN or local IP)" spellcheck="false">
+        <input id="fCode" type="text" placeholder="Its join code, e.g. XXX-XXX" spellcheck="false">
         <div id="fErr" class="err" hidden></div>
         <div class="row"><button id="fSave" class="btn">Add</button><button id="fCancel" class="btn">Cancel</button></div>
       </div>
       <button id="addConn" class="btn">+ Add server</button>
+      <section class="scard wide browser"><h3><span>THIS BROWSER</span></h3>
+        <div class="grid seatgrid">
+          <span class="label">THEME</span><div id="themeSeg" class="seg"></div>
+          <span class="label">DECODED</span><div id="decSeg" class="seg"></div>
+          <span></span><span class="small faint">Readings of each decoded window shown.</span>
+        </div>
+      </section>
     </div>
-    <div class="grid">
-      <span class="label">SPOT RULE</span><div id="sRule" class="seg ro"></div>
-      <span id="lValid" class="label">VALIDATION</span><div id="sValid" class="seg ro"></div>
-      <span id="lCalls" class="label">CALL SOURCE</span><div id="sCalls" class="seg ro"></div>
-      <span></span><span class="small faint">From the selected server's config.</span>
-    </div>
+    <div id="tabCopy" class="scards" hidden></div>
     <div class="row foot"><span class="small faint"><a id="help" target="_blank" rel="noopener">Help</a></span><button id="close" class="btn">Close</button></div>
-  </div>
-</div>
-<div id="statusModal" class="modal" hidden>
-  <div class="dialog status" role="dialog" aria-label="Status">
-    <div class="shead"><h2>Status</h2><div id="statusHead"></div></div>
-    <div id="statusBody"></div>
-    <div class="row foot"><span id="statusFoot" class="small faint"></span><button id="statusClose" class="btn">Close</button></div>
   </div>
 </div>
 </body>
