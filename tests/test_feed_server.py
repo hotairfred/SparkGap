@@ -682,3 +682,86 @@ def test_auto_port_says_when_none_is_free(monkeypatch: pytest.MonkeyPatch,
             assert f"no free port in {p}-{p + 1}" in caplog.text
         finally:
             f.stop()
+
+
+def test_7320_is_the_servers_and_auto_starts_after_it(caplog: pytest.LogCaptureFixture) -> None:
+    assert FeedServer({"bind": "127.0.0.1"}, HELLO).ports[0] == 7321
+    assert list(feed_server.AUTO_PORTS) == list(range(7321, 7340))
+    with caplog.at_level(logging.WARNING):
+        FeedServer({"bind": "127.0.0.1", "port": 7320}, HELLO)
+    assert "is the server's" in caplog.text
+
+
+def _control(c: WS, change: object, rid: object = "r1") -> None:
+    c.send(OP_TEXT, json.dumps({"type": "control", "id": rid, "set": change}).encode())
+
+
+def _next_text(c: WS) -> dict:
+    while True:
+        op, data = c.frame()
+        if op == OP_TEXT:
+            return json.loads(data)
+
+
+def test_a_control_nothing_takes_is_not_supported(feed: FeedServer) -> None:
+    c = WS(feed.port)
+    c.json("snapshot")
+    _control(c, {"band": "20m"})
+    assert c.json("control_result") == {
+        "type": "control_result", "id": "r1", "ok": False, "error": "not supported"
+    }
+
+
+def test_a_control_reaches_sparkgap_and_its_answer_only_the_asker(feed: FeedServer) -> None:
+    asked: list[dict] = []
+
+    def take(change: dict, reply: Any) -> None:
+        asked.append(change)
+        reply(True, "retuned to 20m")
+
+    feed.on_control = take
+    other = WS(feed.port)
+    other.json("snapshot")
+    c = WS(feed.port)
+    c.json("snapshot")
+    wait_for(lambda: feed.n_clients == 2)
+    _control(c, {"band": "20m"}, rid=7)
+    assert c.json("control_result") == {
+        "type": "control_result", "id": 7, "ok": True, "message": "retuned to 20m"
+    }
+    assert asked == [{"band": "20m"}]
+    feed.publish_spot(14021.2, "AF4PX", 18, 22)
+    assert _next_text(other)["type"] == "spot"
+
+
+@pytest.mark.parametrize("rid, change", [([1], {"band": "20m"}), ("x" * 65, {"band": "20m"})])
+def test_a_control_without_a_usable_id_gets_no_answer(feed: FeedServer, rid: object, change: object) -> None:
+    feed.on_control = lambda change, reply: reply(True, "done")
+    c = WS(feed.port)
+    c.json("snapshot")
+    _control(c, change, rid=rid)
+    _control(c, {"band": "20m"}, rid="r2")
+    assert c.json("control_result")["id"] == "r2"
+
+
+def test_a_control_without_settings_is_refused(feed: FeedServer) -> None:
+    feed.on_control = lambda change, reply: reply(True, "done")
+    c = WS(feed.port)
+    c.json("snapshot")
+    _control(c, [])
+    assert c.json("control_result")["error"] == "set must be an object"
+
+
+def test_new_bands_leave_nothing_of_the_old_ones(feed: FeedServer) -> None:
+    feed.publish_window(7021.2, "CQ DE AF4PX AF4PX K", 22, 18.0, 0.4)
+    feed.publish_spot(7021.2, "AF4PX", 18, 22)
+    feed.publish_status({"bins": 3})
+    c = WS(feed.port)
+    c.json("snapshot")
+    wait_for(lambda: feed.n_clients == 1)
+    feed.set_bands([{"name": "20m", "center_khz": 14038.4, "span_khz": 96.0}])
+    assert c.json("hello")["bands"] == [{"name": "20m", "center_khz": 14038.4, "span_khz": 96.0}]
+    snap = c.json("snapshot")
+    assert snap["windows"] == [] and snap["spots"] == [] and snap["signals"] == [] and snap["status"] is None
+    late = WS(feed.port)
+    assert late.json("hello")["bands"][0]["name"] == "20m" and late.json("snapshot")["windows"] == []

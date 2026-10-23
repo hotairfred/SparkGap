@@ -1,100 +1,23 @@
-"""flex_iq logs every connection attempt, each failure and each successful reconnect."""
+"""flex_iq logs every connection attempt and command, and refuses a DAX-IQ channel another client uses
+(status lines captured on the Lakehouse 6600, Fred's 6700 and the Dallas 6400M)."""
 
 import logging
 
 import pytest
 
 import flex_iq
-from flex_iq import FlexIQReceiver
+from flex_iq import FlexConnection, FlexIQReceiver, FlexStation
+from tests.flex_fake_radio import use_fake_radio
 
 Monkey = pytest.MonkeyPatch
 Caplog = pytest.LogCaptureFixture
 ATTEMPT = "[Flex] Connection attempt {} to 192.0.2.1:4992 ({})"
 FAILED = "[Flex] Connection attempt {} failed: connection refused"
-
-
-def _receiver(monkeypatch: Monkey, fail_times: int) -> FlexIQReceiver:
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
-    left = [fail_times]
-
-    def setup() -> None:
-        if left[0]:
-            left[0] -= 1
-            raise OSError("connection refused")
-
-    monkeypatch.setattr(rx, "_setup", setup)
-    monkeypatch.setattr(rx, "_remove_objects", lambda: None)
-    monkeypatch.setattr(flex_iq, "RETRY_S", 0)
-    return rx
+LAKE_STATION = 0x79D6_0253
 
 
 def _lines(caplog: Caplog) -> list[tuple[int, str]]:
     return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == "sparkgap.flex"]
-
-
-def test_first_start_logs_the_attempt(monkeypatch: Monkey, caplog: Caplog) -> None:
-    rx = _receiver(monkeypatch, 0)
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        rx.start()
-    assert _lines(caplog) == [(logging.INFO, ATTEMPT.format(1, "first start"))]
-
-
-def test_failed_first_start_logs_an_error_and_raises(monkeypatch: Monkey, caplog: Caplog) -> None:
-    rx = _receiver(monkeypatch, 1)
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"), pytest.raises(OSError):
-        rx.start()
-    assert (logging.ERROR, FAILED.format(1)) in _lines(caplog)
-
-
-def _no_kill(monkeypatch: Monkey) -> list[int]:
-    kills: list[int] = []
-    monkeypatch.setattr(flex_iq.os, "kill", lambda _pid, sig: kills.append(sig))
-    return kills
-
-
-def test_one_loss_gets_one_reconnect(monkeypatch: Monkey, caplog: Caplog) -> None:
-    rx, kills = _receiver(monkeypatch, 0), _no_kill(monkeypatch)
-    rx._running = True
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        rx._restart("No DAX-IQ packets for 10 s", True)
-    lines = _lines(caplog)
-    assert lines[0] == (logging.ERROR, "[Flex] No DAX-IQ packets for 10 s: connecting again")
-    assert (logging.INFO, ATTEMPT.format(1, "reconnect: No DAX-IQ packets for 10 s")) in lines
-    assert lines[-1][1].startswith("[Flex] Reconnected on attempt 1, ")
-    assert kills == [] and rx._running and rx.reconnects == 1
-
-
-def test_failed_reconnect_stops_sparkgap(monkeypatch: Monkey, caplog: Caplog) -> None:
-    rx, kills = _receiver(monkeypatch, 1), _no_kill(monkeypatch)
-    rx._running = True
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        rx._restart("No DAX-IQ packets for 10 s", True)
-    lines = _lines(caplog)
-    assert (logging.ERROR, FAILED.format(1)) in lines
-    assert lines[-1][0] == logging.ERROR
-    assert lines[-1][1].startswith("[Flex] reconnect attempt 1 failed: stopping SparkGap")
-    assert kills == [flex_iq.signal.SIGINT] and not rx._running and rx.state == "halted"
-
-
-def test_second_loss_within_the_window_stops_sparkgap(monkeypatch: Monkey,
-                                                      caplog: Caplog) -> None:
-    rx, kills = _receiver(monkeypatch, 0), _no_kill(monkeypatch)
-    rx._running = True
-    rx._last_loss = flex_iq.time.time() - 31
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        rx._restart("No DAX-IQ packets for 10 s", True)
-    lines = _lines(caplog)
-    assert len(lines) == 1 and lines[0][0] == logging.ERROR
-    assert "31 s after the previous lost connection: stopping SparkGap" in lines[0][1]
-    assert kills == [flex_iq.signal.SIGINT] and rx.attempts == 0
-
-
-def test_loss_after_the_window_reconnects(monkeypatch: Monkey) -> None:
-    rx, kills = _receiver(monkeypatch, 0), _no_kill(monkeypatch)
-    rx._running = True
-    rx._last_loss = flex_iq.time.time() - flex_iq.HALT_WINDOW_S - 1
-    rx._restart("No DAX-IQ packets for 10 s", True)
-    assert kills == [] and rx.attempts == 1
 
 
 class _ResetSocket:
@@ -106,23 +29,6 @@ class _ResetSocket:
 
     def close(self) -> None:
         pass
-
-
-def test_connection_error_keeps_its_cause() -> None:
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
-    rx._tcp = _ResetSocket()  # pyright: ignore[reportAttributeAccessIssue]
-    assert not rx._read_status()
-    assert rx._lost == "Control connection error: [Errno 104] Connection reset by peer"
-
-
-def test_own_disconnect_names_the_client_and_reason(caplog: Caplog) -> None:
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
-    rx._tcp, rx._handle = _ResetSocket(), "290AB860"  # pyright: ignore[reportAttributeAccessIssue]
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        rx._close("reconnecting")
-        rx._close("stopping")          # already closed: no second line
-    line = "[Flex] Disconnected from 192.0.2.1 (client 0x290AB860, reconnecting)"
-    assert _lines(caplog) == [(logging.INFO, line)]
 
 
 def test_last_packet_time_reads_as_utc() -> None:
@@ -142,113 +48,8 @@ def test_reply_names_its_command_and_flags_refusals() -> None:
     assert flex_iq.reply_log("S1|slice 0 tx=0", sent) is None
 
 
-def test_sent_commands_are_logged_at_info(caplog: Caplog) -> None:
-    import socket
-
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
-    rx._tcp, radio = socket.socketpair()
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        rx._send("sub slice all")
-        radio.sendall(b"R1|0|\n")
-        rx._recv_line(timeout=1.0)
-    assert _lines(caplog) == [(logging.INFO, "[Flex] >>> C1|sub slice all"),
-                              (logging.INFO, "[Flex] <<< R1|0| (sub slice all)")]
-    radio.close()
-    rx._tcp.close()
-
-
-DALLAS_INFO = ('R1|0|model="FLEX-6400M",chassis_serial="0520-0945-6401-3114",name="Dallas",'
-               'callsign="N0CALL",gps="Not Present",atu_present=1,num_scu=1')
-
-
-def test_station_is_named_after_the_radio_nickname() -> None:
-    assert flex_iq.radio_nickname([DALLAS_INFO]) == "Dallas"
-    assert flex_iq.station_for("Dallas", 2) == "SparkGap-Dallas"
-    assert flex_iq.station_for("Lake House", 3) == "SparkGap-Lake-House"
-
-
-def test_no_nickname_falls_back_to_the_daxiq_channel() -> None:
-    assert flex_iq.radio_nickname(['R1|0|model="FLEX-6600",name=""']) == ""
-    assert flex_iq.radio_nickname(["R1|50000016|"]) == ""
-    assert flex_iq.station_for("", 3) == "SparkGap-3"
-
-
-def test_close_says_goodbye_first() -> None:
-    import socket
-
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
-    rx._tcp, radio = socket.socketpair()
-    rx._close("stopping")
-    radio.settimeout(1.0)
-    assert radio.recv(16) == b"\x04"
-    radio.close()
-
-
-class _Sock:
-    def settimeout(self, *_: object) -> None:
-        pass
-
-    def connect(self, *_: object) -> None:
-        pass
-
-
 class _Stop(Exception):
     pass
-
-
-def _setup_commands(monkeypatch: Monkey, listed: list[str], station: str | None = "SparkGap-1",
-                    channel: int = 1, nickname: str = "Dallas") -> list[str]:
-    """Commands _setup sends up to "client udpport", with `listed` as the radio's client status."""
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=channel, station=station)
-    sent: list[str] = []
-
-    def cmd(c: str, timeout: float = 2.0, settle: float = 0.0) -> list[str]:
-        if c.startswith("client udpport"):
-            raise _Stop
-        rx._seq += 1
-        sent.append(c)
-        if c == "info":
-            return [f'R{rx._seq}|0|model="FLEX-6600",name="{nickname}",callsign="N0CALL"']
-        return (listed if c == "sub client all" else []) + [f"R{rx._seq}|0|"]
-
-    monkeypatch.setattr(flex_iq.socket, "socket", lambda *_: _Sock())
-    monkeypatch.setattr(rx, "_drain", lambda *_: ["V1.4.0.0", "H7F19D8AE"])
-    monkeypatch.setattr(rx, "_cmd", cmd)
-    with pytest.raises(_Stop):
-        rx._setup()
-    return sent
-
-
-def test_second_copy_binds_to_its_station_and_never_claims_the_gui(monkeypatch: Monkey) -> None:
-    other = "S0|client 0x4F8B82DB connected client_id=AAAA-1 program=SparkGap station=SparkGap-1"
-    sent = _setup_commands(monkeypatch, [other])
-    assert "client bind client_id=AAAA-1" in sent
-    assert not any(c.startswith("client gui") for c in sent)
-
-
-def test_first_copy_claims_the_gui(monkeypatch: Monkey) -> None:
-    smartsdr = "S0|client 0x2004D85C connected client_id=BBBB-2 program=SmartSDR-Win station=SUPER"
-    sent = _setup_commands(monkeypatch, [smartsdr])
-    assert any(c.startswith("client gui ") for c in sent)
-    assert not any(c.startswith("client bind") for c in sent)
-
-
-def test_copies_on_one_radio_share_its_station(monkeypatch: Monkey) -> None:
-    first = "S0|client 0x4F8B82DB connected client_id=AAAA-1 program=SparkGap station=SparkGap-Lake"
-    sent = _setup_commands(monkeypatch, [first], station=None, channel=3, nickname="Lake")
-    assert sent[0] == "info"
-    assert "client bind client_id=AAAA-1" in sent
-    assert not any(c.startswith("client gui") for c in sent)
-
-
-def test_client_id_is_the_same_for_every_copy_and_start(monkeypatch: Monkey) -> None:
-    def gui_id(channel: int, nickname: str) -> str:
-        sent = _setup_commands(monkeypatch, [], station=None, channel=channel, nickname=nickname)
-        return next(c.split()[2] for c in sent if c.startswith("client gui "))
-
-    a, b, other = gui_id(2, "Lake"), gui_id(3, "Lake"), gui_id(2, "Dallas")
-    assert a == b != other
-    assert a == a.upper() and len(a) == 36
 
 
 MAESTRO = ("S0|client 0x28B5BE40 connected client_id=CCCC-3 program=SmartSDR-Maestro "
@@ -264,6 +65,35 @@ LAKE_PANS = [  # Lake 6600, 2026-10-19: Maestro's pan holds DAX-IQ 1, SparkGap-L
 ]
 
 
+class _Stop(Exception):
+    pass
+
+
+class _Scripted(FlexConnection):
+    """A bound channel's connection that answers from captured status and stops at the pan."""
+
+    def __init__(self, status: dict[str, list[str]]) -> None:
+        super().__init__("192.0.2.1")
+        self.handle, self.status, self.sent = "7F19D8AE", status, []
+
+    def cmd(self, cmd: str, timeout: float = 2.0, settle: float = 0.0) -> list[str]:
+        if cmd.startswith("display pan"):
+            raise _Stop
+        self.seq += 1
+        self.sent.append(cmd)
+        return self.status.get(cmd, []) + [f"R{self.seq}|0|"]
+
+
+def _build_to_pan(channel: int, clients: list[str], pans: list[str]) -> list[str]:
+    """Commands a channel bound to SparkGap-Lake sends until it makes its pan."""
+    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=channel)
+    conn = _Scripted({"sub pan all": pans, "sub daxiq all": pans})
+    rx.conn, rx._clients, rx._station_handle = conn, clients, LAKE_STATION
+    with pytest.raises(_Stop):
+        rx._build()
+    return conn.sent
+
+
 def test_daxiq_holders_reads_pan_status() -> None:
     assert flex_iq.daxiq_holders(LAKE_PANS, 1) == {"0x40000000": "0X28B5BE40"}
     assert flex_iq.daxiq_holders(LAKE_PANS, 3) == {"0x40000002": "0X79D60253"}
@@ -271,41 +101,17 @@ def test_daxiq_holders_reads_pan_status() -> None:
     assert flex_iq.daxiq_holders(["S0|display pan 0x40000003 daxiq_channel=0 "], 0) == {}
 
 
-def _setup_to_pan(monkeypatch: Monkey, channel: int, clients: list[str],
-                  pans: list[str]) -> list[str]:
-    """Commands _setup sends until it creates or sets a pan, on the Lake radio."""
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=channel)
-    sent: list[str] = []
-
-    def cmd(c: str, timeout: float = 2.0, settle: float = 0.0) -> list[str]:
-        if c.startswith("display pan"):
-            raise _Stop
-        rx._seq += 1
-        sent.append(c)
-        if c == "info":
-            return [f'R{rx._seq}|0|model="FLEX-6600",name="Lake",callsign="N0CALL"']
-        status = {"sub client all": clients, "sub pan all": pans}.get(c, [])
-        return status + [f"R{rx._seq}|0|"]
-
-    monkeypatch.setattr(flex_iq.socket, "socket", lambda *_: _Sock())
-    monkeypatch.setattr(rx, "_drain", lambda *_: ["V1.4.0.0", "H7F19D8AE"])
-    monkeypatch.setattr(rx, "_cmd", cmd)
-    with pytest.raises(_Stop):
-        rx._setup()
-    return sent
-
-
 def test_a_channel_another_station_holds_is_refused(monkeypatch: Monkey) -> None:
     with pytest.raises(RuntimeError, match=r"DAX-IQ 1 is in use by MaestroC \(SmartSDR-Maestro\) "
                                            r"on pan 0x40000000"):
-        _setup_to_pan(monkeypatch, 1, [MAESTRO, LAKE_GUI], LAKE_PANS)
+        _build_to_pan(1, [MAESTRO, LAKE_GUI], LAKE_PANS)
 
 
 def test_a_channel_another_copy_of_our_station_streams_is_refused(monkeypatch: Monkey) -> None:
     live = LAKE_PANS + ["S79D60253|stream 0x20000011 type=dax_iq daxiq_channel=3 pan=0x40000002 "
                         "client_handle=0x79D60253 active=1"]
     with pytest.raises(RuntimeError, match=r"DAX-IQ 3 is in use by SparkGap-Lake \(SparkGap\)"):
-        _setup_to_pan(monkeypatch, 3, [MAESTRO, LAKE_GUI], live)
+        _build_to_pan(3, [MAESTRO, LAKE_GUI], live)
 
 
 def test_a_channel_a_bound_copy_streams_names_its_station_and_pan(monkeypatch: Monkey) -> None:
@@ -313,31 +119,18 @@ def test_a_channel_a_bound_copy_streams_names_its_station_and_pan(monkeypatch: M
     live = LAKE_PANS + ["S6B976AE3|stream 0x20000011 type=dax_iq daxiq_channel=3 pan=0x40000002 "
                         "client_handle=0x6B976AE3 client_gui_handle=0x79D60253 active=1"]
     with pytest.raises(RuntimeError, match=r"DAX-IQ 3 is in use by SparkGap-Lake \(SparkGap\) on pan 0x40000002;"):
-        _setup_to_pan(monkeypatch, 3, [MAESTRO, LAKE_GUI], live)
-
-
-def test_our_station_pan_saved_on_our_channel_is_taken_back(monkeypatch: Monkey) -> None:
-    # X, 2026-10-20 11:19Z: the radio restored the station's pan on channel 3 with nobody streaming it
-    sent = _setup_to_pan(monkeypatch, 3, [MAESTRO, LAKE_GUI], LAKE_PANS)
-    assert "display pan create x=1 y=1" not in sent and sent[-1] == "sub tx all"
-
-
-def test_a_channel_this_client_holds_is_ours(monkeypatch: Monkey) -> None:
-    own = ["S0|display pan 0x40000003 client_handle=0x7F19D8AE",
-           "S0|display pan 0x40000003 daxiq_channel=4 "]
-    sent = _setup_to_pan(monkeypatch, 4, [MAESTRO, LAKE_GUI], LAKE_PANS + own)
-    assert "sub pan all" in sent
+        _build_to_pan(3, [MAESTRO, LAKE_GUI], live)
 
 
 def test_a_free_channel_goes_ahead(monkeypatch: Monkey) -> None:
-    sent = _setup_to_pan(monkeypatch, 4, [MAESTRO, LAKE_GUI], LAKE_PANS)
-    assert "sub pan all" in sent
+    sent = _build_to_pan(4, [MAESTRO, LAKE_GUI], LAKE_PANS)
+    assert sent[-1] == "sub tx all"
 
 
 def test_an_unknown_owner_is_named_by_handle(monkeypatch: Monkey) -> None:
     with pytest.raises(RuntimeError,
                        match=r"DAX-IQ 1 is in use by client 0X28B5BE40 on pan 0x40000000"):
-        _setup_to_pan(monkeypatch, 1, [LAKE_GUI], LAKE_PANS)
+        _build_to_pan(1, [LAKE_GUI], LAKE_PANS)
 
 
 Y_STREAM = [  # Y.log 2026-10-20: the owner left, the stream lost its pan, then a restored pan took it
@@ -387,13 +180,13 @@ def test_only_a_bound_stream_or_a_sparkgap_copys_claims_a_channel() -> None:
 
 def test_a_channel_another_program_streams_unbound_goes_ahead(monkeypatch: Monkey) -> None:
     # the radio let a copy stream channel 3 next to the TCI server's unbound stream for 30 min (Fred, 10-20)
-    sent = _setup_to_pan(monkeypatch, 3, [AETHER_GUI, LAKE_GUI], LAKE_PANS + AETHER_TCI)
-    assert "display pan create x=1 y=1" not in sent and sent[-1] == "sub tx all"   # saved pan taken back
+    sent = _build_to_pan(3, [AETHER_GUI, LAKE_GUI], LAKE_PANS + AETHER_TCI)
+    assert sent[-1] == "sub tx all"      # on to its own pan
 
 
 def test_a_channel_another_program_binds_is_refused(monkeypatch: Monkey) -> None:
     with pytest.raises(RuntimeError, match=r"DAX-IQ 2 is in use by Fred6700 \(AetherSDR\) on pan 0x40000000;"):
-        _setup_to_pan(monkeypatch, 2, [AETHER_GUI, LAKE_GUI], LAKE_PANS + AETHER_TCI)
+        _build_to_pan(2, [AETHER_GUI, LAKE_GUI], LAKE_PANS + AETHER_TCI)
 
 
 def test_a_channel_another_copy_streams_before_its_bind_is_refused(monkeypatch: Monkey) -> None:
@@ -401,86 +194,11 @@ def test_a_channel_another_copy_streams_before_its_bind_is_refused(monkeypatch: 
     live = LAKE_PANS + ["S6B976AE3|stream 0x20000011 type=dax_iq daxiq_channel=3 pan=0x0 "
                         "client_handle=0x6B976AE3 client_gui_handle=0x79D60253 active=1"]
     with pytest.raises(RuntimeError, match=r"DAX-IQ 3 is in use by SparkGap-Lake \(SparkGap\) on pan none;"):
-        _setup_to_pan(monkeypatch, 3, [MAESTRO, LAKE_GUI], live)
+        _build_to_pan(3, [MAESTRO, LAKE_GUI], live)
 
 def test_pan_status_keeps_saved_channels_and_drops_removed_pans() -> None:
     lines = LAKE_PANS + ["S0|display pan 0x40000003 center=7.038400", "S0|display pan 0x40000001 removed"]
     assert flex_iq.pan_status(lines) == {0x4000_0000: "1", 0x4000_0002: "3", 0x4000_0003: None}
-
-
-def _setup_refused(monkeypatch: Monkey, refused: str) -> list[str]:
-    """Run _setup on a radio that accepts everything except commands starting with `refused`."""
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=4)
-    sent: list[str] = []
-    ids = {"display pan create": "0x40000003,0x42000003", "slice create": "3",
-           "stream create": "0x20000011"}
-
-    def cmd(c: str, timeout: float = 2.0, settle: float = 0.0) -> list[str]:
-        rx._seq += 1
-        sent.append(c)
-        if c.startswith(refused):
-            return [f"R{rx._seq}|50000029|"]
-        if c == "info":
-            return [f'R{rx._seq}|0|model="FLEX-6600",name="Lake"']
-        if c == "sub client all":
-            return [MAESTRO, f"R{rx._seq}|0|"]
-        if c == "sub slice all":   # the radio's default slice on the new pan
-            return ["S0|slice 3 in_use=1 pan=0x40000003 client_handle=0x7F19D8AE", f"R{rx._seq}|0|"]
-        made = next((v for k, v in ids.items() if c.startswith(k)), "")
-        return [f"R{rx._seq}|0|{made}"]
-
-    monkeypatch.setattr(flex_iq.socket, "socket", lambda *_: _Sock())
-    monkeypatch.setattr(rx, "_drain", lambda *_: ["V1.4.0.0", "H7F19D8AE"])
-    monkeypatch.setattr(rx, "_cmd", cmd)
-    with pytest.raises(RuntimeError, match="refused"):
-        rx._setup()
-    assert rx.state != "live" and not rx._pan_bound
-    return sent
-
-
-def test_a_refused_pan_centre_fails_the_start(monkeypatch: Monkey) -> None:
-    sent = _setup_refused(monkeypatch, "display pan set 0x40000003 center=")
-    assert not any(c.startswith("stream create") for c in sent)
-
-
-def test_a_refused_slice_tune_fails_the_start(monkeypatch: Monkey) -> None:
-    _setup_refused(monkeypatch, "slice tune")
-
-
-def test_a_refused_daxiq_bind_fails_the_start(monkeypatch: Monkey) -> None:
-    sent = _setup_refused(monkeypatch, "display pan set 0x40000003 daxiq_channel=")
-    assert not any(c.startswith("stream set") for c in sent)
-
-
-def test_the_owner_leaves_pans_other_copies_stream(monkeypatch: Monkey) -> None:
-    # O2, 2026-10-20 11:21Z: restored pans on channels 3 and 4; Y's live stream feeds the channel 4 one
-    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=2)
-    sent: list[str] = []
-    own = "client_handle=0x7F19D8AE"
-    pans = [f"S0|display pan 0x40000001 {own} center=7.038400", "S0|display pan 0x40000001 daxiq_channel=4 ",
-            f"S0|display pan 0x40000002 {own} center=7.038400", "S0|display pan 0x40000002 daxiq_channel=2 ",
-            f"S0|display pan 0x40000003 {own} center=3.538400", "S0|display pan 0x40000003 daxiq_channel=3 ",
-            f"S0|display pan 0x40000004 {own} center=14.100000"]    # a copy still starting: no stream yet
-    slices = [f"S0|slice {n} in_use=1 pan=0x4000000{n} {own}" for n in (1, 2, 3, 4)]
-
-    def cmd(c: str, timeout: float = 2.0, settle: float = 0.0) -> list[str]:
-        if c.startswith("stream create"):
-            raise _Stop
-        rx._seq += 1
-        sent.append(c)
-        if c == "info":
-            return [f'R{rx._seq}|0|model="FLEX-6600",name="Lake"']
-        status = {"sub client all": [MAESTRO], "sub pan all": pans, "sub slice all": slices,
-                  "sub daxiq all": Y_STREAM}.get(c, [])
-        return status + [f"R{rx._seq}|0|"]
-
-    monkeypatch.setattr(flex_iq.socket, "socket", lambda *_: _Sock())
-    monkeypatch.setattr(rx, "_drain", lambda *_: ["V1.4.0.0", "H7F19D8AE"])
-    monkeypatch.setattr(rx, "_cmd", cmd)
-    with pytest.raises(_Stop):
-        rx._setup()
-    assert rx._pan_id == 0x4000_0002 and rx._slice_id == 2    # its own saved pan back
-    assert [c for c in sent if "remove" in c] == ["display pan remove 0x40000003"]   # its slice goes with it
 
 
 TX_LINES = [  # Lakehouse 6600, 2026-10-21 17:45:31Z: VVV on the radio's own keyer (break-in)
@@ -505,3 +223,119 @@ def test_transmitting_at_covers_key_down_to_key_up_and_a_hold() -> None:
     assert not rx.transmitting_at(101.05 + flex_iq.TX_HOLD_S + 0.01)
     rx._note_tx("PTT_REQUESTED", 102.0)                 # keyed again, not yet up
     assert rx.transmitting_at(102.5) and not rx.transmitting_at(101.5)
+
+
+def _lines_at(caplog: Caplog, level: int) -> list[str]:
+    return [m for lv, m in _lines(caplog) if lv >= level]
+
+
+def test_a_start_logs_the_attempt_and_a_failure_logs_an_error(monkeypatch: Monkey, caplog: Caplog) -> None:
+    radio = use_fake_radio(monkeypatch)
+    FlexStation("192.0.2.1").start()
+    radio.refuse["stream create"] = "50000005"
+    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
+    with caplog.at_level(logging.INFO, logger="sparkgap.flex"), pytest.raises(RuntimeError):
+        rx.start()
+    assert ATTEMPT.format(1, "first start") in [m for _, m in _lines(caplog)]
+    assert _lines_at(caplog, logging.ERROR) == ["[Flex] Connection attempt 1 failed: [Flex] Failed to create DAX-IQ stream"]
+
+
+def test_a_spent_budget_stops_sparkgap(monkeypatch: Monkey, caplog: Caplog) -> None:
+    use_fake_radio(monkeypatch)
+    kills: list[int] = []
+    monkeypatch.setattr(flex_iq.os, "kill", lambda _pid, sig: kills.append(sig))
+    FlexStation("192.0.2.1").start()
+    rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000)
+    rx.start()
+    rx.budget = flex_iq.LossBudget(budget=0)
+    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
+        rx._recover("No DAX-IQ packets for 10 s", "stream")
+    assert "loss 1 within 60 min: stopping SparkGap" in _lines_at(caplog, logging.ERROR)[-1]
+    assert kills == [flex_iq.signal.SIGINT] and rx.state == "halted"
+
+
+def test_refused_setup_steps_fail_the_start(monkeypatch: Monkey) -> None:
+    for refused in ("display pan set 0x40000000 center=", "slice tune", "display pan set 0x40000000 daxiq_channel="):
+        radio = use_fake_radio(monkeypatch)
+        FlexStation("192.0.2.1").start()
+        radio.refuse[refused] = "50000029"
+        rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=4)
+        with pytest.raises(RuntimeError, match="refused"):
+            rx.start()
+        assert rx.state != "live" and not radio.pans and not radio.streams, refused
+
+
+class _ResetSocket:
+    def recv(self, *_: object) -> bytes:
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+    def sendall(self, *_: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_connection_error_keeps_its_cause() -> None:
+    conn = FlexConnection("192.0.2.1")
+    conn._tcp = _ResetSocket()  # pyright: ignore[reportAttributeAccessIssue]
+    assert conn.poll() is None
+    assert conn.lost == "Control connection error: [Errno 104] Connection reset by peer"
+
+
+def test_own_disconnect_names_the_client_and_reason(caplog: Caplog) -> None:
+    conn = FlexConnection("192.0.2.1")
+    conn._tcp, conn.handle = _ResetSocket(), "290AB860"  # pyright: ignore[reportAttributeAccessIssue]
+    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
+        conn.close("reconnecting")
+        conn.close("stopping")          # already closed: no second line
+    line = "[Flex] Disconnected from 192.0.2.1 (client 0x290AB860, reconnecting)"
+    assert _lines(caplog) == [(logging.INFO, line)]
+
+
+def test_sent_commands_are_logged_at_info_and_pings_quietly(caplog: Caplog) -> None:
+    import socket
+
+    conn = FlexConnection("192.0.2.1")
+    conn._tcp, radio = socket.socketpair()
+    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
+        radio.sendall(b"R1|0|\nR2|0|\n")
+        conn.cmd("sub slice all", timeout=1.0)
+        conn.cmd("ping", timeout=1.0)
+    assert _lines(caplog) == [(logging.INFO, "[Flex] >>> C1|sub slice all"),
+                              (logging.INFO, "[Flex] <<< R1|0| (sub slice all)")]
+    radio.close()
+    conn.close("stopping")
+
+
+def test_close_says_goodbye_first() -> None:
+    import socket
+
+    conn = FlexConnection("192.0.2.1")
+    conn._tcp, radio = socket.socketpair()
+    conn.close("stopping")
+    radio.settimeout(1.0)
+    assert radio.recv(16) == b"\x04"
+    radio.close()
+
+
+DALLAS_INFO = ('R1|0|model="FLEX-6400M",chassis_serial="0520-0945-6401-3114",name="Dallas",'
+               'callsign="N0CALL",gps="Not Present",atu_present=1,num_scu=1')
+
+
+def test_the_station_is_named_after_the_radio_nickname() -> None:
+    assert flex_iq.radio_nickname([DALLAS_INFO]) == "Dallas"
+    assert flex_iq.radio_nickname(['R1|0|model="FLEX-6600",name=""']) == ""
+    assert flex_iq.radio_nickname(["R1|50000016|"]) == ""
+
+
+def test_the_station_client_id_is_the_same_on_every_start_and_differs_by_radio(monkeypatch: Monkey) -> None:
+    def client_id(nickname: str) -> str:
+        use_fake_radio(monkeypatch, nickname=nickname)
+        st = FlexStation("192.0.2.1")
+        st.start()
+        return st.client_id
+
+    a, b, other = client_id("Lake"), client_id("Lake"), client_id("Dallas")
+    assert a == b != other
+    assert a == a.upper() and len(a) == 36

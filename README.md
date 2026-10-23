@@ -70,13 +70,15 @@ in `tools/eval/` and `tools/sim/`.
   optional second port for your own use with its own, looser spot rule (see the quick start);
   `rbn_feeder.py` uploads CQ-tagged spots to RBN directly (keep it off until the RBN criteria
   above are passed).
-- **Options for the spot rule**, all off by default: a validation score using calls RBN
-  skimmers have heard and the SKCC roster (`spot_validation`, `docs/ITILA2.md`), split DX
+- **Options for the spot rule**: a validation score, `normal` by default,
+  using calls RBN skimmers have heard and the SKCC roster (`spot_validation`,
+  `docs/ITILA2.md`); and, off by default, split DX
   signing `TU <call> UP` (`spot_rule_split_up`), back-to-back CQs counted each
   (`spot_rule_cq_repeats`), `CWT <call>` without CQ (`spot_rule_contest_words`), and pieces of
   longer calls held back (`spot_rule_fragments`).
-- **SparkGap Web**, a read-only browser console with waterfall, call ladder and live decode
-  text (`gui_feed`, `docs/CONSOLE.md`).
+- **SparkGap Web**, in a browser: waterfall, call ladder and live decode
+  text, and through each machine's SparkGap server (`sparkgap_server.py`) start, stop and
+  settings for its copies (`docs/WEBUI.md`).
 - **Tools.** An all-band IQ recorder (`iq_recorder.py`), a proxy that replays recordings as an
   HPSDR radio to any number of skimmers at once (`hpsdr_proxy.py`, with `--align` to keep FT8
   slots on the clock and `--drop` to lose packets on purpose), file-mode replay, a band simulator
@@ -167,6 +169,10 @@ The local rule can also set its own `validation`, `validation_calls`, `cq_repeat
 keep another channel on the same radio. If another receiver hangs on one of the radio's receive
 loops, set `flex_loopa`/`flex_loopb` (and `flex_rxant`) to match: SparkGap's pan and slice come up
 with the radio's band setting, and a loop switched off there is off for the whole antenna.
+Several copies on one radio (one band each, each on its own
+`flex_daxiq_channel`) share one SparkGap station there: start
+`python3 flex_station.py --config <one of their configs>` before them and stop
+it after the last one. A copy started alone holds the station itself.
 
 **macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
 omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for

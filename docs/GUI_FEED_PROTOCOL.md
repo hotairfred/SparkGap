@@ -2,14 +2,16 @@
 
 What a running SparkGap sends to its clients when the config has a `gui_feed`
 block: decoded windows, spots, status and spectrum rows over one WebSocket.
-SparkGap Console is one client; anything that speaks WebSocket can be another.
-Setup and the config block are in [CONSOLE.md](CONSOLE.md).
+SparkGap Web is one client; anything that speaks WebSocket can be another.
+Setup and the config block are in [SERVER_SETUP.md](SERVER_SETUP.md).
 
 Protocol `sparkgap.v1`, feed version 1.
 
 ## Connecting
 
-One endpoint per SparkGap: `ws://<host>:7320/feed`, or `wss://` when the config
+One endpoint per SparkGap: `ws://<host>:<port>/feed` (the port is the first free
+one from 7321 to 7339 unless the config sets one; 7320 is the machine's server's,
+which passes the feed through as `/feed/<name>`), or `wss://` when the config
 has `tls_cert` and `tls_key`. A standard WebSocket handshake (RFC 6455,
 version 13):
 
@@ -24,7 +26,7 @@ version 13):
   server echoes only `sparkgap.v1`.
 - A feed without a join code accepts a request with an `Origin` header only
   when that origin is a loopback address (`localhost`, `127.0.0.1`, `::1`) on
-  the feed's own port or on 7320-7339 (another copy's page, which lists this
+  the feed's own port or on 7321-7339 (another copy's page, which lists this
   copy too), so a web page from elsewhere cannot read a feed on this machine,
   even through a name that resolves to 127.0.0.1.
 
@@ -233,7 +235,9 @@ and that the floats are finite.
 
 ## Messages from the client
 
-Text frames of JSON, up to 64 KB. One message exists today:
+Text frames of JSON, up to 64 KB. Two messages exist today.
+
+### subscribe
 
 ```json
 {"type": "subscribe", "spectrum_hz": 20}
@@ -242,6 +246,56 @@ Text frames of JSON, up to 64 KB. One message exists today:
 `spectrum_hz` sets this client's spectrum rows per second, from 0.5 to 60.
 Anything that is not valid JSON, or has an unknown `type`, is ignored. A binary
 frame closes the connection.
+
+### control
+
+Changes the running SparkGap, live.
+
+```json
+{"type": "control", "id": 5, "set": {"band": "20m"}}
+```
+
+- `id`: a string or an integer, up to 64 characters. A message with no usable
+  `id` gets no answer.
+- `set`: a non-empty object, else the answer is the error `set must be an
+  object`. Only `band` can change live (a band name such as `40m`).
+
+The answer goes only to the client that asked:
+
+```json
+{"type": "control_result", "id": 5, "ok": true, "message": "retuned to 20m"}
+```
+
+A refusal has `"ok": false` and `error` in place of `message`.
+
+A live band change works for a FlexRadio copy running live with one band, not
+recording (`record_wav`), and without per-band settings (`per_band_min_snr`,
+`pfb_scanner_bands`). Otherwise the error says why: `not supported` (HPSDR,
+file replay), `only the band can be changed live`, `not supported with more
+than one band`, `not supported while recording`, `unknown band '6m'`, or `not
+supported with per-band settings`. One change runs at a time: another sent
+meanwhile is answered `busy: a change is under way`. A copy already on that
+band answers ok with `already on 40m`.
+
+On success the radio's pan and slice move first. If the radio refuses, nothing
+changes and its error is returned; if the old frequency cannot be confirmed
+after a failure, the copy stops rather than decode a frequency it does not know.
+Then the copy drops the old band's IQ, decoders and waterfall, and every
+connected client gets a new `hello` (with the new `bands`) followed by an empty
+`snapshot`. Queued old-band messages and spectrum rows are dropped first, so
+nothing from the old band arrives after the new `hello`. A client should treat a
+`hello` in mid-connection as a fresh start.
+
+- The change is not written to the copy's config by the copy: it lasts until the
+  copy restarts. (The SparkGap server writes the startup band, see
+  [SERVER_PROTOCOL.md](SERVER_PROTOCOL.md).)
+- The spot tracker is not reset. Spots on another band do not collide in
+  frequency; with `gate_harmonic_filter` on (default off), a call spotted on the
+  old band can hold back a spot of the same call at a harmonic frequency on the
+  new band for the gate's window.
+- The join code also grants control: anyone who can open the feed can change the
+  band. A feed on loopback with no join code can be changed by any local
+  program.
 
 ## Keeping the connection
 

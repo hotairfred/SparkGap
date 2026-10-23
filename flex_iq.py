@@ -11,6 +11,10 @@ Key discovery: the radio requires `client gui <UUID>` registration
 before it will allow panadapter or DAX-IQ creation. Without it, the
 radio treats the connection as a restricted non-GUI client.
 
+One SparkGap station per radio holds that GUI client (FlexStation, run by
+flex_station.py or inside a lone copy); each band's FlexIQReceiver binds to
+it with `client bind` and owns only its own pan, slice and DAX-IQ stream.
+
 Protocol refs:
   - AetherSDR source (ten9876/AetherSDR) — RadioModel.cpp, DaxIqModel.cpp
   - AB4EJ-1/FlexRadioIQ — VITA-49 packet struct
@@ -43,9 +47,22 @@ VALID_RATES = (24000, 48000, 96000, 192000)
 DAXIQ_FULL_SCALE = 32768.0
 
 STATION_NAME = 'SparkGap'   # shown in SmartSDR's station list (Multi-Flex), with the radio's nickname
-STALL_S = 10                # no DAX-IQ packet for this long: set the radio up again
-RETRY_S = 30                # after a reconnect: time for the new stream to start
-HALT_WINDOW_S = 600         # a second loss within this long stops SparkGap: no reconnect loops on the radio
+STALL_S = 10                # no DAX-IQ packet for this long: a new stream
+RETRY_S = 30                # after a recovery: time for the new stream to start
+LOSS_BUDGET = 3             # losses recovered within LOSS_WINDOW_S; the next stops: no loops on the radio
+LOSS_WINDOW_S = 3600
+CMD_TIMEOUT_S = 3.0         # removes and recovery: a 1 s wait missed replies that came (2026-10-22 12:47Z)
+HEARTBEAT_S = 1.0           # the station pings the radio this often, with keepalive on, as FlexLib does
+HEARTBEAT_TIMEOUT_S = 3.0
+KEEPALIVE_DROP_S = 20       # no ping reply this long: the radio has dropped us (its keepalive is 15 s)
+OUTAGE_MAX_S = 600          # an unreachable radio is tried every RETRY_CONNECT_S for this long, then we stop
+RETRY_CONNECT_S = 10
+SETTLE_S = 60               # after an outage the radio must answer pings this long in a row before we
+                            # recover: it takes a minute or two to settle (Dallas 6400M, 2026-10-22 14:02Z)
+STREAM_GRACE_S = 10         # after a stall, time for our stream to resume by itself before a new one
+STATION_WAIT_S = 600        # a copy whose station left waits this long for it before stopping
+STATION_POLL_S = 10
+RETUNE_SETTLE_S = 0.5       # IQ dropped this long after a retune's replies: still the old frequency
 TX_STATES = ('PTT_REQUESTED', 'TRANSMITTING', 'UNKEY_REQUESTED')  # the radio's interlock while keyed
 TX_HOLD_S = 0.15            # after key-up: the DAX-IQ of the transmission arrives after the status line
 TX_SPANS_KEPT = 64
@@ -67,17 +84,6 @@ def owned_objects(lines, handle):
         if m:
             pans.add(m.group(1))
     return slices, pans
-
-
-def slice_pans(lines, handle):
-    """Owned slice number -> the pan it sits on, from slice status lines."""
-    out = {}
-    own = re.compile(r'client_handle=0x' + re.escape(handle) + r'\b', re.I) if handle else None
-    for line in lines:
-        m = re.search(r'\|slice (\d+) .*\bpan=(0x[0-9A-F]+)', line, re.I)
-        if m and own and own.search(line) and 'in_use=0' not in line:
-            out[int(m.group(1))] = m.group(2).lower()
-    return out
 
 
 def gui_stations(lines):
@@ -111,10 +117,11 @@ def daxiq_holders(lines, channel):
     return {p: owner.get(p, '') for p, c in chan.items() if c == str(channel) and c != '0'}
 
 
-def daxiq_streams(lines):
+def daxiq_streams(lines, out=None):
     """DAX-IQ streams in stream status lines: {stream id: {'channel', 'pan', 'client', 'gui'}}.
-    A stream's fields come over several lines; the latest wins and "removed" drops it."""
-    out = {}
+    A stream's fields come over several lines; the latest wins and "removed" drops it.
+    `out`: streams known so far, updated in place."""
+    out = {} if out is None else out
     for line in lines:
         m = re.search(r'\|stream (0x[0-9A-F]+)( .*|$)', line, re.I)
         if not m:
@@ -158,6 +165,16 @@ def pan_status(lines):
     return out
 
 
+def pan_owners(lines):
+    """Pans in pan status lines: {pan id: owner client handle}, both as numbers."""
+    out = {}
+    for line in lines:
+        m = re.search(r'\|display pan (0x[0-9A-F]+) .*\bclient_handle=(0x[0-9A-F]+)', line, re.I)
+        if m:
+            out[int(m.group(1), 16)] = int(m.group(2), 16)
+    return out
+
+
 def daxiq_claims(streams, channel, me, sparkgap):
     """DAX-IQ streams on `channel` from clients other than `me` that claim it: bound to a pan, or
     another SparkGap copy's (`sparkgap`: its GUI handles).  A TCI server keeps an unbound stream on
@@ -181,11 +198,11 @@ def radio_nickname(lines):
     return ''
 
 
-def station_for(nickname, channel):
+def station_for(nickname):
     """SparkGap-<radio nickname>, one station for every copy on that radio;
-    SparkGap-<DAX-IQ channel> when the radio has no nickname."""
+    SparkGap when the radio has no nickname."""
     nick = re.sub(r'[^A-Za-z0-9_-]+', '-', nickname).strip('-')
-    return f"{STATION_NAME}-{nick or channel}"
+    return f"{STATION_NAME}-{nick}" if nick else STATION_NAME
 
 
 def clients_gone(lines):
@@ -228,16 +245,451 @@ def pan_slices(lines, pan_id):
             for m in [re.search(r'\|slice (\d+) ', line)] if m}
 
 
-class FlexIQReceiver:
-    """DAX-IQ receiver for a FlexRadio 6000/8000 series.
+class StationExists(RuntimeError):
+    """The radio already has this SparkGap station: another station process holds it."""
 
-    Drop-in replacement for HPSDRReceiver — same callback contract:
-        callback(rx_index, iq_samples)
-    where iq_samples is list[(float_i, float_q)].
+
+class LossBudget:
+    """Losses in the last LOSS_WINDOW_S: up to LOSS_BUDGET are recovered, the next one stops.
+    A routine LAN hiccup every few hours is recovered; a radio in a bad state is not retried
+    in a loop (2026-10-22: three DAX-IQ stalls in 14 h at Dallas, each recovered in 10-13 s)."""
+
+    def __init__(self, budget=None, window=None):
+        self.budget = LOSS_BUDGET if budget is None else budget
+        self.window = LOSS_WINDOW_S if window is None else window
+        self.losses = []          # (time.time(), why), newest last
+
+    def take(self, why, now=None):
+        """Record a loss; False when the budget is spent and the caller must stop instead."""
+        now = time.time() if now is None else now
+        self.losses = [l for l in self.losses if now - l[0] < self.window]
+        if len(self.losses) >= self.budget:
+            return False
+        self.losses.append((now, why))
+        return True
+
+
+class FlexConnection:
+    """One TCP control connection to the radio: numbered commands, their replies, status lines."""
+
+    def __init__(self, ip, port=4992):
+        self.ip = ip
+        self.port = port
+        self.handle = ''          # this connection's client handle, hex without 0x
+        self.version = '?'
+        self.lost = None          # why the connection is gone, once it is
+        self.missed = 0           # commands that got no reply: the radio not ready, not a refusal
+        self.seq = 0
+        self._sent = {}           # seq -> command, until its reply arrives
+        self._buf = b''
+        self._tcp = None
+
+    def open(self):
+        self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tcp.settimeout(10)
+        self._tcp.connect((self.ip, self.port))
+        hello = self.drain(3)     # version, handle, status flood
+        self.handle = next((l[1:].strip().upper() for l in hello if l.startswith('H')), '')
+        self.version = next((l[1:].strip() for l in hello if l.startswith('V')), '?')
+        log.info("[Flex] Connected to %s, API %s, client handle 0x%s", self.ip, self.version, self.handle)
+        return hello
+
+    def fileno(self):
+        return self._tcp.fileno()
+
+    def _recv_line(self, timeout=3.0):
+        self._tcp.settimeout(timeout)
+        while b'\n' not in self._buf:
+            try:
+                chunk = self._tcp.recv(4096)
+            except socket.timeout:
+                return ''
+            except OSError as e:
+                self.lost = "Control connection error: %s" % e
+                return ''
+            if not chunk:
+                self.lost = "The radio closed the control connection"
+                return ''
+            self._buf += chunk
+        idx = self._buf.index(b'\n')
+        line = self._buf[:idx].decode('utf-8', errors='replace').strip()
+        self._buf = self._buf[idx + 1:]
+        self._log_reply(line)
+        return line
+
+    def _log_reply(self, line):
+        log.debug("[Flex] <<< %s", line)    # every control line, for -v captures
+        r = reply_log(line, self._sent)
+        if r and not (r[0] == logging.INFO and r[1].endswith('(ping)')):
+            log.log(*r)
+
+    def drain(self, timeout=2.0):
+        """Read all available lines within timeout."""
+        lines = []
+        end = time.time() + timeout
+        while time.time() < end:
+            line = self._recv_line(timeout=max(0.1, end - time.time()))
+            if not line:
+                break
+            lines.append(line)
+        return lines
+
+    def send(self, cmd):
+        self.seq += 1
+        self._sent[self.seq] = cmd
+        self._tcp.sendall(f"C{self.seq}|{cmd}\n".encode())
+        (log.debug if cmd == 'ping' else log.info)("[Flex] >>> C%d|%s", self.seq, cmd)
+        return self.seq
+
+    def cmd(self, cmd, timeout=2.0, settle=0.0):
+        """Send a command and read until its own reply R<seq>|... (or timeout),
+        then keep reading `settle` seconds for status lines that follow it."""
+        seq = self.send(cmd)
+        lines = []
+        end = time.time() + timeout
+        while time.time() < end:
+            line = self._recv_line(timeout=max(0.05, end - time.time()))
+            if not line:
+                if self.lost:
+                    break
+                continue
+            lines.append(line)
+            if line.startswith(f"R{seq}|"):
+                break
+        else:
+            self.missed += 1
+        if settle and not self.lost:
+            lines += self.drain(settle)
+        return lines
+
+    def reply(self, resp):
+        """The reply line to the last command in resp, or None."""
+        return next((l for l in resp if l.startswith(f"R{self.seq}|")), None)
+
+    def ok(self, what, resp):
+        """Log OK or FAILED (with the radio's error code) for the last command."""
+        reply = self.reply(resp)
+        if reply is None:
+            log.warning("[Flex] FAILED %s: no reply from the radio", what)
+            return False
+        code = reply.split('|')[1]
+        if code == '0':
+            log.info("[Flex] OK %s", what)
+            return True
+        log.info("[Flex] FAILED %s: radio error %s", what, code)   # the reply line above is the warning
+        return False
+
+    def hex_id(self, resp):
+        """The hex id in the R<seq>|0|<hex_id> reply to the last command, or None."""
+        parts = (self.reply(resp) or '').split('|')
+        if len(parts) >= 3 and parts[1] == '0' and parts[2].strip():
+            raw = parts[2].strip().split(',')[0].strip()
+            for base in (16, 10):
+                try:
+                    return int(raw, base)
+                except ValueError:
+                    pass
+        return None
+
+    def poll(self):
+        """Status lines the radio has sent, without waiting; None when the connection is gone
+        (the cause in self.lost).  Unread, its status messages (many while the operator
+        transmits) fill the socket buffer and the radio drops the client: 2026-10-13."""
+        try:
+            chunk = self._tcp.recv(65536, socket.MSG_DONTWAIT)
+        except (BlockingIOError, InterruptedError, TimeoutError):
+            return []
+        except OSError as e:
+            self.lost = "Control connection error: %s" % e
+            return None
+        if not chunk:
+            self.lost = "The radio closed the control connection"
+            return None
+        *lines, self._buf = (self._buf + chunk).split(b'\n')
+        lines = [l.decode('utf-8', errors='replace') for l in lines]
+        for line in lines:
+            self._log_reply(line)
+        return lines
+
+    def close(self, reason):
+        if self._tcp:
+            try:
+                self._tcp.sendall(b'\x04')    # FlexLib tells the radio it is leaving before it closes
+            except OSError:
+                pass
+            if self.handle:
+                log.info("[Flex] Disconnected from %s (client 0x%s, %s)", self.ip, self.handle, reason)
+            try:
+                self._tcp.close()
+            except OSError:
+                pass
+            self._tcp = None
+
+
+def register_program(conn):
+    resp = conn.cmd(f"client program {STATION_NAME}")
+    if any(l.startswith(f"R{conn.seq}|10000002|") for l in resp):
+        # Not a FlexRadio program name; the radio still records it.
+        log.info("[Flex] OK program name %s (radio notes it as an unknown program)", STATION_NAME)
+    else:
+        conn.ok("program name " + STATION_NAME, resp)
+
+
+def station_name(conn, configured=None):
+    """flex_station when set, else SparkGap-<radio nickname> from "info"."""
+    if configured:
+        return configured
+    nickname = radio_nickname(conn.cmd("info"))
+    name = station_for(nickname)
+    log.info("[Flex] Station %s (radio nickname %s)", name, repr(nickname) if nickname else "none")
+    return name
+
+
+def find_station(lines, station):
+    """(handle, client_id) of the SparkGap GUI client named `station` in client status, or None."""
+    return next(((g[0], g[1]) for g in gui_stations(lines)
+                 if g[2] == STATION_NAME and g[3] == station), None)
+
+
+def nap(seconds, stopping):
+    """Sleep up to `seconds`, waking early once stopping() is true."""
+    end = time.time() + seconds
+    while time.time() < end and not stopping():
+        time.sleep(min(0.5, max(0.0, end - time.time())))
+
+
+def await_radio(ip, port, conn=None, stopping=lambda: False, outage=False):
+    """Wait for the radio to answer pings.  One that answers at once is ready.  One that does not
+    (an outage: a pulled cable, a router reset) must answer SETTLE_S in a row before it is, and while
+    it cannot be reached a new connection is tried each RETRY_CONNECT_S, for up to OUTAGE_MAX_S.
+    Nothing reaches an unreachable radio, so this is no loop against it.  Returns an open
+    connection (`conn` when it lasted) or None.  `outage`: one has already happened (a lost
+    connection), so a first answer is not enough: the radio answers before it is ready (14:19Z)."""
+    t0 = time.time()
+    steady = None
+    while time.time() - t0 < OUTAGE_MAX_S and not stopping():
+        if conn is None or conn.lost:
+            if conn:
+                conn.close("radio unreachable")
+            conn = FlexConnection(ip, port)
+            try:
+                conn.open()
+            except OSError as e:
+                conn, steady, outage = None, None, True
+                log.warning("[Flex] Radio %s unreachable for %.0f s: %s", ip, time.time() - t0, e)
+                nap(RETRY_CONNECT_S, stopping)
+                continue
+        if conn.reply(conn.cmd("ping", timeout=HEARTBEAT_TIMEOUT_S)) is None:
+            if not outage:
+                log.warning("[Flex] Radio %s not answering: waiting for it", ip)
+            steady, outage = None, True
+            continue
+        if not outage:
+            conn.missed = 0
+            return conn
+        if steady is None:
+            steady = time.time()
+            log.info("[Flex] Radio %s answering again after %.0f s; settling %d s", ip, steady - t0, SETTLE_S)
+        if time.time() - steady >= SETTLE_S:
+            log.info("[Flex] Radio %s steady, %.0f s after the outage began", ip, time.time() - t0)
+            conn.missed = 0     # misses while it settled say nothing about what comes next
+            return conn
+        nap(HEARTBEAT_S, stopping)
+    if conn:
+        conn.close("radio did not come back" if not stopping() else "stopping")
+    return None
+
+
+class FlexStation:
+    """SparkGap's one GUI client on a radio.  Every band's FlexIQReceiver binds to it, so a copy
+    that stops, restarts or loses its connection takes nothing of the others' with it.  Run by
+    flex_station.py for a seat of several copies, or inside a lone copy that found none."""
+
+    def __init__(self, ip, control_port=4992, station=None):
+        self.ip = ip
+        self.control_port = control_port
+        self._station_cfg = station
+        self.station = station or STATION_NAME
+        self.client_id = ''
+        self.conn = None
+        self.state = "connecting"
+        self.rtt_ms = None
+        self.last_ping = None
+        self.started = None
+        self.channels = []        # DAX-IQ streams the radio reports for this station
+        self.budget = LossBudget()
+        self._streams = {}
+        self._unanswered = None   # time.time() of the first ping in a row without a reply
+        self._ptt_warned = False
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self, again=False, conn=None):
+        """Register the station.  At first start, raises StationExists when the radio already has it;
+        `again` (after a loss) registers over our own stale entry with the same client id.
+        `conn`: a connection already open (after await_radio)."""
+        try:
+            if conn is None:
+                conn = FlexConnection(self.ip, self.control_port)
+                conn.open()
+            self.station = station_name(conn, self._station_cfg)
+            # one GUI client ID per radio and station, the same on every start, as FlexLib keeps its own
+            self.client_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"sparkgap://{self.ip}/{self.station}")).upper()
+            register_program(conn)
+            clients = conn.cmd("sub client all", settle=0.5)
+            if not again and find_station(clients, self.station):
+                raise StationExists(f"[Flex] The radio already has station {self.station}")
+            # A GUI client's saved pans come back when it registers (2026-10-20); the station keeps none.
+            conn.ok("persistence off", conn.cmd("client start_persistence off"))
+            resp = conn.cmd(f"client gui {self.client_id}", timeout=5.0)
+            if not conn.ok("GUI client", resp):
+                if conn.reply(resp) is None:
+                    raise RuntimeError("[Flex] No reply to the GUI client registration")
+                raise RuntimeError("[Flex] The radio refused the GUI client: both GUI slots in use?")
+            if self._stop.is_set():           # stopped meanwhile: leave no GUI client behind
+                raise RuntimeError("[Flex] Station stopping")
+            conn.ok("station name " + self.station, conn.cmd(f"client station {self.station}"))
+            conn.ok("keepalive", conn.cmd("keepalive enable"))
+            self._streams = daxiq_streams(conn.cmd("sub daxiq all", settle=0.5))
+            self._clear_defaults(conn)
+        except Exception:
+            conn.close("failed start")
+            raise
+        self.conn = conn
+        self._unanswered = None
+        self.started = self.started or time.time()
+        self.state = "live"
+        log.info("[Flex] Station %s holds the GUI client (client 0x%s)", self.station, conn.handle)
+
+    def _clear_defaults(self, conn):
+        """Remove the pan and slice the radio gives a new GUI client: the station streams nothing."""
+        status = conn.cmd("sub pan all", settle=0.5) + conn.cmd("sub slice all", settle=0.5)
+        slices, pans = owned_objects(status, conn.handle)
+        for n in sorted(slices):
+            conn.ok(f"default slice {n} removed", conn.cmd(f"slice remove {n}", timeout=CMD_TIMEOUT_S))
+        for p in sorted(pans):
+            conn.ok(f"default pan {p} removed", conn.cmd(f"display pan remove {p}", timeout=CMD_TIMEOUT_S))
+
+    def start_thread(self):
+        self._thread = threading.Thread(target=self.run, name="flex-station", daemon=True)
+        self._thread.start()
+
+    def run(self, on_beat=None):
+        """Hold the station until stop(): ping each HEARTBEAT_S, read status, and register again
+        after a loss while the budget lasts.  on_beat(health) after each heartbeat."""
+        try:
+            while not self._stop.is_set():
+                why = self._beat()
+                if self._stop.is_set():
+                    return
+                if why and not self._recover(why):
+                    return
+                if on_beat:
+                    on_beat(self.health())
+                self._stop.wait(HEARTBEAT_S)
+        finally:
+            if self._stop.is_set() and self.conn:   # a registration that finished after stop()
+                self.conn.close("stopping")
+                self.conn = None
+
+    def _beat(self):
+        """One heartbeat; the reason the station is lost, or None.  Unanswered pings are a hiccup to
+        ride out, not a loss: the radio decides (its keepalive drops a client after 15 s without a
+        ping, then closes the connection).  Leaving on our own would take every copy's pan with us
+        (2026-10-22 14:02Z: the station left after 11 s of a 17 s outage the radio rode out)."""
+        t0 = time.time()
+        lines = self.conn.cmd("ping", timeout=HEARTBEAT_TIMEOUT_S)
+        self._status(lines)
+        if self.conn.lost:
+            return self.conn.lost
+        if self.conn.reply(lines) is None:
+            if self._unanswered is None:
+                self._unanswered = t0
+                log.warning("[Flex] Station %s: radio not answering pings", self.station)
+            gone = time.time() - self._unanswered
+            return "No ping reply for %.0f s" % gone if gone >= KEEPALIVE_DROP_S else None
+        if self._unanswered is not None:
+            log.warning("[Flex] Station %s: radio answering again after %.0f s", self.station, t0 - self._unanswered)
+            self._unanswered = None
+        self.rtt_ms = round((time.time() - t0) * 1000, 1)
+        self.last_ping = time.time()
+        return None
+
+    def _status(self, lines):
+        self._streams = daxiq_streams(lines, self._streams)
+        me = int(self.conn.handle, 16) if self.conn and self.conn.handle else None
+        self.channels = sorted(({'channel': st.get('channel'), 'pan': st.get('pan'), 'client': st.get('client')}
+                                for st in self._streams.values() if st.get('gui') == me),
+                               key=lambda c: str(c['channel']))
+        for line in clients_gone(lines):
+            log.info("[Flex] Radio reports: %s", line.strip()[:200])
+        if ptt_ours(lines) and not self._ptt_warned:
+            self._ptt_warned = True
+            log.warning("[Flex] The radio's key and PTT jacks now follow the SparkGap station, "
+                        "not the operator's: set local PTT in SmartSDR")
+
+    def _recover(self, why, now=None):
+        """Register again after a loss; False (station halted) when the budget is spent or it fails."""
+        if self.conn:
+            self.conn.close("reconnecting")
+        self.conn = None
+        if not self.budget.take(why, now):
+            return self._halt("%s, loss %d within %d min" % (why, self.budget.budget + 1, self.budget.window // 60))
+        log.error("[Flex] Station %s: %s: registering again once the radio is steady", self.station, why)
+        self.state = "reconnecting"
+        end = time.time() + OUTAGE_MAX_S
+        while True:
+            conn = await_radio(self.ip, self.control_port, stopping=self._stop.is_set, outage=True)
+            if conn is None:
+                return self._halt("the radio did not come back within %d min" % (OUTAGE_MAX_S // 60))
+            try:
+                self.start(again=True, conn=conn)
+                break
+            except Exception as e:       # no reply: not ready yet, so wait again; a refusal stops
+                if not conn.missed or self._stop.is_set() or time.time() > end:
+                    return self._halt("registering again failed: %s" % e)
+                log.warning("[Flex] Station %s: the radio is not ready (%s): waiting again", self.station, e)
+        log.info("[Flex] Station %s registered again", self.station)
+        return True
+
+    def _halt(self, why):
+        log.error("[Flex] Station %s: %s: leaving the radio alone until it is started again", self.station, why)
+        self.state = "halted"
+        self._stop.set()
+        return False
+
+    def request_stop(self):
+        """Make run() return after the heartbeat in progress; safe from a signal handler."""
+        self._stop.set()
+
+    def stop(self):
+        """Drop the GUI client: the radio removes every pan of the station with it."""
+        self._stop.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=HEARTBEAT_TIMEOUT_S + RETRY_CONNECT_S + 5)
+        if self.conn:
+            self.conn.close("stopping")
+            self.conn = None
+        if self.state != "halted":
+            self.state = "stopped"
+        log.info("[Flex] Station %s stopped", self.station)
+
+    def health(self):
+        return {'type': 'flex-station', 'address': self.ip, 'station': self.station, 'state': self.state,
+                'rtt_ms': self.rtt_ms, 'last_ping': self.last_ping, 'started': self.started,
+                'unanswered_since': self._unanswered,
+                'losses': [[round(t), why] for t, why in self.budget.losses], 'channels': list(self.channels)}
+
+
+class FlexIQReceiver:
+    """DAX-IQ receiver for a FlexRadio 6000/8000 series: one band's channel on the radio.
+
+    Binds to the radio's SparkGap station (FlexStation) and owns exactly one pan, the slice on it
+    and one DAX-IQ stream; it removes only those.  Drop-in replacement for HPSDRReceiver, same
+    callback contract: callback(rx_index, iq_samples), iq_samples an (n, 2) array.
 
     Usage:
-        rx = FlexIQReceiver('192.168.1.238', freq_hz=7040000,
-                            sample_rate=192000)
+        rx = FlexIQReceiver('192.168.1.238', freq_hz=7040000, sample_rate=192000)
         rx.start()
         rx.receive(callback)   # blocks
         rx.stop()
@@ -261,25 +713,26 @@ class FlexIQReceiver:
                                                        ('loopa', None if loopa is None else int(bool(loopa))),
                                                        ('loopb', None if loopb is None else int(bool(loopb))))
                                if v is not None)
-        self.station = station or f"{STATION_NAME}-{daxiq_channel}"
-        self.client_id = ''
+        self.station = station or STATION_NAME
         self.udp_port = udp_port
         self.control_port = control_port
         self.frequencies = [freq_hz]  # match HPSDRReceiver interface
 
-        self._tcp = None
-        self._handle = ''          # client handle of the open connection, for the disconnect line
-        self._lost = None          # why _read_status found the connection gone
-        self.last_packet = None    # time.time() of the newest DAX-IQ packet since the last connect
-        self._seq = 0
-        self._sent = {}            # seq -> command, until its reply arrives
-        self._buf = b''
+        self.conn = None
+        self._udp = None
+        self._running = False
         self._stream_id = None
         self._pan_id = None
         self._slice_id = None
-
-        self._udp = None
-        self._running = False
+        self._stream_handle = None    # the client handle that made our stream
+        self._pan_owner = None        # the station handle that owned our pan when we made it
+        self._station_handle = None   # the station's GUI client handle, as a number
+        self._station_lost = False
+        self._own_station = None      # the FlexStation this copy holds when it found none on the radio
+        self._start_missed = False    # the last failed start had a command without a reply
+        self._clients = []            # client status at the last connect
+        self._discard_until = 0.0     # IQ before this time is the old frequency (retune)
+        self.last_packet = None       # time.time() of the newest DAX-IQ packet since the last stream
 
         # for the GUI status page (health())
         self.state = "connecting"
@@ -288,209 +741,103 @@ class FlexIQReceiver:
         self.reconnects = 0
         self.last_reconnect = None
         self.attempts = 0         # connection attempts, first start and reconnects
-        self._last_loss = None    # time.time() of the last lost connection
-        self._bound = False       # attached to another copy's station with client bind
-        self._stale = None        # (stream, slice, pan) a bound copy left when its connection was lost
-        self._pan_bound = False   # our stream was bound to our pan in this start
-        self._stream_handle = None    # the client handle that made our stream
+        self.budget = LossBudget()
         self._stopping = False
-        self._lock = threading.Lock()   # stop() waits for a reconnect in progress
+        self._lock = threading.RLock()  # one user of the control connection at a time
         self._ptt_warned = False
         self.others = []          # other stations on the radio at the last connect
         self._tx_since = None     # arrival time of the key-down in progress
         self._tx_spans = []       # (key-down, key-up) arrival times, newest last
 
-    # -- TCP control channel -------------------------------------------------
-
-    def _recv_line(self, timeout=3.0):
-        self._tcp.settimeout(timeout)
-        while b'\n' not in self._buf:
-            try:
-                chunk = self._tcp.recv(4096)
-            except socket.timeout:
-                return ''
-            if not chunk:
-                return ''
-            self._buf += chunk
-        idx = self._buf.index(b'\n')
-        line = self._buf[:idx].decode('utf-8', errors='replace').strip()
-        self._buf = self._buf[idx + 1:]
-        self._log_reply(line)
-        return line
-
-    def _log_reply(self, line):
-        log.debug("[Flex] <<< %s", line)    # every control line, for -v captures
-        r = reply_log(line, self._sent)
-        if r:
-            log.log(*r)
-
-    def _drain(self, timeout=2.0):
-        """Read all available lines within timeout, log interesting ones."""
-        lines = []
-        end = time.time() + timeout
-        while time.time() < end:
-            line = self._recv_line(timeout=max(0.1, end - time.time()))
-            if not line:
-                break
-            lines.append(line)
-        return lines
-
-    def _send(self, cmd):
-        self._seq += 1
-        line = f"C{self._seq}|{cmd}\n"
-        self._sent[self._seq] = cmd
-        self._tcp.sendall(line.encode())
-        log.info("[Flex] >>> C%d|%s", self._seq, cmd)
-        return self._seq
-
-    def _cmd(self, cmd, timeout=2.0, settle=0.0):
-        """Send a command and read until its own reply R<seq>|... (or timeout),
-        then keep reading `settle` seconds for status lines that follow it."""
-        seq = self._send(cmd)
-        lines = []
-        end = time.time() + timeout
-        while time.time() < end:
-            line = self._recv_line(timeout=max(0.05, end - time.time()))
-            if not line:
-                break
-            lines.append(line)
-            if line.startswith(f"R{seq}|"):
-                break
-        if settle:
-            lines += self._drain(settle)
-        return lines
-
-    def _report(self, what, resp):
-        """Log OK or FAILED (with the radio's error code) for the last command."""
-        reply = next((l for l in resp if l.startswith(f"R{self._seq}|")), None)
-        if reply is None:
-            log.warning("[Flex] FAILED %s: no reply from the radio", what)
-            return False
-        code = reply.split('|')[1]
-        if code == '0':
-            log.info("[Flex] OK %s", what)
-            return True
-        log.info("[Flex] FAILED %s: radio error %s", what, code)   # the reply line above is the warning
-        return False
-
     # -- lifecycle -----------------------------------------------------------
 
     def start(self, why=None):
-        """Connect to the radio, register as GUI, set up DAX-IQ stream.  `why`: the reason for a reconnect."""
-        self._stream_id = self._pan_id = self._slice_id = None
-        self._pan_bound = False
-        self._stream_handle = None
+        """Connect, bind to the station and set up our pan, slice and DAX-IQ stream.
+        `why`: the reason for a reconnect."""
         self.last_packet = None
-        self._sent = {}
-        self._handle = ''
         self._ptt_warned = False
         self._tx_since = None
+        self._station_lost = False
         self.attempts += 1
         log.info("[Flex] Connection attempt %d to %s:%d (%s)", self.attempts, self.ip, self.control_port,
                  "reconnect: %s" % why if why else "first start")
         try:
-            self._setup()
+            self._connect(first=why is None)
+            if self._stream_id or self._pan_id:    # left by a lost connection; the station kept them
+                self._remove_objects()
+            self._build()
         except Exception as e:
             log.error("[Flex] Connection attempt %d failed: %s", self.attempts, e)
-            # a copy that joined another station leaves its pan to that station,
-            # which the radio keeps after we disconnect (2026-10-18)
+            self._start_missed = bool(self.conn and self.conn.missed)   # no reply: the radio not ready
             self._remove_objects()
             self._close("failed start")
+            if why is None and self._own_station:
+                self._own_station.stop()
+                self._own_station = None
             raise
 
-    def _setup(self):
-        self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._tcp.settimeout(10)
-        self._tcp.connect((self.ip, self.control_port))
+    def _connect(self, first):
+        """Open the control connection and bind to the station.  A lone copy that finds no station
+        at its first start holds one itself; after that a copy only ever binds, so two copies never
+        race for the GUI client (2026-10-21 23:19Z)."""
+        conn = self.conn = FlexConnection(self.ip, self.control_port)
+        conn.open()
+        self.station = station_name(conn, self._station_cfg)
+        register_program(conn)
+        self._clients = conn.cmd("sub client all", settle=0.5)
+        found = find_station(self._clients, self.station)
+        if not found and first and not self._own_station:
+            log.info("[Flex] No station %s on the radio: this copy holds it", self.station)
+            station = FlexStation(self.ip, self.control_port, self._station_cfg)
+            try:
+                station.start()
+                station.start_thread()
+                self._own_station = station
+            except StationExists:       # another copy got there first: bind to its station
+                log.info("[Flex] Station %s appeared meanwhile: attaching to it", self.station)
+            self._clients = conn.cmd("sub client all", settle=0.5)
+            found = find_station(self._clients, self.station)
+        elif not found:
+            found = self._wait_for_station()
+        if not found:
+            raise RuntimeError(f"[Flex] Station {self.station} is not on the radio")
+        handle, client_id = found
+        if not conn.ok(f"attached to station {self.station}", conn.cmd(f"client bind client_id={client_id}")):
+            raise RuntimeError(f"[Flex] The radio refused to attach us to station {self.station}")
+        self._station_handle = int(handle, 16)
+        conn.ok(f"UDP port {self.udp_port} for DAX-IQ", conn.cmd(f"client udpport {self.udp_port}"))
 
-        # Consume initial handshake (version, handle, status flood)
-        hello = self._drain(3)
-        handle = next((l[1:].strip().upper() for l in hello if l.startswith('H')), '')
-        version = next((l[1:].strip() for l in hello if l.startswith('V')), '?')
-        log.info("[Flex] Connected to %s, API %s, client handle 0x%s", self.ip, version, handle)
-        self._handle = handle
+    def _wait_for_station(self):
+        """The station after a loss: wait STATION_WAIT_S for it to register again, never take its place."""
+        end = time.time() + STATION_WAIT_S
+        log.info("[Flex] Waiting up to %d s for station %s", STATION_WAIT_S, self.station)
+        while time.time() < end and not self._stopping and not self.conn.lost:
+            self._clients = self.conn.cmd("sub client all", settle=0.5)
+            found = find_station(self._clients, self.station)
+            if found:
+                return found
+            nap(STATION_POLL_S, lambda: self._stopping)
+        return None
 
-        # One station per radio: every copy on it names the same station, so a later copy
-        # finds the first one's GUI client below and attaches to it.
-        if not self._station_cfg:
-            nickname = radio_nickname(self._cmd("info"))
-            self.station = station_for(nickname, self.channel)
-            log.info("[Flex] Station %s (radio nickname %s)", self.station, repr(nickname) if nickname else "none")
-        # one GUI client ID per radio and station, the same on every start, as FlexLib keeps its own
-        self.client_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"sparkgap://{self.ip}/{self.station}")).upper()
-
-        # Same order FlexLib uses: program, then gui, then station name.  The
-        # name waits for the reply to "client gui": sent before the radio has
-        # registered the GUI client it is refused (R|500000AA), which happened
-        # to a second copy on a radio that already had one.
-        # "client gui" is required for pan and DAX-IQ creation (AetherSDR).
-        # The radio takes two GUI clients (SmartSDR is usually one).  A copy it
-        # refuses attaches to the SparkGap station already there (FlexLib's
-        # "client bind"), so its pan and slice belong to that station.
-        resp = self._cmd(f"client program {STATION_NAME}")
-        if any(l.startswith(f"R{self._seq}|10000002|") for l in resp):
-            # Not a FlexRadio program name; the radio still records it.
-            log.info("[Flex] OK program name %s (radio notes it as an unknown program)", STATION_NAME)
-        else:
-            self._report("program name " + STATION_NAME, resp)
-        # As FlexLib, pick the role first: a station that already has its GUI client
-        # is joined with "client bind"; "client gui" with the station's ID evicts it.
-        joined = [g for g in gui_stations(self._cmd("sub client all", settle=0.5))
-                  if g[2] == STATION_NAME and g[3] == self.station]
-        self._bound = False
-        if joined:
-            self._bound = self._report(f"attached to station {self.station}",
-                                       self._cmd(f"client bind client_id={joined[0][1]}"))
-        elif self._report("GUI client", self._cmd(f"client gui {self.client_id}", timeout=5.0)):
-            self._report("station name " + self.station, self._cmd(f"client station {self.station}"))
-        else:
-            listed = self._cmd("sub client all", settle=0.5)
-            ours = [g for g in gui_stations(listed) if g[2] == STATION_NAME]
-            if not ours:
-                log.warning("[Flex] Client status from the radio: %s", [l for l in listed if 'client' in l])
-                raise RuntimeError("[Flex] No free GUI client on the radio and no SparkGap station to attach to")
-            _, client_id, _, self.station = ours[0]
-            self._bound = self._report(f"attached to station {self.station}",
-                                       self._cmd(f"client bind client_id={client_id}"))
-        self._report(f"UDP port {self.udp_port} for DAX-IQ", self._cmd(f"client udpport {self.udp_port}"))
-        if self._stale:    # a bound copy's: the station kept them when our connection was lost
-            self._stream_id, self._slice_id, self._pan_id, self._stream_handle = self._stale
-            self._pan_bound = True
-            self._remove_objects()
-            self._stream_id = self._pan_id = self._slice_id = self._stream_handle = None
-            self._pan_bound = False
-        self._stale = None
-
-        # The radio gives a new GUI client a default pan with a band-default
-        # slice (on a 6600: 14.100 MHz, and a further slice on any pan it
-        # creates).  Reuse that pan and slice instead of removing and creating.
-        clients = self._cmd("sub client all", settle=0.5)
-        self.others = []
-        for m in re.finditer(r'\|client (0x[0-9A-F]+) connected.*?program=(\S*).*?station=(\S*)',
-                             '\n'.join(clients), re.I):
-            name = m.group(3).replace('\x7f', ' ')
-            if m.group(1).upper() == '0X' + handle:
-                log.info("[Flex] Radio lists this client as station '%s' (program %s)", name, m.group(2))
-            else:
-                log.info("[Flex] Other station on the radio: '%s' (program %s, client %s)",
-                         name, m.group(2), m.group(1))
-                self.others.append(f"{name} ({m.group(2)})")
-        status = (self._cmd("sub pan all", settle=0.5) + self._cmd("sub slice all", settle=0.5)
-                  + self._cmd("sub daxiq all", settle=0.5))
-        self._report("transmit state for the GUI", self._cmd("sub tx all", settle=0.3))  # key-down: an empty spectrum
-        slices, pans = owned_objects(status, handle)
-        if not pans:
-            status += self._drain(1.0)     # the default pan's status can lag
-            slices, pans = owned_objects(status, handle)
-        # A DAX-IQ channel another station's pan holds (Maestro, SmartSDR, DAX) is not ours to take,
-        # nor one another client streams.  Our station's pans carry saved channels: not a claim.
-        stations = gui_stations(clients)
+    def _build(self):
+        """Our pan, the slice on it and our DAX-IQ stream, each created by this copy."""
+        conn = self.conn
+        me = int(conn.handle, 16)
         num = lambda h: int(h, 16) if h else None   # handles compare as numbers, not text
-        me = num(handle)
-        station = {me} | {num(g[0]) for g in stations if g[2] == STATION_NAME and g[3] == self.station}
+        for g in gui_stations(self._clients):
+            if num(g[0]) == self._station_handle:
+                continue
+            log.info("[Flex] Other station on the radio: '%s' (program %s, client %s)", g[3], g[2], g[0])
+        self.others = [f"{g[3]} ({g[2]})" for g in gui_stations(self._clients) if num(g[0]) != self._station_handle]
+        status = (conn.cmd("sub pan all", settle=0.5) + conn.cmd("sub slice all", settle=0.5)
+                  + conn.cmd("sub daxiq all", settle=0.5))
+        conn.ok("transmit state for the GUI", conn.cmd("sub tx all", settle=0.3))  # key-down: an empty spectrum
+        # A DAX-IQ channel another station's pan holds (Maestro, SmartSDR, DAX) is not ours to take,
+        # nor one another client streams (another copy set to the same channel included).
+        stations = gui_stations(self._clients)
         sparkgap = {num(g[0]) for g in stations if g[2] == STATION_NAME}
         streams = daxiq_streams(status)
-        taken = {p: h for p, h in daxiq_holders(status, self.channel).items() if num(h) not in station}
+        taken = {p: h for p, h in daxiq_holders(status, self.channel).items() if num(h) != self._station_handle}
         claims = daxiq_claims(streams, self.channel, me, sparkgap)
         if taken or claims:
             if taken:
@@ -502,167 +849,149 @@ class FlexIQReceiver:
             who = next((f"{g[3]} ({g[2]})" for g in stations if num(g[0]) == num(h)), f"client {h}")
             raise RuntimeError(f"[Flex] DAX-IQ {self.channel} is in use by {who} on pan {pan}; "
                                "set another flex_daxiq_channel or free it there")
-        # pans another client's stream feeds, or whose channel another client streams: another copy's
-        chans = pan_status(status)
-        busy = {st['pan'] for st in streams.values() if st.get('client') != me and st.get('pan')}
-        busy |= {p for p, c in chans.items() if c not in (None, '0') and daxiq_users(streams, c, me, sparkgap)}
-        pans = {p for p in pans if int(p, 16) not in busy}
-        # saved pans nobody streams are ours to clear; a pan with no channel may be a copy still starting
-        spare = {p for p in pans if chans.get(int(p, 16)) not in (None, '0')}
-        # a station pan saved on our channel (the radio restores them) is ours to take back
-        saved = sorted(p for h in station for p in owned_objects(status, f"{h:08X}")[1]
-                       if chans.get(int(p, 16)) == str(self.channel) and int(p, 16) not in busy)
+
+        self._pan_id = conn.hex_id(conn.cmd("display pan create x=1 y=1"))
+        if self._pan_id is None:
+            raise RuntimeError("[Flex] No free panadapter on the radio; close one in SmartSDR or on the front panel")
+        self._pan_owner = self._station_handle
+        log.info("[Flex] Pan created: 0x%08x", self._pan_id)
         bw_mhz = self.sample_rate / 1e6
-        if saved:
-            self._pan_id = int(saved[0], 16)
-            slices = pan_slices(status, self._pan_id)
-            for p in sorted(spare - {saved[0]}):
-                self._cmd(f"display pan remove {p}")
-            log.info("[Flex] Using our station's saved pan 0x%08x on DAX-IQ channel %d", self._pan_id, self.channel)
-        elif pans:
-            on_pan = slice_pans(status, handle)
-            keep = next((p for p in sorted(pans) if p.lower() in on_pan.values()), sorted(pans)[0])
-            self._pan_id = int(keep, 16)
-            slices = {n for n, p in on_pan.items() if p == keep.lower()} or slices
-            for p in sorted(spare - {keep}):
-                self._cmd(f"display pan remove {p}")
-            log.info("[Flex] Using the radio's default pan 0x%08x", self._pan_id)
-        else:
-            resp = self._cmd("display pan create x=1 y=1")
-            self._pan_id = self._parse_hex_response(resp)
-            if self._pan_id is None:
-                raise RuntimeError("[Flex] No free panadapter on the radio; close one in SmartSDR or on the front panel")
-            log.info("[Flex] Pan created: 0x%08x", self._pan_id)
-            status = self._cmd("sub slice all", settle=0.5)
-            slices, _ = owned_objects(status, handle)
-            if self._bound:                # the station owns the slice the radio put on our pan
-                slices = pan_slices(status, self._pan_id)
-        if not self._report(f"pan 0x{self._pan_id:08x} center {self.freq_mhz:.6f} MHz, bandwidth {bw_mhz:.3f} MHz",
-                            self._cmd(f"display pan set 0x{self._pan_id:08x} "
-                                      f"center={self.freq_mhz:.6f} bandwidth={bw_mhz:.6f}{self.rx_path}")):
+        if not conn.ok(f"pan 0x{self._pan_id:08x} center {self.freq_mhz:.6f} MHz, bandwidth {bw_mhz:.3f} MHz",
+                       conn.cmd(f"display pan set 0x{self._pan_id:08x} "
+                                f"center={self.freq_mhz:.6f} bandwidth={bw_mhz:.6f}{self.rx_path}")):
             raise RuntimeError(f"[Flex] The radio refused to set pan 0x{self._pan_id:08x}")
 
-        # One slice keeps the RF path live (without one the Flex streams zeros).
-        # dax=0: the default slice comes with a DAX audio channel; we need none.
+        # One slice keeps the RF path live (without one the Flex streams zeros).  The radio puts a
+        # band-default slice on a new pan; only slices on our own pan are ours (2026-10-22: a station-wide
+        # pick took another copy's slice and moved its pan).  dax=0: we need no DAX audio channel.
+        slices = pan_slices(conn.cmd("sub slice all", settle=0.5), self._pan_id)
         self._slice_id = min(slices) if slices else None
         if self._slice_id is not None:
-            if not self._report(f"slice {self._slice_id} tuned to {self.freq_mhz:.6f} MHz",
-                                self._cmd(f"slice tune {self._slice_id} {self.freq_mhz:.6f}")):
+            # the radio keeps a band's slice lock: a new pan's slice can come up locked (50000068)
+            conn.ok(f"slice {self._slice_id} unlocked", conn.cmd(f"slice unlock {self._slice_id}"))
+            if not conn.ok(f"slice {self._slice_id} tuned to {self.freq_mhz:.6f} MHz",
+                           conn.cmd(f"slice tune {self._slice_id} {self.freq_mhz:.6f}")):
                 raise RuntimeError(f"[Flex] The radio refused to tune slice {self._slice_id}")
-            self._report(f"slice {self._slice_id} mode CW",          # one field per command,
-                         self._cmd(f"slice set {self._slice_id} mode=CW"))   # as FlexLib sends them
-            self._report(f"slice {self._slice_id} DAX audio off",
-                         self._cmd(f"slice set {self._slice_id} dax=0"))
-            log.info("[Flex] Using the radio's default slice %d at %.6f MHz",
-                     self._slice_id, self.freq_mhz)
+            conn.ok(f"slice {self._slice_id} mode CW", conn.cmd(f"slice set {self._slice_id} mode=CW"))
+            conn.ok(f"slice {self._slice_id} DAX audio off", conn.cmd(f"slice set {self._slice_id} dax=0"))
+            for n in sorted(slices - {self._slice_id}):
+                conn.ok(f"extra slice {n} on our pan removed", conn.cmd(f"slice remove {n}", timeout=CMD_TIMEOUT_S))
         else:
-            resp = self._cmd(f"slice create pan=0x{self._pan_id:08x} freq={self.freq_mhz:.6f} mode=CW")
-            raw = next((l.split('|')[2].strip() for l in resp
-                        if l.startswith(f"R{self._seq}|0|") and len(l.split('|')) >= 3), '')
-            self._slice_id = int(raw) if raw.isdigit() else None
+            resp = conn.cmd(f"slice create pan=0x{self._pan_id:08x} freq={self.freq_mhz:.6f} mode=CW")
+            parts = (conn.reply(resp) or '').split('|')
+            self._slice_id = int(parts[2]) if len(parts) >= 3 and parts[1] == '0' and parts[2].strip().isdigit() else None
             if self._slice_id is None:
-                log.warning("[Flex] Slice create reply not understood: %s", resp[-3:])
-            else:
-                log.info("[Flex] Slice created: %d", self._slice_id)
-        if self._slice_id is not None:     # unmuted, the operator hears it in the radio's headphones
-            self._report(f"slice {self._slice_id} muted",
-                         self._cmd(f"slice set {self._slice_id} audio_mute=1"))
-            self._report(f"slice {self._slice_id} not a transmit slice",   # the key must never land on it
-                         self._cmd(f"slice set {self._slice_id} tx=0"))
-            # the slice carries its own copy of the loop settings
-            if self.rx_path and not self._report(f"slice {self._slice_id}{self.rx_path}",
-                                                 self._cmd(f"slice set {self._slice_id}{self.rx_path}")):
-                raise RuntimeError(f"[Flex] The radio refused{self.rx_path} on slice {self._slice_id}")
-        status = self._cmd("sub slice all", settle=0.3)
-        all_slices, _ = owned_objects(status, handle)
-        on_pan = slice_pans(status, handle)
-        extra = {n for n in all_slices - {self._slice_id} if on_pan.get(n) == f"0x{self._pan_id:08x}"} \
-            if self._slice_id is not None else set()    # slices on other pans: theirs, or gone with the pan
-        for n in sorted(extra):
-            self._cmd(f"slice remove {n}")
-        if extra:
-            log.info("[Flex] Freed extra slices %s", sorted(extra))
+                raise RuntimeError(f"[Flex] The radio refused a slice on pan 0x{self._pan_id:08x}")
+            log.info("[Flex] Slice created: %d", self._slice_id)
+        # unmuted, the operator hears it in the radio's headphones; the key must never land on it
+        conn.ok(f"slice {self._slice_id} muted", conn.cmd(f"slice set {self._slice_id} audio_mute=1"))
+        conn.ok(f"slice {self._slice_id} not a transmit slice", conn.cmd(f"slice set {self._slice_id} tx=0"))
+        # the slice carries its own copy of the loop settings
+        if self.rx_path and not conn.ok(f"slice {self._slice_id}{self.rx_path}",
+                                        conn.cmd(f"slice set {self._slice_id}{self.rx_path}")):
+            raise RuntimeError(f"[Flex] The radio refused{self.rx_path} on slice {self._slice_id}")
+        # locked, a click on its VFO (SmartSDR, Maestro, front panel) cannot move it or our pan (FlexLib Slice.Lock)
+        conn.ok(f"slice {self._slice_id} locked", conn.cmd(f"slice lock {self._slice_id}"))
 
-        # Create DAX-IQ stream
-        resp = self._cmd(f"stream create type=dax_iq daxiq_channel={self.channel}")
-        self._stream_id = self._parse_hex_response(resp)
-        if self._stream_id is None:
-            raise RuntimeError("[Flex] Failed to create DAX-IQ stream")
-        self._stream_handle = me
-        log.info("[Flex] DAX-IQ stream: 0x%08x", self._stream_id)
-
-        # Bind DAX-IQ to the panadapter — THE critical step
-        if not self._report(f"DAX-IQ channel {self.channel} bound to pan 0x{self._pan_id:08x}",
-                            self._cmd(f"display pan set 0x{self._pan_id:08x} daxiq_channel={self.channel}")):
-            raise RuntimeError(f"[Flex] The radio refused DAX-IQ channel {self.channel} on pan 0x{self._pan_id:08x}")
-        self._pan_bound = True
-
-        # Set sample rate after binding; newer firmware rejects it on an unbound stream
-        resp = self._cmd(f"stream set 0x{self._stream_id:08x} "
-                         f"daxiq_rate={self.sample_rate}")
-        if not any(l.startswith(f"R{self._seq}|0|") for l in resp):
-            raise RuntimeError(f"[Flex] Radio refused daxiq_rate={self.sample_rate}: {resp[-1:]}")
-
-        # Open UDP receiver
-        self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        self._udp.bind(('', self.udp_port))
-
+        self._make_stream()
+        if self._udp is None:
+            self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self._udp.bind(('', self.udp_port))
         self._running = not self._stopping
-        log.info("[Flex] DAX-IQ streaming at %d Hz on UDP port %d",
-                 self.sample_rate, self.udp_port)
         self.state = "live"
         log.info("[Flex] Ready: station %s (client 0x%s), pan 0x%08x at %.6f MHz x %.3f MHz, "
                  "slice %s CW, DAX-IQ channel %d stream 0x%08x at %d Hz to UDP %d",
-                 self.station, handle, self._pan_id, self.freq_mhz, bw_mhz, self._slice_id,
+                 self.station, conn.handle, self._pan_id, self.freq_mhz, bw_mhz, self._slice_id,
                  self.channel, self._stream_id, self.sample_rate, self.udp_port)
 
+    def _make_stream(self):
+        """Create our DAX-IQ stream, bind it to our pan and set its rate."""
+        conn = self.conn
+        self._stream_id = conn.hex_id(conn.cmd(f"stream create type=dax_iq daxiq_channel={self.channel}"))
+        if self._stream_id is None:
+            raise RuntimeError("[Flex] Failed to create DAX-IQ stream")
+        self._stream_handle = int(conn.handle, 16)
+        log.info("[Flex] DAX-IQ stream: 0x%08x", self._stream_id)
+        # Bind DAX-IQ to the panadapter: THE critical step
+        if not conn.ok(f"DAX-IQ channel {self.channel} bound to pan 0x{self._pan_id:08x}",
+                       conn.cmd(f"display pan set 0x{self._pan_id:08x} daxiq_channel={self.channel}")):
+            raise RuntimeError(f"[Flex] The radio refused DAX-IQ channel {self.channel} on pan 0x{self._pan_id:08x}")
+        # Set sample rate after binding; newer firmware rejects it on an unbound stream
+        resp = conn.cmd(f"stream set 0x{self._stream_id:08x} daxiq_rate={self.sample_rate}")
+        if not any(l.startswith(f"R{conn.seq}|0|") for l in resp):
+            raise RuntimeError(f"[Flex] Radio refused daxiq_rate={self.sample_rate}: {resp[-1:]}")
+        log.info("[Flex] DAX-IQ streaming at %d Hz on UDP port %d", self.sample_rate, self.udp_port)
+
+    def _new_stream(self, why):
+        """A stalled stream on a live connection: remove ours, confirm it is gone, make a new one.
+        The station, pan and slice stay, so no other copy is touched (2026-10-22 Codex review)."""
+        conn = self.conn
+        log.error("[Flex] %s: new DAX-IQ stream", why)
+
+        def streams():   # no reply is not "not listed" (2026-10-22 14:02Z: that made a second stream)
+            lines = conn.cmd("sub daxiq all", timeout=CMD_TIMEOUT_S, settle=0.5)
+            if conn.reply(lines) is None:
+                raise RuntimeError("[Flex] No reply to the stream status: not making a second stream")
+            return daxiq_streams(lines)
+
+        if self._stream_id is not None:
+            ours = streams().get(self._stream_id)
+            if ours and ours.get('client') == self._stream_handle:
+                conn.ok(f"DAX-IQ stream 0x{self._stream_id:08x} removed",
+                        conn.cmd(f"stream remove 0x{self._stream_id:08x}", timeout=CMD_TIMEOUT_S))
+                again = streams().get(self._stream_id)
+                if again and again.get('client') == self._stream_handle:
+                    raise RuntimeError(f"[Flex] DAX-IQ stream 0x{self._stream_id:08x} would not go")
+        self._stream_id = None
+        self._make_stream()
+
+    def _stream_resumed(self):
+        """Whether our stream's packets come back by themselves within STREAM_GRACE_S: after a
+        hiccup the radio still lists the stream and may carry on with it."""
+        end = time.time() + STREAM_GRACE_S
+        self._udp.settimeout(0.2)
+        try:
+            while time.time() < end and not self._stopping:
+                try:
+                    data, _ = self._udp.recvfrom(DAXIQ_PACKET_SIZE + 128)
+                except (socket.timeout, BlockingIOError, InterruptedError):
+                    continue
+                if len(data) >= 8 and struct.unpack(">I", data[4:8])[0] == self._stream_id:
+                    return True
+        finally:
+            self._udp.settimeout(None)
+        return False
+
     def _close(self, reason):
-        if self._tcp:
+        if self.conn:
+            self.conn.close(reason)
+        self.conn = None
+        if self._udp:
             try:
-                self._tcp.sendall(b'\x04')    # FlexLib tells the radio it is leaving before it closes
+                self._udp.close()
             except OSError:
                 pass
-        if self._tcp and self._handle:
-            log.info("[Flex] Disconnected from %s (client 0x%s, %s)", self.ip, self._handle, reason)
-        for name in ('_tcp', '_udp'):
-            sock = getattr(self, name)
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                setattr(self, name, None)
+            self._udp = None
 
-    def _read_status(self):
-        """Read what the radio has sent on the control connection.  Unread, its
-        status messages (many while the operator transmits) fill the socket
-        buffer and the radio drops the station: 2026-10-13, 14 h into a run.
-        Returns False when the connection is gone, with the cause in self._lost."""
-        try:
-            chunk = self._tcp.recv(65536, socket.MSG_DONTWAIT)
-        except (BlockingIOError, InterruptedError, TimeoutError):
-            return True
-        except OSError as e:
-            self._lost = "Control connection error: %s" % e
-            return False
-        if not chunk:
-            self._lost = "The radio closed the control connection"
-            return False
-        *lines, self._buf = (self._buf + chunk).split(b'\n')
-        lines = [l.decode('utf-8', errors='replace') for l in lines]
-        for line in lines:
-            self._log_reply(line)
+    def _poll(self):
+        """Read what the radio has sent on the control connection; None when the connection is gone."""
+        lines = self.conn.poll()
+        if lines is None:
+            return None
         for state in tx_states(lines):
             self._note_tx(state, time.time())
         for line in clients_gone(lines):
             log.info("[Flex] Radio reports: %s", line.strip()[:200])
+            m = re.search(r'\|client (0x[0-9A-F]+) disconnected', line, re.I)
+            if m and int(m.group(1), 16) == self._station_handle:
+                self._station_lost = True
         if ptt_ours(lines) and not self._ptt_warned:
             self._ptt_warned = True
             log.warning("[Flex] The radio's key and PTT jacks now follow the SparkGap station, "
                         "not the operator's: set local PTT in SmartSDR")
-        return True
+        return lines
 
     def _note_tx(self, state, now):
         """Key-down and key-up times from the interlock state, for the GUI's spectrum."""
@@ -681,44 +1010,90 @@ class FlexIQReceiver:
             return True
         return any(a <= t <= b + TX_HOLD_S for a, b in reversed(self._tx_spans))
 
-    def _restart(self, why, alive):
-        """Drop the connection and set the radio up once more; a second loss within
-        HALT_WINDOW_S, or a failed reconnect, stops SparkGap instead.
-        alive: the control connection still works (the stream stalled)."""
+    def _recover(self, why, kind):
+        """Recover from a loss while the budget lasts; stop SparkGap when it is spent or recovery fails.
+        kind: 'stream' (stall, connection alive): a new stream only; 'link' (connection lost): connect
+        again and bind; 'station' (the station left, taking our pan): wait for it, bind, build again."""
         with self._lock:
             if self._stopping:
                 return
             now = time.time()
-            if self._last_loss and now - self._last_loss < HALT_WINDOW_S:
-                self._halt("%s, %.0f s after the previous lost connection" % (why, now - self._last_loss), alive)
+            if not self.budget.take(why, now):
+                self._halt("%s, loss %d within %d min" % (why, self.budget.budget + 1, self.budget.window // 60),
+                           alive=kind == 'stream')
                 return
-            self._last_loss = now
-            log.error("[Flex] %s: connecting again", why)
             self.state = "reconnecting"
             self.reconnects += 1
             self.last_reconnect = round(now)
-            if alive:
-                self._remove_objects()
-            elif self._bound:
-                self._stale = (self._stream_id, self._slice_id, self._pan_id, self._stream_handle)
-            self._close("reconnecting")
-            self._buf = b''
+            stopping = lambda: self._stopping
+            settled = False
             try:
-                self.start(why)
-            except Exception:
-                self._halt("reconnect attempt %d failed" % self.attempts)
+                if kind == 'stream':           # the link may be down too: wait until the radio answers
+                    log.error("[Flex] %s: waiting for the radio", why)
+                    conn = await_radio(self.ip, self.control_port, conn=self.conn, stopping=stopping)
+                    if conn is None:
+                        self.conn = None
+                        self._halt("the radio did not come back within %d min" % (OUTAGE_MAX_S // 60), alive=False)
+                        return
+                    settled = True
+                    station = find_station(conn.cmd("sub client all", settle=0.5), self.station)
+                    if conn is not self.conn:  # our connection did not last the outage
+                        conn.close("ready")
+                        kind = 'link'
+                    elif not station or int(station[0], 16) != self._station_handle:
+                        log.warning("[Flex] Station %s registered again meanwhile, taking our pan: building again",
+                                    self.station)
+                        kind = 'station'
+                    elif self._stream_resumed():
+                        log.info("[Flex] DAX-IQ stream 0x%08x resumed by itself", self._stream_id)
+                    else:
+                        try:
+                            self._new_stream(why)
+                        except Exception as e:  # no reply: not ready yet, so rebuild after a settle
+                            if not self.conn or not self.conn.missed:
+                                raise
+                            log.warning("[Flex] The radio is not ready (%s): building again", e)
+                            kind, settled = 'link', False
+
+                if kind != 'stream':
+                    log.error("[Flex] %s: connecting again once the radio is steady", why)
+                    if kind == 'station':      # the radio removed them with the station
+                        self._stream_id = self._pan_id = self._slice_id = None
+                    udp, self._udp = self._udp, None
+                    self._close("reconnecting")
+                    self._udp = udp
+                    end = time.time() + OUTAGE_MAX_S
+                    while True:
+                        if not settled:            # a steady radio needs no second settle
+                            conn = await_radio(self.ip, self.control_port, stopping=stopping, outage=True)
+                            if conn is None:
+                                self._halt("the radio did not come back within %d min" % (OUTAGE_MAX_S // 60),
+                                           alive=False)
+                                return
+                            conn.close("ready")
+                        settled = False
+                        try:
+                            self.start(why)
+                            break
+                        except Exception as e:  # no reply: not ready yet, so wait again; a refusal stops
+                            if not self._start_missed or self._stopping or time.time() > end:
+                                raise
+                            log.warning("[Flex] The radio is not ready (%s): waiting again", e)
+                self.state = "live"
+            except Exception as e:
+                self._halt("recovery failed: %s" % e, alive=self.conn is not None and not self.conn.lost)
                 return
-            log.info("[Flex] Reconnected on attempt %d, %.0f s after reconnecting began",
-                     self.attempts, time.time() - now)
+            log.info("[Flex] Recovered (%s) on attempt %d, %.0f s after it began", kind, self.attempts,
+                     time.time() - now)
 
     def _halt(self, why, alive=True):
         """Leave the radio alone: remove our objects if still connected, disconnect, and stop SparkGap."""
         log.error("[Flex] %s: stopping SparkGap and leaving the radio alone until it is started again", why)
         self.state = "halted"
         self._running = False
-        if self._tcp and alive:
+        if self.conn and alive:
             self._remove_objects()
-        self._stream_id = self._pan_id = self._slice_id = self._stream_handle = None
+        self._stream_id = self._pan_id = self._slice_id = None
         self._close("halted")
         os.kill(os.getpid(), signal.SIGINT)    # SparkGap's normal shutdown
 
@@ -729,24 +1104,78 @@ class FlexIQReceiver:
                 'last_reconnect': self.last_reconnect, 'station': self.station,
                 'daxiq_channel': self.channel, 'others': list(self.others)}
 
+    def retune(self, freq_hz):
+        """Move our pan and slice to freq_hz in place: nothing is torn down and no other copy is touched.
+        IQ is dropped until RETUNE_SETTLE_S after the move.  A refusal raises once our pan and slice are
+        confirmed back where they were; when that cannot be confirmed, SparkGap halts (decoding a frequency
+        we do not know is worse than stopping) and it raises."""
+        with self._lock:
+            conn, sl = self.conn, self._slice_id
+            if self.state != "live" or not conn or self._pan_id is None or sl is None:
+                raise RuntimeError("[Flex] Not live: nothing to retune")
+            old, mhz = self.freq_mhz, freq_hz / 1e6
+            bw_mhz = self.sample_rate / 1e6
+            pan = f"display pan set 0x{self._pan_id:08x} center=%.6f bandwidth={bw_mhz:.6f}"
+            self._discard_until = float('inf')
+            try:
+                if not conn.ok(f"slice {sl} unlocked", conn.cmd(f"slice unlock {sl}")):
+                    raise RuntimeError(f"[Flex] The radio did not unlock slice {sl}")
+                tune = f"slice tune {sl} %.6f"
+                resp = conn.cmd(pan % mhz)
+                if conn.ok(f"pan 0x{self._pan_id:08x} center {mhz:.6f} MHz", resp):
+                    resp = conn.cmd(tune % mhz)
+                    if conn.ok(f"slice {sl} tuned to {mhz:.6f} MHz", resp):
+                        self.freq_hz, self.freq_mhz, self.frequencies = freq_hz, mhz, [freq_hz]
+                        log.info("[Flex] Retuned to %.6f MHz (%d queued packets of the old frequency dropped)",
+                                 mhz, self._drop_queued())
+                        return
+                    undo = [pan % old] + ([tune % old] if conn.reply(resp) is None else [])
+                else:  # a refusal moved nothing; no reply may have
+                    undo = [pan % old] if conn.reply(resp) is None else []
+                back = all(conn.ok(f"back at {old:.6f} MHz: {c}", conn.cmd(c)) for c in undo)
+                if not back:
+                    self._halt("retune to %.6f MHz failed and %.6f MHz could not be confirmed" % (mhz, old))
+                raise RuntimeError(f"[Flex] The radio refused {mhz:.6f} MHz" + ("" if back else ": halted"))
+            finally:
+                if self.state != "halted":
+                    conn.ok(f"slice {sl} locked", conn.cmd(f"slice lock {sl}"))   # a safety measure, not a guarantee
+                    self._discard_until = time.time() + RETUNE_SETTLE_S
+
+    def _drop_queued(self):
+        """Empty the DAX-IQ socket: what it holds now came from before the retune, and a backlog can
+        outlast RETUNE_SETTLE_S (the receive buffer holds seconds of IQ)."""
+        n = 0
+        while self._udp is not None:
+            try:
+                self._udp.recvfrom(DAXIQ_PACKET_SIZE + 128, socket.MSG_DONTWAIT)
+            except OSError:
+                break
+            n += 1
+        return n
+
     def stop(self):
         self._stopping = True
         self._running = False
         time.sleep(0.25)               # receive() leaves its loop; it reads the same connection
         with self._lock:
             self._running = False
-            self._remove_objects()
+            if self.conn:
+                self._remove_objects()
             self._close("stopping")
+        if self._own_station:
+            self._own_station.stop()
+            self._own_station = None
         log.info("[Flex] Stopped")
 
     def _remove_objects(self):
-        """Remove our DAX-IQ stream, slice and pan from the radio, only while it still has them as ours:
-        the stream while the radio reports it from the client that made it (ids are reused), the pan
-        while our stream feeds it or, before the bind, while no other stream does."""
+        """Remove our DAX-IQ stream, slice and pan, only while the radio still has them as ours:
+        the stream while it comes from the client that made it (ids are reused), the pan while our
+        stream feeds it or no stream does (ours, kept by the station after a lost connection)."""
+        conn = self.conn
         try:
-            if self._stream_id or self._pan_id:
-                status = (self._cmd("sub daxiq all", settle=0.5) + self._cmd("sub pan all", settle=0.3)
-                          + self._cmd("sub slice all", settle=0.3))
+            if conn and (self._stream_id or self._pan_id):
+                status = (conn.cmd("sub daxiq all", settle=0.5) + conn.cmd("sub pan all", settle=0.3)
+                          + conn.cmd("sub slice all", settle=0.3))
                 streams = daxiq_streams(status)
                 ours = streams.get(self._stream_id) if self._stream_id else None
                 if ours and ours.get('client') != self._stream_handle:
@@ -757,33 +1186,34 @@ class FlexIQReceiver:
                 if self._pan_id:
                     fed = bool(ours) and ours.get('pan') == self._pan_id
                     other = any(st.get('pan') == self._pan_id for st in streams.values() if st is not ours)
-                    if not (fed or (not self._pan_bound and not other and self._pan_id in pan_status(status))):
+                    # unfed, it is ours only while the station that owned it still does: ids are reused
+                    kept = pan_owners(status).get(self._pan_id) == self._pan_owner
+                    if other or not (fed or kept):
                         log.warning("[Flex] Pan 0x%08x is no longer ours (dropped, or another copy's): "
                                     "leaving it and its slice alone", self._pan_id)
                         self._pan_id = self._slice_id = None
                 if self._slice_id is not None and not (self._pan_id and self._slice_id in pan_slices(status, self._pan_id)):
                     self._slice_id = None
-            if self._stream_id:
-                self._report(f"DAX-IQ stream 0x{self._stream_id:08x} removed",
-                             self._cmd(f"stream remove 0x{self._stream_id:08x}", timeout=1))
-            if self._slice_id is not None:
-                self._report(f"slice {self._slice_id} removed",
-                             self._cmd(f"slice remove {self._slice_id}", timeout=1))
-            if self._pan_id:
-                self._report(f"pan 0x{self._pan_id:08x} removed",
-                             self._cmd(f"display pan remove 0x{self._pan_id:08x}", timeout=1))
+                if self._stream_id:
+                    conn.ok(f"DAX-IQ stream 0x{self._stream_id:08x} removed",
+                            conn.cmd(f"stream remove 0x{self._stream_id:08x}", timeout=CMD_TIMEOUT_S))
+                if self._slice_id is not None:
+                    conn.ok(f"slice {self._slice_id} removed",
+                            conn.cmd(f"slice remove {self._slice_id}", timeout=CMD_TIMEOUT_S))
+                if self._pan_id:
+                    conn.ok(f"pan 0x{self._pan_id:08x} removed",
+                            conn.cmd(f"display pan remove 0x{self._pan_id:08x}", timeout=CMD_TIMEOUT_S))
         except Exception:
             log.exception("[Flex] Cleanup failed")
+        self._stream_id = self._pan_id = self._slice_id = None
 
     # -- receive loop --------------------------------------------------------
 
     def receive(self, callback, duration=None):
         """Receive DAX-IQ data. Calls callback(0, iq_samples) per packet.
 
-        iq_samples is a list of (float_i, float_q) tuples. The Flex
-        emits float32 natively — no int24→float conversion needed.
-
-        Matches HPSDRReceiver.receive() contract. rx_index is always 0.
+        iq_samples is an (n, 2) float64 array of I/Q. Matches HPSDRReceiver.receive();
+        rx_index is always 0.
         """
         if not self._running:
             return
@@ -799,7 +1229,7 @@ class FlexIQReceiver:
 
         # Flex v1.4+ sends payload_endian=little. Confirmed empirically:
         # big-endian parses as all zeros, little-endian gives real RF values.
-        # AetherSDR's big-endian swap is for older firmware — trust the radio.
+        # AetherSDR's big-endian swap is for older firmware: trust the radio.
         endian_char = '<'
 
         while self._running:
@@ -812,22 +1242,29 @@ class FlexIQReceiver:
                             "UDP port %d reaches this machine (WSL mirrored networking, firewall) "
                             "and that DAX-IQ channel %d is bound to the pan",
                             other_streams, self.udp_port, self.channel)
-            ready = select.select([self._udp, self._tcp], [], [], 0.1)[0]
-            why, alive = None, True
-            if self._tcp in ready and not self._read_status():
-                why, alive = self._lost, False
-            elif pkt_count and time.time() - last_pkt > STALL_S:
-                why = "No DAX-IQ packets for %d s (last packet %s)" % (STALL_S, utc_hms(self.last_packet))
+            conn, udp = self.conn, self._udp
+            if conn is None or udp is None:
+                time.sleep(0.1)
+                continue
+            ready = select.select([udp, conn], [], [], 0.1)[0]
+            why, kind = None, None
+            with self._lock:
+                if conn is self.conn and conn in ready and self._poll() is None:
+                    why, kind = conn.lost, 'link'
+            if not why and self._station_lost:
+                why, kind = "Station %s left the radio" % self.station, 'station'
+            elif not why and pkt_count and time.time() - last_pkt > STALL_S:
+                why, kind = "No DAX-IQ packets for %d s (last packet %s)" % (STALL_S, utc_hms(self.last_packet)), 'stream'
             if why:
-                self._restart(why, alive)
+                self._recover(why, kind)
                 last_counter = None
                 last_pkt = time.time() + RETRY_S    # time for the new stream to start
                 continue
-            if self._udp not in ready:
+            if udp not in ready:
                 continue
 
             try:
-                data, addr = self._udp.recvfrom(DAXIQ_PACKET_SIZE + 128)
+                data, addr = udp.recvfrom(DAXIQ_PACKET_SIZE + 128)
             except socket.error:
                 continue
 
@@ -859,6 +1296,10 @@ class FlexIQReceiver:
                     log.debug("[Flex] Packet gap: %d missed", gap)   # the 30 s report counts them
             last_counter = counter
 
+            now = last_pkt = self.last_packet = time.time()
+            if now < self._discard_until:     # the old frequency, after a retune
+                continue
+
             # Parse float32 I/Q pairs into one (n, 2) float64 array (cdub89/SparkGap#16)
             iq_rows = np.frombuffer(data, dtype=f"{endian_char}f4", count=2 * n_samples,
                                     offset=VITA_HEADER_SIZE).astype(np.float64).reshape(-1, 2)
@@ -870,31 +1311,11 @@ class FlexIQReceiver:
                          time.time() - start, n_samples, stream_id)
             pkt_count += 1
             self.packets += 1
-            now = last_pkt = self.last_packet = time.time()
             if now - last_report >= 30:
                 elapsed = now - start
                 log.info("[Flex] %d packets in %.0fs (%.0f pkt/s, %d samp/pkt, %d lost)",
                          pkt_count, elapsed, pkt_count / elapsed, n_samples, lost)
                 last_report = now
-
-    # -- helpers -------------------------------------------------------------
-
-    def _parse_hex_response(self, lines):
-        """Extract hex ID from the R<seq>|0|<hex_id> reply to the last command."""
-        for line in lines:
-            if not line.startswith(f"R{self._seq}|"):
-                continue
-            parts = line.split('|')
-            if len(parts) >= 3 and parts[1] == '0' and parts[2].strip():
-                raw = parts[2].strip().split(',')[0].strip()
-                try:
-                    return int(raw, 16)
-                except ValueError:
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        pass
-        return None
 
 
 # -- Standalone test ---------------------------------------------------------
