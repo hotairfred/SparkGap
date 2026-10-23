@@ -45,6 +45,9 @@ in `tools/eval/` and `tools/sim/`.
   firmware, up to 8 receivers at 48 to 192 kHz each), and FlexRadio DAX-IQ through `flex_iq.py`
   (`skimmer_flex.example.json`). Lost UDP packets are counted from the sequence number and their
   time kept as silence, so FT8 slots stay on the clock (`FT8 trigger: ... lost=` in the log).
+  A Red Pitaya streams to one client, and any client on the LAN can stop it: with no IQ for
+  `hpsdr_restart_after_s` (default 30 s; 0 = never) the receiver sends the start sequence again and
+  logs `Receiver: no IQ ... sent the start sequence again`. Multi-band (C receiver) only for now.
 - **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
   is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
   keying (`docs/ITILA2.md`).
@@ -53,7 +56,10 @@ in `tools/eval/` and `tools/sim/`.
   copies by RBN's call pattern file (`patt3ch.lst`), with lock-on (who owns the frequency) and
   CQ qualifiers (`CQ PA`, `CQ FD`). Callers are never spotted.
 - **RTTY.** RTTY signals are found in each band's RTTY segment and decoded once a minute, with
-  the same repeat rule.
+  the same repeat rule. For a contest weekend, `rtty_contest` (off by default) adds that contest's
+  rules: `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group
+  even when the CQ itself was lost, and reads a call followed by a grid square as a caller being
+  sent the exchange. Makrothen is the only contest defined so far (`RTTY_CONTESTS` in `sparkgap.py`).
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when

@@ -24,6 +24,9 @@ def test_a_call_sent_a_grid_square_is_a_caller() -> None:
     assert runner_calls(text, every=True) == ["AA4DD"]
     assert runner_calls(text, every=True, grid=True) == []
     assert runner_calls("CQ MAK K8IA K8IA CQ", every=True, grid=True) == ["K8IA"]   # runners unchanged
+    # RR73 has a grid square's shape (RR = a field, 73) but is a sign-off: the runner is not a caller
+    assert runner_calls("CQ MAK N4TL N4TL TU N4TL RR73", every=True, grid=True) == ["N4TL"]
+    assert runner_calls("TEST N4TL N4TL RR73", every=True, grid=True) == ["N4TL"]
 
 
 def test_the_contest_setting() -> None:

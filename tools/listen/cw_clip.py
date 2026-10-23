@@ -47,7 +47,8 @@ def parse_name(path):
 def recording_parts(path, freq_hz=None, centre_khz=None, start=None):
     """(parts in order, start epoch, centre Hz, rate). A directory: the band whose centre is nearest
     freq_hz. A WAV not named by the recorder (record_wav's template, e.g. lake3_14038_20261021_183854Z.wav)
-    needs centre_khz and start ('YYYY-MM-DD HH:MM:SS' UTC); the rate always comes from its header."""
+    needs centre_khz; its start comes from the name's UTC time unless start ('YYYY-MM-DD HH:MM:SS' UTC)
+    is given, and its _p2, _p3 ... parts are read after it. The rate always comes from its header."""
     if os.path.isdir(path):
         firsts = [p for p in glob.glob(os.path.join(path, '*.wav'))
                   if parse_name(p) and parse_name(p)[3] == 1]
@@ -58,11 +59,21 @@ def recording_parts(path, freq_hz=None, centre_khz=None, start=None):
         rate = w.getframerate()
     info = parse_name(path)
     if info is None:
-        if centre_khz is None or start is None:
+        # record_wav names: <prefix>_YYYYMMDD_HHMMSSZ.wav, continued in _p2, _p3 ... (RECORD_WAV_MAX_BYTES)
+        stamp = re.search(r'(\d{8}_\d{6})Z(?:_p\d+)?\.wav$', os.path.basename(path))
+        if start is None and stamp:
+            t0 = calendar.timegm(time.strptime(stamp.group(1), '%Y%m%d_%H%M%S'))
+        elif start is not None:
+            t0 = calendar.timegm(time.strptime(start, '%Y-%m-%d %H:%M:%S'))
+        else:
+            t0 = None
+        if centre_khz is None or t0 is None:
             raise SystemExit(f"{path}: not a recorder file name (YYYYMMDD_HHMMSSZ_<kHz>kHz_...wav), so give "
-                             "--centre KHZ and --start 'YYYY-MM-DD HH:MM:SS' (UTC)")
-        t0 = calendar.timegm(time.strptime(start, '%Y-%m-%d %H:%M:%S'))
-        return [path], t0, int(round(centre_khz * 1000)), rate
+                             "--centre KHZ, and --start 'YYYY-MM-DD HH:MM:SS' (UTC) unless the name has the time")
+        base = re.sub(r'_p\d+\.wav$', '.wav', path)
+        parts = [base] + sorted(glob.glob(base[:-4] + '_p*.wav'),
+                                key=lambda p: int(re.search(r'_p(\d+)\.wav$', p).group(1)))
+        return [p for p in parts if os.path.exists(p)], t0, int(round(centre_khz * 1000)), rate
     t0, ck = info[0], info[1]
     if centre_khz is not None:
         ck = int(round(centre_khz * 1000))

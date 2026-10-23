@@ -69,7 +69,8 @@ CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:/[A-Z0-9]{1,3})?$")                          # /0, /P
 _SPLIT_RE = re.compile(r"[^A-Z0-9?/]+")   # keep / for HK3/NP4Z, N5AW/0
 _RST_RE = re.compile(r"^[5E][9N][9N]$")    # 599, 5NN, ENN: contest report before the number
-GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}$")  # a 4-character grid square: the exchange of Makrothen RTTY
+GRID_RE = re.compile(r"^(?!RR73$)[A-R]{2}[0-9]{2}$")  # a 4-character grid square: the exchange of
+#                                                      Makrothen RTTY; RR73 (a sign-off) has the shape but is not one
 _MERGED_PREFIXES = ("CQ", "TEST", "CWT", "SST", "MST", "DE")
 _TRIGGER_WORDS = ("CQ", "TEST", "CWT", "SST", "MST")
 _STOP_WORDS = frozenset({"TU", "DE", "CQ", "TEST", "CWT", "SST", "MST", "QRZ", "AGN",

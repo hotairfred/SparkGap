@@ -1,5 +1,6 @@
 """tools/listen/cw_clip.py: a tone in a recording comes out at the pitch, across part files, and
 the log lines near the frequency and time come with it."""
+import calendar
 import os
 import sys
 import wave
@@ -102,3 +103,18 @@ def test_log_times_are_the_logging_pcs_local_time(tmp_path):
     t0 = cw_clip.parse_name("20261014_125900Z_7090kHz_192000_24bit.wav")[0]     # 12:59Z
     assert cw_clip.log_lines(str(log), 7035.0, t0 + 8 * 60, t0 + 10 * 60, utc_offset_h=-4)   # EDT log
     assert not cw_clip.log_lines(str(log), 7035.0, t0 + 8 * 60, t0 + 10 * 60, utc_offset_h=0)
+
+
+def test_record_wav_parts_and_start_from_the_name(tmp_path):
+    """record_wav's names carry the UTC start and continue in _p2 ... (cdub89's note on #89)."""
+    base = _recording(tmp_path)                                   # 6 s, split into two files at 2.5 s
+    rw = tmp_path / "lake3_7020_20261014_125900Z.wav"
+    os.rename(base, rw)
+    os.rename(tmp_path / f"20261014_125900Z_7020kHz_{RATE}_24bit_p2.wav", tmp_path / "lake3_7020_20261014_125900Z_p2.wav")
+    parts, t0, ck, _rate = cw_clip.recording_parts(str(tmp_path / "lake3_7020_20261014_125900Z_p2.wav"), centre_khz=7020)
+    assert [os.path.basename(p) for p in parts] == ["lake3_7020_20261014_125900Z.wav", "lake3_7020_20261014_125900Z_p2.wav"]
+    assert ck == 7020000 and t0 == calendar.timegm((2026, 10, 14, 12, 59, 0))   # from the name
+    out = tmp_path / "c.wav"                                      # 12:59:01.5 to 12:59:05.5 crosses into _p2
+    cw_clip.main([str(rw), "--freq", "7031.2", "--time", "12:59:01", "--dur", "4", "--centre", "7020", "--out", str(out)])
+    hz, n = _peak_hz(out)
+    assert abs(hz - 600) < 2 and n >= 3.9 * cw_clip.OUT_RATE
