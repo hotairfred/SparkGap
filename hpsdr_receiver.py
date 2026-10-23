@@ -264,6 +264,11 @@ class HPSDRReceiver:
         self.sock.setblocking(False)
         self.seq = 0
         self.frequencies = [7000000] * n_receivers  # Default 40m
+        # Restart on silence (as the C receiver, hpsdr_fast.c): a Red Pitaya streams to one client and
+        # any client's STOP stops it, so with no IQ for this long the start sequence is sent again
+        # (0 = never; passive mode never sends it). SparkGap sets it from hpsdr_restart_after_s.
+        self.restart_after_s = 30.0
+        self.restarts = 0
 
     def set_frequency(self, rx_index, freq_hz):
         """Set frequency for a receiver (in Hz).
@@ -345,10 +350,19 @@ class HPSDRReceiver:
         start_time = time.time()
         pkt_count = 0
         last_report = start_time
+        last_iq = start_time
 
         while running:
             if duration and (time.time() - start_time) >= duration:
                 break
+            if (not self.passive and self.restart_after_s > 0
+                    and time.time() - last_iq >= self.restart_after_s):
+                self.restarts += 1
+                print(f"Receiver: no IQ from {self.ip} for {self.restart_after_s:.0f} s, sending the start "
+                      f"sequence again ({self.restarts} time{'' if self.restarts == 1 else 's'} so far)",
+                      file=sys.stderr, flush=True)
+                self.start()
+                last_iq = time.time()          # and again after another restart_after_s
 
             ready = select.select([self.sock], [], [], 0.1)
             if not ready[0]:
@@ -375,6 +389,7 @@ class HPSDRReceiver:
 
             seq, all_iq = result
             pkt_count += 1
+            last_iq = time.time()
 
             for rx in range(self.n_receivers):
                 if all_iq[rx]:

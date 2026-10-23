@@ -7536,6 +7536,7 @@ class SparkGap:
                                               listen_port=listen_port,
                                               passive=passive, rx_filter=rx_filter)
                 self.receiver.lna_gain = lna_gain
+                self.receiver.restart_after_s = float(self.cfg.get('hpsdr_restart_after_s', 30.0))
             for _name, center_hz, rx_idx in self._band_meta:
                 self.receiver.set_frequency(rx_idx, center_hz)
         if not getattr(self, '_use_c_receiver', False):
