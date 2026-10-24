@@ -47,7 +47,8 @@ in `tools/eval/` and `tools/sim/`.
   time kept as silence, so FT8 slots stay on the clock (`FT8 trigger: ... lost=` in the log).
   A Red Pitaya streams to one client, and any client on the LAN can stop it: with no IQ for
   `hpsdr_restart_after_s` (default 30 s; 0 = never) the receiver sends the start sequence again and
-  logs `Receiver: no IQ ... sent the start sequence again`. Multi-band (C receiver) only for now.
+  logs `Receiver: no IQ ... sent the start sequence again`, on the multi-band C receiver and the
+  single-band Python one alike.
 - **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
   is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
   keying (`docs/ITILA2.md`).
