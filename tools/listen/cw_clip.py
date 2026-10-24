@@ -71,9 +71,11 @@ def recording_parts(path, freq_hz=None, centre_khz=None, start=None):
             raise SystemExit(f"{path}: not a recorder file name (YYYYMMDD_HHMMSSZ_<kHz>kHz_...wav), so give "
                              "--centre KHZ, and --start 'YYYY-MM-DD HH:MM:SS' (UTC) unless the name has the time")
         base = re.sub(r'_p\d+\.wav$', '.wav', path)
-        parts = [base] + sorted(glob.glob(base[:-4] + '_p*.wav'),
-                                key=lambda p: int(re.search(r'_p(\d+)\.wav$', p).group(1)))
-        return [p for p in parts if os.path.exists(p)], t0, int(round(centre_khz * 1000)), rate
+        if not os.path.exists(base):        # the start from the name is part 1's: without it, times would shift
+            raise SystemExit(f"{path}: its first part {os.path.basename(base)} is missing, so clip times can't be placed")
+        later = [p for p in glob.glob(base[:-4] + '_p*.wav') if re.search(r'_p(\d+)\.wav$', p)]
+        parts = [base] + sorted(later, key=lambda p: int(re.search(r'_p(\d+)\.wav$', p).group(1)))
+        return parts, t0, int(round(centre_khz * 1000)), rate
     t0, ck = info[0], info[1]
     if centre_khz is not None:
         ck = int(round(centre_khz * 1000))

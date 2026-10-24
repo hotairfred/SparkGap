@@ -118,3 +118,19 @@ def test_record_wav_parts_and_start_from_the_name(tmp_path):
     cw_clip.main([str(rw), "--freq", "7031.2", "--time", "12:59:01", "--dur", "4", "--centre", "7020", "--out", str(out)])
     hz, n = _peak_hz(out)
     assert abs(hz - 600) < 2 and n >= 3.9 * cw_clip.OUT_RATE
+
+
+def test_record_wav_missing_first_part_and_stray_files(tmp_path):
+    """A _p2 without its first part stops (its times would shift); a stray _pold.wav is ignored."""
+    import pytest
+    base = _recording(tmp_path)
+    rw = tmp_path / "lake3_7020_20261014_125900Z.wav"
+    os.rename(base, rw)
+    p2 = tmp_path / "lake3_7020_20261014_125900Z_p2.wav"
+    os.rename(tmp_path / f"20261014_125900Z_7020kHz_{RATE}_24bit_p2.wav", p2)
+    (tmp_path / "lake3_7020_20261014_125900Z_pold.wav").write_bytes(b"")
+    parts, *_ = cw_clip.recording_parts(str(rw), centre_khz=7020)
+    assert [os.path.basename(p) for p in parts] == [rw.name, p2.name]
+    os.remove(rw)
+    with pytest.raises(SystemExit):
+        cw_clip.recording_parts(str(p2), centre_khz=7020)
