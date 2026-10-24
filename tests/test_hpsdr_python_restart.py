@@ -63,3 +63,14 @@ def test_zero_and_passive_never_restart() -> None:
         assert rx.restarts == 0
         t.join()
         rx.sock.close()
+
+
+def test_a_restart_prints_one_line_in_the_c_receivers_wording(capsys) -> None:
+    rx, port, _got, t = _run(0.4)
+    t.start()
+    t.join()
+    rx.sock.close()
+    err = capsys.readouterr().err
+    lines = [l for l in err.splitlines() if l.strip()]
+    assert rx.restarts >= 2
+    assert all(l.startswith("Receiver: no IQ from 127.0.0.1, sent the start sequence again") for l in lines), lines
