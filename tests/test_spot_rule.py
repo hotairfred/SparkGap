@@ -825,3 +825,120 @@ def test_a_portable_call_is_not_a_fragment_of_itself() -> None:
     assert not _fragment("WA2USA", "WA2USA/P")
     assert not _fragment("HK3/NP4Z", "HK3/NP4Z/P")
     assert _fragment("K1V", "K1VUT")
+
+
+def test_lock_idle_s_key() -> None:
+    """Ownership lapses after LOCK_IDLE_S (180 s) unless spot_rule_lock_idle_s says otherwise."""
+    assert LOCK_IDLE_S == 180.0
+    for kw, want in (({}, None), ({"lock_idle_s": 600.0}, "W6YH")):
+        rule = RepeatSpotRule(_tier2, lockon=True, **kw)
+        _feed(rule, ["CQ TEST W6YH"])
+        assert rule.owner(7019.3, 179.0) == "W6YH"
+        assert rule.owner(7019.3, 181.0) == want
+
+
+def test_owner_listed_one_copy_of_an_unlisted_call_owns_nothing() -> None:
+    """lake3 20m 10-24: W4LOO's first CQ after a QSO read W4LTMO, which owned the frequency from
+    that one copy and held W4LOO's real CQ. owner_listed: one copy owns an empty frequency only
+    when the call is listed; otherwise it takes two copies."""
+    listed = {"W1AW", "W4LOO"}
+
+    def rule(on: bool) -> RepeatSpotRule:
+        return RepeatSpotRule(_tier2, cq_groups=True, lockon=True, validation="normal",
+                              listed=lambda c: c in listed, owned_two_windows=True, owner_listed=on)
+    for on in (False, True):
+        r = rule(on)
+        _feed(r, ["CQ POTA W4LTMO K"])
+        assert r.owner(7019.3, 1.0) == (None if on else "W4LTMO")
+        _feed(r, ["CQ POTA W4LTMO K"], t0=60.0)
+        assert r.owner(7019.3, 61.0) == "W4LTMO"                 # two copies own either way
+        r = rule(on)
+        _feed(r, ["CQ CQ DE W1AW W1AW K"])
+        assert r.owner(7019.3, 1.0) == "W1AW"                    # listed: one copy owns
+        r = rule(on)
+        assert _feed(r, ["CQ POTA W4LOO K"]) == []               # first hearing, one copy: not yet
+        _feed(r, ["CQ POTA W4LTMO K"], t0=700.0)                 # the garble, alone in its window
+        spots = _feed(r, ["CQ POTA W4LOO K"], t0=760.0)          # heard before and listed: passes
+        assert spots == ([("W4LOO", 7019.3)] if on else [])      # off: F2 holds it for W4LTMO
+
+
+def test_owner_listed_call_with_a_glued_prosign_never_owns() -> None:
+    """20m 10-24: special event W4E; the decoder read W4E DE as W4EDE, which is on the RBN known
+    list because other skimmers bust it the same way. A copy heard near the frequency plus a
+    glued stop word or prosign is a garble of that copy and takes no ownership."""
+    listed = {"W4E", "W4EDE"}
+    for on in (False, True):
+        r = RepeatSpotRule(_tier2, cq_groups=True, lockon=True, validation="normal",
+                           listed=lambda c: c in listed, owner_listed=on)
+        _feed(r, ["CQ CQ DE W4E W4E K"])
+        _feed(r, ["CQ CQ DE W4EDE W4EDE K", "CQ CQ DE W4EDE W4EDE K"], t0=60.0)
+        assert r.owner(7019.3, 121.0) == ("W4E" if on else "W4EDE")
+
+
+def test_la1d_noise_letters_take_no_lookahead_and_a_signoff_ends_it() -> None:
+    assert runner_calls("CQ CQ E E HFT ON6FT") == []
+    assert runner_calls("CQ CQ E E HFT ON6FT", la1d=True) == ["ON6FT"]
+    assert runner_calls("CQ K W1AW") == ["W1AW"]
+    assert runner_calls("CQ K W1AW", la1d=True) == []
+    texts = ["CQ CQ E E HFT ON6FT"] * 2
+    assert _feed(_rule(), texts) == []
+    assert _feed(RepeatSpotRule(_tier2, la1d=True), texts) == [("ON6FT", 7019.3)]
+
+
+def test_gluek_k_prosign_glued_to_a_call_present_in_the_text() -> None:
+    from spot_rule import tokens
+    assert tokens("CQ DE WB0MQAK WB0MQA") == ["CQ", "DE", "WB0MQAK", "WB0MQA"]
+    assert tokens("CQ DE WB0MQAK WB0MQA", gluek=True) == ["CQ", "DE", "WB0MQA", "K", "WB0MQA"]
+    assert tokens("CQ DE WB0MQAK", gluek=True) == ["CQ", "DE", "WB0MQAK"]   # the call is not in the text
+    assert tokens("W4E W4EK", gluek=True) == ["W4E", "W4EK"]                # 3 characters: too short
+    assert runner_calls("CQ DE WB0MQAK WB0MQA") == ["WB0MQAK"]
+    assert runner_calls("CQ DE WB0MQAK WB0MQA", gluek=True) == ["WB0MQA"]
+    texts = ["CQ DE WB0MQAK WB0MQA"] * 2
+    assert _feed(_rule(), texts) == [("WB0MQAK", 7019.3)]
+    assert _feed(RepeatSpotRule(_tier2, gluek=True), texts) == [("WB0MQA", 7019.3)]
+
+
+def test_norival_unlisted_rival_does_not_count_against_a_listed_call() -> None:
+    from collections import Counter
+
+    from spot_rule import _Copy
+
+    def rule(on: bool, listed: set) -> RepeatSpotRule:
+        return RepeatSpotRule(_tier2, validation="normal", listed=lambda c: c in listed, norival=on)
+    near = [_Copy(0.0, 1, "K1ABD", 7019.3, 0.0), _Copy(30.0, 2, "K1ABD", 7019.3, 0.0),
+            _Copy(60.0, 3, "K1ABC", 7019.3, 0.0)]
+    counts = Counter(c.call for c in near)
+    off = rule(False, {"K1ABC"}).score("K1ABC", near, counts, False)
+    on = rule(True, {"K1ABC"}).score("K1ABC", near, counts, False)
+    assert on - off == pytest.approx(-rule(True, {"K1ABC"}).weights["rival"])
+    both = {"K1ABC", "K1ABD"}                                    # a listed rival keeps the penalty
+    assert rule(True, both).score("K1ABC", near, counts, False) == rule(False, both).score("K1ABC", near, counts, False)
+    one = {"K1ABD"}                                             # unlisted call: no relief
+    assert rule(True, one).score("K1ABC", near, counts, False) == rule(False, one).score("K1ABC", near, counts, False)
+
+
+def test_strongest_db_drops_a_weaker_copy_of_the_same_call_elsewhere_in_the_band() -> None:
+    def run(strongest_db: float | None, weak_db: float, weak_f: float = 7059.3) -> list[tuple[str, float]]:
+        r = RepeatSpotRule(_tier2, strongest_db=strongest_db)
+        out = []
+        for i, t in enumerate((0.0, 30.0)):                    # the real signal: two strong copies
+            out += r.feed(i, 7030.0, "CQ AI5IN AI5IN", t, 44.0)
+        for i, t in enumerate((40.0, 50.0), start=10):        # a spur of it, weaker, 29 kHz up
+            out += r.feed(i, weak_f, "CQ AI5IN AI5IN", t, weak_db)
+        return out
+    assert run(None, 20.0) == [("AI5IN", 7030.0), ("AI5IN", 7059.3)]
+    assert run(10.0, 20.0) == [("AI5IN", 7030.0)]
+    assert run(10.0, 35.0) == [("AI5IN", 7030.0), ("AI5IN", 7059.3)]   # 9 dB down: kept
+    assert run(10.0, 20.0, weak_f=14059.3) == [("AI5IN", 7030.0), ("AI5IN", 14059.3)]   # other band
+
+
+def test_takeover_idle_s_lets_a_new_runner_take_a_frequency_its_old_owner_left() -> None:
+    def run(takeover: float | None) -> list[tuple[str, float]]:
+        r = RepeatSpotRule(lambda c: 1, lockon=True, owned_two_windows=True,
+                           lock_idle_s=600.0, takeover_idle_s=takeover)
+        out = r.feed(0, 7030.0, "CQ W6YH W6YH", 0.0, 30.0)
+        out += r.feed(1, 7030.0, "CQ K1ABC K1ABC", 400.0, 30.0)   # W6YH silent 400 s
+        return out
+    assert run(None) == [("W6YH", 7030.0)]                       # still owned: one window waits
+    assert run(180.0) == [("W6YH", 7030.0), ("K1ABC", 7030.0)]
+

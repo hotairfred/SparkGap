@@ -1983,7 +1983,7 @@ def _make_spot_rule(config, tracker, local=None):
     below 2), validation and validation_calls (as spot_validation and spot_validation_calls,
     for this port only). doubled_calls has no effect while validation is on: the score
     already weighs a call sent twice."""
-    from spot_rule import RepeatSpotRule
+    from spot_rule import LOCK_IDLE_S, RepeatSpotRule
     # spot_validation (off by default): permissive / normal / aggressive confidence score in
     # place of the tier count; spot_validation_calls adds a call list to the score: "scp"
     # (MASTER.SCP), "rbn" (RBN known calls, rbn_known.py, refreshed from the archives here) or
@@ -2019,6 +2019,16 @@ def _make_spot_rule(config, tracker, local=None):
         doubled=bool(doubled), split_up=bool(split_up),
         contest_words=bool(contest_words), cq_repeats=bool(cq_repeats),
         fragments=config.get('spot_rule_fragments') or None,
+        # spot_rule_lock_idle_s, _owner_listed, _la1d, _gluek, _norival, _strongest_db, _takeover_idle_s: cdub89/SparkGap#11, unset = as before
+        lock_idle_s=float(config.get('spot_rule_lock_idle_s', LOCK_IDLE_S)),
+        owner_listed=bool(config.get('spot_rule_owner_listed', False)),
+        la1d=bool(config.get('spot_rule_la1d', False)),
+        gluek=bool(config.get('spot_rule_gluek', False)),
+        norival=bool(config.get('spot_rule_norival', False)),
+        strongest_db=(float(config['spot_rule_strongest_db'])
+                      if config.get('spot_rule_strongest_db') is not None else None),
+        takeover_idle_s=(float(config['spot_rule_takeover_idle_s'])
+                         if config.get('spot_rule_takeover_idle_s') is not None else None),
         owner_cell=bool(config.get('spot_rule_owner_cell', False)),
         owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)))
 
