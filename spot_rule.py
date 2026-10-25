@@ -16,7 +16,8 @@ The spot goes out on the strongest window (bin SNR) among the copies, once per c
 REPEAT_S unless it moves more than MOVE_KHZ. A window is one decode window of one bin;
 both LPF paths of a window count once. One transmission counts once: when two bins sit on
 one signal (100 Hz apart), a copy of the call from the second bin less than one window length
-after the first is the same audio and is no copy; the stronger of the two gives the frequency.
+after the first is the same audio and is no copy; the stronger of the two gives the frequency
+and the SNR (spot_snr).
 
 CQ groups (cq_groups; always on in SparkGap): every CQ group naming the call
 counts as a copy, also several in one window (CQ WES DE N5QLZ N5QLZ K CQ WES DE N5QLZ is two),
@@ -407,6 +408,7 @@ class _Copy:
     freq_khz: float
     snr: float
     nth: int = 0              # which CQ group of its window (always 0 without cq_groups)
+    report: float | None = None   # the SNR a spot from this copy reports, when it differs from snr
 
 
 class RepeatSpotRule:
@@ -456,6 +458,7 @@ class RepeatSpotRule:
         self._bins: dict[int, int] = {}                         # window id -> bin
         self._next_window = 0
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}   # (call, MHz) -> (time, freq)
+        self.spot_snr: dict[str, float] = {}                    # call -> SNR of the copy that gave its last spot
         self._pruned = 0.0
 
     def window_id(self, bin_id: int, window_key: int, now: float) -> int:
@@ -468,8 +471,10 @@ class RepeatSpotRule:
         return self._window_ids[key][0]
 
     def feed(self, window: int, freq_khz: float, text: str, now: float,
-             snr: float | None = None) -> list[tuple[str, float]]:
-        """Record one decoded text of a window; return [(call, freq_khz)] to spot now."""
+             snr: float | None = None, report: float | None = None) -> list[tuple[str, float]]:
+        """Record one decoded text of a window; return [(call, freq_khz)] to spot now. snr ranks the
+        copies (best frequency, same audio); report, when given, is the SNR the spot
+        carries (itila2_snr_decoder), from the copy snr chose, else that call's latest copy with one."""
         self._expire(now)
         if self.split_runs:
             text = split_runs(text)
@@ -485,11 +490,11 @@ class RepeatSpotRule:
             new = 0
             for nth in range(n):
                 if (window, call, nth) not in self._seen:
-                    if self._same_audio(window, call, freq_khz, now, snr):
+                    if self._same_audio(window, call, freq_khz, now, snr, report):
                         continue
                     self._seen.add((window, call, nth))
                     self._copies.append(_Copy(now, window, call, freq_khz,
-                                              snr if snr is not None else float("-inf"), nth))
+                                              snr if snr is not None else float("-inf"), nth, report))
                     new += 1
             near = [c for c in self._copies if abs(c.freq_khz - freq_khz) <= NEAR_KHZ]
             counts = Counter(c.call for c in near)
@@ -511,6 +516,16 @@ class RepeatSpotRule:
             last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
             if last is None or now - last[0] >= REPEAT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
                 self._last_spot[key] = (now, spot_f)
+                best = max((c for c in near if c.call == call), key=lambda c: c.snr)   # the copy spot_f came from
+                reports = [c.report for c in near if c.call == call and c.report is not None]
+                if best.report is not None:
+                    self.spot_snr[call] = best.report
+                elif reports:
+                    self.spot_snr[call] = reports[-1]
+                elif best.snr != float("-inf"):        # a copy fed without an SNR keeps the window's
+                    self.spot_snr[call] = best.snr
+                else:
+                    self.spot_snr.pop(call, None)
                 spots.append((call, spot_f))
         return spots
 
@@ -535,7 +550,7 @@ class RepeatSpotRule:
         return s
 
     def _same_audio(self, window: int, call: str, freq_khz: float, now: float,
-                    snr: float | None) -> bool:
+                    snr: float | None, report: float | None = None) -> bool:
         """Another bin gave this call near freq_khz less than one window length ago. That copy
         takes this bin's frequency when this bin is the stronger."""
         mine = self._bins.get(window)
@@ -545,7 +560,8 @@ class RepeatSpotRule:
             if (c.call == call and abs(c.freq_khz - freq_khz) <= NEAR_KHZ
                     and now - c.time < self.window_s and self._bins.get(c.window, mine) != mine):
                 if snr is not None and snr > c.snr:
-                    self._copies[i] = _Copy(c.time, c.window, call, freq_khz, snr, c.nth)
+                    self._copies[i] = _Copy(c.time, c.window, call, freq_khz, snr, c.nth,
+                                            report if report is not None else c.report)
                 return True
         return False
 

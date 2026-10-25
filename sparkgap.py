@@ -1925,6 +1925,18 @@ def _select_decode_threads(n):
         log.info("ITILA decode threads: %d", n)
     return n
 
+_snr_decoder = False   # config itila2_snr_decoder: spot SNR from the decoder's window (marks over spaces)
+
+def _select_snr_decoder(on):
+    """Config key itila2_snr_decoder (default off): spot SNR in 500 Hz as CW Skimmer measures it: the
+    mean linear power over a decoded window's key-down samples (itila_feed_pow, itila_get_mark_power)
+    less the noise in its path, over the band's noise density (itila_sc_drain_env_pow)."""
+    global _snr_decoder
+    _snr_decoder = bool(on)
+    if _snr_decoder:
+        log.info("Spot SNR: the decoder's window")
+    return _snr_decoder
+
 _SPOT_RULES = ('off', 'repeat')
 _spot_rule_on = False
 _window_seq = itertools.count(1)   # window keys for spot_rule; never reused, unlike id(bin state)
@@ -2040,6 +2052,13 @@ def _get_itila_lib():
             # Timing-cost confidence (ggmorse-inspired, added 2026-05-14).
             _itila_lib.itila_get_last_cost.restype  = _ct.c_double
             _itila_lib.itila_get_last_cost.argtypes = [_ct.c_void_p]
+            if hasattr(_itila_lib, 'itila_feed_pow'):     # itila2 only (itila2_snr_decoder)
+                _itila_lib.itila_feed_pow.restype  = _ct.c_char_p
+                _itila_lib.itila_feed_pow.argtypes = [_ct.c_void_p, _ct.POINTER(_ct.c_double),
+                                                      _ct.POINTER(_ct.c_double), _ct.c_int,
+                                                      _ct.c_double, _ct.c_double]
+                _itila_lib.itila_get_mark_power.restype  = _ct.c_double
+                _itila_lib.itila_get_mark_power.argtypes = [_ct.c_void_p]
             log.info("Loaded %s", _itila_lib_path)
         except OSError:
             log.warning("%s not found, ITILA decoder unavailable", _itila_lib_path)
@@ -2714,6 +2733,15 @@ class _ItilaSc:
         return self._lib.itila_sc_drain_env(
             self._h, _ct.c_double(f_hz), p100, p200, _ct.c_int(max_n))
 
+    def drain_env_pow(self, f_hz, env100, env200, pow100, pow200, max_n):
+        """drain_env plus each path's power and the noise density: (n, n0); n is -1 when off."""
+        import ctypes as _ct
+        ptr = lambda a: a.ctypes.data_as(_ct.POINTER(_ct.c_double))
+        n0 = _ct.c_double(0.0)
+        n = self._lib.itila_sc_drain_env_pow(self._h, _ct.c_double(f_hz), ptr(env100), ptr(env200),
+                                             ptr(pow100), ptr(pow200), _ct.c_int(max_n), _ct.byref(n0))
+        return n, n0.value
+
     def peek_env(self, f_hz, env100, env200, max_n):
         import ctypes as _ct
         p100 = env100.ctypes.data_as(_ct.POINTER(_ct.c_double))
@@ -2790,6 +2818,9 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
             lib.itila_sc_set_cost_fn.argtypes = [_ct.c_void_p, _ct.c_void_p]
         except AttributeError:
             pass
+        if hasattr(lib, 'itila_sc_set_decoder_pow'):     # itila2_snr_decoder on the C decode loop
+            lib.itila_sc_set_decoder_pow.restype  = None
+            lib.itila_sc_set_decoder_pow.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_void_p]
         # Optional: exclusion zones (itila2 scanner, RTTY tones). Older libraries lack them.
         try:
             lib.itila_sc_exclude.restype  = None
@@ -2828,6 +2859,16 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
             lib.itila_sc_set_threads.argtypes = [_ct.c_void_p, _ct.c_int]
             n = lib.itila_sc_set_threads(_ct.c_void_p(h), _itila_decode_threads)
             log.info("ITILA scanner threads: %d", n)
+        if _snr_decoder and hasattr(lib, 'itila_sc_set_snr_marks'):
+            lib.itila_sc_set_snr_marks.restype = _ct.c_int
+            lib.itila_sc_set_snr_marks.argtypes = [_ct.c_void_p, _ct.c_int]
+            lib.itila_sc_drain_env_pow.restype = _ct.c_int
+            lib.itila_sc_drain_env_pow.argtypes = [_ct.c_void_p, _ct.c_double] + [_ct.POINTER(_ct.c_double)] * 4 + [
+                _ct.c_int, _ct.POINTER(_ct.c_double)]
+            lib.itila_sc_snr_from_power.restype = _ct.c_double
+            lib.itila_sc_snr_from_power.argtypes = [_ct.c_double, _ct.c_double, _ct.c_int]
+            if not lib.itila_sc_set_snr_marks(_ct.c_void_p(h), 1):
+                log.warning("ITILA scanner: no memory for the decoder SNR; spot SNR from the scanner")
         return _ItilaSc(lib, _ct.c_void_p(h))
     except OSError:
         log.warning("%s not found", _scanner_lib_path)
@@ -3206,6 +3247,11 @@ class _ItilaScanner:
                 self._sc._lib.itila_sc_set_cost_fn(
                     self._sc._h,
                     _ct.cast(itila_lib.itila_get_last_cost, _ct.c_void_p))
+            if _snr_decoder and hasattr(self._sc._lib, 'itila_sc_set_decoder_pow') and hasattr(itila_lib, 'itila_feed_pow'):
+                self._sc._lib.itila_sc_set_decoder_pow(      # itila2_snr_decoder on the C decode loop
+                    self._sc._h,
+                    _ct.cast(itila_lib.itila_feed_pow, _ct.c_void_p),
+                    _ct.cast(itila_lib.itila_get_mark_power, _ct.c_void_p))
             self._c_decode = True
             # Pre-allocate result buffer for C decode loop
             # NOTE: ScDecodeResult is now 288 bytes (added 8-byte trailing cost field).
@@ -3314,24 +3360,43 @@ class _ItilaScanner:
 
         env100 = np.empty(self._window_samples, dtype=np.float64)
         env200 = np.empty(self._window_samples, dtype=np.float64)
-        n_drained = self._sc.drain_env(f_hz, env100, env200, self._window_samples)
+        pows = None
+        if _snr_decoder and hasattr(self._sc._lib, 'itila_sc_drain_env_pow') and hasattr(lib, 'itila_feed_pow'):
+            pows = (np.empty(self._window_samples, dtype=np.float64), np.empty(self._window_samples, dtype=np.float64))
+            n_drained, n0 = self._sc.drain_env_pow(f_hz, env100, env200, pows[0], pows[1], self._window_samples)
+            if n_drained < 0:
+                pows = None
+        if pows is None:
+            n_drained = self._sc.drain_env(f_hz, env100, env200, self._window_samples)
         if n_drained < self._window_samples:
             return None
 
         f_khz = f_hz / 1000.0
         snr = self._sc._lib.itila_sc_get_snr(self._sc._h, _ct.c_double(f_hz))
         decoded = []
-        for h, env in ((st['h100'], env100), (st['h200'], env200)):
+        for wide, h, env in ((0, st['h100'], env100), (1, st['h200'], env200)):
             if h is None or h.value is None:
                 continue
             env_c = np.ascontiguousarray(env[:n_drained], dtype=np.float64)
             ptr = env_c.ctypes.data_as(_ct.POINTER(_ct.c_double))
-            result = lib.itila_feed(h, ptr, _ct.c_int(n_drained),
-                                    _ct.c_double(f_khz),
-                                    _ct.c_double(self.ev_thresh))
+            if pows is not None:
+                pw = pows[wide][:n_drained].ctypes.data_as(_ct.POINTER(_ct.c_double))
+                result = lib.itila_feed_pow(h, ptr, pw, _ct.c_int(n_drained),
+                                            _ct.c_double(f_khz), _ct.c_double(self.ev_thresh))
+            else:
+                result = lib.itila_feed(h, ptr, _ct.c_int(n_drained),
+                                        _ct.c_double(f_khz),
+                                        _ct.c_double(self.ev_thresh))
             raw = result.decode('ascii', errors='replace').strip() if result else ''
             if raw:
-                decoded.append((raw, lib.itila_get_last_cost(h), lib.itila_get_wpm(h)))
+                dsnr = None       # itila2_snr_decoder: this path's own reading
+                if pows is not None:
+                    dsnr = self._sc._lib.itila_sc_snr_from_power(lib.itila_get_mark_power(h), n0, wide)
+                    dsnr = dsnr if np.isfinite(dsnr) else None
+                decoded.append((raw, lib.itila_get_last_cost(h), lib.itila_get_wpm(h), dsnr))
+        if pows is not None:      # itila2_snr_decoder: a path without a reading takes the other path's
+            other = next((d[3] for d in reversed(decoded) if d[3] is not None), None)
+            decoded = [(r, c, w, d if d is not None else other) for r, c, w, d in decoded]
         return snr, decoded
 
     def _decode_post(self, f_hz, st, win):
@@ -3344,10 +3409,12 @@ class _ItilaScanner:
         now = time.time()
         window_key = next(_window_seq)
 
-        for raw, cost, wpm_est in decoded:
+        for raw, cost, wpm_est, dsnr in decoded:
+            if _snr_decoder:
+                st['snr500'] = dsnr      # reported by the spot; st['snr'] (the scanner's) ranks the copies
             log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
             if _gui_feed:
-                _gui_feed.publish_window(f_khz, raw, wpm_est, snr, cost)
+                _gui_feed.publish_window(f_khz, raw, wpm_est, dsnr if _snr_decoder else snr, cost)
             # Timing-cost gate (off by default).  Drops the whole decode
             # window's call extraction when segmentation quality is too low;
             # logs the suppression with cost so we can tune the threshold
@@ -5706,6 +5773,7 @@ class SpotIntent:
                            # multiple intents from one window without text reparse
     bin_id:    int = 0     # id(bin_state) — stable for bin lifetime
     window_text: str = ''  # spot_rule "repeat": whole decoded text, call empty
+    snr500: float = None   # itila2_snr_decoder: SNR in 500 Hz the spot reports; snr_db still ranks copies
 
 
 def _emit_intent(st, f_khz, call, wpm, is_runner, raw_text=''):
@@ -5731,7 +5799,7 @@ def _emit_window(st, f_khz, raw, wpm, window_key):
     Both LPF paths of a window share window_key, so they count as one sighting."""
     st['pending'].append(SpotIntent(
         call='', freq_khz=f_khz, snr_db=st['snr'], wpm=wpm, is_runner=True,
-        window_id=window_key, bin_id=id(st), window_text=raw))
+        window_id=window_key, bin_id=id(st), window_text=raw, snr500=st.get('snr500')))
 
 
 class SpotTracker:
@@ -6699,10 +6767,10 @@ class SpotTracker:
                 if rule is None:
                     continue
                 w = rule.window_id(intent.bin_id, intent.window_id, now)
-                spots += [{'call': call, 'freq_khz': f, 'snr': intent.snr_db,
+                spots += [{'call': call, 'freq_khz': f, 'snr': rule.spot_snr.get(call, intent.snr_db),
                            'wpm': intent.wpm, 'method': 'repeat', 'stream': stream}
                           for call, f in rule.feed(w, intent.freq_khz, intent.window_text, now,
-                                                   intent.snr_db)
+                                                   intent.snr_db, intent.snr500)
                           if call not in self.blacklist]
             return spots
         # gate_short_scp_exact: require a second sighting at the same freq
@@ -7395,6 +7463,7 @@ class SparkGap:
                                    gate_config=gate_config,
                                    recent_band_config=self.cfg.get('recent_band_floor'))
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
+        _select_snr_decoder(self.cfg.get('itila2_snr_decoder', False))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
             self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
             log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s",
@@ -7963,6 +8032,9 @@ class SparkGap:
                     f_hz = _ct.c_double.from_buffer(poll_buf, off).value
                     snr = _ct.c_double.from_buffer(poll_buf, off + 8).value
                     wpm = _ct.c_int.from_buffer(poll_buf, off + 16).value
+                    snr500 = _ct.c_float.from_buffer(poll_buf, off + 20).value   # itila2_snr_decoder, NAN if none
+                    snr500 = (snr500 if _snr_decoder and _scanner_lib_path == _SCANNER_LIBS['itila2']
+                              and snr500 == snr500 else None)   # NaN != NaN; itila's scanner leaves 0 there
                     raw = poll_buf[off+24:off+280].split(b'\0')[0].decode('ascii', errors='replace')
                     cost = _ct.c_double.from_buffer(poll_buf, off + 280).value
                     if not raw:
@@ -7970,7 +8042,7 @@ class SparkGap:
                     f_khz = f_hz / 1000.0
                     log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
                     if _gui_feed:
-                        _gui_feed.publish_window(f_khz, raw, wpm, snr, cost)
+                        _gui_feed.publish_window(f_khz, raw, wpm, snr500 if _snr_decoder else snr, cost)
                     # Find or create bin state for ticker tape
                     scanner = None
                     for mgr in self.managers:
@@ -7996,6 +8068,8 @@ class SparkGap:
                         }
                     st = scanner._bins[f_hz]
                     st['snr'] = snr
+                    if _snr_decoder:
+                        st['snr500'] = snr500
                     if wpm > 0:
                         st['wpm'] = wpm
                     st['text_buf'] = (st['text_buf'] + ' ' + raw)[-512:]
@@ -8814,6 +8888,7 @@ def run_file_mode(args, config):
                           scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)),
                           gate_config=gate_config)
     _select_decode_threads(config.get('itila_decode_threads', 1))
+    _select_snr_decoder(config.get('itila2_snr_decoder', False))
     if _select_spot_rule(_spot_rule_name(config)):
         _trk = tracker
         _trk.spot_rule = _make_spot_rule(config, tracker)

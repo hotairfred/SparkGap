@@ -146,6 +146,9 @@ typedef struct {
     int           carry_n;
     double       *feed_env;         /* MAX_ENV, carry + new window, level-normalised */
     double       *feed_raw;         /* MAX_ENV, carry + new window as received */
+    double       *feed_pow;         /* MAX_ENV, the same samples' linear power; set by itila_feed_pow */
+    double       *carry_pow;        /* CARRY_MAX, carried power; allocated by the first itila_feed_pow */
+    const double *pow_in;           /* the new window's power during an itila_feed_pow call, else NULL */
     double        lw_units_prev;    /* last fitted letter/word boundary, in units */
     double        dit_prev, dah_prev; /* last two-class mark fit on this handle, samples */
 
@@ -181,6 +184,7 @@ typedef struct {
     char result_buf[RESULT_BUF];
     double last_wpm;          /* WPM from most recent successful decode */
     double pitch_wpm;         /* WPM from mark + element gap pitch, 0 if too few */
+    double last_mark_pow;     /* itila_feed_pow: mean key-down power of the last decoded window, NAN if none */
     double last_timing_cost;  /* ggmorse-inspired confidence score: sum of
                                * squared deviations from canonical Morse
                                * timing on the most recent decode's run list.
@@ -1647,6 +1651,21 @@ static void level_follow(itila_state_t *st, const double *x, int n, double *y) {
     }
 }
 
+/* itila2_snr_decoder: mean linear power over the key-down samples, SNR_EDGE samples in from each
+ * edge (transitions and the marks' edge uncertainty dropped, as CW Skimmer does). Mean, not median:
+ * under Rayleigh fading the mean is the estimate of the received power. NAN under SNR_MARK_MIN samples. */
+#define SNR_EDGE      2
+#define SNR_MARK_MIN 20
+static double mark_power(const double *pow, const int8_t *marks, int n) {
+    double sum = 0.0; int m = 0, run = 0;
+    for (int i = 0; i < n; i++) {
+        run = marks[i] ? run + 1 : 0;
+        int c = i - SNR_EDGE;   /* sample c has SNR_EDGE marks on each side when run >= 2*SNR_EDGE + 1 */
+        if (run >= 2 * SNR_EDGE + 1 && isfinite(pow[c])) { sum += pow[c]; m++; }
+    }
+    return m >= SNR_MARK_MIN ? sum / m : NAN;
+}
+
 /* Blank the marks of segments that are not CW. A segment is keying between pauses of 5 units
  * or more of the fastest speed candidate; its log Bayes factor (fresh forward pass, mean over the speed bins, against all
  * noise) must reach SEG_RATE_MIN per second. Marks at or after n_dec (the carry) are kept. */
@@ -1719,6 +1738,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
 {
     itila_state_t *st = (itila_state_t*)h;
     st->result_buf[0] = '\0';
+    st->last_mark_pow = NAN;
     if (!bind_scratch(st)) return st->result_buf;
 
     int carry = st->carry_n;
@@ -1728,6 +1748,10 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     /* carry_env holds raw samples: normalise carry and new block together (no seam) */
     memcpy(st->feed_raw, st->carry_env, (size_t)carry * sizeof(double));
     memcpy(st->feed_raw + carry, envelope, (size_t)n * sizeof(double));
+    if (st->pow_in) {
+        memcpy(st->feed_pow, st->carry_pow, (size_t)carry * sizeof(double));
+        memcpy(st->feed_pow + carry, st->pow_in, (size_t)n * sizeof(double));
+    }
     n += carry;
     level_follow(st, st->feed_raw, n, st->feed_env);
     envelope = st->feed_env;
@@ -1769,8 +1793,10 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
     st->carry_n = n - n_dec;
     memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
+    if (st->pow_in) memcpy(st->carry_pow, st->feed_pow + n_dec, (size_t)st->carry_n * sizeof(double));
     gate_segments(st, envelope, n_dec, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]),
                   wpm_cands, n_cands);
+    if (st->pow_in) st->last_mark_pow = mark_power(st->feed_pow, st->marks, n_dec);
 
     /* Per-handle scratch, was function-local static; live mode races. */
     callsign_t *calls = st->sc_calls;
@@ -2023,6 +2049,29 @@ void itila_reset_online(itila_t h)
     st->oss_init = 0;
 }
 
+/* itila2_snr_decoder: itila_feed with the window's linear power (same n samples, from the scanner's
+ * itila_sc_drain_env_pow); the power is carried across windows with the envelope. */
+const char* itila_feed_pow(itila_t h, const double *envelope, const double *pow, int n,
+                           double freq_khz, double ev_thresh)
+{
+    static _Thread_local double *tl_feed_pow;     /* per thread, as the other scratch; only once used */
+    itila_state_t *st = (itila_state_t*)h;
+    if (!tl_feed_pow) tl_feed_pow = (double*)malloc(MAX_ENV * sizeof(double));
+    if (!st->carry_pow) st->carry_pow = (double*)calloc(CARRY_MAX, sizeof(double));
+    if (!tl_feed_pow || !st->carry_pow) return itila_feed(h, envelope, n, freq_khz, ev_thresh);
+    st->feed_pow = tl_feed_pow;
+    st->pow_in = pow;
+    const char *r = itila_feed(h, envelope, n, freq_khz, ev_thresh);
+    st->pow_in = NULL;
+    return r;
+}
+
+/* Mean key-down power of the last itila_feed_pow window, NAN when it did not decode. */
+double itila_get_mark_power(itila_t h) {
+    if (!h) return NAN;
+    return ((itila_state_t*)h)->last_mark_pow;
+}
+
 double itila_get_last_cost(itila_t h) {
     if (!h) return 999.0;
     return ((itila_state_t*)h)->last_timing_cost;
@@ -2032,6 +2081,7 @@ void itila_free(itila_t h) {
     if (!h) return;
     itila_state_t *st = (itila_state_t*)h;
     free(st->carry_env);
+    free(st->carry_pow);
     free(st);
 }
 
@@ -2108,4 +2158,8 @@ double itila2_test_estimate_wpm(const int *is_mark, const int *dur, int n) {
     double wpm = estimate_wpm_from_gamma(gamma, T);
     free(gamma);
     return wpm;
+}
+
+double itila2_test_mark_power(const double *pow, const int8_t *marks, int n) {
+    return mark_power(pow, marks, n);
 }
