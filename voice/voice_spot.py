@@ -308,11 +308,18 @@ ONE_BY_ONE = re.compile(r'^[KNW][0-9][A-Z]$')          # special-event calls, no
 LONG_CALL = re.compile(r'[0-9][A-Z]{4,}$')              # longer than a 2x3 (Fred 10-21: rare, special events)
 
 
+# a call in neither MASTER.SCP nor the FCC list needs this many copies (10-26: live spots a misreading
+# heard first, XR6K before CR6K, P4X before IP4X; RBN's pattern file does the same for CW)
+UNKNOWN_COPIES = int(_os.environ.get('VS_UNKNOWN_COPIES', 3))
+
+
 def copies_needed(base, fcc):
     """Clean runner copies a call needs: 3 for a 1x1 (can't be checked against the FCC list) and for a
     call longer than a 2x3 (rare; a stutter like KC5SCKK makes them); 2 otherwise."""
     if LONG_CALL.search(base) or (ONE_BY_ONE.match(base) and fcc is not None):
         return 3
+    if UNKNOWN_COPIES > 2 and not known(base, fcc) and not (fcc is None and US_CALL.match(base)):
+        return UNKNOWN_COPIES             # not in MASTER.SCP or the FCC list: wait for the real call to show
     return 2
 
 

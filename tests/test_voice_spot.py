@@ -177,3 +177,10 @@ def test_a_caller_on_a_runner_s_carrier_is_not_spotted() -> None:
     clipped = _g('I1X', 7166.4, [100, 130, 160, 190, 220, 250])  # Whisper's clipped II1X is not another station
     full = _g('II1X', 7166.4, [200, 260])
     assert not v.caller_on_owned(full, [clipped, full])
+
+
+def test_a_call_on_neither_list_needs_three_copies(monkeypatch) -> None:
+    monkeypatch.setattr(v, '_SCP', {'CR6K', 'IP4X'})
+    assert v.copies_needed('CR6K', set()) == 2
+    assert v.copies_needed('XR6K', set()) == 3          # Whisper's misreading, heard before the real call
+    assert v.copies_needed('W1AW', {'W1AW'}) == 2       # a US call in the FCC list

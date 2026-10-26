@@ -21,8 +21,10 @@ is the runner:
 - **A runner copy** is a call right after CQ, QRZ or "this is", or one right before "QRZ",
   "contest" or "calling CQ", with a CQ or QRZ in the last 30 s. A call right after "thank you",
   "copy", "you're" or a report is a caller and never counts.
-- **Two copies spot a call**, within 500 Hz and 10 minutes. 1x1 calls and calls longer than a 2x3
-  need three. A US-format call must be in the FCC list (`--fcc`, built by `fcc_calls.py`).
+- **Two copies spot a call**, within 500 Hz and 10 minutes. 1x1 calls, calls longer than a 2x3 and
+  calls in neither MASTER.SCP nor the FCC list need three: live, a misreading is often heard before
+  the real call has its copies (XR6K before CR6K, P4X before IP4X), as RBN's pattern file allows for
+  in CW. A US-format call must be in the FCC list (`--fcc`, built by `fcc_calls.py`).
 - **The better of two readings wins.** When a variant of the call is heard on the same carrier
   (I8R beside HI8R, MS53M beside S53M, 1B1B beside CB1B), the known call wins (MASTER.SCP, or the
   FCC list for a US call), then a call that only adds letters in front, then more copies.
@@ -39,7 +41,8 @@ is the runner:
 
 Each rule can be turned off for measuring with an environment variable: `VS_VARIANTS`,
 `VS_DOMINANT`, `VS_ASKS`, `VS_LOCKON` (`0` = off), `VS_SAME_KHZ` (kHz, `0` = off),
-`VS_VARIANT_S` and `VS_POOL_S` (seconds), `VS_SCP` (a newer MASTER.SCP).
+`VS_VARIANT_S` and `VS_POOL_S` (seconds), `VS_UNKNOWN_COPIES` (copies for a call on neither list),
+`VS_SCP` (a newer MASTER.SCP).
 
 ## Running it
 
@@ -62,7 +65,7 @@ people posted (DX Summit and a cluster node) for the same call within 3 kHz and 
 
 | | Spots | Calls | Calls a person also spotted |
 | --- | --- | --- | --- |
-| These rules, all eight band-hours | 372 | 353 | 248 |
+| These rules, all eight band-hours | 368 | 349 | 248 |
 
 - "Not spotted by a person" isn't the same as wrong: in CQ WW almost nobody spots US and Canadian
   stations, and most of our unconfirmed calls are those. Reading the transcripts of two of the
@@ -71,7 +74,10 @@ people posted (DX Summit and a cluster node) for the same call within 3 kHz and 
   checked on two held-out ones: confirmed calls on 20 m went from 20 to 26 and on 15 m from 46 to
   50, and 8 busts went away.
 - One spot per call within 3 kHz and lock-on together removed 27 duplicate or caller spots from
-  the eight band-hours; no call a person had spotted was lost.
+  the eight band-hours, and three copies for calls on neither list 4 misreadings (TK1TTT, IR3Z,
+  S5T, T9FRX); no call a person had spotted was lost.
+- The same rules in the live runner, on one 40 m hour replayed with nothing dropped: 67 calls,
+  54 of them spotted by a person (81%), against 71 and 54 (76%) before these three changes.
 
 Run live on one band, the GTX 1060 falls about a third short of keeping up with a busy contest
 band, so a busy hour loses some speech it never gets to. That is for the live-runner pull request.
