@@ -65,6 +65,10 @@ in `tools/eval/` and `tools/sim/`.
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
   it says the PC clock is off.
+- **SSB (voice), arriving in pieces.** Voices found in the IQ are transcribed with Whisper and
+  the station calling CQ is spotted, by spoken versions of the same rules: runner copies, the
+  better of two readings, lock-on. The spot rules are in `voice/` now; the detector and the live
+  runner follow. What it does and how it measured on CQ WW SSB: `voice/README.md`.
 - **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format (RTTY lines as
   RTTY Skimmer Server writes them), so loggers, clusters and Aggregator can read them; an
   optional second port for your own use with its own, looser spot rule (see the quick start);
