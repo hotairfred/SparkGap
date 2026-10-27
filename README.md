@@ -205,6 +205,34 @@ RBN: SparkGap is not yet authorized to connect. The checks a node must make itse
 spot reaches RBN (CQ only, repeats, mode codes, beacons, frequency) and what we measured are in
 #49. `docs/rbn-feeding.md` describes `rbn_feeder.py` for when that work is done.
 
+## Sharing one Red Pitaya between computers
+
+A Red Pitaya streams to one client. `hpsdr_proxy.py` takes that stream once and passes it to any number of
+SparkGaps, so a second computer can take some of the bands:
+
+```
+python3 hpsdr_proxy.py --pitaya 192.168.1.54 --port 1025 --owner 192.168.1.76
+```
+
+- **The owner tunes the radio.** Only the computer named in `--owner` (an IP, or IP:port) sets the
+  receivers' frequencies, the sample rate and the number of receivers; the others only listen. Without
+  `--owner`, every client's tuning goes to the radio and the last one wins. A client's STOP never reaches
+  the radio either way.
+- **A listener lists the owner's bands** (the same receivers on the same frequencies, `max_receivers` the
+  same) and decodes the ones it names with `rx_index`, for example
+  `"bands": [{"center_khz": 14090, "rx_index": 3}, {"center_khz": 18083, "rx_index": 4}]`. A listener that
+  asks for another frequency is logged once per receiver (`! ... wants RX1 on 7000.0 kHz, the owner has it
+  on 7090.0 kHz`); its tuning never reaches the radio.
+- **Point each SparkGap at the proxy** (`sdr_ip`, `sdr_port`). The multi-band receiver binds the same local
+  port it sends to, so the proxy can't share a computer with a multi-band SparkGap on the same port. Run
+  it elsewhere, or give a single-band listener its own `hpsdr_listen_port`.
+
+Measured with a 2-receiver replay of a CWT (40 m and 20 m): the owner decoded both bands and a listener on
+another computer decoded only 20 m through the proxy. All 29 of the owner's 20 m calls came out of the
+listener too, at the same frequency (median 0.00 kHz). The listener's own tuning (RX1 to 7000 kHz: a
+single-band receiver tunes RX1 whatever its `rx_index`) was held back and logged. Not yet run against a
+live Red Pitaya.
+
 ## Replaying and measuring
 
 File mode decodes a recording as fast as the CPU allows:

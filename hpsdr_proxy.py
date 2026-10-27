@@ -12,6 +12,8 @@ Stretch:    --wav replays a recorded WAV as fake Protocol 1 UDP frames,
 Usage:
     # Live proxy (pitaya → SkimSrv + SparkGap)
     python3 hpsdr_proxy.py --pitaya 192.168.1.54
+    # ... where only one consumer tunes the radio; the others just listen
+    python3 hpsdr_proxy.py --pitaya 192.168.1.54 --owner 192.168.1.76
 
     # WAV replay (regression / A-B without hardware)
     python3 hpsdr_proxy.py --wav B1_20260319_030000_7090kHz.wav
@@ -94,13 +96,37 @@ def _iq_packet_np(seq, blk):
 # Live proxy mode
 # ---------------------------------------------------------------------------
 
-class HPSDRProxy:
-    """Receives IQ from a real pitaya and fans it out to multiple consumers."""
+def rx_freqs(data):
+    """{receiver (0-based): Hz} from the NCO frequency registers in a C&C packet (EF FE 01 02, two 512-byte
+    frames of sync 7F 7F 7F then C0..C4). C0 = address << 1 | MOX: RX1..RX7 are addresses 2..8, RX8 is 0x12."""
+    out = {}
+    for off in (8, 520):
+        if len(data) < off + 8 or data[off:off + 3] != b'\x7f\x7f\x7f':
+            continue
+        c0 = data[off + 3] & 0xFE
+        rx = 7 if c0 == 0x24 else c0 // 2 - 2 if 0x04 <= c0 <= 0x10 else None
+        if rx is not None:
+            out[rx] = int.from_bytes(data[off + 4:off + 8], 'big')
+    return out
 
-    def __init__(self, pitaya_ip, pitaya_port=HPSDR_PORT, listen_port=HPSDR_PORT):
+
+class HPSDRProxy:
+    """Receives IQ from a real pitaya and fans it out to multiple consumers.
+
+    owner: None, every consumer's C&C (tuning, sample rate, receivers) goes to the radio, so the last one wins;
+    or "IP" / "IP:PORT", only that consumer's does. The others only listen: each needs the owner's band list
+    (the same receivers on the same frequencies), and may decode just some of them (rx_index in its bands). A
+    listener asking for a different frequency is logged once per receiver. A consumer's STOP never reaches
+    the radio either way."""
+
+    def __init__(self, pitaya_ip, pitaya_port=HPSDR_PORT, listen_port=HPSDR_PORT, owner=None):
         self.pitaya = (pitaya_ip, pitaya_port)
         self.consumers = {}     # addr → last_seen timestamp
         self.seq = 0
+        ip, _, port = (owner or '').partition(':')
+        self.owner = (ip, int(port) if port else None) if owner else None
+        self.owner_freqs = {}   # receiver → Hz, the owner's latest
+        self.warned = set()     # (consumer addr, receiver) mismatches logged
 
         # Upstream socket: our connection to the pitaya
         self.up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -147,7 +173,24 @@ class HPSDRProxy:
                 self.consumers.pop(addr, None)
                 print(f"  -consumer {addr[0]}", file=sys.stderr)
         elif len(data) >= 8 and data[2:4] == b'\x01\x02':  # C&C (freq/config)
-            self.up.sendto(data, self.pitaya)       # forward to pitaya
+            if self.is_owner(addr):
+                self.owner_freqs.update(rx_freqs(data))
+                self.up.sendto(data, self.pitaya)   # forward to pitaya
+            else:
+                self.listener_cc(data, addr)
+
+    def is_owner(self, addr):
+        return self.owner is None or (addr[0] == self.owner[0] and self.owner[1] in (None, addr[1]))
+
+    def listener_cc(self, data, addr):
+        """A listener's C&C stays here; one that asks for a frequency the owner doesn't have is decoding
+        the wrong band, so say so (once per receiver)."""
+        for rx, hz in rx_freqs(data).items():
+            have = self.owner_freqs.get(rx)
+            if have is not None and abs(have - hz) > 1 and (addr, rx) not in self.warned:
+                self.warned.add((addr, rx))
+                print(f"  ! {addr[0]}:{addr[1]} wants RX{rx + 1} on {hz / 1e3:.1f} kHz, the owner has it on "
+                      f"{have / 1e3:.1f} kHz: its bands must match the owner's", file=sys.stderr)
 
     def _forward_to_consumers(self, data):
         if len(data) < 8 or data[0:2] != COOKIE or data[2:4] != b'\x01\x06':
@@ -388,6 +431,8 @@ def main():
 
     ap = argparse.ArgumentParser(description='HPSDR Protocol 1 proxy / multiplexer')
     ap.add_argument('--pitaya',      default='192.168.1.54', help='Pitaya IP (live mode)')
+    ap.add_argument('--owner', default=None, metavar='IP[:PORT]',
+                    help='live mode: only this consumer tunes the radio; the others listen (same band list)')
     ap.add_argument('--port',  type=int, default=HPSDR_PORT, help='Listen port')
     ap.add_argument('--wav', action='append',
                     help='WAV file to replay (instead of live pitaya); repeat once per '
@@ -414,7 +459,7 @@ def main():
                        negate_q=args.negate_q, n_rx=args.n_rx, align_sec=args.align,
                        drop=tuple(int(x) for x in args.drop.split(':')) if args.drop else None)
              if args.wav else
-             HPSDRProxy(args.pitaya, HPSDR_PORT, args.port))
+             HPSDRProxy(args.pitaya, HPSDR_PORT, args.port, owner=args.owner))
     try:
         proxy.run()
     finally:
