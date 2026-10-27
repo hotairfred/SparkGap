@@ -9,7 +9,9 @@ folder holds it as it lands, piece by piece:
 | Spot rules: transcripts in, spots out | `voice_spot.py` | here |
 | Active US calls from the FCC database | `fcc_calls.py` | here |
 | Voice detector: IQ in, one audio track per voice | `voice_detect.py` | here |
-| Live runner: detector, Whisper and the rules on a running radio, spots on telnet | | next |
+| FlexRadio DAX-IQ recorder (one SparkGap station on the radio) | `flex_record.py` | here |
+| Live runner: detector, Whisper and the rules on a running radio, spots on telnet | `live_voice.py` | here |
+| Live rules on saved transcripts, without the GPU | `live_rule_replay.py` | here |
 
 ## How voices are found
 
@@ -103,9 +105,41 @@ python3 voice/voice_spot.py DUMPDIR large-v3-turbo --strict --fcc fcc_active_cal
 
 `DUMPDIR` holds one Whisper transcript per voice track,
 `ssb_<carrier kHz>@<start s>.<model>.json`, each a list of
-`[start, end, text, avg_logprob, [[word, probability], ...]]`. The clips come from `voice_detect.py`;
-the transcription step that writes these files comes with the live runner. `--debug` prints why each heard call was or wasn't spotted.
-Tests: `python3 -m pytest tests/test_voice_spot.py`.
+`[start, end, text, avg_logprob, [[word, probability], ...]]` (the clips come from `voice_detect.py`).
+`--debug` prints why each heard call was or wasn't spotted. Tests: `python3 -m pytest tests/test_voice_spot.py`.
+
+## Running live
+
+The live runner needs faster-whisper and a CUDA GPU: `pip install -r voice/requirements.txt`, and put
+the pip CUDA libraries on the path:
+
+```
+export LD_LIBRARY_PATH=$(python3 -c "import os, nvidia.cublas as b, nvidia.cudnn as d; print(':'.join(os.path.join(list(m.__path__)[0], 'lib') for m in (b, d)))")
+```
+
+Record a band from a FlexRadio and run the skimmer on the recording as it grows:
+
+```
+python3 voice/flex_record.py 192.168.1.50 rec 3600 auto:14246000 &
+python3 voice/live_voice.py rec/*_14246kHz_*.cf32 14246 14153 14339 --follow --dur 3600 \
+        --call N0CALL-4 --port 7373 --fcc fcc_active_calls.txt --spots spots.txt
+```
+
+- Spots go out on the telnet port as `DX de N0CALL-4: 14246.0  K1ABC  SSB CQ 2 copies  1234Z`, for a
+  cluster or a logger. Give the skimmer an SSID of its own.
+- A 192 kHz DAX-IQ stream takes half the radio's DAX-IQ budget, so a radio records two bands at most.
+- Without `--follow` it replays a recording: `--speed 1` at live pace (the keep-up test), `--speed 0` as
+  fast as it goes.
+- Transcripts stay in memory (15 minutes) and are dropped. `--transcripts DIR` keeps them, appended to
+  `DIR/segs.jsonl`, and `live_rule_replay.py DIR/segs.jsonl START_UTC` replays the live rules on them in
+  seconds, without the GPU, to measure a rule change.
+- When the GPU falls behind, a piece more than 10 minutes behind the newest audio is dropped and its
+  frequency gets the next fresh look. A spotted runner's frequency is only sampled (30 s every 5 minutes)
+  until it goes quiet. If 20 pieces in a row fail to transcribe (a missing CUDA library, say), the runner
+  stops with `FATAL` instead of running on without spotting.
+
+Tests: `python3 -m pytest tests/test_live_voice.py` (the live rules, the telnet port, the failure stop and
+each track's audio across blocks; no GPU or radio needed).
 
 ## Measured
 
@@ -129,5 +163,11 @@ people posted (DX Summit and a cluster node) for the same call within 3 kHz and 
 - The same rules in the live runner, on one 40 m hour replayed with nothing dropped: 67 calls,
   54 of them spotted by a person (81%), against 71 and 54 (76%) before these three changes.
 
-Run live on one band, the GTX 1060 falls about a third short of keeping up with a busy contest
-band, so a busy hour loses some speech it never gets to. That is for the live-runner pull request.
+**Live, into a DX cluster**, CQ WW SSB 2026, Sunday 06:55 to 23:58Z on one band (40 m, then 20 m):
+2083 spots of 412 calls, 203 of the calls also spotted by a person (49%; again, mostly US and Canadian
+stations nobody spots). Most spots went out within seconds of the station being heard.
+
+**One GTX 1060 is about a third short of one busy contest band.** On 20 m on Sunday the runner dropped 300
+to 1500 pieces an hour that it never got to. A 40 m hour replayed at 0.6x speed, so that nothing was
+dropped, gave 71 calls with 54 confirmed, against 64 and 53 live with the same rules: the drops cost
+few confirmed calls, but late spots and missed ones. A faster GPU, or two, is the fix.
