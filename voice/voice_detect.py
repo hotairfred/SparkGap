@@ -1,11 +1,10 @@
 """SSB voice tracks from wideband IQ: find each voice by its filter shape and speech rhythm,
 follow it, and cut its audio for the transcriber (voice_spot.py reads the transcripts).
 
-usage: voice_detect.py IQ CENTRE_KHZ LO_KHZ HI_KHZ OUTDIR [--start S] [--dur S] [--tracks-only] [--both]
-IQ at 192 kHz: .cf32 (interleaved float32 I, Q; measured on FlexRadio DAX-IQ recordings) or a 24-bit stereo
-WAV as record_wav writes it (read, but not yet measured on voice; a Red Pitaya recording may need Q negated,
-as hpsdr_proxy.py --negate-q does). --both looks for USB and LSB on every band (default: LSB below 10 MHz,
-USB above).
+usage: voice_detect.py IQ CENTRE_KHZ LO_KHZ HI_KHZ OUTDIR [--start S] [--dur S] [--tracks-only]
+IQ at 192 kHz: .cf32 (interleaved float32 I, Q; measured on FlexRadio DAX-IQ recordings) or a stereo 16- or
+24-bit WAV as record_wav and iq_recorder.py write them (read, but not yet measured on voice; a Red Pitaya
+recording may need Q negated, as hpsdr_proxy.py --negate-q does). LSB below 10 MHz, USB above.
 Writes OUTDIR/tracks.json and OUTDIR/clips/ssb_<carrier kHz>@<start s>.wav (16 kHz, one per track).
 
 Detection, every 2 s window (25 Hz bins, 40 ms frames):
@@ -15,8 +14,9 @@ Detection, every 2 s window (25 Hz bins, 40 ms frames):
   spread  >= 30% of the block's bins 6 dB over the floor (a CW carrier or birdie fills one bin)
   rhythm  the block's 40 ms power swings >= 3 dB (std of dB): syllables and pauses; carriers, RTTY,
           FT8 and noise stay flat
-Tracks: a hit within 150 Hz of a live track (same sideband) extends it; a new track needs 2 hits in
-10 s; a track ends after 120 s with no hit.
+Tracks: a hit within 400 Hz of a live track (same sideband) extends it; a track ends after 120 s with no
+hit and is kept with 3 hits or more, or with 2 within 10 s (a sporadic voice with 3 hits minutes apart
+counts: YO7WC on 15 m in CQ WW came only from one).
 """
 import json
 import os
@@ -47,16 +47,26 @@ PAD_S = 2
 
 
 def read_block(path, start_s, dur_s):
-    n0, n = int(start_s * FS), int(dur_s * FS)
+    """IQ from start_s for dur_s (whole samples, rounded; shorter at the end of the file)."""
+    n0, n = int(round(start_s * FS)), int(round(dur_s * FS))
     if path.endswith('.cf32'):
         a = np.fromfile(path, dtype=np.float32, offset=n0 * 8, count=n * 2)
         return (a[0::2] + 1j * a[1::2]).astype(np.complex64)
     with wave.open(path, 'rb') as w:
+        width = w.getsampwidth()
+        if w.getnchannels() != 2 or w.getframerate() != FS or width not in (2, 3):
+            raise ValueError('%s: need stereo 16- or 24-bit IQ at %d Hz, got %d channels, %d bits, %d Hz'
+                             % (path, FS, w.getnchannels(), 8 * width, w.getframerate()))
+        if n0 >= w.getnframes():
+            return np.zeros(0, np.complex64)
         w.setpos(n0)
         raw = w.readframes(n)
-    b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
-    v = (b[:, 0].astype(np.int32) | (b[:, 1].astype(np.int32) << 8) | (b[:, 2].astype(np.int32) << 16))
-    v = np.where(v >= 1 << 23, v - (1 << 24), v).astype(np.float32) / (1 << 23)
+    if width == 2:
+        v = np.frombuffer(raw, dtype='<i2').astype(np.float32) / (1 << 15)
+    else:
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        v = (b[:, 0].astype(np.int32) | (b[:, 1].astype(np.int32) << 8) | (b[:, 2].astype(np.int32) << 16))
+        v = np.where(v >= 1 << 23, v - (1 << 24), v).astype(np.float32) / (1 << 23)
     v = v.reshape(-1, 2)
     return (v[:, 0] + 1j * v[:, 1]).astype(np.complex64)
 
@@ -95,7 +105,9 @@ def window_hits(db, f, floor, lo_hz, hi_hz, t0):
     sides = []
     both = (('USB', BOX, GUARD), ('LSB', (-BOX[1], -BOX[0]), (-GUARD[1], -GUARD[0])))
     usb_band = (lo_hz + hi_hz) / 2 >= 10e6                # convention: USB from 10 MHz up, LSB below
-    for sb, box, guard in [x for x in both if SIDEBANDS == 'both' or (x[0] == 'USB') == usb_band]:
+    # Only the band's sideband: looking for both makes a mirrored ghost of every voice (its far edge reads
+    # as the other sideband's block, about 3 kHz away), transcribed twice.
+    for sb, box, guard in [x for x in both if (x[0] == 'USB') == usb_band]:
         k0, k1 = idx(cs - 40), idx(cs + 40)
         b0, b1, g0, g1 = idx(cs + box[0]), idx(cs + box[1]), idx(cs + guard[0]), idx(cs + guard[1])
         ok = (b0 >= 0) & (g0 >= 0) & (b1 <= len(f)) & (g1 <= len(f))
@@ -121,7 +133,7 @@ def window_hits(db, f, floor, lo_hz, hi_hz, t0):
                     cands.append((float(inb[k] - grd[k]), float(cs[k]), sb))
         cands.sort(reverse=True)
         taken = []
-        for score, c, sb in cands:                                # strongest first, 1 kHz apart
+        for score, c, sb in cands:                                # strongest first, NMS_HZ apart
             if all(abs(c - c2) > NMS_HZ for c2 in taken):
                 taken.append(c)
                 hits.append((t0 + (w0 + WIN_FRAMES / 2) * FRAME / FS, c, sb, score))
@@ -132,7 +144,7 @@ def build_tracks(hits):
     live, done = [], []
     for t, c, sb, score in sorted(hits):
         for tr in live:
-            if tr['sb'] == sb and abs(np.median(tr['carriers']) - c) <= JOIN_HZ:
+            if tr['sb'] == sb and abs(np.median(tr['carriers']) - c) <= JOIN_HZ and t - tr['times'][-1] <= END_S:
                 tr['times'].append(t)
                 tr['carriers'].append(c)
                 break
@@ -163,79 +175,76 @@ def _norm(a):
     return np.clip(a / (np.percentile(np.abs(a), 99.5) + 1e-12) * 0.5, -1, 1).astype(np.float32)
 
 
-def cut_audio_fft(path, centre_hz, tracks, start_s, end_s, emit):
+def cut_audio_fft(path, centre_hz, tracks, start_s, end_s, emit, tmp_dir=None):
     """Phase-continuous LSB/USB audio per track at 16 kHz, in bounded memory (10-24: mixing and resampling
     each track separately held every track at once and ran a 438-track contest hour out of memory, and was
-    ~30x slower). One FFT per block (padded
-    CUT_PAD_S each side); each track takes its voice-band bins (carrier+200..+3000 Hz for USB,
-    -3000..-200 for LSB) into a 16 kHz spectrum and one small inverse FFT; the pads are discarded.
-    Mixing is an integer-bin shift, with the phase referred to absolute sample time, so blocks join
-    without a step. Each block's audio is appended to a per-track temp file (VD_TMP, default /tmp); a
-    track is read back, normalised and handed to emit(k, audio) as soon as the blocks pass its end."""
+    ~30x slower). One FFT per block, every block the same length (BLOCK_S plus CUT_PAD_S each side, zeros
+    past the ends of the file), so a track's frequency is the same whole bin in every block; each track
+    takes its voice-band bins (carrier+200..+3000 Hz for USB, -3000..-200 for LSB) into a 16 kHz spectrum
+    and one small inverse FFT; the pads are discarded. The mix's phase is referred to absolute sample
+    time, so blocks join without a step. Each block's audio is appended to a per-track temp file (in
+    tmp_dir, else VD_TMP, else /tmp; removed even on an error); a track is read back, normalised and
+    handed to emit(k, audio) as soon as the blocks pass its end."""
+    import shutil
     import tempfile
-    total = total_seconds(path)
+    total = int(round(total_seconds(path) * FS))
     dec = FS // AUDIO_FS
-    tmp = tempfile.mkdtemp(prefix='vd_cut_', dir=os.environ.get('VD_TMP', '/tmp'))
-    bufs, done = {}, set()          # k -> temp file of float32 audio so far (contest runners: hour-long tracks)
-    order = sorted(range(len(tracks)), key=lambda k: tracks[k]['end'])
-    for b0 in np.arange(start_s, end_s, BLOCK_S):
-        b1 = min(end_s, b0 + BLOCK_S)
-        act = [k for k, tr in enumerate(tracks) if k not in done and tr['start'] < b1 and tr['end'] > b0]
-        if act:
-            r0 = max(0.0, b0 - CUT_PAD_S)
-            r1 = min(total, b1 + CUT_PAD_S)
-            n0 = int(round(r0 * FS))
-            n = (int(round(r1 * FS)) - n0) // dec * dec          # a multiple of the decimation
-            iq = read_block(path, r0, n / FS)[:n]
-            n = len(iq) // dec * dec
-            iq = iq[:n]
-            Z = np.fft.fft(iq)
-            m = n // dec
-            skip = int(round((b0 - r0) * AUDIO_FS))                # output samples before b0
-            for k in act:
-                tr = tracks[k]
-                kc = int(round((tr['carrier_hz'] - centre_hz) * n / FS))
-                lo, hi = (200, 3000) if tr['sb'] == 'USB' else (-3000, -200)
-                r_lo, r_hi = int(np.ceil(lo * n / FS)), int(np.floor(hi * n / FS))
-                rel = np.arange(r_lo, r_hi + 1)
-                W = np.zeros(m, np.complex64)
-                W[rel % m] = Z[(kc + rel) % n]
-                y = np.fft.ifft(W)
-                # integer-bin mix referred to sample n0: one phase term joins the blocks
-                y *= np.exp(-2j * np.pi * kc * n0 / n)      # the shift by kc bins, from sample 0, not n0
-                a = np.real(y).astype(np.float32)
-                s0 = skip + int(max(0.0, tr['start'] - b0) * AUDIO_FS)
-                s1 = skip + int((min(b1, tr['end']) - b0) * AUDIO_FS)
-                fn = bufs.setdefault(k, os.path.join(tmp, '%d.f32' % k))
-                with open(fn, 'ab') as fh:
-                    a[s0:s1].tofile(fh)
-        for k in [k for k in order if k not in done and tracks[k]['end'] <= b1 and k in bufs]:
-            fn = bufs.pop(k)
-            emit(k, _norm(np.fromfile(fn, np.float32)))
-            os.remove(fn)
-            done.add(k)
-    for k in list(bufs):
-        fn = bufs.pop(k)
-        emit(k, _norm(np.fromfile(fn, np.float32)))
-        os.remove(fn)
-    os.rmdir(tmp)
-
-
-SIDEBANDS = 'convention'    # LSB below 10 MHz, USB above; 'both' looks for each on every band. main() takes it
-                            # from --both; never from an importer's command line (#102 review)
+    pad = int(round(CUT_PAD_S * FS))
+    blk = int(round(BLOCK_S * FS))
+    n = (blk + 2 * pad + dec - 1) // dec * dec           # the same FFT length for every block
+    m = n // dec
+    tmp = tempfile.mkdtemp(prefix='vd_cut_', dir=tmp_dir or os.environ.get('VD_TMP', '/tmp'))
+    try:
+        bufs, done = {}, set()      # k -> temp file of float32 audio so far (contest runners: hour-long tracks)
+        order = sorted(range(len(tracks)), key=lambda k: tracks[k]['end'])
+        s_end = int(round(end_s * FS))
+        for s0 in range(int(round(start_s * FS)), s_end, blk):
+            b0, b1 = s0 / FS, min(s_end, s0 + blk) / FS
+            act = [k for k, tr in enumerate(tracks) if k not in done and tr['start'] < b1 and tr['end'] > b0]
+            if act:
+                n0 = s0 - pad                                   # sample at x[0]; may be before the file
+                x = np.zeros(n, np.complex64)
+                r0, r1 = max(0, n0), min(total, n0 + n)
+                if r1 > r0:
+                    iq = read_block(path, r0 / FS, (r1 - r0) / FS)
+                    x[r0 - n0:r0 - n0 + len(iq)] = iq
+                Z = np.fft.fft(x)
+                skip = pad // dec                               # output samples before b0
+                for k in act:
+                    tr = tracks[k]
+                    kc = int(round((tr['carrier_hz'] - centre_hz) * n / FS))
+                    lo, hi = (200, 3000) if tr['sb'] == 'USB' else (-3000, -200)
+                    rel = np.arange(int(np.ceil(lo * n / FS)), int(np.floor(hi * n / FS)) + 1)
+                    W = np.zeros(m, np.complex64)
+                    W[rel % m] = Z[(kc + rel) % n]
+                    y = np.fft.ifft(W)
+                    y *= np.exp(-2j * np.pi * kc * n0 / n)      # the shift by kc bins, from sample 0, not n0
+                    out = np.real(y).astype(np.float32)
+                    a0 = skip + int(max(0.0, tr['start'] - b0) * AUDIO_FS)
+                    a1 = skip + int((min(b1, tr['end']) - b0) * AUDIO_FS)
+                    fn = bufs.setdefault(k, os.path.join(tmp, '%d.f32' % k))
+                    with open(fn, 'ab') as fh:
+                        out[a0:a1].tofile(fh)
+            for k in [k for k in order if k not in done and tracks[k]['end'] <= b1 and k in bufs]:
+                emit(k, _norm(np.fromfile(bufs.pop(k), np.float32)))
+                done.add(k)
+        for k in list(bufs):
+            emit(k, _norm(np.fromfile(bufs.pop(k), np.float32)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
-    global SIDEBANDS
     path, centre_khz, lo_khz, hi_khz, outdir = sys.argv[1:6]
-    SIDEBANDS = 'both' if '--both' in sys.argv else 'convention'
     arg = lambda k, d: float(sys.argv[sys.argv.index(k) + 1]) if k in sys.argv else d
     centre, lo, hi = float(centre_khz) * 1000, float(lo_khz) * 1000, float(hi_khz) * 1000
+    total = total_seconds(path)
     start = arg('--start', 0.0)
-    end = start + arg('--dur', total_seconds(path) - start)
+    end = min(total, start + arg('--dur', total - start))            # never past the end of the file
     tj = os.path.join(outdir, 'tracks.json')
-    if os.environ.get('VD_REUSE') and os.path.exists(tj):          # reuse a finished detection
-        hits, tracks = (lambda d: (d['hits'], d['tracks']))(json.load(open(tj)))
+    saved = json.load(open(tj)) if os.environ.get('VD_REUSE') and os.path.exists(tj) else None
+    if saved and saved.get('span') == [start, end]:                     # reuse a finished detection of this span
+        hits, tracks = saved['hits'], saved['tracks']
         print('reusing %s: %d tracks' % (tj, len(tracks)), flush=True)
     else:
         hits = []
@@ -246,7 +255,7 @@ def main():
             print('block %4.0f s: %d hits so far' % (b0, len(hits)), flush=True)
         tracks = build_tracks(hits)
         os.makedirs(outdir, exist_ok=True)
-        json.dump({'hits': hits, 'tracks': tracks}, open(tj, 'w'))
+        json.dump({'span': [start, end], 'hits': hits, 'tracks': tracks}, open(tj, 'w'))
     os.makedirs(os.path.join(outdir, 'clips'), exist_ok=True)
     if '--tracks-only' in sys.argv:
         print('%d tracks, %.0f s of audio' % (len(tracks), sum(t['end'] - t['start'] for t in tracks)))

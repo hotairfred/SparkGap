@@ -16,25 +16,33 @@ folder holds it as it lands, piece by piece:
 `voice_detect.py` looks at the band every 2 s (25 Hz bins, 40 ms frames) for the shape an SSB voice leaves:
 
 - **Shape:** for each candidate carrier (50 Hz steps), the 2.3 kHz voice window on one side (300 to
-  2600 Hz from the carrier) is at least 4 dB louder than the carrier side, which a transmitter's filter
-  leaves quiet. LSB below 10 MHz and USB above, or both everywhere with `--both`.
+  2600 Hz from the carrier) averages at least 6 dB over the noise floor and 4 dB over the carrier side,
+  which a transmitter's filter leaves quiet. LSB below 10 MHz, USB above.
 - **Spread:** at least 30% of the window's bins are 6 dB over the noise floor. A CW carrier or a birdie
   fills one bin.
-- **Rhythm:** the window's loudness swings at least 3 dB from frame to frame: syllables and pauses.
-  Carriers, RTTY, FT8 and noise stay flat.
-- **Tracks:** a hit within 400 Hz of a live track extends it, a new track needs 2 hits in 10 s, and a
-  track ends after 120 s without one. Each track's audio is cut at 16 kHz on its sideband, in
-  bounded memory (one FFT per minute of IQ), for the transcriber.
+- **Rhythm:** the window's loudness, frame by frame over the 2 s, varies by at least 3 dB (standard
+  deviation): syllables and pauses. Carriers, RTTY, FT8 and noise stay flat.
+- **No carrier:** a peak 10 dB over the window at the carrier itself is AM or a carrier, not SSB.
+- **One voice per 2.2 kHz** of a sideband in each window, the strongest.
+- **Tracks:** a hit within 400 Hz of a live track extends it, and a track ends after 120 s without one.
+  It is kept with 3 hits or more, or with 2 within 10 s: a sporadic voice counts (YO7WC on 15 m in CQ WW
+  came only from 3 hits minutes apart). Each track's audio is cut at 16 kHz on its sideband, in bounded
+  memory (one FFT per minute of IQ, every block the same length so the audio has no step at the joins),
+  for the transcriber.
 
 ```
 python3 voice/voice_detect.py IQ.cf32 CENTRE_KHZ LO_KHZ HI_KHZ OUTDIR [--start S] [--dur S] [--tracks-only]
 ```
 
-IQ is 192 kHz: `.cf32` (interleaved float32 I, Q) as measured on FlexRadio DAX-IQ, or a 24-bit WAV as
-`record_wav` writes it (read, but not yet measured on voice). OUTDIR gets `tracks.json` (every hit and
-track) and `clips/ssb_<carrier kHz>@<start s>.wav`. Thresholds: `VD_SHAPE_DB`, `VD_LEVEL_DB`,
-`VD_SPREAD`, `VD_RHYTHM_DB`, `VD_END_S`. Tests: `tests/test_voice_detect.py` (synthetic voices,
-a CW carrier, a data signal, track rules, and the cutter across block edges).
+IQ is 192 kHz: `.cf32` (interleaved float32 I, Q) as measured on FlexRadio DAX-IQ, or a stereo 16- or
+24-bit WAV as `record_wav` and `iq_recorder.py` write them (read, but not yet measured on voice; a Red
+Pitaya recording may need Q negated, as `hpsdr_proxy.py --negate-q` does). OUTDIR gets `tracks.json`
+(the span, every hit and track) and `clips/ssb_<carrier kHz>@<start s>.wav`. Thresholds: `VD_SHAPE_DB`,
+`VD_LEVEL_DB`, `VD_SPREAD`, `VD_RHYTHM_DB`, `VD_END_S`. `VD_TMP`: where the cutter keeps its temp files
+(default /tmp; removed even on an error). `VD_REUSE=1`: cut from an existing `tracks.json` of the same
+span instead of detecting again. Tests: `tests/test_voice_detect.py` (synthetic voices, a CW carrier, a
+data signal, the track rules, the cutter's audio and its phase across block joins at an awkward carrier,
+tracks at the ends of a file, cleanup when a step fails, and 16- and 24-bit WAV).
 
 Known limits, from the CQ WW recordings:
 
