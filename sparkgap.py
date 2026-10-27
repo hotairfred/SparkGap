@@ -164,6 +164,10 @@ def _get_hpsdr_fast():
         try:
             lib = _ct.CDLL('./libhpsdr_fast.so')
             lib.hpsdr_create.restype = _ct.c_void_p
+            if hasattr(lib, 'hpsdr_create_listen'):      # a local port of its own (behind hpsdr_proxy.py)
+                lib.hpsdr_create_listen.restype = _ct.c_void_p
+                lib.hpsdr_create_listen.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_int, _ct.c_int,
+                                                    _ct.c_int, _ct.c_int]
             lib.hpsdr_create.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_int,
                                           _ct.c_int, _ct.c_int]
             lib.hpsdr_set_freq.restype = None
@@ -265,7 +269,7 @@ def _get_hpsdr_fast():
 class _CReceiver:
     """Drop-in replacement for HPSDRReceiver using C receive thread."""
 
-    def __init__(self, ip, port, n_receivers, sample_rate, lna_gain=20, restart_after_s=30.0):
+    def __init__(self, ip, port, n_receivers, sample_rate, lna_gain=20, restart_after_s=30.0, listen_port=None):
         import ctypes as _ct
         self.ip = ip
         self._health_pkts = (0, time.time())
@@ -275,8 +279,12 @@ class _CReceiver:
         self.sample_rate = sample_rate
         self._h = None
         if self.lib:
-            self._h = _ct.c_void_p(self.lib.hpsdr_create(
-                ip.encode(), port, n_receivers, sample_rate, lna_gain))
+            if listen_port and listen_port != port and hasattr(self.lib, 'hpsdr_create_listen'):
+                self._h = _ct.c_void_p(self.lib.hpsdr_create_listen(
+                    ip.encode(), port, listen_port, n_receivers, sample_rate, lna_gain))
+            else:
+                self._h = _ct.c_void_p(self.lib.hpsdr_create(
+                    ip.encode(), port, n_receivers, sample_rate, lna_gain))
             if not self._h:
                 log.error("hpsdr_create failed")
             elif hasattr(self.lib, 'hpsdr_set_restart_after'):
@@ -7602,7 +7610,8 @@ class SparkGap:
                 # again (another client stopped the radio); 0 = never
                 self.receiver = _CReceiver(device_ip, sdr_port,
                                             n_rx, rx_sample_rate, lna_gain,
-                                            self.cfg.get('hpsdr_restart_after_s', 30.0))
+                                            self.cfg.get('hpsdr_restart_after_s', 30.0),
+                                            listen_port=listen_port)
             else:
                 self.receiver = HPSDRReceiver(device_ip, port=sdr_port,
                                               n_receivers=n_rx, sample_rate=rx_sample_rate,

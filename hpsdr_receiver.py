@@ -263,7 +263,8 @@ class HPSDRReceiver:
         self.sock.bind(('', self.listen_port))
         self.sock.setblocking(False)
         self.seq = 0
-        self.frequencies = [7000000] * n_receivers  # Default 40m
+        self.frequencies = [None] * n_receivers   # set_frequency(); start() tunes only these (a shared
+                                                  # radio's other receivers are someone else's)
         # Restart on silence (as the C receiver, hpsdr_fast.c): a Red Pitaya streams to one client and
         # any client's STOP stops it, so with no IQ for this long the start sequence is sent again
         # (0 = never; passive mode never sends it). SparkGap sets it from hpsdr_restart_after_s.
@@ -326,8 +327,10 @@ class HPSDRReceiver:
         time.sleep(0.01)
         say(f"  LNA gain: {lna_gain} dB", file=sys.stderr)
 
-        # Send frequency for each receiver
+        # Send frequency for each receiver that was set
         for i in range(self.n_receivers):
+            if self.frequencies[i] is None:
+                continue
             freq_c0c4 = build_freq_packet(i, self.frequencies[i])
             say(f"  freq C0-C4 RX{i}: {freq_c0c4.hex(' ')}  ({self.frequencies[i]/1000:.3f} kHz)", file=sys.stderr)
             self._send_packet(config_c0c4, freq_c0c4)
@@ -335,7 +338,8 @@ class HPSDRReceiver:
 
         say(f"  Frequencies set:", file=sys.stderr)
         for i in range(self.n_receivers):
-            say(f"    RX{i}: {self.frequencies[i] / 1000:.1f} kHz", file=sys.stderr)
+            if self.frequencies[i] is not None:
+                say(f"    RX{i}: {self.frequencies[i] / 1000:.1f} kHz", file=sys.stderr)
 
     def stop(self):
         """Stop the receiver. In passive mode, just closes — no STOP command."""
@@ -374,7 +378,9 @@ class HPSDRReceiver:
                     speed_bits = _SPEED_BITS.get(self.sample_rate, 0)
                     config_c0c4 = bytes([0x00, speed_bits, 0x00, 0x00,
                                          (1 << 2) | (((self.n_receivers - 1) & 0x07) << 3)])
-                    freq_c0c4 = build_freq_packet(0, self.frequencies[0])
+                    mine = [k for k, f in enumerate(self.frequencies) if f is not None]
+                    # the first receiver this copy tuned (10-27: RX0 always, someone else's on a shared radio)
+                    freq_c0c4 = build_freq_packet(mine[0], self.frequencies[mine[0]]) if mine else config_c0c4
                     self._send_packet(config_c0c4, freq_c0c4)
                 continue
 
@@ -436,7 +442,7 @@ class IQRecorder:
             os.makedirs(self.output_dir, exist_ok=True)
 
         for i in range(self.n_receivers):
-            freq_khz = frequencies[i] / 1000
+            freq_khz = (frequencies[i] or 0) / 1000
             if self.output_dir:
                 path = os.path.join(self.output_dir, f'rx{i}_{freq_khz:.0f}kHz.wav')
             else:

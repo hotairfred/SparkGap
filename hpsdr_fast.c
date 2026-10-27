@@ -397,8 +397,11 @@ static void *recv_thread(void *arg) {
 
 /* ---- public API ---- */
 
-HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
-                         int sample_rate, int lna_gain) {
+/* listen_port: the local UDP port to receive on. hpsdr_create() binds the same port it sends to, so a
+ * SparkGap can't share a computer with hpsdr_proxy.py on that port (it takes the proxy's packets); a
+ * listener behind the proxy uses its own. */
+HpsdrFast *hpsdr_create_listen(const char *ip, int port, int listen_port, int n_receivers,
+                               int sample_rate, int lna_gain) {
     HpsdrFast *h = (HpsdrFast *)calloc(1, sizeof(HpsdrFast));
     if (!h) return NULL;
 
@@ -407,7 +410,7 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
     h->lna_gain = lna_gain;
     h->sdr_ip = inet_addr(ip);
     h->sdr_port = port;
-    h->listen_port = port;
+    h->listen_port = listen_port > 0 ? listen_port : port;
     h->seq_tx = 0;
     h->restart_after_s = 30.0;
 
@@ -441,6 +444,11 @@ HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
 
     pthread_mutex_init(&h->lock, NULL);
     return h;
+}
+
+HpsdrFast *hpsdr_create(const char *ip, int port, int n_receivers,
+                         int sample_rate, int lna_gain) {
+    return hpsdr_create_listen(ip, port, port, n_receivers, sample_rate, lna_gain);
 }
 
 /* C0 of a receiver's NCO frequency register (HPSDR Protocol 1, C0 =
@@ -509,8 +517,10 @@ static void send_start(HpsdrFast *h) {
     send_ep2(h, config, lna);
     usleep(50000);
 
-    /* Set frequencies — send each twice with delay for reliability */
+    /* Set frequencies — send each twice with delay for reliability. Only the receivers set with
+     * hpsdr_set_freq: on a shared radio (hpsdr_proxy.py) the others are someone else's. */
     for (int i = 0; i < h->n_receivers; i++) {
+        if (!h->rx_enabled[i]) continue;
         uint8_t freq[5];
         freq[0] = rx_freq_c0(i);
         uint32_t f = h->frequencies[i];
