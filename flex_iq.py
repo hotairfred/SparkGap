@@ -60,7 +60,8 @@ RETRY_CONNECT_S = 10
 SETTLE_S = 60               # after an outage the radio must answer pings this long in a row before we
                             # recover: it takes a minute or two to settle (Dallas 6400M, 2026-10-22 14:02Z)
 STREAM_GRACE_S = 10         # after a stall, time for our stream to resume by itself before a new one
-STATION_WAIT_S = 600        # a copy whose station left waits this long for it before stopping
+STATION_WAIT_S = 600        # a copy whose own station left waits this long for it before stopping
+STATION_TAKEOVER_S = 10     # times the DAX-IQ channel: a copy waits this long for a lost station, then holds it
 STATION_POLL_S = 10
 RETUNE_SETTLE_S = 0.5       # IQ dropped this long after a retune's replies: still the old frequency
 TX_STATES = ('PTT_REQUESTED', 'TRANSMITTING', 'UNKEY_REQUESTED')  # the radio's interlock while keyed
@@ -445,10 +446,17 @@ def station_name(conn, configured=None):
     return name
 
 
-def find_station(lines, station):
-    """(handle, client_id) of the SparkGap GUI client named `station` in client status, or None."""
+def station_client_id(ip, station):
+    """One GUI client ID per radio and station, the same on every start, as FlexLib keeps its own."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sparkgap://{ip}/{station}")).upper()
+
+
+def find_station(lines, station, ip=None):
+    """(handle, client_id) of the SparkGap GUI client named `station` in client status, or None.
+    With `ip`, also one still registering: listed by its client ID before it has its name."""
+    cid = station_client_id(ip, station) if ip else None
     return next(((g[0], g[1]) for g in gui_stations(lines)
-                 if g[2] == STATION_NAME and g[3] == station), None)
+                 if (g[2] == STATION_NAME and g[3] == station) or g[1] == cid), None)
 
 
 def nap(seconds, stopping):
@@ -512,6 +520,7 @@ class FlexStation:
         self.station = station or STATION_NAME
         self.client_id = ''
         self.conn = None
+        self.conn_handle = None   # the handle the station last registered under
         self.state = "connecting"
         self.rtt_ms = None
         self.last_ping = None
@@ -533,11 +542,12 @@ class FlexStation:
                 conn = FlexConnection(self.ip, self.control_port)
                 conn.open()
             self.station = station_name(conn, self._station_cfg)
-            # one GUI client ID per radio and station, the same on every start, as FlexLib keeps its own
-            self.client_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"sparkgap://{self.ip}/{self.station}")).upper()
+            self.client_id = station_client_id(self.ip, self.station)
             register_program(conn)
             clients = conn.cmd("sub client all", settle=0.5)
-            if not again and find_station(clients, self.station):
+            found = find_station(clients, self.station, self.ip)
+            # after a loss, a station under another handle is a copy that took our place: leave it to that copy
+            if found and not (again and self.conn_handle and int(found[0], 16) == int(self.conn_handle, 16)):
                 raise StationExists(f"[Flex] The radio already has station {self.station}")
             # A GUI client's saved pans come back when it registers (2026-10-20); the station keeps none.
             conn.ok("persistence off", conn.cmd("client start_persistence off"))
@@ -556,6 +566,7 @@ class FlexStation:
             conn.close("failed start")
             raise
         self.conn = conn
+        self.conn_handle = conn.handle
         self._unanswered = None
         self.started = self.started or time.time()
         self.state = "live"
@@ -645,6 +656,8 @@ class FlexStation:
             try:
                 self.start(again=True, conn=conn)
                 break
+            except StationExists:
+                return self._halt("a copy holds the station now")
             except Exception as e:       # no reply: not ready yet, so wait again; a refusal stops
                 if not conn.missed or self._stop.is_set() or time.time() > end:
                     return self._halt("registering again failed: %s" % e)
@@ -777,28 +790,32 @@ class FlexIQReceiver:
             raise
 
     def _connect(self, first):
-        """Open the control connection and bind to the station.  A lone copy that finds no station
-        at its first start holds one itself; after that a copy only ever binds, so two copies never
-        race for the GUI client (2026-10-21 23:19Z)."""
+        """Open the control connection and bind to the station.  A copy that finds no station holds one
+        itself: at once at its first start, and after a loss once the station has stayed away for
+        STATION_TAKEOVER_S times its DAX-IQ channel, so copies never race for the GUI client
+        (2026-10-21 23:19Z) and the copies left keep running when the one holding it stops."""
+        if self._own_station and self._own_station.state == "halted":   # evicted, or gave up: hold no more
+            self._own_station.stop()
+            self._own_station = None
         conn = self.conn = FlexConnection(self.ip, self.control_port)
         conn.open()
         self.station = station_name(conn, self._station_cfg)
         register_program(conn)
         self._clients = conn.cmd("sub client all", settle=0.5)
-        found = find_station(self._clients, self.station)
-        if not found and first and not self._own_station:
-            log.info("[Flex] No station %s on the radio: this copy holds it", self.station)
+        found = find_station(self._clients, self.station, self.ip)
+        if not found and not first:
+            found = self._wait_for_station()
+        if not found and not self._own_station:
             station = FlexStation(self.ip, self.control_port, self._station_cfg)
             try:
                 station.start()
                 station.start_thread()
                 self._own_station = station
+                log.info("[Flex] No station %s was on the radio: this copy holds it", self.station)
             except StationExists:       # another copy got there first: bind to its station
                 log.info("[Flex] Station %s appeared meanwhile: attaching to it", self.station)
             self._clients = conn.cmd("sub client all", settle=0.5)
-            found = find_station(self._clients, self.station)
-        elif not found:
-            found = self._wait_for_station()
+            found = find_station(self._clients, self.station, self.ip)
         if not found:
             raise RuntimeError(f"[Flex] Station {self.station} is not on the radio")
         handle, client_id = found
@@ -808,15 +825,17 @@ class FlexIQReceiver:
         conn.ok(f"UDP port {self.udp_port} for DAX-IQ", conn.cmd(f"client udpport {self.udp_port}"))
 
     def _wait_for_station(self):
-        """The station after a loss: wait STATION_WAIT_S for it to register again, never take its place."""
-        end = time.time() + STATION_WAIT_S
-        log.info("[Flex] Waiting up to %d s for station %s", STATION_WAIT_S, self.station)
-        while time.time() < end and not self._stopping and not self.conn.lost:
+        """The station after a loss: wait for it to register again, STATION_WAIT_S when this copy holds
+        it, else STATION_TAKEOVER_S times our channel before taking its place."""
+        wait = STATION_WAIT_S if self._own_station else STATION_TAKEOVER_S * max(1, self.channel)
+        end = time.time() + wait
+        log.info("[Flex] Waiting up to %d s for station %s", wait, self.station)
+        while not self._stopping and not self.conn.lost:
             self._clients = self.conn.cmd("sub client all", settle=0.5)
-            found = find_station(self._clients, self.station)
-            if found:
+            found = find_station(self._clients, self.station, self.ip)
+            if found or time.time() >= end:     # the last look is at the deadline, not a poll before it
                 return found
-            nap(STATION_POLL_S, lambda: self._stopping)
+            nap(min(STATION_POLL_S, end - time.time()), lambda: self._stopping)
         return None
 
     def _build(self):
@@ -849,6 +868,22 @@ class FlexIQReceiver:
             who = next((f"{g[3]} ({g[2]})" for g in stations if num(g[0]) == num(h)), f"client {h}")
             raise RuntimeError(f"[Flex] DAX-IQ {self.channel} is in use by {who} on pan {pan}; "
                                "set another flex_daxiq_channel or free it there")
+        # A copy that died without cleaning up (kill -9, OOM) leaves its pan and slice with the station:
+        # a station pan on our channel that no stream feeds is that copy's; remove it before making ours.
+        # Judged again on a fresh status just before removing: a pan a copy starting now just made only
+        # takes the channel when its stream is bound to it, so it never matches.
+        def orphans(lines):
+            fed = {st.get('pan') for st in daxiq_streams(lines).values()}
+            return [p for p, h in sorted(daxiq_holders(lines, self.channel).items())
+                    if num(h) == self._station_handle and int(p, 16) not in fed]
+        if orphans(status):
+            now = (conn.cmd("sub pan all", settle=0.3) + conn.cmd("sub daxiq all", settle=0.5)   # pans first:
+                   + conn.cmd("sub slice all", settle=0.3))                                    # a bound pan reads fed
+            for pan in orphans(now):
+                for n in sorted(pan_slices(now, int(pan, 16))):
+                    conn.ok(f"slice {n} left by a stopped copy removed", conn.cmd(f"slice remove {n}", timeout=CMD_TIMEOUT_S))
+                conn.ok(f"pan {pan} left by a stopped copy removed",
+                        conn.cmd(f"display pan remove {pan}", timeout=CMD_TIMEOUT_S))
 
         self._pan_id = conn.hex_id(conn.cmd("display pan create x=1 y=1"))
         if self._pan_id is None:
@@ -1036,7 +1071,7 @@ class FlexIQReceiver:
                         self._halt("the radio did not come back within %d min" % (OUTAGE_MAX_S // 60), alive=False)
                         return
                     settled = True
-                    station = find_station(conn.cmd("sub client all", settle=0.5), self.station)
+                    station = find_station(conn.cmd("sub client all", settle=0.5), self.station, self.ip)
                     if conn is not self.conn:  # our connection did not last the outage
                         conn.close("ready")
                         kind = 'link'

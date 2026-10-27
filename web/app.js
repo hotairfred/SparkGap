@@ -1541,7 +1541,7 @@ function copyCards(k, sv, i) {
     `<span data-value="${esc(JSON.stringify(v))}"${v === cur ? ' class="on"' : ""}>${esc(l)}</span>`).join("")}</div>`;
   const onOff = (k2, cur) => choices(k2, [[false, "off"], [true, "on"]], !!cur);
   const row = (label, control, hint) => `<span class="label"${hint ? ` title="${esc(hint)}"` : ""}>${label}</span>${control}`;  // hint: on hover
-  const bands = `<select class="bandsel${"band" in pend ? " pend" : ""}" ${at} data-key="band"${busy ? " disabled" : ""}>${(saved.bands_known && saved.bands_known.length ? saved.bands_known : [saved.band])
+  const bands = saved.multi_band ? `<span title="several bands: set in its config">${esc(String(saved.band))}</span>` : `<select class="bandsel${"band" in pend ? " pend" : ""}" ${at} data-key="band"${busy ? " disabled" : ""}>${(saved.bands_known && saved.bands_known.length ? saved.bands_known : [saved.band])
     .map(b => `<option${b === st.band ? " selected" : ""}>${esc(String(b))}</option>`).join("")}</select>`;
   const state = busy ? `${busy}...` : run ? "running" : "stopped";
   const err = !run && i.last_error ? `<div class="small err">${esc(i.last_error)}</div>`

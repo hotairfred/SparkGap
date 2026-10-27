@@ -95,6 +95,19 @@ def test_a_setting_is_written_and_a_running_copy_restarted(seat: Seat) -> None:
     assert "live" in out and seat.pid("dallas2") not in (None, before)
 
 
+def test_a_multi_band_copy_keeps_its_bands(seat: Seat) -> None:
+    """hotairfred/SparkGap#94 review: a band change wrote a multi-band config down to one band."""
+    i = seat.instance("dallas1")
+    cfg = json.loads(i.config.read_text())
+    i.config.write_text(json.dumps({**cfg, "bands": ["40m", "20m"]}))
+    before = i.config.read_text()
+    assert seat.band(i) == "40m+20m" and seat.settings(i)["multi_band"] is True
+    with pytest.raises(SeatError, match="dallas1 runs 40m\\+20m: set its bands in its config"):
+        seat.change("dallas1", {"band": "17m"})
+    assert i.config.read_text() == before
+    assert seat.settings(seat.instance("dallas2"))["multi_band"] is False
+
+
 def test_a_stopped_copy_is_only_written(seat: Seat) -> None:
     assert seat.change("dallas1", {"band": "20m"}) == "dallas1: band 20m"
     assert seat.pid("dallas1") is None and seat.band(seat.instance("dallas1")) == "20m"

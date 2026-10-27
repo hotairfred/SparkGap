@@ -348,6 +348,7 @@ def use_fake_radio(monkeypatch: pytest.MonkeyPatch, **kw: object) -> FakeRadio:
     monkeypatch.setattr(flex_iq.os, "kill", lambda *_: None)
     monkeypatch.setattr(flex_iq.time, "sleep", lambda _s: None)
     monkeypatch.setattr(flex_iq, "STATION_WAIT_S", 0.05)
+    monkeypatch.setattr(flex_iq, "STATION_TAKEOVER_S", 0.01)
     for name in ("SETTLE_S", "RETRY_CONNECT_S", "HEARTBEAT_S", "STATION_POLL_S"):
         monkeypatch.setattr(flex_iq, name, 0)
     monkeypatch.setattr(flex_iq, "STREAM_GRACE_S", 0.01)

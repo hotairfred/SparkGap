@@ -182,7 +182,11 @@ class Seat:
 
     def band(self, i: Instance) -> str:
         bands = self.config(i).get("bands") or ["?"]
-        return str(bands[0])
+        return "+".join(str(b) for b in bands)
+
+    def multi_band(self, i: Instance) -> bool:
+        """Several bands in one copy: its bands are set in its config, never from the web."""
+        return len(self.config(i).get("bands") or []) > 1
 
     def radio(self, i: Instance) -> str | None:
         """The Flex radio an instance uses (its sdr_ip), None for any other receiver."""
@@ -378,6 +382,7 @@ class Seat:
         return {
             "band": self.band(i),
             "bands_known": self.bands_known(i),
+            "multi_band": self.multi_band(i),
             "validation": cfg.get("spot_validation", "normal") or "off",
             "call_source": cfg.get("spot_validation_calls") or "scp",
             **{k: bool(cfg.get(k, False)) for k in RULE_FLAGS},
@@ -397,6 +402,8 @@ class Seat:
         changes: dict[str, Any] = {}
         for key, value in settings.items():
             if key == "band":
+                if self.multi_band(i):
+                    raise SeatError(f"{name} runs {self.band(i)}: set its bands in its config")
                 if value not in self.bands_known(i):
                     raise SeatError(f"band must be one of: {' '.join(self.bands_known(i))}")
                 changes["bands"] = [value]

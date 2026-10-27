@@ -78,6 +78,7 @@ class _Scripted(FlexConnection):
 
     def cmd(self, cmd: str, timeout: float = 2.0, settle: float = 0.0) -> list[str]:
         if cmd.startswith("display pan"):
+            self.sent.append(cmd)
             raise _Stop
         self.seq += 1
         self.sent.append(cmd)
@@ -85,7 +86,7 @@ class _Scripted(FlexConnection):
 
 
 def _build_to_pan(channel: int, clients: list[str], pans: list[str]) -> list[str]:
-    """Commands a channel bound to SparkGap-Lake sends until it makes its pan."""
+    """Commands a channel bound to SparkGap-Lake sends, up to its first pan command."""
     rx = FlexIQReceiver("192.0.2.1", sample_rate=96_000, daxiq_channel=channel)
     conn = _Scripted({"sub pan all": pans, "sub daxiq all": pans})
     rx.conn, rx._clients, rx._station_handle = conn, clients, LAKE_STATION
@@ -124,7 +125,7 @@ def test_a_channel_a_bound_copy_streams_names_its_station_and_pan(monkeypatch: M
 
 def test_a_free_channel_goes_ahead(monkeypatch: Monkey) -> None:
     sent = _build_to_pan(4, [MAESTRO, LAKE_GUI], LAKE_PANS)
-    assert sent[-1] == "sub tx all"
+    assert sent[-2:] == ["sub tx all", "display pan create x=1 y=1"]   # nothing removed first
 
 
 def test_an_unknown_owner_is_named_by_handle(monkeypatch: Monkey) -> None:
@@ -181,7 +182,7 @@ def test_only_a_bound_stream_or_a_sparkgap_copys_claims_a_channel() -> None:
 def test_a_channel_another_program_streams_unbound_goes_ahead(monkeypatch: Monkey) -> None:
     # the radio let a copy stream channel 3 next to the TCI server's unbound stream for 30 min (Fred, 10-20)
     sent = _build_to_pan(3, [AETHER_GUI, LAKE_GUI], LAKE_PANS + AETHER_TCI)
-    assert sent[-1] == "sub tx all"      # on to its own pan
+    assert sent[-1] == "display pan remove 0x40000002"   # not refused; the station's unfed pan on 3 goes first
 
 
 def test_a_channel_another_program_binds_is_refused(monkeypatch: Monkey) -> None:

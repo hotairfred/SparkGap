@@ -8,7 +8,15 @@ import pytest
 
 import flex_iq
 from flex_iq import FlexIQReceiver, FlexStation, LossBudget, StationExists
-from tests.flex_fake_radio import FakeConnection, FakeRadio, Slice, _Udp, use_fake_radio
+from tests.flex_fake_radio import (
+    FakeConnection,
+    FakeRadio,
+    Pan,
+    Slice,
+    Stream,
+    _Udp,
+    use_fake_radio,
+)
 
 Monkey = pytest.MonkeyPatch
 Caplog = pytest.LogCaptureFixture
@@ -103,6 +111,70 @@ def test_stop_removes_only_this_channels_objects(radio: FakeRadio) -> None:
     assert [st.channel for st in radio.streams.values()] == [2]
 
 
+def _kill(radio: FakeRadio, rx: FlexIQReceiver) -> None:
+    """kill -9: the copy's control connection drops and no cleanup runs."""
+    assert rx.conn is not None
+    for conn in [c for c in radio.conns if c.handle == rx.conn.handle]:
+        conn.lost = "killed"
+        radio.conns.remove(conn)
+    radio.drop(int(rx.conn.handle, 16))
+
+
+def test_a_killed_copy_restarted_on_its_channel_leaves_no_pan_behind(radio: FakeRadio) -> None:
+    st = _station(radio)
+    _kill(radio, _channel(MHZ_17M, 1))
+    assert len(radio.pans) == 1 and not radio.streams       # the station kept the dead copy's pan
+    a = _channel(MHZ_17M, 1)
+    assert set(radio.pans) == {a._pan_id} and set(radio.slices) == {a._slice_id}
+    a.stop()
+    assert not radio.pans and not radio.slices
+    st.stop()
+
+
+def test_a_killed_copy_restarts_on_a_two_pan_radio_leaving_the_other(radio: FakeRadio) -> None:
+    _station(radio)                                          # max_pans 2, as a FLEX-6400
+    _kill(radio, _channel(MHZ_17M, 1))
+    b = _channel(MHZ_20M, 2)
+    b_objects = (b._pan_id, b._slice_id, b._stream_id)
+    a = _channel(MHZ_17M, 1)
+    assert a.state == "live" and _pan_of(radio, a) == MHZ_17M
+    assert (b._pan_id, b._slice_id, b._stream_id) == b_objects and b._stream_id in radio.streams
+
+
+def test_a_pan_another_copy_takes_over_meanwhile_is_left_alone(
+    radio: FakeRadio, monkeypatch: Monkey
+) -> None:
+    radio.max_pans = 4
+    st = _station(radio)
+    _kill(radio, _channel(MHZ_17M, 1))
+    (orphan,) = radio.pans
+    assert st.conn is not None
+    gui = int(st.conn.handle, 16)
+    run = radio.run
+    taken: list[Pan] = []
+
+    def another_copy_starts(handle: int, cmd: str):  # after our first status, before we act
+        if cmd == "sub tx all" and orphan in radio.pans and not radio.streams:
+            radio.remove_pan(orphan)
+            taken.append(Pan(gui, MHZ_17M, 1))
+            radio.pans[orphan] = taken[0]  # the same id, now another copy's live pan
+            radio.streams[0x2000_0F00] = Stream(1, 0x7777_0001, gui, orphan)
+        return run(handle, cmd)
+
+    monkeypatch.setattr(radio, "run", another_copy_starts)
+    _channel(MHZ_17M, 1)
+    assert taken and radio.pans.get(orphan) is taken[0]
+
+
+def test_another_channels_leftover_pan_is_not_ours_to_remove(radio: FakeRadio) -> None:
+    radio.max_pans = 4
+    _station(radio)
+    _kill(radio, _channel(MHZ_20M, 2))
+    left = set(radio.pans)
+    a = _channel(MHZ_17M, 1)
+    assert set(radio.pans) == left | {a._pan_id}
+
+
 def test_a_lone_copy_holds_the_station_and_the_next_copy_binds_to_it(radio: FakeRadio) -> None:
     a = _channel(MHZ_17M, 1)
     assert a._own_station is not None
@@ -173,12 +245,93 @@ def test_a_channel_rebuilds_when_its_station_registers_again(radio: FakeRadio) -
     )
 
 
-def test_a_channel_whose_station_never_returns_stops(radio: FakeRadio) -> None:
+def test_a_channel_whose_station_never_returns_holds_it_and_builds_again(radio: FakeRadio) -> None:
+    st = _station(radio)
+    a = _channel(MHZ_17M, 1)
+    _cut(st.conn)  # flex_station.py crashed
+    a._recover("Station left the radio", "station")
+    assert a.state == "live" and a._own_station is not None and _pan_of(radio, a) == MHZ_17M
+    assert len(_gui_commands(radio)) == 2
+    a.stop()
+
+
+def test_stopping_the_lone_copy_that_holds_the_station_leaves_the_next_copy_running(
+    radio: FakeRadio,
+) -> None:
+    """hotairfred/SparkGap#94 review: stopping the copy holding the station took the others down."""
+    a = _channel(MHZ_17M, 1)
+    b = _channel(MHZ_20M, 2)
+    assert a._own_station is not None and b._own_station is None
+    a.stop()
+    assert not radio.pans  # the radio removes every pan of the station
+    b._poll()
+    assert b._station_lost
+    b._recover("Station left the radio", "station")
+    assert b.state == "live" and b._own_station is not None
+    assert _pan_of(radio, b) == MHZ_20M and len(radio.pans) == 1 and len(radio.streams) == 1
+    c = _channel(MHZ_17M, 1)  # the stopped copy started again binds to it
+    assert c._own_station is None and len(_gui_commands(radio)) == 2
+    c.stop()
+    b.stop()
+
+
+def test_after_a_station_crash_one_copy_holds_it_and_the_other_binds(
+    radio: FakeRadio, monkeypatch: Monkey, caplog: Caplog
+) -> None:
+    """Copies wait STATION_TAKEOVER_S x their channel: channel 1 registers while channel 2 waits."""
+    st = _station(radio)
+    a, b = _channel(MHZ_17M, 1), _channel(MHZ_20M, 2)
+    _cut(st.conn)
+    monkeypatch.setattr(flex_iq, "STATION_TAKEOVER_S", 10)
+    run, polls = radio.run, []
+
+    def a_first(handle: int, cmd: str) -> tuple[str, str, list[str]]:
+        if cmd == "sub client all" and b.conn and handle == int(b.conn.handle, 16):
+            polls.append(cmd)
+            if len(polls) == 2:  # b's first poll while it waits: channel 1's wait ends first
+                monkeypatch.setattr(flex_iq, "STATION_TAKEOVER_S", 0.01)
+                a._recover("Station left the radio", "station")
+                monkeypatch.setattr(flex_iq, "STATION_TAKEOVER_S", 10)
+        return run(handle, cmd)
+
+    monkeypatch.setattr(radio, "run", a_first)
+    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
+        b._recover("Station left the radio", "station")
+    assert "Waiting up to 20 s for station" in caplog.text
+    assert caplog.text.count("this copy holds it") == 1  # a's; b only attached
+    assert a.state == b.state == "live" and a._own_station is not None and b._own_station is None
+    assert len(_gui_commands(radio)) == 2
+    assert _pan_of(radio, a) == MHZ_17M and _pan_of(radio, b) == MHZ_20M
+    b.stop()
+    a.stop()
+
+
+def test_the_station_process_leaves_a_station_a_copy_took_over(radio: FakeRadio) -> None:
     st = _station(radio)
     a = _channel(MHZ_17M, 1)
     _cut(st.conn)
     a._recover("Station left the radio", "station")
-    assert a.state == "halted" and len(_gui_commands(radio)) == 1
+    assert not st._recover("lost")
+    assert st.state == "halted" and len(_gui_commands(radio)) == 2
+    assert a.state == "live" and _pan_of(radio, a) == MHZ_17M
+    a.stop()
+
+
+def test_the_station_registers_over_its_own_stale_entry(
+    radio: FakeRadio, monkeypatch: Monkey
+) -> None:
+    st = _station(radio)
+    a = _channel(MHZ_17M, 1)
+    old = st.conn
+    assert isinstance(old, FakeConnection)
+    old.lost = "No ping reply for 15 s"
+    monkeypatch.setattr(old, "close", lambda _why: radio.conns.remove(old))  # still listed
+    assert st._recover("No ping reply for 15 s")
+    assert int(old.handle, 16) not in radio.clients  # evicted by our own registration
+    assert st.state == "live" and len(_gui_commands(radio)) == 2
+    a._poll()
+    a._recover("Station left the radio", "station")
+    assert a._own_station is None and a.state == "live"
 
 
 def test_three_losses_an_hour_are_recovered_and_the_fourth_stops(radio: FakeRadio) -> None:
@@ -486,3 +639,41 @@ def test_a_retune_drops_the_iq_queued_from_the_old_frequency(radio: FakeRadio) -
     _Udp.packets = [b"old"] * 5
     a.retune(round(MHZ_40M * 1e6))
     assert _Udp.packets == []
+
+
+def test_a_copy_whose_station_was_evicted_takes_over_again_later(radio: FakeRadio) -> None:
+    a = _channel(MHZ_17M, 1)
+    b = _channel(MHZ_20M, 2)
+    own = a._own_station
+    assert own is not None and own._thread is not None
+    own.request_stop()  # drive its recovery here instead of on its heartbeat thread
+    own._thread.join()  # leaving, it drops its GUI client: lost
+    own._stop.clear()
+    assert own.conn is None and not radio.pans
+    other = FlexStation("192.0.2.1")
+    other.start()
+    assert not own._recover("lost") and own.state == "halted"
+    for rx in (a, b):
+        rx._poll()
+        rx._recover("Station left the radio", "station")
+    assert a._own_station is None and a.state == b.state == "live"
+    assert other.conn is not None
+    _cut(other.conn)  # the new holder goes too: a copy takes over, not wait 600 s
+    for rx in (a, b):
+        rx._poll()
+        rx._recover("Station left the radio", "station")
+    assert a._own_station is not None and a.state == b.state == "live"
+    b.stop()
+    a.stop()
+
+
+def test_a_station_still_registering_is_bound_to_not_registered_over(radio: FakeRadio) -> None:
+    """Dallas 2026-10-27 02:37Z: a station is listed by its client ID about 6 s before its name."""
+    conn = radio.connect()
+    conn.open()
+    conn.cmd("client program SparkGap")
+    conn.cmd("client gui " + flex_iq.station_client_id("192.0.2.1", "SparkGap-Dallas"))
+    a = _channel(MHZ_17M, 1)
+    assert a._own_station is None and a.state == "live" and len(_gui_commands(radio)) == 1
+    assert a._station_handle == int(conn.handle, 16)
+    a.stop()
