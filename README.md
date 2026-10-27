@@ -70,9 +70,8 @@ in `tools/eval/` and `tools/sim/`.
   optional second port for your own use with its own, looser spot rule (see the quick start);
   `rbn_feeder.py` uploads CQ-tagged spots to RBN directly (keep it off until the RBN criteria
   above are passed).
-- **Options for the spot rule**: a validation score, `normal` by default,
-  using calls RBN skimmers have heard and the SKCC roster (`spot_validation`,
-  `docs/ITILA2.md`); and, off by default, split DX
+- **Options for the spot rule**, all off by default: a validation score using calls RBN
+  skimmers have heard and the SKCC roster (`spot_validation`, `docs/ITILA2.md`), split DX
   signing `TU <call> UP` (`spot_rule_split_up`), back-to-back CQs counted each
   (`spot_rule_cq_repeats`), `CWT <call>` without CQ (`spot_rule_contest_words`), and pieces of
   longer calls held back (`spot_rule_fragments`).

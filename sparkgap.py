@@ -64,7 +64,7 @@ def _gui_settings(cfg, sample_rate):
     behaviour built into the repeat rule. Defaults mirror where each key is read."""
     import rbn_known
     rule = _spot_rule_name(cfg)
-    validation = cfg.get('spot_validation', 'normal') or None
+    validation = cfg.get('spot_validation') or None
     validation = None if validation == 'off' else validation
     calls = cfg.get('spot_validation_calls') if validation else None
     repeat = rule == 'repeat'
@@ -1996,7 +1996,7 @@ def _make_spot_rule(config, tracker, local=None):
     for this port only). doubled_calls has no effect while validation is on: the score
     already weighs a call sent twice."""
     from spot_rule import LOCK_IDLE_S, RepeatSpotRule
-    # spot_validation (normal by default; "off" turns it off): permissive / normal / aggressive confidence score in
+    # spot_validation (off by default): permissive / normal / aggressive confidence score in
     # place of the tier count; spot_validation_calls adds a call list to the score: "scp"
     # (MASTER.SCP), "rbn" (RBN known calls, rbn_known.py, refreshed from the archives here) or
     # "rbn+skcc" (those and SKCC member calls, skcc_roster.py).
@@ -2004,7 +2004,7 @@ def _make_spot_rule(config, tracker, local=None):
     # otherwise it follows these. "off" and false both mean off.
     def off(v):
         return None if v in (None, False, 'off', '') else v
-    validation = off(config.get('spot_validation', 'normal'))
+    validation = off(config.get('spot_validation'))
     calls = config.get('spot_validation_calls')
     if local is not None:
         validation = off(local.get('validation', validation))

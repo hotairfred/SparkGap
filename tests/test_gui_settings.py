@@ -28,15 +28,14 @@ def test_repeat_rule_with_rbn_validation() -> None:
     assert eff["flex_daxiq_channel"] == 1 and "flex_daxiq_channel" in defaults
 
 
-def test_validation_normal_by_default() -> None:
-    eff, defaults, _ = _gui_settings({}, 48_000)
-    assert eff["spot_validation"] == "normal" and "spot_validation" in defaults
-    assert eff["spot_validation_calls"] == "none" and eff["rbn_known_days"] is None
+def test_validation_off_by_default() -> None:
+    eff, _, _ = _gui_settings({}, 48_000)
+    assert eff["spot_validation"] == "off" and eff["rbn_known_days"] is None
 
 
-def test_a_call_list_alone_is_used_by_the_default_validation() -> None:
+def test_calls_ignored_without_validation() -> None:
     eff, _, _ = _gui_settings({"spot_validation_calls": "rbn"}, 48_000)
-    assert eff["spot_validation"] == "normal" and eff["spot_validation_calls"] == "rbn"
+    assert eff["spot_validation_calls"] == "off" and eff["rbn_known_days"] is None
 
 
 def test_validation_off_is_accepted() -> None:

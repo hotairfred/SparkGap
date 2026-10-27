@@ -383,7 +383,7 @@ class Seat:
             "band": self.band(i),
             "bands_known": self.bands_known(i),
             "multi_band": self.multi_band(i),
-            "validation": cfg.get("spot_validation", "normal") or "off",
+            "validation": cfg.get("spot_validation") or "off",
             "call_source": cfg.get("spot_validation_calls") or "scp",
             **{k: bool(cfg.get(k, False)) for k in RULE_FLAGS},
             "record": bool(cfg.get("record_wav")),
