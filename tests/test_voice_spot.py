@@ -4,7 +4,6 @@ import sys
 
 import pytest
 
-sys.argv = ['voice_spot', 'x', 'x', '--strict']
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'voice'))
 import voice_spot as v  # noqa: E402
 
@@ -134,7 +133,7 @@ def test_variants() -> None:
 
 
 def test_the_better_reading_of_two_variants_wins(monkeypatch) -> None:
-    monkeypatch.setattr(v, '_SCP', {'HI8R', 'S53M', 'CB1B', 'TF3SG'})
+    monkeypatch.setattr(v, 'scp_calls', lambda: {'HI8R', 'S53M', 'CB1B', 'TF3SG'})
     def g(call, n, t=100.0, khz=14287.9):
         return {'base': call, 'call': call, 'khz': khz, 'first': t, 'last': t + 300, 'n': n}
     hi, i8 = g('HI8R', 4), g('I8R', 9)                    # known beats unknown, whatever the copies
@@ -180,7 +179,40 @@ def test_a_caller_on_a_runner_s_carrier_is_not_spotted() -> None:
 
 
 def test_a_call_on_neither_list_needs_three_copies(monkeypatch) -> None:
-    monkeypatch.setattr(v, '_SCP', {'CR6K', 'IP4X'})
+    monkeypatch.setattr(v, 'scp_calls', lambda: {'CR6K', 'IP4X'})
     assert v.copies_needed('CR6K', set()) == 2
     assert v.copies_needed('XR6K', set()) == 3          # Whisper's misreading, heard before the real call
     assert v.copies_needed('W1AW', {'W1AW'}) == 2       # a US call in the FCC list
+
+
+QUALIFIERS = [
+    ("CQ Japan, Kilo One Alpha Bravo Charlie, CQ Japan.", ["K1ABC"]),       # a directed CQ, not JK1ABC
+    ("CQ North America, Kilo One Alpha Bravo Charlie.", ["K1ABC"]),         # not AK1ABC
+    ("CQ contest, Papa Japan 4 Kilo, contest.", ["PJ4K"]),                  # Japan inside a call is J
+    ("CQ contest, Japan 62 Kilo, contest.", ["J62K"]),                      # and can start one after a qualifier
+    ("CQ contest, Japan Alpha One Alpha Bravo Charlie, contest.", ["JA1ABC"]),
+]
+
+
+@pytest.mark.parametrize("text,calls", QUALIFIERS)
+def test_japan_and_america_after_cq_are_qualifiers(text: str, calls: list[str]) -> None:
+    assert [h[1] for h in v.runner_hits([[0.0, 3.0, text, -0.2, []]])] == calls
+
+
+def test_importing_reads_no_command_line() -> None:
+    assert v.STRICT                     # an importer gets strict mode whatever its own arguments
+    assert v.load_fcc(None) is None
+
+
+def test_a_missing_master_scp_warns_once(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv('VS_SCP', str(tmp_path / 'nowhere.scp'))
+    monkeypatch.setattr(v, '_SCP', None)
+    monkeypatch.setattr(v, '_SCP_AT', None)
+    assert v.scp_calls() == set() and 'no MASTER.SCP' in capsys.readouterr().err
+    monkeypatch.setattr(v, '_scp_checked', 0.0)
+    v.scp_calls()
+    assert capsys.readouterr().err == ''           # the same missing file: no second warning
+    scp = tmp_path / 'nowhere.scp'
+    scp.write_text('# test\nK1ABC\n')
+    monkeypatch.setattr(v, '_scp_checked', 0.0)
+    assert v.scp_calls() == {'K1ABC'}               # it appears: read on the next check

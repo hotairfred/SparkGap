@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 
 NATO = {
     'alpha': 'A', 'alfa': 'A', 'bravo': 'B', 'charlie': 'C', 'delta': 'D', 'echo': 'E',
@@ -54,7 +55,8 @@ def after_cq(toks, a):
     while k >= 0 and a - k <= 7:
         if toks[k] in CQ_WORDS:
             return True
-        if toks[k] not in CQ_QUALIFIERS or unit(toks[k]) is not None and toks[k] not in ('20', '40', '15', '10', '80', '17', '12'):
+        if toks[k] not in CQ_QUALIFIERS or (unit(toks[k]) is not None and unit(toks[k])[1] != 'alt'
+                                            and toks[k] not in ('20', '40', '15', '10', '80', '17', '12')):
             return False
         k -= 1
     return False
@@ -132,6 +134,12 @@ def units(toks):
     for k in range(1, len(toks) - 1):
         if toks[k] in FOR_FOUR and u[k - 1] and u[k + 1] and u[k - 1][1] == 'nato' and u[k + 1][1] == 'nato':
             u[k] = ('4', 'digit')
+    for k in range(1, len(toks) - 1):
+        # "CQ Japan, Kilo One ...", "CQ North America, ...": a qualifier, not the call's first letter. Only right
+        # after CQ (or North/South) and before a letter: "CQ contest, Japan 62 Kilo" is J62K, "Papa Japan" is PJ.
+        if (u[k] and u[k][1] == 'alt' and toks[k] in CQ_QUALIFIERS and toks[k - 1] in CQ_WORDS | {'north', 'south'}
+                and u[k + 1] and u[k + 1][1] in ('nato', 'alt')):
+            u[k] = None
     return u
 
 
@@ -211,15 +219,15 @@ def calls_in(toks):
     return out
 
 
-STRICT = '--strict' in sys.argv          # precision first: a CQ in the last 30 s for every copy
+STRICT = True    # precision first: a CQ in the last 30 s for every copy. On for code that imports this module;
+                 # main() takes it from its own --strict (Chris, #102: never from an importer's command line)
 MIN_LOGPROB = -0.8                       # --strict: skip segments Whisper itself doubts
 WORD_MIN = 0.5                           # --strict: every word of a call (and the next) heard this surely
 # A spoken digit's confidence is split between the ways Whisper can write it (Seven, seven, 7), so it reads
 # low even when clean: "CQ Bigfoot, this is Whiskey, Seven, Oscar, QRZ" scored Seven 0.14-0.19 three times
 # (10-22). Digit words are left out of the WORD_MIN check (VS_DIGITS_EXEMPT=0 to restore); phonetics and
 # letters still must pass.
-import os as _os
-DIGITS_EXEMPT = _os.environ.get('VS_DIGITS_EXEMPT', '1') != '0'
+DIGITS_EXEMPT = os.environ.get('VS_DIGITS_EXEMPT', '1') != '0'
 
 
 def unsure(toks, probs, a, b):
@@ -310,12 +318,13 @@ LONG_CALL = re.compile(r'[0-9][A-Z]{4,}$')              # longer than a 2x3 (Fre
 
 # a call in neither MASTER.SCP nor the FCC list needs this many copies (10-26: live spots a misreading
 # heard first, XR6K before CR6K, P4X before IP4X; RBN's pattern file does the same for CW)
-UNKNOWN_COPIES = int(_os.environ.get('VS_UNKNOWN_COPIES', 3))
+UNKNOWN_COPIES = int(os.environ.get('VS_UNKNOWN_COPIES', 3))
 
 
 def copies_needed(base, fcc):
-    """Clean runner copies a call needs: 3 for a 1x1 (can't be checked against the FCC list) and for a
-    call longer than a 2x3 (rare; a stutter like KC5SCKK makes them); 2 otherwise."""
+    """Clean runner copies a call needs: 3 for a 1x1 when the FCC list is loaded (special-event calls aren't
+    in it, so they can't be checked), for a call longer than a 2x3 (rare; a stutter like KC5SCKK makes them)
+    and for a call in neither MASTER.SCP nor the FCC list (UNKNOWN_COPIES); 2 otherwise."""
     if LONG_CALL.search(base) or (ONE_BY_ONE.match(base) and fcc is not None):
         return 3
     if UNKNOWN_COPIES > 2 and not known(base, fcc) and not (fcc is None and US_CALL.match(base)):
@@ -323,28 +332,27 @@ def copies_needed(base, fcc):
     return 2
 
 
-def load_fcc():
-    """--fcc FILE: active US calls; a US-format call not in it is not spotted (1x1s excepted)."""
-    if '--fcc' not in sys.argv:
-        return None
-    return set(open(sys.argv[sys.argv.index('--fcc') + 1]).read().split())
+def load_fcc(path):
+    """Active US calls from FILE (fcc_calls.py), or None without one; a US-format call not in it is not
+    spotted (1x1s excepted)."""
+    return set(open(path).read().split()) if path else None
 
 
 def us_call_ok(base, fcc):
     return fcc is None or not US_CALL.match(base) or ONE_BY_ONE.match(base) or base in fcc
 
 
-VARIANTS = _os.environ.get('VS_VARIANTS', '1') != '0'   # outvoted() in place of cut_off() (10-24)
+VARIANTS = os.environ.get('VS_VARIANTS', '1') != '0'   # outvoted() in place of cut_off() (10-24)
 # dominant call on a carrier (10-24, Fred: a contest runner mostly names the CALLER, "K3NM 59 08,
 # thanks, QRZ", and signs "thanks, P40W" or "take care, P40W" now and then): within DOM_S on one
 # 0.5 kHz carrier, the call named in the most transmissions (not counting a name followed by a
 # report, which is the runner talking TO a caller) owns the frequency when it is named DOM_MIN times,
 # DOM_RATIO times as often as the next call, and the carrier has contest words there
-DOMINANT = _os.environ.get('VS_DOMINANT', '1') != '0'
+DOMINANT = os.environ.get('VS_DOMINANT', '1') != '0'
 DOM_S, DOM_MIN, DOM_RATIO = 600.0, 4, 3.0
 CONTEST_WORDS = {'contest', 'qrz', 'cq', 'cqcq'}
-VARIANT_S = float(_os.environ.get('VS_VARIANT_S', 1800))  # a variant on the same carrier within 30 min is the same station
-POOL_KHZ, POOL_S = 0.5, float(_os.environ.get('VS_POOL_S', 600))   # copies within 500 Hz and 10 min count together
+VARIANT_S = float(os.environ.get('VS_VARIANT_S', 1800))  # a variant on the same carrier within 30 min is the same station
+POOL_KHZ, POOL_S = 0.5, float(os.environ.get('VS_POOL_S', 600))   # copies within 500 Hz and 10 min count together
 
 
 def contained(short, long_):
@@ -368,7 +376,7 @@ def cut_off(g, groups, fcc=None):
 # "Again?", "say again", "I need your call again", "what's your call?" (Fred 10-24: a question for a call;
 # in contest traffic mostly the runner asking a caller, 586 "again"s and 115 "your call"s in two hours):
 # the next transmission is a caller saying his own call, so it is neither a runner copy nor an owner mention
-ASKS = _os.environ.get('VS_ASKS', '1') != '0'
+ASKS = os.environ.get('VS_ASKS', '1') != '0'
 _ASK_RE = re.compile(r"\b(your call|what'?s your call|call ?sign\b.*\?|say again|call again)\b|\bagain\W*$", re.I)
 
 
@@ -421,19 +429,42 @@ def variant(a, b):
     return contained(short, long_) or long_.startswith(short) and len(long_) - len(short) <= 2
 
 
-_SCP = None
+_SCP, _SCP_AT = None, None        # the call set and the file's (path, mtime) it came from
+SCP_CHECK_S = 600                 # a long-running caller (the live runner) sees a new MASTER.SCP within 10 min
+_scp_checked = 0.0
 
 
-def known(call, fcc):
-    """In MASTER.SCP (VS_SCP, default the repository's MASTER.SCP), or for a US call the FCC list."""
-    global _SCP
-    if _SCP is None:
-        path = _os.environ.get('VS_SCP', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'MASTER.SCP'))
+def scp_path():
+    return os.environ.get('VS_SCP', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'MASTER.SCP'))
+
+
+def scp_calls():
+    """MASTER.SCP as a set (VS_SCP, default the repository's), reloaded when the file changes. A missing
+    file warns once: every non-US call would then need UNKNOWN_COPIES copies."""
+    global _SCP, _SCP_AT, _scp_checked
+    now = time.time()
+    if _SCP is not None and now - _scp_checked < SCP_CHECK_S:
+        return _SCP
+    _scp_checked = now
+    path = scp_path()
+    try:
+        at = (path, os.path.getmtime(path))
+    except OSError:
+        at = (path, None)
+    if at != _SCP_AT:
         try:
             _SCP = {l.strip() for l in open(path) if l.strip() and not l.startswith(('#', '!'))}
         except OSError:
             _SCP = set()
-    return call in _SCP or bool(fcc) and call in fcc
+            print('voice_spot: no MASTER.SCP at %s; every call outside the FCC list needs %d copies'
+                  % (path, UNKNOWN_COPIES), file=sys.stderr)
+        _SCP_AT = at
+    return _SCP
+
+
+def known(call, fcc):
+    """In MASTER.SCP (scp_calls()), or for a US call the FCC list."""
+    return call in scp_calls() or bool(fcc) and call in fcc
 
 
 def outvoted(g, groups, fcc=None, heard_n=None):
@@ -472,8 +503,8 @@ def outvoted(g, groups, fcc=None, heard_n=None):
 
 
 
-SAME_KHZ = float(_os.environ.get('VS_SAME_KHZ', 3.0))   # one spot per call within this (10-26)
-LOCKON = _os.environ.get('VS_LOCKON', '1') != '0'      # caller_on_owned() (10-26)
+SAME_KHZ = float(os.environ.get('VS_SAME_KHZ', 3.0))   # one spot per call within this (10-26)
+LOCKON = os.environ.get('VS_LOCKON', '1') != '0'      # caller_on_owned() (10-26)
 OWN_RATIO, OWN_S = 2.0, 330.0     # an owner: twice the copies, heard within 330 s (a lock period + its check)
 
 
@@ -505,7 +536,9 @@ def caller_on_owned(g, groups):
 
 
 def main():
+    global STRICT
     dumpdir, model = sys.argv[1], sys.argv[2]
+    STRICT = '--strict' in sys.argv
     debug = '--debug' in sys.argv
     hits, heard, worked, heard_n = [], {}, {}, {}   # heard_n: 0.5 kHz carrier -> call -> segments naming it
     mentions, contest_at = {}, {}                     # cell -> [(t, call, khz, text)] not followed by a report; cell -> [t]
@@ -546,7 +579,7 @@ def main():
             groups.append({'base': b, 'call': call, 'khz': khz, 'first': t, 'last': t, 'n': 1, 'ctx': ctx, 'ts': [t]})
     spotted = set()
     sent = []                              # (base, kHz, t) spotted: same_spot()
-    fcc = load_fcc()
+    fcc = load_fcc(sys.argv[sys.argv.index('--fcc') + 1] if '--fcc' in sys.argv else None)
     for g in sorted(groups, key=lambda g: -g['n']):    # the best-supported carrier of a call is the one spotted
         if g['n'] < copies_needed(g['base'], fcc) and g['n'] >= 2:
             if debug:
