@@ -110,6 +110,18 @@ def rx_freqs(data):
     return out
 
 
+def rx_config(data):
+    """(sample rate code, number of receivers) from a C&C packet's config register (C0 0x00: C1 bits 1:0 the
+    rate, 0=48k 1=96k 2=192k 3=384k; C4 bits 5:3 receivers - 1), or None if it has none."""
+    for off in (8, 520):
+        if len(data) >= off + 8 and data[off:off + 3] == b'\x7f\x7f\x7f' and data[off + 3] & 0xFE == 0x00:
+            return data[off + 4] & 0x03, ((data[off + 7] >> 3) & 0x07) + 1
+    return None
+
+
+RATE_NAMES = {0: '48 kHz', 1: '96 kHz', 2: '192 kHz', 3: '384 kHz'}
+
+
 class HPSDRProxy:
     """Receives IQ from a real pitaya and fans it out to multiple consumers.
 
@@ -126,7 +138,9 @@ class HPSDRProxy:
         ip, _, port = (owner or '').partition(':')
         self.owner = (ip, int(port) if port else None) if owner else None
         self.owner_freqs = {}   # receiver → Hz, the owner's latest
-        self.warned = set()     # (consumer addr, receiver) mismatches logged
+        self.owner_cfg = None   # (rate code, receivers), the owner's latest
+        self.listeners = {}     # addr → [{receiver: Hz}, (rate code, receivers)], each listener's latest
+        self.warned = set()     # (consumer addr, receiver or 'cfg') mismatches logged
 
         # Upstream socket: our connection to the pitaya
         self.up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -174,8 +188,13 @@ class HPSDRProxy:
                 print(f"  -consumer {addr[0]}", file=sys.stderr)
         elif len(data) >= 8 and data[2:4] == b'\x01\x02':  # C&C (freq/config)
             if self.is_owner(addr):
+                before = (dict(self.owner_freqs), self.owner_cfg)
                 self.owner_freqs.update(rx_freqs(data))
+                self.owner_cfg = rx_config(data) or self.owner_cfg
                 self.up.sendto(data, self.pitaya)   # forward to pitaya
+                if (self.owner_freqs, self.owner_cfg) != before:     # a listener that started first
+                    for laddr in list(self.listeners):
+                        self.check_listener(laddr)
             else:
                 self.listener_cc(data, addr)
 
@@ -183,14 +202,29 @@ class HPSDRProxy:
         return self.owner is None or (addr[0] == self.owner[0] and self.owner[1] in (None, addr[1]))
 
     def listener_cc(self, data, addr):
-        """A listener's C&C stays here; one that asks for a frequency the owner doesn't have is decoding
-        the wrong band, so say so (once per receiver)."""
-        for rx, hz in rx_freqs(data).items():
+        """A listener's C&C stays here; it is remembered and checked against the owner's (now, and again
+        whenever the owner's changes: a listener can start first)."""
+        last = self.listeners.setdefault(addr, [{}, None])
+        last[0].update(rx_freqs(data))
+        last[1] = rx_config(data) or last[1]
+        self.check_listener(addr)
+
+    def check_listener(self, addr):
+        """Say so, once each, when a listener's frequency, sample rate or receiver count differs from the
+        owner's: it then decodes the wrong band, or reads the IQ frames with the wrong layout (garbage)."""
+        freqs, cfg = self.listeners[addr]
+        who = f"{addr[0]}:{addr[1]}"
+        for rx, hz in freqs.items():
             have = self.owner_freqs.get(rx)
             if have is not None and abs(have - hz) > 1 and (addr, rx) not in self.warned:
                 self.warned.add((addr, rx))
-                print(f"  ! {addr[0]}:{addr[1]} wants RX{rx + 1} on {hz / 1e3:.1f} kHz, the owner has it on "
+                print(f"  ! {who} wants RX{rx + 1} on {hz / 1e3:.1f} kHz, the owner has it on "
                       f"{have / 1e3:.1f} kHz: its bands must match the owner's", file=sys.stderr)
+        if cfg and self.owner_cfg and cfg != self.owner_cfg and (addr, 'cfg') not in self.warned:
+            self.warned.add((addr, 'cfg'))
+            print(f"  ! {who} runs {cfg[1]} receivers at {RATE_NAMES[cfg[0]]}, the owner {self.owner_cfg[1]} at "
+                  f"{RATE_NAMES[self.owner_cfg[0]]}: it would read the IQ wrongly (sample_rate and max_receivers "
+                  f"must match the owner's)", file=sys.stderr)
 
     def _forward_to_consumers(self, data):
         if len(data) < 8 or data[0:2] != COOKIE or data[2:4] != b'\x01\x06':

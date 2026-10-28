@@ -71,3 +71,44 @@ def test_without_an_owner_every_consumer_tunes() -> None:
         p.close()
         radio.close()
         a.close()
+
+
+def cfg_value(rate_code, receivers):
+    """C1..C4 of the config register: C1 bits 1:0 the rate, C4 bits 5:3 receivers - 1 (and duplex, bit 2)."""
+    return (rate_code << 24) | (1 << 2) | ((receivers - 1) << 3)
+
+
+def test_rx_config_reads_rate_and_receivers() -> None:
+    assert hp.rx_config(cc_packet([(0x00, cfg_value(2, 8)), (0x04, 7_090_000)])) == (2, 8)
+    assert hp.rx_config(cc_packet([(0x04, 7_090_000), (0x06, 14_090_000)])) is None
+
+
+def test_a_listener_on_another_rate_or_receiver_count_is_warned(capsys) -> None:
+    radio, owner, listener = udp(), udp(), udp()
+    o_addr, l_addr = owner.getsockname(), listener.getsockname()
+    p = hp.HPSDRProxy('127.0.0.1', radio.getsockname()[1], 0, owner='127.0.0.1:%d' % o_addr[1])
+    try:
+        p._handle_consumer(cc_packet([(0x00, cfg_value(2, 2)), (0x04, 7_090_000)]), o_addr)
+        p._handle_consumer(cc_packet([(0x00, cfg_value(2, 8)), (0x04, 7_090_000)]), l_addr)
+        p._handle_consumer(cc_packet([(0x00, cfg_value(2, 8)), (0x04, 7_090_000)]), l_addr)
+        err = capsys.readouterr().err
+        assert err.count('runs 8 receivers at 192 kHz, the owner 2 at 192 kHz') == 1
+    finally:
+        p.close()
+        for s in (radio, owner, listener):
+            s.close()
+
+
+def test_a_listener_that_starts_before_the_owner_is_still_checked(capsys) -> None:
+    radio, owner, listener = udp(), udp(), udp()
+    o_addr, l_addr = owner.getsockname(), listener.getsockname()
+    p = hp.HPSDRProxy('127.0.0.1', radio.getsockname()[1], 0, owner='127.0.0.1:%d' % o_addr[1])
+    try:
+        p._handle_consumer(cc_packet([(0x04, 7_040_000), (0x06, 14_090_000)]), l_addr)   # the owner isn't up yet
+        assert '!' not in capsys.readouterr().err
+        p._handle_consumer(cc_packet([(0x04, 7_090_000), (0x06, 14_090_000)]), o_addr)   # now it is
+        assert 'wants RX1 on 7040.0 kHz, the owner has it on 7090.0 kHz' in capsys.readouterr().err
+    finally:
+        p.close()
+        for s in (radio, owner, listener):
+            s.close()
