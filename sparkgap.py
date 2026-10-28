@@ -279,7 +279,11 @@ class _CReceiver:
         self.sample_rate = sample_rate
         self._h = None
         if self.lib:
-            if listen_port and listen_port != port and hasattr(self.lib, 'hpsdr_create_listen'):
+            own_port = bool(listen_port and listen_port != port)
+            if own_port and not hasattr(self.lib, 'hpsdr_create_listen'):
+                log.warning("hpsdr_listen_port %d: libhpsdr_fast.so has no hpsdr_create_listen (an old build: "
+                            "make -B libhpsdr_fast.so); receiving on port %d", listen_port, port)
+            if own_port and hasattr(self.lib, 'hpsdr_create_listen'):
                 self._h = _ct.c_void_p(self.lib.hpsdr_create_listen(
                     ip.encode(), port, listen_port, n_receivers, sample_rate, lna_gain))
             else:
