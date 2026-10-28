@@ -506,6 +506,8 @@ def outvoted(g, groups, fcc=None, heard_n=None):
 SAME_KHZ = float(os.environ.get('VS_SAME_KHZ', 3.0))   # one spot per call within this (10-26)
 LOCKON = os.environ.get('VS_LOCKON', '1') != '0'      # caller_on_owned() (10-26)
 OWN_RATIO, OWN_S = 2.0, 330.0     # an owner: twice the copies, heard within 330 s (a lock period + its check)
+OWN_EST_N = int(os.environ.get('VS_OWN_EST', 2))   # an owner with this many copies before the newcomer, an established
+# runner, needs only as many copies as the newcomer, not twice (0 = off; 10-28: NB4A on DR1A's 7165)
 
 
 def same_spot(sent, base, khz, t, respot_s=None):
@@ -520,17 +522,20 @@ def caller_on_owned(g, groups):
     """Lock-on for voice: g is a station answering the runner who owns g's carrier, not a runner
     (KF0WYR: 2 copies on W1RCR's 14228.2 while W1RCR ran there, 136 copies; KF0WYR was searching and
     pouncing on 14233, 14305 and 14284 too). The owner is another call on the carrier with a copy in the
-    OWN_S before g's first copy and OWN_RATIO times g's copies within OWN_S of g's. A runner who takes a
-    frequency its owner has left gets no owner copies before it and is spotted as usual."""
+    OWN_S before g's first copy and OWN_RATIO times g's copies within OWN_S of g's; once it has OWN_EST_N
+    copies before g, as many as g's (NB4A: DR1A repeating "... from November Bravo 4 Alpha", 2 copies, while
+    DR1A had 3). A runner who takes a frequency its owner has left gets no owner copies before it and is
+    spotted as usual."""
     for h in groups:
         if h is g or h['base'] == g['base'] or abs(h['khz'] - g['khz']) > POOL_KHZ:
             continue
         if variant(g['base'], h['base']) or contained(g['base'], h['base']) or contained(h['base'], g['base']):
             continue                      # another reading of the same station (I1X of II1X, J62KJ of J62K)
         ts = h.get('ts') or [h['first'], h['last']]
-        before = any(g['first'] - OWN_S <= x <= g['first'] for x in ts)
+        n_before = sum(1 for x in ts if g['first'] - OWN_S <= x <= g['first'])
         near = sum(1 for x in ts if g['first'] - OWN_S <= x <= g['last'] + OWN_S)
-        if before and near >= OWN_RATIO * g['n']:
+        ratio = 1.0 if OWN_EST_N and n_before >= OWN_EST_N else OWN_RATIO
+        if n_before and near >= ratio * g['n']:
             return h['base']              # truthy: the owner, for --debug
     return None
 

@@ -85,8 +85,9 @@ is the runner:
 - **One spot per call within 3 kHz.** One voice can show up as two or three carriers a kHz or two
   apart; it is spotted once, on the carrier with the most copies.
 - **Lock-on.** A call heard on a carrier that another station is running (that station heard in
-  the 330 s before, with twice the copies around it) is a caller answering the runner, not
-  another runner. A station that takes over a frequency someone has left is spotted as usual.
+  the 330 s before, with twice the copies around it, or as many once it already had two before)
+  is a caller answering the runner, not another runner. A station that takes over a frequency
+  someone has left is spotted as usual.
 
 Each rule can be turned off for measuring with an environment variable: `VS_VARIANTS`,
 `VS_DOMINANT`, `VS_ASKS`, `VS_LOCKON` (`0` = off), `VS_SAME_KHZ` (kHz, `0` = off),
