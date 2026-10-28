@@ -477,6 +477,7 @@ def main():
     ap.add_argument('--batch', type=int, default=0, help='batch a piece\'s speech segments on the GPU (0 = off)')
     ap.add_argument('--transcripts', default=None, help='also keep every transcript here (off: memory only)')
     a = ap.parse_args()
+    vd.settings_from_env()                                  # the detector's VD_* thresholds, as voice_detect.py's main()
     if not a.fcc:
         print('live_voice: no --fcc list: US calls are not checked against the FCC database', file=sys.stderr)
     r = Runner(a)
