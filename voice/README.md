@@ -17,7 +17,7 @@ folder holds it as it lands, piece by piece:
 
 - **Shape:** for each candidate carrier (50 Hz steps), the 2.3 kHz voice window on one side (300 to
   2600 Hz from the carrier) averages at least 6 dB over the noise floor and 4 dB over the carrier side,
-  which a transmitter's filter leaves quiet. LSB below 10 MHz, USB above.
+  which a transmitter's filter leaves quiet. LSB below 10 MHz, USB above and on 60 m.
 - **Spread:** at least 30% of the window's bins are 6 dB over the noise floor. A CW carrier or a birdie
   fills one bin.
 - **Rhythm:** the window's loudness, frame by frame over the 2 s, varies by at least 3 dB (standard
@@ -39,7 +39,7 @@ IQ is 192 kHz: `.cf32` (interleaved float32 I, Q) as measured on FlexRadio DAX-I
 Pitaya recording may need Q negated, as `hpsdr_proxy.py --negate-q` does). OUTDIR gets `tracks.json`
 (the span, every hit and track) and `clips/ssb_<carrier kHz>@<start s>.wav`. Thresholds: `VD_SHAPE_DB`,
 `VD_LEVEL_DB`, `VD_SPREAD`, `VD_RHYTHM_DB`, `VD_END_S`. `VD_TMP`: where the cutter keeps its temp files
-(default /tmp; removed even on an error). `VD_REUSE=1`: cut from an existing `tracks.json` of the same
+(default OUTDIR, since /tmp can be RAM; removed even on an error). `VD_REUSE=1`: cut from an existing `tracks.json` of the same
 span instead of detecting again. Tests: `tests/test_voice_detect.py` (synthetic voices, a CW carrier, a
 data signal, the track rules, the cutter's audio and its phase across block joins at an awkward carrier,
 tracks at the ends of a file, cleanup when a step fails, and 16- and 24-bit WAV).

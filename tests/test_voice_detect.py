@@ -173,3 +173,18 @@ def test_wav_iq_16_and_24_bit(tmp_path) -> None:
         raise AssertionError('a mono WAV must be refused')
     except ValueError:
         pass
+
+
+def test_60m_is_usb_and_40m_lsb() -> None:
+    assert vd.usb(14_200_000) and vd.usb(5_357_000) and vd.usb(5_403_500)
+    assert not vd.usb(7_200_000) and not vd.usb(3_750_000) and not vd.usb(1_850_000)
+
+
+def test_thresholds_come_from_the_environment_only_when_asked(monkeypatch) -> None:
+    monkeypatch.setenv('VD_SHAPE_DB', '9.5')
+    assert vd.SHAPE_DB == 4.0                                # importing read nothing
+    monkeypatch.setattr(vd, 'SHAPE_DB', vd.SHAPE_DB)         # restored after the test
+    monkeypatch.setattr(vd, 'END_S', vd.END_S)
+    monkeypatch.setenv('VD_END_S', '60')
+    vd.settings_from_env()
+    assert vd.SHAPE_DB == 9.5 and vd.END_S == 60.0

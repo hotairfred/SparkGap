@@ -4,7 +4,7 @@ follow it, and cut its audio for the transcriber (voice_spot.py reads the transc
 usage: voice_detect.py IQ CENTRE_KHZ LO_KHZ HI_KHZ OUTDIR [--start S] [--dur S] [--tracks-only]
 IQ at 192 kHz: .cf32 (interleaved float32 I, Q; measured on FlexRadio DAX-IQ recordings) or a stereo 16- or
 24-bit WAV as record_wav and iq_recorder.py write them (read, but not yet measured on voice; a Red Pitaya
-recording may need Q negated, as hpsdr_proxy.py --negate-q does). LSB below 10 MHz, USB above.
+recording may need Q negated, as hpsdr_proxy.py --negate-q does). LSB below 10 MHz, USB above and on 60 m.
 Writes OUTDIR/tracks.json and OUTDIR/clips/ssb_<carrier kHz>@<start s>.wav (16 kHz, one per track).
 
 Detection, every 2 s window (25 Hz bins, 40 ms frames):
@@ -33,17 +33,32 @@ BLOCK_S = 60
 GRID_HZ = 50
 BOX = (300, 2600)                # voice block relative to the carrier
 GUARD = (-500, 100)              # carrier side, should be quiet
-SHAPE_DB = float(os.environ.get('VD_SHAPE_DB', 4.0))
-LEVEL_DB = float(os.environ.get('VD_LEVEL_DB', 6.0))
-SPREAD = float(os.environ.get('VD_SPREAD', 0.30))
-RHYTHM_DB = float(os.environ.get('VD_RHYTHM_DB', 3.0))
+SHAPE_DB = 4.0                   # thresholds; main() takes VD_SHAPE_DB etc. from the environment, an importer
+LEVEL_DB = 6.0                   # sets them itself (settings_from_env, #103 review)
+SPREAD = 0.30
+RHYTHM_DB = 3.0
 JOIN_HZ = 400
 NMS_HZ = 2200                    # one voice per 2.2 kHz of a sideband in each window (10-27: letting closer
                                  # neighbours through added transcription and junk, not calls)
 CARRIER_DB = 10.0               # a peak this far over the block at the carrier = AM or a carrier, not SSB
 SPAWN_HITS, SPAWN_S = 2, 10
-END_S = float(os.environ.get('VD_END_S', 120))
+END_S = 120.0
 PAD_S = 2
+
+
+def settings_from_env():
+    """VD_SHAPE_DB, VD_LEVEL_DB, VD_SPREAD, VD_RHYTHM_DB, VD_END_S over the defaults (main() calls it)."""
+    global SHAPE_DB, LEVEL_DB, SPREAD, RHYTHM_DB, END_S
+    SHAPE_DB = float(os.environ.get('VD_SHAPE_DB', SHAPE_DB))
+    LEVEL_DB = float(os.environ.get('VD_LEVEL_DB', LEVEL_DB))
+    SPREAD = float(os.environ.get('VD_SPREAD', SPREAD))
+    RHYTHM_DB = float(os.environ.get('VD_RHYTHM_DB', RHYTHM_DB))
+    END_S = float(os.environ.get('VD_END_S', END_S))
+
+
+def usb(centre_hz):
+    """The voice sideband by convention: USB from 10 MHz up and on 60 m (5.3-5.4 MHz channels), LSB below."""
+    return centre_hz >= 10e6 or 5.25e6 <= centre_hz <= 5.45e6
 
 
 def read_block(path, start_s, dur_s):
@@ -104,7 +119,7 @@ def window_hits(db, f, floor, lo_hz, hi_hz, t0):
     idx = lambda hz: np.round((hz - f[0]) / df).astype(int)
     sides = []
     both = (('USB', BOX, GUARD), ('LSB', (-BOX[1], -BOX[0]), (-GUARD[1], -GUARD[0])))
-    usb_band = (lo_hz + hi_hz) / 2 >= 10e6                # convention: USB from 10 MHz up, LSB below
+    usb_band = usb((lo_hz + hi_hz) / 2)                   # convention: USB from 10 MHz up and on 60 m, LSB below
     # Only the band's sideband: looking for both makes a mirrored ghost of every voice (its far edge reads
     # as the other sideband's block, about 3 kHz away), transcribed twice.
     for sb, box, guard in [x for x in both if (x[0] == 'USB') == usb_band]:
@@ -193,7 +208,7 @@ def cut_audio_fft(path, centre_hz, tracks, start_s, end_s, emit, tmp_dir=None):
     blk = int(round(BLOCK_S * FS))
     n = (blk + 2 * pad + dec - 1) // dec * dec           # the same FFT length for every block
     m = n // dec
-    tmp = tempfile.mkdtemp(prefix='vd_cut_', dir=tmp_dir or os.environ.get('VD_TMP', '/tmp'))
+    tmp = tempfile.mkdtemp(prefix='vd_cut_', dir=tmp_dir or os.environ.get('VD_TMP') or tempfile.gettempdir())
     try:
         bufs, done = {}, set()      # k -> temp file of float32 audio so far (contest runners: hour-long tracks)
         order = sorted(range(len(tracks)), key=lambda k: tracks[k]['end'])
@@ -235,6 +250,7 @@ def cut_audio_fft(path, centre_hz, tracks, start_s, end_s, emit, tmp_dir=None):
 
 
 def main():
+    settings_from_env()
     path, centre_khz, lo_khz, hi_khz, outdir = sys.argv[1:6]
     arg = lambda k, d: float(sys.argv[sys.argv.index(k) + 1]) if k in sys.argv else d
     centre, lo, hi = float(centre_khz) * 1000, float(lo_khz) * 1000, float(hi_khz) * 1000
@@ -270,7 +286,8 @@ def main():
             w.writeframes((a * 32767).astype(np.int16).tobytes())
         print('%s %s %4.0f-%4.0f s, %d hits' % (os.path.basename(name), tr['sb'], tr['start'], tr['end'], tr['hits']), flush=True)
 
-    cut_audio_fft(path, centre, tracks, start, end, emit)
+    # temp audio next to the output (230 MB per track-hour; /tmp can be RAM), unless VD_TMP says otherwise
+    cut_audio_fft(path, centre, tracks, start, end, emit, tmp_dir=os.environ.get('VD_TMP') or outdir)
     print('%d tracks' % len(tracks))
 
 
