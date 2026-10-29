@@ -128,6 +128,9 @@ python3 voice/live_voice.py rec/*_14246kHz_*.cf32 14246 14153 14339 --follow --d
 - Spots go out on the telnet port as `DX de N0CALL-4: 14246.0  K1ABC  SSB CQ 2 copies  1234Z`, for a
   cluster or a logger. Give the skimmer an SSID of its own.
 - A 192 kHz DAX-IQ stream takes half the radio's DAX-IQ budget, so a radio records two bands at most.
+- If your skimmer antenna hangs on a receive loop, give the recorder the receive path, e.g.
+  `--rxant ANT1 --loopb 1`, as `flex_rxant` and `flex_loopb` do for SparkGap. A pan that comes up with
+  the loop off turns it off for everything on that antenna.
 - Without `--follow` it replays a recording: `--speed 1` at live pace (the keep-up test), `--speed 0` as
   fast as it goes.
 - Transcripts stay in memory (15 minutes) and are dropped. `--transcripts DIR` keeps them, appended to
