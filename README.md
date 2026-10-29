@@ -226,15 +226,16 @@ python3 hpsdr_proxy.py --pitaya 192.168.1.54 --port 1025 --owner 192.168.1.76
   asks for another frequency, or runs another sample rate or receiver count (it would read the IQ frames
   wrongly), is logged once (`! ... wants RX1 on 7000.0 kHz, the owner has it on 7090.0 kHz`), also when it
   started before the owner; its tuning never reaches the radio.
-- **Point each SparkGap at the proxy** (`sdr_ip`, `sdr_port`). The multi-band receiver binds the same local
-  port it sends to, so the proxy can't share a computer with a multi-band SparkGap on the same port. Run
-  it elsewhere, or give a single-band listener its own `hpsdr_listen_port`.
+- **Point each SparkGap at the proxy** (`sdr_ip`, `sdr_port`). A SparkGap on the proxy's own computer
+  needs its own `hpsdr_listen_port`: the receivers otherwise bind the port they send to, and take the
+  proxy's packets.
 
 Measured with a 2-receiver replay of a CWT (40 m and 20 m): the owner decoded both bands and a listener on
 another computer decoded only 20 m through the proxy. All 29 of the owner's 20 m calls came out of the
-listener too, at the same frequency (median 0.00 kHz). The listener's own tuning (RX1 to 7000 kHz: a
-single-band receiver tunes RX1 whatever its `rx_index`) was held back and logged. Not yet run against a
-live Red Pitaya.
+listener too, at the same frequency (median 0.00 kHz). In a second run, a multi-band listener on the
+proxy's own computer, with its own `hpsdr_listen_port`, spotted all 30 of the owner's calls. A receiver
+tunes only the receivers it decodes, so a listener never retunes the owner's. Not yet run against a live
+Red Pitaya.
 
 ## Replaying and measuring
 
