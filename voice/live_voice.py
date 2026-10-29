@@ -9,11 +9,11 @@ file being written (flex_record.py's output) and is read as it grows; without, i
 --speed times real time (1 = live pace, for the keep-up test; 0 = as fast as it goes).
 Needs faster-whisper and, for live use, a CUDA GPU (voice/README.md).
 
-Each 10 s block: voice_detect's 2 s window hits -> tracks (a carrier that keeps a voice). Each
-track's audio is kept at 16 kHz; when its speaker pauses (no hit for OVER_GAP_S) the over goes to
-Whisper (one decode per window, no retries). The strict rule (voice_spot.runner_hits, cut-off and
-FCC checks) runs on the last 10 min of that carrier's transcripts; a call with two runner copies
-(three for a 1x1) is spotted. Once spotted, a carrier is only sampled (LOCK_CHECK_S every
+Each 4 s block (BLOCK_S): voice_detect's 2 s window hits -> tracks (a carrier that keeps a voice).
+Each track's audio is kept at 16 kHz and goes to Whisper in pieces: when its speaker pauses, or at
+most every OVER_MAX_S (one decode per piece, no retries). The voice_spot rules run on the last 15 min
+(TRANSCRIPT_KEEP_S) of that carrier's transcripts; a call with two runner copies (three for 1x1s,
+long calls and calls on neither list) is spotted. Once spotted, a carrier is only sampled (LOCK_CHECK_S every
 LOCK_PERIOD_S) until it goes quiet. Transcripts live in memory for TRANSCRIPT_KEEP_S and are then
 dropped; only spots are written (--spots), unless --transcripts DIR asks for them (for measuring).
 """
@@ -60,6 +60,7 @@ CHECK_S = 30.0
 PRI_OWED, PRI_NEW, PRI_LOCKED = 0, 1, 2
 TRANSCRIPT_KEEP_S = 900.0   # transcripts kept (in memory) this long, then dropped
 RESPOT_S = 600.0
+SEND_TIMEOUT_S = 5.0     # a telnet client that takes longer than this to take a spot line is dropped
 FAIL_STOP = 20          # this many pieces in a row that Whisper can't decode: stop, loudly
 CARRIER_OFFSET_HZ = 100.0   # our carrier estimate runs 0-200 Hz inside the dial (10-20 check)
 PROMPT = ("CQ contest, QRZ, thank you, five nine, Kilo, November, Whiskey, Alpha, Bravo, Charlie, Delta, "
@@ -164,7 +165,9 @@ def sideband_audio(z, sb):
 # ---------------------------------------------------------------- spots out
 
 class Telnet:
-    """A minimal DX-cluster telnet server: asks for a call, then streams 'DX de' lines."""
+    """A minimal DX-cluster telnet server: asks for a call, then streams 'DX de' lines. Each client is greeted
+    on its own thread, and a client that stops reading is dropped after SEND_TIMEOUT_S, so neither a silent
+    nor a stuck client can hold up the next one or the transcriber that calls spot() (#104 review)."""
 
     def __init__(self, port, call):
         self.call, self.clients, self.lock = call, [], threading.Lock()
@@ -177,16 +180,19 @@ class Telnet:
     def _accept(self):
         while True:
             c, _ = self.srv.accept()
-            try:
-                c.sendall(b'Please enter your call: ')
-                c.settimeout(30)
-                c.recv(64)
-                c.settimeout(None)
-                c.sendall(('Hello, %s voice skimmer (experimental, SSB runners only)\r\n' % self.call).encode())
-                with self.lock:
-                    self.clients.append(c)
-            except OSError:
-                c.close()
+            threading.Thread(target=self._greet, args=(c,), daemon=True).start()
+
+    def _greet(self, c):
+        try:
+            c.sendall(b'Please enter your call: ')
+            c.settimeout(30)
+            c.recv(64)
+            c.settimeout(SEND_TIMEOUT_S)                 # from now on only spot() writes to it
+            c.sendall(('Hello, %s voice skimmer (experimental, SSB runners only)\r\n' % self.call).encode())
+            with self.lock:
+                self.clients.append(c)
+        except OSError:
+            c.close()
 
     def spot(self, khz, call, comment):
         line = 'DX de %-10s%9.1f  %-12s %-30s %sZ\r\n' % (self.call + ':', khz, call, comment[:30],
@@ -195,8 +201,9 @@ class Telnet:
             for c in list(self.clients):
                 try:
                     c.sendall(line.encode())
-                except OSError:
+                except OSError:                          # gone, or not reading for SEND_TIMEOUT_S
                     self.clients.remove(c)
+                    c.close()
         return line.strip()
 
 

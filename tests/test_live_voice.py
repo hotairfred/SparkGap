@@ -120,3 +120,48 @@ def test_a_tracks_audio_is_continuous_across_blocks() -> None:
     assert abs(peak - 1_000) <= 5
     ph = np.unwrap(np.angle(hilbert(a)))[200:-200]
     assert np.abs(np.diff(ph) - np.median(np.diff(ph))).max() < 0.05
+
+
+def _free_tcp_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def test_a_silent_client_does_not_hold_up_the_next() -> None:
+    port = _free_tcp_port()
+    lv.Telnet(port, 'N0CALL-4')
+    silent = socket.create_connection(('127.0.0.1', port), timeout=5)     # connects, never answers
+    t0 = time.monotonic()
+    c = socket.create_connection(('127.0.0.1', port), timeout=5)
+    assert b'call' in c.recv(100)
+    c.sendall(b'N0TEST\r\n')
+    assert b'N0CALL-4' in c.recv(200)
+    assert time.monotonic() - t0 < 2                                    # not 30 s behind the silent one
+    silent.close()
+    c.close()
+
+
+def test_a_client_that_stops_reading_is_dropped_without_stalling_spots(monkeypatch) -> None:
+    monkeypatch.setattr(lv, 'SEND_TIMEOUT_S', 0.3)
+    port = _free_tcp_port()
+    tel = lv.Telnet(port, 'N0CALL-4')
+    c = socket.create_connection(('127.0.0.1', port), timeout=5)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    c.recv(100)
+    c.sendall(b'N0TEST\r\n')
+    c.recv(200)
+    for _ in range(50):
+        if tel.clients:
+            break
+        time.sleep(0.02)
+    slowest = 0.0
+    for k in range(200_000):                                            # it never reads again
+        t0 = time.monotonic()
+        tel.spot(7189.9, 'K1ABC', 'SSB CQ 2 copies ' + 'x' * 30)
+        slowest = max(slowest, time.monotonic() - t0)
+        if not tel.clients:
+            break
+    assert not tel.clients                                              # dropped
+    assert slowest < 1.0                                                # each spot() came back within the timeout
+    c.close()
