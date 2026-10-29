@@ -4,7 +4,7 @@
 
 Open-source, Linux-native, multi-band skimmer for amateur radio: **CW, RTTY and FT8** on
 several bands at once, with DX-cluster spots on telnet and an uploader for the Reverse Beacon
-Network (RBN).
+Network (RBN). **SSB voice** spotting is in `voice/` too (experimental; it needs a CUDA GPU).
 
 > **Status: beta.** In daily use on a Red Pitaya STEMlab 125-14 at WF8Z skimming 8 bands
 > (80, 40, 30, 20, 17, 15, 12 and 10 m), feeding a local cluster and PSKReporter (FT8).
@@ -30,13 +30,20 @@ against what other RBN skimmers reported at the same time:
   stations, all real; RTTY Skimmer Server's CQ-tagged spots were 92 real of 110 on its DX profile
   and 110 of 116 on its Makrothen profile. Frequencies agreed to a median of 0.00 kHz. Details,
   both sides' mistakes and what we are doing about the stations only it found are in #91.
+- **SSB (voice).** CQ WW SSB 2026, eight band-hours recorded from a FlexRadio and scored against the
+  DX cluster spots people posted: 347 calls spotted, 248 of them also spotted by a person (almost nobody
+  spots US and Canadian stations in CQ WW, and most of the rest are those); reading the transcripts,
+  about 91% of spots were real. Live into a cluster for Sunday of that weekend: 2083 spots of 412 calls,
+  most within seconds of the station being heard. One GTX 1060 is about a third short of one busy
+  contest band. Details in `voice/README.md`.
 - **Copy on known text.** Character error on three W1AW code-practice clips: 3.1, 3.7 and
   1.9% (`docs/ITILA2.md`; CW Skimmer copies the same audio nearly perfectly).
 - **Cost.** 8 bands at 192 kHz with CW, FT8 and RTTY use about 1.7 cores of CPU time on a 35 W i5-9500T
   with `itila_decode_threads: 4` on a weekday afternoon (2.2 before the October CPU work; profile
   in #59).
 
-These are calibration on our station, not a contest result. The harness to reproduce them is
+The CW, RTTY and FT8 numbers are calibration on our station, not a contest result; the SSB ones are
+from one contest weekend. The harness to reproduce them is
 in `tools/eval/` and `tools/sim/`.
 
 ## What it does
@@ -65,10 +72,12 @@ in `tools/eval/` and `tools/sim/`.
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
   it says the PC clock is off.
-- **SSB (voice), arriving in pieces.** Voices found in the IQ are transcribed with Whisper and
-  the station calling CQ is spotted, by spoken versions of the same rules: runner copies, the
-  better of two readings, lock-on. The spot rules are in `voice/` now; the detector and the live
-  runner follow. What it does and how it measured on CQ WW SSB: `voice/README.md`.
+- **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
+  transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
+  is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of
+  two readings, lock-on. It runs on its own beside the CW skimmer: `voice/live_voice.py` on IQ from
+  `voice/flex_record.py` (FlexRadio DAX-IQ). How it works, how to run it and how it measured:
+  `voice/README.md`.
 - **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format (RTTY lines as
   RTTY Skimmer Server writes them), so loggers, clusters and Aggregator can read them; an
   optional second port for your own use with its own, looser spot rule (see the quick start);

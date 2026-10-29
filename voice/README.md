@@ -1,17 +1,17 @@
 # Voice (SSB) spotting
 
 SparkGap's voice skimmer finds SSB voices in the IQ, transcribes each one with Whisper and spots
-the station calling CQ, the same way the CW repeat rule does: the runner, never the caller. This
-folder holds it as it lands, piece by piece:
+the station calling CQ, the same way the CW repeat rule does: the runner, never the caller. It is
+experimental, and needs a CUDA GPU to keep up live.
 
-| Part | File | State |
-| --- | --- | --- |
-| Spot rules: transcripts in, spots out | `voice_spot.py` | here |
-| Active US calls from the FCC database | `fcc_calls.py` | here |
-| Voice detector: IQ in, one audio track per voice | `voice_detect.py` | here |
-| FlexRadio DAX-IQ recorder (one SparkGap station on the radio) | `flex_record.py` | here |
-| Live runner: detector, Whisper and the rules on a running radio, spots on telnet | `live_voice.py` | here |
-| Live rules on saved transcripts, without the GPU | `live_rule_replay.py` | here |
+| Part | File |
+| --- | --- |
+| Spot rules: transcripts in, spots out | `voice_spot.py` |
+| Active US calls from the FCC database | `fcc_calls.py` |
+| Voice detector: IQ in, one audio track per voice | `voice_detect.py` |
+| FlexRadio DAX-IQ recorder (one SparkGap station on the radio) | `flex_record.py` |
+| Live runner: detector, Whisper and the rules on a running radio, spots on telnet | `live_voice.py` |
+| Live rules on saved transcripts, without the GPU | `live_rule_replay.py` |
 
 ## How voices are found
 
@@ -149,7 +149,7 @@ people posted (DX Summit and a cluster node) for the same call within 3 kHz and 
 
 | | Spots | Calls | Calls a person also spotted |
 | --- | --- | --- | --- |
-| These rules, all eight band-hours | 368 | 349 | 248 |
+| These rules, all eight band-hours | 366 | 347 | 248 |
 
 - "Not spotted by a person" isn't the same as wrong: in CQ WW almost nobody spots US and Canadian
   stations, and most of our unconfirmed calls are those. Reading the transcripts of two of the
@@ -159,7 +159,8 @@ people posted (DX Summit and a cluster node) for the same call within 3 kHz and 
   50, and 8 busts went away.
 - One spot per call within 3 kHz and lock-on together removed 27 duplicate or caller spots from
   the eight band-hours, and three copies for calls on neither list 4 misreadings (TK1TTT, IR3Z,
-  S5T, T9FRX); no call a person had spotted was lost.
+  S5T, T9FRX), and an established runner outvoting a caller with as many copies 2 more callers
+  (NN7A, W1UL); no call a person had spotted was lost.
 - The same rules in the live runner, on one 40 m hour replayed with nothing dropped: 67 calls,
   54 of them spotted by a person (81%), against 71 and 54 (76%) before these three changes.
 
