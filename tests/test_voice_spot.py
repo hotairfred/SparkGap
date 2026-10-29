@@ -221,7 +221,7 @@ def test_a_missing_master_scp_warns_once(tmp_path, monkeypatch, capsys) -> None:
 def test_an_established_runner_outvotes_a_caller_with_as_many_copies() -> None:
     runner = _g('DR1A', 7165.0, [46.6, 59.5, 76.2, 106.2, 123.0])      # running: copies before and after
     caller = _g('NB4A', 7165.1, [88.0, 94.0])                          # "... from November Bravo 4 Alpha"
-    assert v.caller_on_owned(caller, [runner, caller]) == 'DR1A'       # 2 before, 5 near >= 2: a caller
+    assert v.caller_on_owned(caller, [runner, caller]) == "DR1A"       # 3 before, 5 near >= 2: a caller
     new = _g('DR1A', 7165.0, [80.0, 90.0])                            # one copy before: not established yet
     other = _g('NB4A', 7165.1, [85.0, 95.0, 100.0])
     assert not v.caller_on_owned(other, [new, other])
