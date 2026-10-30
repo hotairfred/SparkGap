@@ -24,3 +24,9 @@ def test_a_small_dense_scene(tmp_path: Path) -> None:
         assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (2, 3, 192000)
         assert abs(w.getnframes() / 192000 - 30) < 0.1
     assert not list(tmp_path.glob("group*_7030kHz_192000_24bit.wav"))      # the group files are summed and gone
+
+
+def test_too_many_runners_stop_with_a_reason(tmp_path: Path) -> None:
+    r = subprocess.run([sys.executable, str(ROOT / "tools/sim/gen_dense.py"), str(tmp_path), "640"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "do not fit" in r.stderr and "at most 560" in r.stderr

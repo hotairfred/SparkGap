@@ -61,8 +61,9 @@ def main():
     ap.add_argument('--compose-procs', type=int, default=4)
     ap.add_argument('--seed', type=int, default=2026)
     a = ap.parse_args()
-    if a.n * a.spacing / 1000.0 > (a.hi - a.lo) * 0.8:
-        sys.exit('%d runners %g Hz apart do not fit in %g-%g kHz' % (a.n, a.spacing, a.lo, a.hi))
+    if a.n * a.spacing / 1000.0 > (a.hi - a.lo) * 0.7:        # random placement jams near 75%
+        sys.exit('%d runners %g Hz apart do not fit in %g-%g kHz (at most %d)' % (
+            a.n, a.spacing, a.lo, a.hi, int((a.hi - a.lo) * 0.7 * 1000 / a.spacing)))
     rng = random.Random(a.seed)
     cells_dir = os.path.join(a.out, 'cells')
     os.makedirs(cells_dir, exist_ok=True)
@@ -88,8 +89,12 @@ def main():
         list(ex.map(run, jobs))
     print('%d cells' % len(jobs), flush=True)
 
-    pos = []
+    pos, tries = [], 0
     while len(pos) < a.n:
+        tries += 1
+        if tries > 1000 * a.n:
+            sys.exit('placed %d of %d runners %g Hz apart in %g-%g kHz: widen the band or use fewer' % (
+                len(pos), a.n, a.spacing, a.lo, a.hi))
         p = rng.uniform(a.lo, a.hi)
         if all(abs(p - q) >= a.spacing / 1000.0 for q in pos):
             pos.append(p)

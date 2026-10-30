@@ -8,7 +8,7 @@
 #   e.g. tools/sim/run_capacity.sh dense/dense_7030kHz_192000_24bit.wav 7030 dense/dense.truth.json \
 #            my.json runs/cap600 '{"itila_max_bins": 600}'
 # CONFIG is your SparkGap config; the run gets its own copy with the proxy as the radio
-# (127.0.0.1:$PROXY_PORT, listening on $LISTEN_PORT), the two bands on 2 receivers, telnet on 17300/17301, recording
+# (127.0.0.1:$PROXY_PORT, listening on $LISTEN_PORT), the two bands on 2 receivers, telnet on 17300/17301, both recorders
 # and FT8 off, then OVERRIDES on top. Run it from the checkout. The proxy shares the computer, so for
 # CPU numbers it is fairest on a machine with a core to spare (it was on another host on #47).
 set -eu
@@ -31,7 +31,7 @@ src, dst, centre, quiet, pport, lport, ovr = sys.argv[1:]
 c = json.load(open(src))
 c.update(sdr_ip='127.0.0.1', sdr_port=int(pport), hpsdr_listen_port=int(lport), max_receivers=2,
          bands=[int(float(centre) * 1000), int(float(quiet) * 1000)],
-         telnet_port=17300, telnet_local_port=17301, enable_ft8=False, record_iq_dir='')
+         telnet_port=17300, telnet_local_port=17301, enable_ft8=False, record_iq_dir='', record_wav='')
 c.update(json.loads(ovr))
 json.dump(c, open(dst, 'w'), indent=1)
 PY
