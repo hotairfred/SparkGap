@@ -38,3 +38,20 @@ example the same cell at three levels, 18 kHz apart) put the same calls on sever
 frequencies at once, and SparkGap's handling of one call on several frequencies then
 decides which copies get spotted. That showed up as a false regression once. To test
 levels, use one scene per level.
+
+## Dense scenes and capacity runs
+
+`gen_dense.py` builds a CQ WW-class band: N runner cells, each with its own callers (no call twice
+on the band), placed at random at least 100 Hz apart, levels −70 to −45 dBFS over a −50 dBFS floor.
+The composer holds a whole scene's cells in memory, so they are composed in groups and summed.
+
+```
+tools/sim/gen_dense.py dense 400 --minutes 10 --lo 7000 --hi 7080     # dense/dense_7030kHz_192000_24bit.wav + dense.truth.json
+tools/sim/run_capacity.sh dense/dense_7030kHz_192000_24bit.wav 7030 dense/dense.truth.json my.json runs/cap600 '{"itila_max_bins": 600}'
+```
+
+`run_capacity.sh` replays the scene in real time through `hpsdr_proxy.py` to a SparkGap on the same
+computer, next to a quiet second band (the C receiver path, the live one, runs only with two bands or
+more), and prints the CPU after a 3 minute warm-up, the drops in the Health lines and the scene's score.
+400 runners for 10 minutes need about 12 GB with 4 compose processes. The 10-23
+and 10-29/30 capacity notes in hotairfred/SparkGap#47 used this scene.
