@@ -12,24 +12,28 @@ import flex_record  # noqa: E402
 
 class FakeRx:
     made = []
+    refuse = {}       # DAX-IQ channel -> the RuntimeError its start() raises
 
     def __init__(self, ip, **kw):
         self.kw = kw
+        self.stopped = False
         FakeRx.made.append(self)
 
     def start(self):
-        pass
+        err = FakeRx.refuse.get(self.kw['daxiq_channel'])
+        if err:
+            raise RuntimeError(err)
 
     def receive(self, cb, duration=None):
         cb(0, [0.0, 0.0] * 4)
 
     def stop(self):
-        pass
+        self.stopped = True
 
 
 @pytest.fixture
 def record(monkeypatch, tmp_path):
-    FakeRx.made = []
+    FakeRx.made, FakeRx.refuse = [], {}
     monkeypatch.setattr(flex_record, 'FlexIQReceiver', FakeRx)
 
     def run(*extra):
@@ -51,3 +55,24 @@ def test_the_receive_path_reaches_every_receiver(record, tmp_path) -> None:
 def test_left_out_the_radio_keeps_its_band_setting(record) -> None:
     kws = record()
     assert all(k['rxant'] is None and k['loopa'] is None and k['loopb'] is None for k in kws)
+
+
+def test_a_busy_channel_moves_on_to_the_next(record) -> None:
+    FakeRx.refuse = {1: "[Flex] DAX-IQ 1 is in use by SmartSDR on pan 0x40000000; ..."}
+    kws = record()
+    assert [k['daxiq_channel'] for k in kws] == [1, 2, 1, 3]   # each band: 1 is busy, so 2, then 3
+
+
+def test_a_refused_receive_path_stops_with_the_radio_s_reason(record) -> None:
+    FakeRx.refuse = {2: "[Flex] The radio refused rxant=ANT3 on slice 1"}
+    with pytest.raises(SystemExit, match="refused rxant=ANT3"):
+        record('--rxant', 'ANT3')
+    assert [k['daxiq_channel'] for k in (r.kw for r in FakeRx.made)] == [1, 2]   # no channel 3 or 4 tried
+    assert FakeRx.made[0].stopped                                                 # the first band let go
+
+
+def test_help_prints_usage_once(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(sys, 'argv', ['flex_record.py', '-h'])
+    with pytest.raises(SystemExit):
+        flex_record.main()
+    assert capsys.readouterr().out.lower().count('usage:') == 1

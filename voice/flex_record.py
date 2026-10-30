@@ -30,8 +30,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger('flex_record')
 
 
+def channel_taken(err):
+    """flex_iq's refusal of the DAX-IQ channel itself (another program holds it), as opposed to the pan,
+    the slice or the receive path, which are the same on every channel."""
+    msg = str(err)
+    return ('DAX-IQ' in msg and 'in use' in msg) or 'refused DAX-IQ channel' in msg
+
+
+def stop_all(rxs):
+    for rx in rxs:
+        rx.stop()
+
+
 def main():
-    ap = argparse.ArgumentParser(usage=__doc__)
+    ap = argparse.ArgumentParser(usage=argparse.SUPPRESS, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)   # the text has the usage
     ap.add_argument('radio')
     ap.add_argument('outdir')
     ap.add_argument('seconds', type=float)
@@ -54,8 +67,12 @@ def main():
                 rx.start()
                 break
             except RuntimeError as e:
+                if not channel_taken(e):          # a refused receive path, pan or slice: no other channel helps
+                    stop_all(rxs)
+                    raise SystemExit(str(e))
                 log.info('DAX-IQ %d not available (%s); trying the next', ch, e)
         else:
+            stop_all(rxs)
             raise SystemExit('no free DAX-IQ channel for %d Hz' % freq)
         used.add(ch)
         path = os.path.join(outdir, '%s_%dkHz_ch%d.cf32' % (stamp, freq // 1000, ch))
