@@ -210,18 +210,18 @@ typedef struct {
     double dl1_q[2*SC_FIR1_MAX];
     int    dl1_count;                  /* samples fed since last output */
 
-    /* FIR stage 2: 12k→2k (96 taps, complex I/Q, two paths) */
-    double dl2_100i[2*FIR_S2_100_LEN];
-    double dl2_100q[2*FIR_S2_100_LEN];
-    double dl2_200i[2*FIR_S2_200_LEN];
-    double dl2_200q[2*FIR_S2_200_LEN];
+    /* FIR stage 2: 12k→2k (complex I/Q, two paths); stage 2 and the Hann/wide filters run in float32 */
+    float  dl2_100i[2*FIR_S2_100_LEN];
+    float  dl2_100q[2*FIR_S2_100_LEN];
+    float  dl2_200i[2*FIR_S2_200_LEN];
+    float  dl2_200q[2*FIR_S2_200_LEN];
     int    dl2_count;
 
     /* Hann window on the 100 Hz path (2 kHz, complex I/Q) */
-    double dlh_i[2*SC_HANN_LEN];
-    double dlh_q[2*SC_HANN_LEN];
-    double dlw_i[2*SC_WIDE_LEN];         /* channel filter on the 200 Hz path */
-    double dlw_q[2*SC_WIDE_LEN];
+    float  dlh_i[2*SC_HANN_LEN];
+    float  dlh_q[2*SC_HANN_LEN];
+    float  dlw_i[2*SC_WIDE_LEN];         /* channel filter on the 200 Hz path */
+    float  dlw_q[2*SC_WIDE_LEN];
     int    dlw_count;
     int    dlh_count;
     int    need_preroll;               /* feed the pre-roll IQ on the next process_bins */
@@ -272,6 +272,7 @@ struct ItilaSc {
     double band_min_hz;
     double band_max_hz;
     double hann[SC_HANN_LEN];
+    float  hannf[SC_HANN_LEN], s2_100f[FIR_S2_100_LEN], s2_200f[FIR_S2_200_LEN], widef[SC_WIDE_LEN];  /* float32 taps */
     double *pre_i;             /* ring: last SC_PREROLL_SEC of IQ fed to the bins */
     double *pre_q;
     int     pre_len;
@@ -691,6 +692,15 @@ static double fir_dot(const double *dl, int pos, const double *h, int len)
     return acc;
 }
 
+static float fir_dotf(const float *dl, int pos, const float *h, int len)
+{
+    const float *x = dl + pos + len;
+    float acc = 0.0f;
+    for (int k = 0; k < len; k++)
+        acc += x[-k] * h[k];
+    return acc;
+}
+
 /* Stages 2 and 3 for one 12 kHz sample of a bin: FIR2 (100/200 Hz paths) to 2 kHz, Hann and
  * channel filter, envelope, FIR3 to 200 Hz.  Returns 1 when the envelope buffer was full. */
 HOT_CLONES static int bin_push_12k(const ItilaSc *sc, ScBin *b, double s1_i, double s1_q)
@@ -706,25 +716,25 @@ HOT_CLONES static int bin_push_12k(const ItilaSc *sc, ScBin *b, double s1_i, dou
 
     if (b->dl2_count % SC_DEC2 != 0) return 0;
     /* Output one 2k sample per path */
-    double s2_100i = fir_dot(b->dl2_100i, pos2_100, FIR_S2_100, FIR_S2_100_LEN);
-    double s2_100q = fir_dot(b->dl2_100q, pos2_100, FIR_S2_100, FIR_S2_100_LEN);
-    double s2_200i = fir_dot(b->dl2_200i, pos2_200, FIR_S2_200, FIR_S2_200_LEN);
-    double s2_200q = fir_dot(b->dl2_200q, pos2_200, FIR_S2_200, FIR_S2_200_LEN);
+    double s2_100i = fir_dotf(b->dl2_100i, pos2_100, sc->s2_100f, FIR_S2_100_LEN);
+    double s2_100q = fir_dotf(b->dl2_100q, pos2_100, sc->s2_100f, FIR_S2_100_LEN);
+    double s2_200i = fir_dotf(b->dl2_200i, pos2_200, sc->s2_200f, FIR_S2_200_LEN);
+    double s2_200q = fir_dotf(b->dl2_200q, pos2_200, sc->s2_200f, FIR_S2_200_LEN);
 
     /* Hann window on the 100 Hz path before the magnitude */
     int ph = b->dlh_count;
     b->dlh_i[ph] = b->dlh_i[ph + SC_HANN_LEN] = s2_100i;
     b->dlh_q[ph] = b->dlh_q[ph + SC_HANN_LEN] = s2_100q;
     if (++b->dlh_count == SC_HANN_LEN) b->dlh_count = 0;
-    s2_100i = fir_dot(b->dlh_i, ph, sc->hann, SC_HANN_LEN);
-    s2_100q = fir_dot(b->dlh_q, ph, sc->hann, SC_HANN_LEN);
+    s2_100i = fir_dotf(b->dlh_i, ph, sc->hannf, SC_HANN_LEN);
+    s2_100q = fir_dotf(b->dlh_q, ph, sc->hannf, SC_HANN_LEN);
 
     int pw = b->dlw_count;
     b->dlw_i[pw] = b->dlw_i[pw + SC_WIDE_LEN] = s2_200i;
     b->dlw_q[pw] = b->dlw_q[pw + SC_WIDE_LEN] = s2_200q;
     if (++b->dlw_count == SC_WIDE_LEN) b->dlw_count = 0;
-    s2_200i = fir_dot(b->dlw_i, pw, WIDE_TAPS, SC_WIDE_LEN);
-    s2_200q = fir_dot(b->dlw_q, pw, WIDE_TAPS, SC_WIDE_LEN);
+    s2_200i = fir_dotf(b->dlw_i, pw, sc->widef, SC_WIDE_LEN);
+    s2_200q = fir_dotf(b->dlw_q, pw, sc->widef, SC_WIDE_LEN);
     if (sc->afc) {      /* phase step and power of the wide path over this 200 Hz step */
         b->afc_re += s2_200i * b->afc_pi + s2_200q * b->afc_pq;
         b->afc_im += s2_200q * b->afc_pi - s2_200i * b->afc_pq;
@@ -1191,6 +1201,10 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     double sum = 0.0;
     for (int k = 0; k < SC_HANN_LEN; k++) { sc->hann[k] = 0.5 - 0.5 * cos(2.0 * M_PI * (k + 0.5) / SC_HANN_LEN); sum += sc->hann[k]; }
     for (int k = 0; k < SC_HANN_LEN; k++) sc->hann[k] /= sum;
+    for (int k = 0; k < SC_HANN_LEN; k++) sc->hannf[k] = (float)sc->hann[k];
+    for (int k = 0; k < FIR_S2_100_LEN; k++) sc->s2_100f[k] = (float)FIR_S2_100[k];
+    for (int k = 0; k < FIR_S2_200_LEN; k++) sc->s2_200f[k] = (float)FIR_S2_200[k];
+    for (int k = 0; k < SC_WIDE_LEN; k++) sc->widef[k] = (float)WIDE_TAPS[k];
 
     sc->scan_i = (double *)calloc(energy_win, sizeof(double));
     sc->scan_q = (double *)calloc(energy_win, sizeof(double));
