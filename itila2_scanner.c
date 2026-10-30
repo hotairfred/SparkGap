@@ -317,6 +317,7 @@ struct ItilaSc {
     /* Worker pool for process_bins (itila_sc_set_threads).  Bin k goes to
      * stripe k % n_threads; stripe 0 runs on the calling thread. */
     int      n_threads;
+    int      dec_threads;   /* itila_sc_set_decode_threads: bins decoded at once by decode_ready; 1 = serial */
     pthread_t workers[SC_MAX_THREADS];
     struct ScWorker { struct ItilaSc *sc; int stripe; uint64_t seen; } worker_arg[SC_MAX_THREADS];
     pthread_mutex_t pool_lock;
@@ -971,6 +972,19 @@ int itila_sc_set_threads(ItilaSc *sc, int n)
     return started;
 }
 
+/* itila2_parallel_decode: decode_ready decodes up to n bins at once (1, the default, is the serial
+ * loop).  Each bin's two paths stay on one thread, in order; separate bins share nothing (every decoder
+ * handle owns its state and result buffer).  Returns the count set. */
+int itila_sc_set_decode_threads(ItilaSc *sc, int n)
+{
+    if (n < 1) n = 1;
+    if (n > SC_MAX_THREADS) n = SC_MAX_THREADS;
+    pthread_mutex_lock(&sc->lock);
+    sc->dec_threads = n;
+    pthread_mutex_unlock(&sc->lock);
+    return n;
+}
+
 /* One path's first n power samples of a bin, NAN where none was kept. Caller holds sc->lock. */
 static void pow_take(const struct ScPow *pw, int path, int n, double *out)
 {
@@ -1100,6 +1114,7 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
     pthread_cond_init(&sc->pool_go, NULL);
     pthread_cond_init(&sc->pool_done, NULL);
     sc->n_threads = 1;
+    sc->dec_threads = 1;
     switch (sample_rate) {
     case 192000: sc->dec1 = 16; sc->fir1 = FIR1W_192K; sc->fir1_len = FIR1W_192K_LEN; break;
     case 96000:  sc->dec1 = 8;  sc->fir1 = FIR1W_96K;  sc->fir1_len = FIR1W_96K_LEN;  break;
@@ -1530,10 +1545,14 @@ typedef struct {
     double cost;     /* timing-cost confidence; 999.0 if no API available */
 } ScDecodeResult;
 
+static int decode_ready_parallel(ItilaSc *sc, int window_samples, ScDecodeResult *results, int max_results);
+
 int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
                            ScDecodeResult *results, int max_results) {
     if (!sc->dec_create || !sc->dec_feed) return 0;
     if (window_samples <= 0 || window_samples > SC_ENV_CAP) return 0;
+    if (sc->dec_threads > 1)
+        return decode_ready_parallel(sc, window_samples, results, max_results);
 
     /* Heap-allocated env-copy buffer.  VLA on stack would also work
      * (window_samples is typically 12000 -> 96 KB), but with up to 8
@@ -1656,6 +1675,146 @@ int itila_sc_decode_ready(ItilaSc *sc, int window_samples,
     pthread_mutex_unlock(&sc->lock);
     free(env_local);
     free(pow_local);
+    return n_results;
+}
+
+/* One ready window of one bin, decoded off the lock by decode_ready_parallel. */
+typedef struct {
+    ScBin  *b;
+    double  f_hz, snr, n0;
+    void   *h[2];
+    double *env[2], *pow[2];    /* this window's copies, taken under the lock */
+    char    text[2][256];
+    int     has[2], wpm[2];
+    double  cost[2], snr500[2];
+} ScDecJob;
+
+typedef struct {
+    ItilaSc  *sc;
+    ScDecJob *jobs;
+    int       n_jobs, next, win, use_pow;
+    double    ev_thresh;
+} ScDecRun;
+
+static void dec_job(const ScDecRun *r, ScDecJob *j)
+{
+    ItilaSc *sc = r->sc;
+    for (int p = 0; p < 2; p++) {
+        j->has[p] = 0;
+        if (!j->h[p]) continue;
+        const char *raw = r->use_pow
+            ? sc->dec_feed_pow(j->h[p], j->env[p], j->pow[p], r->win, j->f_hz / 1000.0, r->ev_thresh)
+            : sc->dec_feed(j->h[p], j->env[p], r->win, j->f_hz / 1000.0, r->ev_thresh);
+        j->snr500[p] = r->use_pow ? itila_sc_snr_from_power(sc->dec_get_mark_pow(j->h[p]), j->n0, p) : NAN;
+        j->cost[p] = sc->dec_get_last_cost ? sc->dec_get_last_cost(j->h[p]) : 999.0;
+        j->wpm[p] = (int)(sc->dec_get_wpm(j->h[p]) + 0.5);
+        if (!raw || !raw[0]) continue;
+        int len = strlen(raw);
+        if (len > 255) len = 255;
+        memcpy(j->text[p], raw, len);
+        j->text[p][len] = '\0';
+        while (len > 0 && (j->text[p][len-1] == ' ' || j->text[p][len-1] == '\n'))
+            j->text[p][--len] = '\0';
+        j->has[p] = len > 0;
+    }
+}
+
+static void *dec_run_worker(void *arg)
+{
+    ScDecRun *r = (ScDecRun *)arg;
+    int k;
+    while ((k = __atomic_fetch_add(&r->next, 1, __ATOMIC_RELAXED)) < r->n_jobs)
+        dec_job(r, &r->jobs[k]);
+    return NULL;
+}
+
+/* decode_ready with dec_threads > 1.  In rounds: under the lock take one ready window from each of up
+ * to DEC_JOBS bins (the copies the serial loop takes path by path), mark them in_decode, release the
+ * lock and decode them on dec_threads threads (the calling one included); then, locked again, post the
+ * results in bin order and shift each bin's envelope as the serial loop does.  A bin with more than one
+ * window waiting gets the next one in the next round. */
+#define DEC_JOBS 64
+static int decode_ready_parallel(ItilaSc *sc, int window_samples, ScDecodeResult *results, int max_results)
+{
+    const int win = window_samples;
+    ScDecJob *jobs = (ScDecJob *)calloc(DEC_JOBS, sizeof(ScDecJob));
+    double *buf = (double *)malloc((size_t)DEC_JOBS * 4 * win * sizeof(double));
+    if (!jobs || !buf) { free(jobs); free(buf); return 0; }
+    for (int k = 0; k < DEC_JOBS; k++)
+        for (int p = 0; p < 2; p++) {
+            jobs[k].env[p] = buf + ((size_t)k * 4 + p) * win;
+            jobs[k].pow[p] = buf + ((size_t)k * 4 + 2 + p) * win;
+        }
+    pthread_mutex_lock(&sc->lock);
+    const int use_pow = sc->pow && sc->dec_feed_pow && sc->dec_get_mark_pow;
+    int n_results = 0;
+    for (;;) {
+        int room = (max_results - n_results) / 2;       /* every job can post both paths */
+        if (room > DEC_JOBS) room = DEC_JOBS;
+        int nj = 0;
+        for (int bi = 0; bi < SC_MAX_BINS && nj < room; bi++) {
+            ScBin *b = &sc->bins[bi];
+            if (!b->active || b->env_n < win) continue;
+            if (!b->h100) b->h100 = sc->dec_create(200, 100.0);
+            if (!b->h200) b->h200 = sc->dec_create(200, 200.0);
+            ScDecJob *j = &jobs[nj++];
+            j->b = b;
+            j->f_hz = b->f_hz;
+            j->snr = b->snr_db;
+            j->n0 = sc->n0;
+            j->h[0] = b->h100;
+            j->h[1] = b->h200;
+            memcpy(j->env[0], b->env100, (size_t)win * sizeof(double));
+            memcpy(j->env[1], b->env200, (size_t)win * sizeof(double));
+            if (use_pow) {
+                pow_take(&sc->pow[bi], 0, win, j->pow[0]);
+                pow_take(&sc->pow[bi], 1, win, j->pow[1]);
+            }
+            b->in_decode = 1;      /* feed_iq's eviction skips it while we are unlocked */
+        }
+        if (!nj) break;
+        ScDecRun run = { sc, jobs, nj, 0, win, use_pow, sc->ev_thresh };
+        int nt = sc->dec_threads < nj ? sc->dec_threads : nj;
+        pthread_mutex_unlock(&sc->lock);
+        pthread_t th[SC_MAX_THREADS];
+        int started = 0;
+        for (int t = 1; t < nt; t++)
+            if (pthread_create(&th[started], NULL, dec_run_worker, &run) == 0) started++;
+        dec_run_worker(&run);
+        for (int t = 0; t < started; t++) pthread_join(th[t], NULL);
+        pthread_mutex_lock(&sc->lock);
+        for (int k = 0; k < nj; k++) {
+            ScDecJob *j = &jobs[k];
+            ScBin *b = j->b;
+            b->in_decode = 0;
+            if (!b->active) continue;
+            int r_first = n_results;
+            for (int p = 0; p < 2; p++) {
+                if (!j->has[p]) continue;
+                ScDecodeResult *r = &results[n_results++];
+                r->f_hz = j->f_hz;
+                r->snr = j->snr;
+                r->wpm = j->wpm[p];
+                r->snr500 = (float)j->snr500[p];
+                r->cost = j->cost[p];
+                memcpy(r->text, j->text[p], sizeof(r->text));
+            }
+            float shared = NAN;          /* as the serial loop: a path without a reading takes the other's */
+            for (int q = n_results - 1; q >= r_first; q--)
+                if (isfinite(results[q].snr500)) { shared = results[q].snr500; break; }
+            for (int q = r_first; q < n_results; q++)
+                if (!isfinite(results[q].snr500)) results[q].snr500 = shared;
+            int rem = b->env_n - win;
+            if (rem < 0) rem = 0;
+            memmove(b->env100, b->env100 + win, rem * sizeof(double));
+            if (sc->pow) pow_shift(&sc->pow[b - sc->bins], win);
+            memmove(b->env200, b->env200 + win, rem * sizeof(double));
+            b->env_n = rem;
+        }
+    }
+    pthread_mutex_unlock(&sc->lock);
+    free(jobs);
+    free(buf);
     return n_results;
 }
 
