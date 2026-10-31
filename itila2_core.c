@@ -21,6 +21,7 @@
 #include <ctype.h>
 #include <assert.h>
 #include <stdio.h>
+#include <pthread.h>
 /* Hot loops built twice, AVX2/FMA and baseline, chosen at load time: portable builds keep
  * running on older CPUs and get the native speed on newer ones (cdub89/SparkGap#19 A4). */
 #if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
@@ -1601,6 +1602,23 @@ static void free_scratch(itila_state_t *s) {
 
 static _Thread_local itila_state_t *tl_scratch;
 
+/* Each thread's scratch is freed when the thread exits (a decode pool's threads end with their scanner). */
+static pthread_key_t scratch_key, feed_pow_key;
+static pthread_once_t scratch_keys_once = PTHREAD_ONCE_INIT;
+static int scratch_keys_ok;     /* both keys made; otherwise a thread's scratch is not freed at exit, as before */
+static void scratch_release(void *p) { free_scratch((itila_state_t *)p); free(p); }
+static void scratch_keys_make(void)
+{
+    if (pthread_key_create(&scratch_key, scratch_release) != 0) return;
+    if (pthread_key_create(&feed_pow_key, free) != 0) { pthread_key_delete(scratch_key); return; }
+    scratch_keys_ok = 1;
+}
+static void scratch_keep(pthread_key_t *key, void *p)
+{
+    if (pthread_once(&scratch_keys_once, scratch_keys_make) == 0 && scratch_keys_ok)
+        pthread_setspecific(*key, p);   /* on failure: no cleanup at exit, the same as without a key */
+}
+
 static int bind_scratch(itila_state_t *st) {
     itila_state_t *s = tl_scratch;
     if (!s) {
@@ -1608,6 +1626,7 @@ static int bind_scratch(itila_state_t *st) {
         if (!s) return 0;
         if (!alloc_scratch(s)) { free_scratch(s); free(s); return 0; }
         tl_scratch = s;
+        scratch_keep(&scratch_key, s);
     }
     st->log_B = s->log_B; st->log_alpha = s->log_alpha; st->log_beta = s->log_beta;
     st->gamma = s->gamma; st->gamma_marg = s->gamma_marg; st->env_norm = s->env_norm;
@@ -2072,7 +2091,10 @@ const char* itila_feed_pow(itila_t h, const double *envelope, const double *pow,
 {
     static _Thread_local double *tl_feed_pow;     /* per thread, as the other scratch; only once used */
     itila_state_t *st = (itila_state_t*)h;
-    if (!tl_feed_pow) tl_feed_pow = (double*)malloc(MAX_ENV * sizeof(double));
+    if (!tl_feed_pow) {
+        tl_feed_pow = (double*)malloc(MAX_ENV * sizeof(double));
+        if (tl_feed_pow) scratch_keep(&feed_pow_key, tl_feed_pow);
+    }
     if (!st->carry_pow) st->carry_pow = (double*)calloc(CARRY_MAX, sizeof(double));
     if (!tl_feed_pow || !st->carry_pow) return itila_feed(h, envelope, n, freq_khz, ev_thresh);
     st->feed_pow = tl_feed_pow;

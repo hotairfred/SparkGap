@@ -1987,6 +1987,20 @@ def _select_decode_threads(n):
         log.info("ITILA decode threads: %d", n)
     return n
 
+_parallel_decode = False   # config itila2_parallel_decode: the C decode path decodes bins on the decode threads
+
+
+def _select_parallel_decode(on):
+    """Config key itila2_parallel_decode (default off): the itila2 scanner's C decode loop
+    (itila_sc_decode_ready) decodes up to itila_decode_threads bins at once instead of one after another,
+    so one busy band is not held to one core.  Needs itila_decode_threads > 1."""
+    global _parallel_decode
+    _parallel_decode = bool(on)
+    if _parallel_decode:
+        log.info("ITILA C decode: bins in parallel on the decode threads (itila2_parallel_decode)")
+    return _parallel_decode
+
+
 _snr_decoder = False   # config itila2_snr_decoder: spot SNR from the decoder's window (marks over spaces)
 
 def _select_snr_decoder(on):
@@ -2993,6 +3007,13 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
             lib.itila_sc_set_threads.argtypes = [_ct.c_void_p, _ct.c_int]
             n = lib.itila_sc_set_threads(_ct.c_void_p(h), _itila_decode_threads)
             log.info("ITILA scanner threads: %d", n)
+        if _parallel_decode and _itila_decode_threads > 1:
+            if hasattr(lib, 'itila_sc_set_decode_threads'):
+                lib.itila_sc_set_decode_threads.restype = _ct.c_int
+                lib.itila_sc_set_decode_threads.argtypes = [_ct.c_void_p, _ct.c_int]
+                lib.itila_sc_set_decode_threads(_ct.c_void_p(h), _itila_decode_threads)
+            else:
+                log.warning("itila2_parallel_decode: %s has no itila_sc_set_decode_threads; serial", _scanner_lib_path)
         if _snr_decoder and hasattr(lib, 'itila_sc_set_snr_marks'):
             lib.itila_sc_set_snr_marks.restype = _ct.c_int
             lib.itila_sc_set_snr_marks.argtypes = [_ct.c_void_p, _ct.c_int]
@@ -7619,6 +7640,7 @@ class SparkGap:
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
         _select_snr_decoder(self.cfg.get('itila2_snr_decoder', False))
         _select_afc(self.cfg.get('itila2_afc', False))
+        _select_parallel_decode(self.cfg.get('itila2_parallel_decode', False))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
             self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
             log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s%s",
@@ -9136,6 +9158,7 @@ def run_file_mode(args, config):
     _select_decode_threads(config.get('itila_decode_threads', 1))
     _select_snr_decoder(config.get('itila2_snr_decoder', False))
     _select_afc(config.get('itila2_afc', False))
+    _select_parallel_decode(config.get('itila2_parallel_decode', False))
     if _select_spot_rule(_spot_rule_name(config)):
         _trk = tracker
         _trk.spot_rule = _make_spot_rule(config, tracker)

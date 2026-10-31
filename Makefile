@@ -31,7 +31,7 @@ libitila.so: itila_core.c fb_core.c itila.h
 	    -o $@ itila_core.c fb_core.c -lm $(FASTMATH_CRT)
 
 libitila2.so: itila2_core.c fb_core.c itila.h
-	gcc -O3 $(ARCHFLAG) -ffast-math -shared -fPIC \
+	gcc -O3 $(ARCHFLAG) -ffast-math -shared -fPIC -pthread \
 	    -o $@ itila2_core.c fb_core.c -lm $(FASTMATH_CRT)
 
 libitila_dsp.so: itila_dsp.c itila_dsp.h
