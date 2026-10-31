@@ -21,6 +21,7 @@ const DECODER_OPTIONS = [
   ["spot_rule_doubled_calls", "Doubled calls", "A call sent twice in one CQ (CQ K8TLJ K8TLJ) counts as two copies. Used only while call validation is off; validation scores it itself."],
   ["spot_rule_split_up", "Split up", "TU <call> UP, a station working split, counts as a copy of that call."],
   ["spot_rule_runner_signs", "Runner signs", "Split DX that never sends CQ: KH8A UP or TU UP KH8A makes KH8A the runner of that frequency, and each window there holding KH8A counts as a copy. A call sent a report there (JH7ME 5NN) never counts."],
+  ["spot_rule_window_join", "Window join", "A CQ group cut by the window edge, CQ CQ DE at the end of one window and the call at the start of the next, is read as one: the tail of the previous window from its CQ is read in front of the next window of the same signal."],
   ["spot_rule_owner_cell", "Owner cell", "A new owner replaces only the owner within 0.25 kHz: a neighbour 0.5 kHz away keeps its frequency."],
   ["spot_rule_owned_two_windows", "Owned: two windows", "A call challenging a frequency another call owns needs copies in two windows."],
   ["spot_rule_owner_listed", "Owner listed", "One copy owns an empty frequency only when its call is on the known call list; a call with a prosign glued on (WB0MQAK) never owns one."],
