@@ -364,6 +364,14 @@ def runner_signs_of(text: str, gluek: bool = False) -> tuple[set[str], set[str]]
     return runners - worked, worked
 
 
+def has_runner_sign(text: str, gluek: bool = False) -> bool:
+    """A split runner is sending here: a runner sign (runner_signs_of) or a bare TU UP, the split
+    runner's sign-off (JH7ME 5NN TU UP). Bin liveness only: it names no call, so it spots nothing."""
+    toks = tokens(text, gluek)
+    return bool(runner_signs_of(text, gluek)[0]) or any(
+        a == "TU" and b == "UP" for a, b in zip(toks, toks[1:], strict=False))
+
+
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
                   cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,

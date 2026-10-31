@@ -35,3 +35,13 @@ def test_without_a_seat_list_only_scp_counts() -> None:
 def test_the_list_is_read_only_with_liveness_and_a_list_set() -> None:
     assert sparkgap._liveness_list({"spot_validation_calls": "rbn"}, object()) is None
     assert sparkgap._liveness_list({"itila2_bin_liveness": True}, object()) is None
+
+
+def test_a_split_runners_sign_keeps_its_bin_only_with_runner_signs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KH8A, 40m 10-31: split DX never sends CQ (cdub89/SparkGap#37)."""
+    raw = "I K3RA 5NN TU UP NE1Q 5NN K1ZZ TU UP"
+    assert not sparkgap._copies_known_runner(raw, SCP)
+    monkeypatch.setattr(sparkgap, "_liveness_runner_signs", True)
+    assert sparkgap._copies_known_runner(raw, SCP)
+    assert sparkgap._copies_known_runner("JH7ME 5NN OH7ME 5NN KH8A UP E", set())
+    assert not sparkgap._copies_known_runner("KH8A TP V BZO 5? TU S F", SCP)
