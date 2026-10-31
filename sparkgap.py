@@ -85,6 +85,7 @@ def _gui_settings(cfg, sample_rate):
         'spot_rule_cq_repeats': repeat and bool(cfg.get('spot_rule_cq_repeats', False)),
         'spot_rule_doubled_calls': repeat and bool(cfg.get('spot_rule_doubled_calls', False)),
         'spot_rule_split_up': repeat and bool(cfg.get('spot_rule_split_up', False)),
+        'spot_rule_runner_signs': repeat and bool(cfg.get('spot_rule_runner_signs', False)),
         'spot_rule_fragments': (cfg.get('spot_rule_fragments') or 'off') if repeat else 'off',
         'spot_rule_owner_cell': repeat and bool(cfg.get('spot_rule_owner_cell', False)),
         'spot_rule_owned_two_windows': repeat and bool(cfg.get('spot_rule_owned_two_windows', False)),
@@ -2114,7 +2115,8 @@ def _make_spot_rule(config, tracker, local=None):
         takeover_idle_s=(float(config['spot_rule_takeover_idle_s'])
                          if config.get('spot_rule_takeover_idle_s') is not None else None),
         owner_cell=bool(config.get('spot_rule_owner_cell', False)),
-        owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)))
+        owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)),
+        runner_signs=bool(config.get('spot_rule_runner_signs', False)))   # cdub89/SparkGap#37
 
 def _get_itila_lib():
     global _itila_lib
@@ -7573,8 +7575,9 @@ class SparkGap:
         _select_afc(self.cfg.get('itila2_afc', False))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
             self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
-            log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s",
-                     ", split runs" if self.tracker.spot_rule.split_runs else "")
+            log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s%s",
+                     ", split runs" if self.tracker.spot_rule.split_runs else "",
+                     ", runner signs" if self.tracker.spot_rule.runner_signs else "")
         # If the gate is configured (peers listed), start the peer-tee
         # threads regardless of whether the gate is currently on. The
         # support map is cheap to maintain and we want it warm if the
@@ -9084,8 +9087,9 @@ def run_file_mode(args, config):
     if _select_spot_rule(_spot_rule_name(config)):
         _trk = tracker
         _trk.spot_rule = _make_spot_rule(config, tracker)
-        log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s",
-                 ", split runs" if _trk.spot_rule.split_runs else "")
+        log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s%s",
+                 ", split runs" if _trk.spot_rule.split_runs else "",
+                 ", runner signs" if _trk.spot_rule.runner_signs else "")
         audio_now = [args.start_min * 60]
         _trk.clock = lambda: audio_now[0]      # repeats counted in audio time, as live
 

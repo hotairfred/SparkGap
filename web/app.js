@@ -20,6 +20,7 @@ const DECODER_OPTIONS = [
   ["spot_rule_cq_repeats", "CQ repeats", "Back-to-back CQs from one call count as separate copies, so a runner is spotted sooner."],
   ["spot_rule_doubled_calls", "Doubled calls", "A call sent twice in one CQ (CQ K8TLJ K8TLJ) counts as two copies. Used only while call validation is off; validation scores it itself."],
   ["spot_rule_split_up", "Split up", "TU <call> UP, a station working split, counts as a copy of that call."],
+  ["spot_rule_runner_signs", "Runner signs", "Split DX that never sends CQ: KH8A UP or TU UP KH8A makes KH8A the runner of that frequency, and each window there holding KH8A counts as a copy. A call sent a report there (JH7ME 5NN) never counts."],
   ["spot_rule_owner_cell", "Owner cell", "A new owner replaces only the owner within 0.25 kHz: a neighbour 0.5 kHz away keeps its frequency."],
   ["spot_rule_owned_two_windows", "Owned: two windows", "A call challenging a frequency another call owns needs copies in two windows."],
   ["spot_rule_owner_listed", "Owner listed", "One copy owns an empty frequency only when its call is on the known call list; a call with a prosign glued on (WB0MQAK) never owns one."],
@@ -88,6 +89,22 @@ const $ = id => document.getElementById(id);
 const now = () => Date.now() / 1000;
 const esc = s => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const baseCall = word => word.split("/").reduce((a, b) => (b.length > a.length ? b : a), "");
+const RUNNER_KEEP_S = 600;   // a split runner found by its sign labels its frequency this long (the spot rule's REPEAT_S)
+const NOISE_LETTERS = new Set(["E", "T", "I", "S", "?"]);
+
+// A split runner's call in one window: KH8A UP or TU UP KH8A (stray letters after UP allowed),
+// never a call sent a report (JH7ME 5NN). As spot_rule.runner_signs_of (cdub89/SparkGap#37).
+function runnerSign(text) {
+  const toks = text.split(/\s+/).filter(Boolean);
+  const worked = new Set(toks.filter((t, i) => /^[5E][9N][9N]$/.test(toks[i + 1] || "")));
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (!CALL_RE.test(baseCall(t)) || worked.has(t)) continue;
+    const before = toks.slice(Math.max(0, i - 4), i).filter(x => !NOISE_LETTERS.has(x));
+    if (toks[i + 1] === "UP" || before.slice(-2).join(" ") === "TU UP") return baseCall(t);
+  }
+  return "";
+}
 
 function load(key, fallback) {
   try { const v = localStorage.getItem(STORE + key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; }
@@ -110,6 +127,7 @@ class Instance {
     this.spots = new Map();    // call -> latest spot
     this.signals = new Map();  // khz -> latest window
     this.recent = new Map();   // khz -> last texts
+    this.runners = new Map();  // khz -> {call, utc}: a split runner found by its sign (runnerSign)
     this.heardList = [];
     this.selKhz = null;
     this.selCall = "";
@@ -212,7 +230,7 @@ class Instance {
       if (this.moved) { this.selKhz = null; this.selCall = null; this.lastPick = null; }
       this.hello = m;
       if (!this.bands[this.band]) this.band = 0;
-      this.windows = []; this.spots.clear(); this.signals.clear(); this.recent.clear();
+      this.windows = []; this.spots.clear(); this.signals.clear(); this.recent.clear(); this.runners.clear();
       this.on("hello");
     } else if (m.type === "snapshot") {
       for (const w of m.windows || []) this.addWindow(w);
@@ -263,6 +281,8 @@ class Instance {
     r.push(text);
     if (r.length > GUESS_WINDOWS) r.shift();
     this.recent.set(khz, r);
+    const runner = runnerSign(text);
+    if (runner) this.runners.set(khz, { call: runner, utc: now() });
   }
 
   onBinary(buf) {
@@ -325,6 +345,7 @@ class Instance {
     for (const [k, s] of this.signals) {
       if (t - s.utc > SIGNAL_KEEP_S) { this.signals.delete(k); this.recent.delete(k); changed = true; }
     }
+    for (const [k, r] of this.runners) if (t - r.utc > RUNNER_KEEP_S) this.runners.delete(k);
     if (changed) this.on("ladder");
   }
 
@@ -386,8 +407,13 @@ class Instance {
     return items.sort((a, b) => b.khz - a.khz);
   }
 
-  // the call-shaped word seen most often (at least twice) in khz's recent windows
+  // a split runner found near khz by its sign (KH8A UP), else the call-shaped word seen most
+  // often (at least twice) in khz's recent windows: a split DX sends each caller's call twice
   guessCall(khz) {
+    const t = now();
+    for (const [k, r] of this.runners) {
+      if (Math.abs(k - khz) <= DETAIL_MATCH_KHZ && t - r.utc <= RUNNER_KEEP_S) return r.call;
+    }
     const n = new Map();
     for (const [k, texts] of this.recent) {
       if (Math.abs(k - khz) > FREQ_MATCH_KHZ) continue;

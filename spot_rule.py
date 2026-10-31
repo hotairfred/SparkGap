@@ -49,6 +49,14 @@ Doubled calls (doubled; off by default): a call sent twice inside one CQ group
 (CQ K8TLJ K8TLJ, CQ CQ DE K8TLJ K8TLJ K) counts as two copies, so a common call spots on its
 first clean CQ. Needs cq_groups. Whether CW Skimmer counts this way, and whether RBN wants it,
 is open (hotairfred/SparkGap#43); on 7 recordings it added 101 calls, 89 confirmed.
+
+Runner signs (runner_signs; off by default; cdub89/SparkGap#37): split DX often never sends CQ
+(JH7ME 5NN TU UP KH8A UP). KH8A UP or TU UP KH8A makes KH8A the split runner of that frequency
+for REPEAT_S; each window there holding KH8A whole counts as a copy, as a CQ group would, even
+with its UP garbled (KH8A TP), so it spots on tier(call) such windows. A call sent a report
+near that frequency (JH7ME 5NN) never counts, and a station calling on the DX's frequency never
+gets a runner sign. TU <call> is no sign (in a contest the next caller follows TU at once). It
+adds copies only: it owns nothing.
 """
 
 import re
@@ -81,6 +89,7 @@ _STOP_WORDS = frozenset({"TU", "DE", "CQ", "TEST", "CWT", "SST", "MST", "QRZ", "
 _PROSIGNS = frozenset({"K", "AR", "KN", "BK", "SK", "TU", "EE", "DX", "UP", "NA", "GM", "GE", "GA",
                        "GN", "ES", "HW", "CL", "OK", "RR", "UR", "OP", "VY", "FB", "HI"})
 STRAY_MAX = 2                 # letters after a call that may be the rest of it
+UP_NOISE_MAX = 2              # runner_signs: stray letters allowed between TU UP and the call after it
 _NOISE_LETTERS = frozenset("ETIS?")                          # la1d: noise between CQ and the call
 _SIGNOFF = frozenset({"K", "AR", "KN", "SK", "BK", "TU"})    # la1d: ends the search for the sender
 
@@ -325,6 +334,28 @@ def _split_signoff(toks: list[str], i: int) -> int | None:
     return None
 
 
+def runner_signs_of(text: str, gluek: bool = False) -> tuple[set[str], set[str]]:
+    """Runner signs of one decoded text (runner_signs): the calls sent as a split runner, KH8A UP
+    or TU UP KH8A (stray letters after UP allowed: TU UP E KH8A; a bare UP before a call is
+    noise as often as not: G U? UP E KD2SC), and the calls sent a report,
+    JH7ME 5NN, which are the stations being worked and never the runner. A DX working split
+    never sends CQ: JH7ME 5NN TU UP KH8A UP. TU <call> is no sign: in a contest the next caller
+    follows the runner's TU at once (TU KK4E KK4E)."""
+    toks = tokens(text, gluek)
+    runners: set[str] = set()
+    worked: set[str] = set()
+    for i, t in enumerate(toks):
+        if CALL_RE.match(t) is None:
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        before = [x for x in toks[max(0, i - 2 - UP_NOISE_MAX):i] if x not in _NOISE_LETTERS]
+        if _RST_RE.match(nxt):
+            worked.add(t)
+        elif nxt == "UP" or before[-2:] == ["TU", "UP"]:
+            runners.add(t)
+    return runners - worked, worked
+
+
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
                   cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,
@@ -459,7 +490,7 @@ class RepeatSpotRule:
                  owned_two_windows: bool = False, lock_idle_s: float = LOCK_IDLE_S,
                  owner_listed: bool = False, la1d: bool = False, gluek: bool = False,
                  norival: bool = False, strongest_db: float | None = None,
-                 takeover_idle_s: float | None = None) -> None:
+                 takeover_idle_s: float | None = None, runner_signs: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -497,6 +528,9 @@ class RepeatSpotRule:
         self.gluek = gluek                      # tokens(): CALL+K reads as CALL K, see tokens()
         self.norival = norival                  # score(): no rival penalty for a listed call from an unlisted rival
         self.strongest_db = strongest_db        # a copy this many dB stronger elsewhere in the band: no spot here
+        self.runner_signs = runner_signs        # KH8A UP: KH8A runs here, see _runner_copies()
+        self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
+        self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
         self._copies: deque[_Copy] = deque()                    # oldest first
         self._seen: set[tuple[int, str, int]] = set()           # (window, call, nth) in _copies
@@ -534,6 +568,8 @@ class RepeatSpotRule:
                                    contest_words=self.contest_words, cq_repeats=self.cq_repeats,
                                    stray=self.stray, words=self.words, grid=self.grid,
                                    la1d=self.la1d, gluek=self.gluek))
+        if self.runner_signs:
+            calls = calls + self._runner_copies(window, freq_khz, text, now, calls)
         for call, n in Counter(calls).items():
             new = 0
             for nth in range(n):
@@ -697,11 +733,32 @@ class RepeatSpotRule:
                 self._own(owner, freq_khz, now)
         return calls
 
+    def _runner_copies(self, window: int, freq_khz: float, text: str, now: float,
+                       calls: list[str]) -> list[str]:
+        """runner_signs: calls this window counts as copies of without a CQ. A runner sign (KH8A UP)
+        makes the call the split runner near freq_khz for REPEAT_S; every window there holding
+        the call whole then counts, even with its UP garbled (KH8A TP). A call sent a report
+        near freq_khz never counts. The tier or the validation score still needs more windows."""
+        runners, worked = runner_signs_of(text, self.gluek)
+        self._worked.extend((now, c, freq_khz) for c in worked)
+        self._runners.extend((now, c, freq_khz) for c in runners)
+        near = {c for _, c, f in self._runners if abs(f - freq_khz) <= NEAR_KHZ}
+        out: list[str] = []
+        for c in tokens(text, self.gluek):
+            if (c in near and c not in calls and c not in out
+                    and not any(w == c and abs(f - freq_khz) <= NEAR_KHZ for _, w, f in self._worked)):
+                out.append(c)
+        return out
+
     def _expire(self, now: float) -> None:
         cutoff = now - REPEAT_S
         while self._copies and self._copies[0].time < cutoff:
             c = self._copies.popleft()
             self._seen.discard((c.window, c.call, c.nth))
+        while self._worked and self._worked[0][0] < cutoff:
+            self._worked.popleft()
+        while self._runners and self._runners[0][0] < cutoff:
+            self._runners.popleft()
         if now - self._pruned >= 60.0:
             self._pruned = now
             self._last_spot = {k: v for k, v in self._last_spot.items() if v[0] >= cutoff}

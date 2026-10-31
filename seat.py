@@ -47,6 +47,7 @@ OPTION_FLAGS = (
     "spot_rule_cq_repeats",
     "spot_rule_doubled_calls",
     "spot_rule_split_up",
+    "spot_rule_runner_signs",
     "spot_rule_owner_cell",
     "spot_rule_owned_two_windows",
     "spot_rule_owner_listed",
