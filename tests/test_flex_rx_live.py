@@ -6,7 +6,7 @@ import threading
 import pytest
 
 import flex_iq
-from flex_iq import FlexIQReceiver, pan_rx, radio_loops, rfgain_steps, slice_letter
+from flex_iq import FlexIQReceiver, pan_center, pan_rx, radio_loops, rfgain_steps, slice_letter
 from tests.flex_fake_radio import FakeConnection, FakeRadio, use_fake_radio
 
 Monkey = pytest.MonkeyPatch
@@ -218,3 +218,54 @@ def test_after_a_change_the_target_is_what_the_radio_reported(monkeypatch: Monke
     monkeypatch.setattr(radio, "run", run)
     assert rx.set_rx({"rfgain": 24}) == "receive path rfgain=8"
     assert rx.rx["rfgain"] == 8 and rx._target["rfgain"] == 8
+
+
+def test_pan_center_reads_only_our_pan_and_the_last_report() -> None:
+    lines = [
+        "S0|display pan 0x40000001 center=7.040000 rxant=ANT1",
+        "S0|display pan 0x40000000 center=14.044000 rxant=ANT1",
+        "S0|display pan 0x40000000 rxant=ANT2",
+        "S0|display pan 0x40000000 center=14.055000",
+    ]
+    assert pan_center(lines, PAN) == 14.055
+    assert pan_center(lines[:1], PAN) is None
+
+
+def test_our_pan_at_our_centre_stays_live(monkeypatch: Monkey) -> None:
+    radio, rx = _live(monkeypatch)
+    conn = rx.conn
+    assert isinstance(conn, FakeConnection)
+    conn.queue.append(radio.pan_line(PAN))
+    rx._poll()
+    assert rx.state == "live"
+
+
+def test_a_pan_moved_by_another_client_halts(monkeypatch: Monkey) -> None:
+    radio, rx = _live(monkeypatch)
+    conn = rx.conn
+    assert isinstance(conn, FakeConnection)
+    radio.pans[PAN].center = 14.055
+    conn.queue.append(radio.pan_line(PAN))
+    rx._poll()
+    assert rx.state == "halted" and not radio.pans
+
+
+def test_our_own_retune_does_not_trip_the_guard(monkeypatch: Monkey) -> None:
+    radio, rx = _live(monkeypatch)
+    rx.retune(7_040_000)
+    conn = rx.conn
+    assert isinstance(conn, FakeConnection) and rx._pan_id is not None
+    conn.queue.append(radio.pan_line(rx._pan_id))  # the radio's report of our move, read late
+    rx._poll()
+    assert rx.state == "live" and radio.pans[rx._pan_id].center == pytest.approx(7.04)
+
+
+def test_a_move_right_after_our_retune_still_halts(monkeypatch: Monkey) -> None:
+    radio, rx = _live(monkeypatch)
+    rx.retune(7_040_000)
+    conn = rx.conn
+    assert isinstance(conn, FakeConnection) and rx._pan_id is not None
+    radio.pans[rx._pan_id].center = 7.040002  # 2 Hz, inside the old settle window
+    conn.queue.append(radio.pan_line(rx._pan_id))
+    rx._poll()
+    assert rx.state == "halted"

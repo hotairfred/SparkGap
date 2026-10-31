@@ -66,6 +66,7 @@ STATION_TAKEOVER_S = 10     # times the DAX-IQ channel: a copy waits this long f
 STATION_POLL_S = 10
 LIVE_LOCK_WAIT_S = 2.0      # a live change waits this long for the receiver; a recovery holds it longer
 RETUNE_SETTLE_S = 0.5       # IQ dropped this long after a retune's replies: still the old frequency
+PAN_MOVED_MHZ = 0.5e-6      # our pan's reported centre further than this (0.5 Hz; it reports 1 Hz) from ours: moved by someone else
 TX_STATES = ('PTT_REQUESTED', 'TRANSMITTING', 'UNKEY_REQUESTED')  # the radio's interlock while keyed
 TX_HOLD_S = 0.1             # after key-up (READY/RECEIVE): bridges the shortest gaps between words of an over
 TX_SPANS_KEPT = 64
@@ -294,6 +295,13 @@ def pan_rx(lines, pan_id, out=None, loops=('loopa', 'loopb')):
         if 'ant_list' in kv:
             out['ant_list'] = [a for a in kv['ant_list'].split(',') if a]
     return out
+
+
+def pan_center(lines, pan_id):
+    """The last centre (MHz) the radio reported for panadapter pan_id in these lines, or None."""
+    tag = re.compile(r'\|display pan 0x0*%x .*\bcenter=([0-9.]+)' % pan_id, re.I)
+    found = [float(m.group(1)) for line in lines for m in [tag.search(line)] if m]
+    return found[-1] if found else None
 
 
 def rfgain_steps(reply):
@@ -1126,6 +1134,12 @@ class FlexIQReceiver:
             self.slice_letter = slice_letter(lines, self._slice_id) or self.slice_letter
         if self._pan_id is not None:
             self._note_rx(pan_rx(lines, self._pan_id, self.rx, self.loops))
+            centre = pan_center(lines, self._pan_id)
+            # our own retune holds this lock and updates freq_mhz before _poll can read again
+            if centre is not None and self.state == "live" and abs(centre - self.freq_mhz) > PAN_MOVED_MHZ:
+                log.warning("[Flex] Our pan was moved to %.6f MHz (ours %.6f) by another client", centre, self.freq_mhz)
+                self._halt("pan moved to %.6f MHz by another client: its spots would carry the wrong frequency" % centre)
+                return lines
         if ptt_ours(lines) and not self._ptt_warned:
             self._ptt_warned = True
             log.warning("[Flex] The radio's key and PTT jacks now follow the SparkGap station, "
