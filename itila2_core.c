@@ -924,11 +924,16 @@ static double fit_unit(const run_t *runs, int n_runs, double unit_in, int *fitte
         double floor_len = pass == 0 ? UNIT_FIT_NOISE_FRAC * median : unit_samples(WPM_MAX);
         if (floor_len < unit_samples(WPM_MAX)) floor_len = unit_samples(WPM_MAX);
         double x[2048];
-        int n_surv = 0;
+        int n_surv = 0, n_dropped = 0;
         for (int i = 0; i < n_marks; i++) {
-            if (d[i] < floor_len) continue;
+            if (d[i] < floor_len) { n_dropped += d[i] >= unit_samples(WPM_MAX); continue; }
             x[n_surv++] = log(d[i]);
         }
+        /* When pass 0 drops a quarter or more of the marks as noise although each is at least a
+         * 35 WPM dit long, they are the dits and the median is a dah (CWT N1DE: dits 7 to 8
+         * samples, dahs 21, more dahs than dits): fit on every legal mark instead.  40m CWT
+         * 2026-10-08: 369 of 2,318 bad fits corrected, none made worse (cdub89/SparkGap#30 NW6). */
+        if (pass == 0 && n_dropped >= 2 && n_dropped * 4 >= n_marks) continue;
 
         if (n_surv < UNIT_FIT_MIN_MARKS) continue;
 
