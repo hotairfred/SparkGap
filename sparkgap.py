@@ -2034,7 +2034,7 @@ _liveness_runner_signs = False   # spot_rule_runner_signs: a split runner's sign
 
 def _select_bin_liveness(on, listed=None, runner_signs=False):
     """Config key itila2_bin_liveness (default off): mark the scanner bin live (itila_sc_mark_evidence)
-    when a decoded window has an SCP call next to CQ/TEST.  The scanner evicts any bin with no evidence
+    when a decoded window has an SCP call next to CQ/TEST or right after DE.  The scanner evicts any bin with no evidence
     for 300 s, and on the spot-rule paths nothing else marks it, so without this every bin, a steady
     runner's too, is evicted and respawned every 5 minutes (its audio until the respawn is lost and its
     decoders start over).  A bare decode is not evidence: noise windows score low costs too (4df58f5)."""
@@ -2043,7 +2043,7 @@ def _select_bin_liveness(on, listed=None, runner_signs=False):
     _liveness_listed = listed if _bin_liveness else None
     _liveness_runner_signs = _bin_liveness and bool(runner_signs)
     if _bin_liveness:
-        log.info("ITILA bins: a known CQ call keeps its bin (itila2_bin_liveness)%s%s",
+        log.info("ITILA bins: a known CQ call or a known call after DE keeps its bin (itila2_bin_liveness)%s%s",
                  " (MASTER.SCP, add_calls and the spot_validation_calls list)" if listed else "",
                  "; so does a split runner's sign (KH8A UP, TU UP)" if _liveness_runner_signs else "")
     return _bin_liveness
@@ -2059,19 +2059,26 @@ def _liveness_list(config, tracker):
 def _copies_known_runner(raw, valid_calls):
     """True when `raw` has a call next to CQ/TEST that is known: in valid_calls (MASTER.SCP + add_calls),
     by itself or by its base call (W1AW/8 as W1AW), or on the seat's spot_validation_calls list.
-    With spot_rule_runner_signs, also a split runner's sign (KH8A UP, TU UP), which never sends CQ."""
+    With spot_rule_runner_signs, also a split runner's sign (KH8A UP, TU UP), which never sends CQ.
+    Also a known call right after DE: an over between two operators (KQ4MHE DE SM5COP)."""
     if _liveness_runner_signs:
         from spot_rule import has_runner_sign
         if has_runner_sign(raw):
             return True
     if not valid_calls and not _liveness_listed:
         return False
+
+    def known(call):
+        if valid_calls and (call in valid_calls or max(call.split('/'), key=len) in valid_calls):
+            return True
+        return bool(_liveness_listed and _liveness_listed(call))
+
     call = _itila_extract_cq_call(raw, valid_calls)
-    if not call:
-        return False
-    if valid_calls and (call in valid_calls or max(call.split('/'), key=len) in valid_calls):
+    if call and known(call):
         return True
-    return bool(_liveness_listed and _liveness_listed(call))
+    from spot_rule import CALL_RE, tokens
+    toks = tokens(raw)
+    return any(a == 'DE' and CALL_RE.match(b) and known(b) for a, b in zip(toks, toks[1:]))
 
 
 _SPOT_RULES = ('off', 'repeat')

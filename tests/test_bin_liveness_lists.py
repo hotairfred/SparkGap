@@ -45,3 +45,19 @@ def test_a_split_runners_sign_keeps_its_bin_only_with_runner_signs(monkeypatch: 
     assert sparkgap._copies_known_runner(raw, SCP)
     assert sparkgap._copies_known_runner("JH7ME 5NN OH7ME 5NN KH8A UP E", set())
     assert not sparkgap._copies_known_runner("KH8A TP V BZO 5? TU S F", SCP)
+
+
+@pytest.mark.parametrize("raw, live", [
+    ("KQ4MHE DE K1ABC 579 579 NAME RUNE", True),   # SM5COP, 15m 10-31: an over in a ragchew
+    ("TU DE W1AW/8 K", True),                      # a portable by its base call
+    ("R R DE E E 5NN", False),                     # DE before noise
+    ("KQ4MHE DE N9ZZZ 579", False),                # an unknown call after DE
+    ("K1ABC 599 OH TU", False),                    # a known call with no DE, CQ or TEST
+])
+def test_a_known_call_after_de_keeps_its_bin(raw: str, live: bool) -> None:
+    assert sparkgap._copies_known_runner(raw, SCP) is live
+
+
+@pytest.mark.usefixtures("listed")
+def test_a_listed_call_after_de_keeps_its_bin() -> None:
+    assert sparkgap._copies_known_runner("W1AW DE N0RBN 559 TU", SCP)
