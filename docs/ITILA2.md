@@ -13,7 +13,8 @@ Status: the decoder, scanner and spot rule (`spot_rule: repeat`, the default wit
 | | `itila` | `itila_core.c` + `itila_scanner.c`, Fred's chain, unchanged |
 | `spot_rule` | `off` (default with `itila`) | the original spot path (`_itila_extract_cq_call`, `SpotTracker.process`) |
 | | `repeat` (default with `itila2`) | `spot_rule.py`: whole decode windows go to `RepeatSpotRule` |
-| `spot_rule_split_runs` | `false` (default) | with `spot_rule: repeat`, words run together with no gap are split before rule 1 (`CQCQDE` -> `CQ CQ DE`) |
+| `spot_rule_split_runs` | `false` (default) | with `spot_rule: repeat`, words run together with no gap are split before rule 1 (`CQCQDE` -> `CQ CQ DE`; after a CQ word, `CQ POTADEW3RA` -> `CQ POTA DE W3RA`) |
+| `spot_rule_de_rejoin` | `false` (default) | with `spot_rule_split_runs`, letters run into DE join the call after them: `CQ POTADEW D9DWX` -> `CQ POTA DE WD9DWX` |
 | `spot_rule_fragments` | off (default) | with `spot_rule: repeat`, a call 2-4 characters shorter than a longer call heard near the same frequency, and contained in it (K1V of K1VUT), waits: `even` (suggested) while the longer call has as many copies, `any` while it has any; add `stray` to give no copy to `TEST K1V U T`. Delays, never adds spots; `rtty_spot_rule_fragments` is the same for the RTTY rule |
 | `spot_validation` | off (default) | with `spot_rule: repeat`, `permissive`, `normal` or `aggressive`: a confidence score replaces rules 2 and 3 (see below) |
 | `spot_validation_calls` | off (default) | with `spot_validation`, a call list adds to the score: `scp` (MASTER.SCP), `rbn` (RBN known calls, `rbn_known.py`) or `rbn+skcc` (those and SKCC member calls, `skcc_roster.py`) |

@@ -168,15 +168,41 @@ def _split_merged(tok: str) -> list[str]:
     return out
 
 
-def split_runs(text: str) -> str:
+def _de_rejoin(u: str, prev: str | None, nxt: str) -> list[str] | None:
+    """de_rejoin: a word ending DE plus one or two letters that are not a call, followed by the
+    rest of the call: CQ POTADEW D9DWX -> CQ POTA DE WD9DWX (the gap fell inside the call)."""
+    for k in (1, 2):
+        head, lead = u[:-k], u[-k:]
+        if not (lead.isalpha() and head.endswith("DE")) or not CALL_RE.match(lead + nxt):
+            continue
+        parts = _split_run_together(head, prev)
+        if parts and parts[-1] == "DE" and (len(parts) > 1 or prev in KEYWORDS):
+            return parts + [lead + nxt]
+    return None
+
+
+def split_runs(text: str, de_rejoin: bool = False) -> str:
     """Text with words run together split apart (spot_rule_split_runs): hand-sent CW often
-    drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA. A word is split only
-    when the whole of it reads as keywords, an event tag and a call; anything else is kept."""
-    out = []
-    for w in text.split():
+    drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA, and after a CQ or
+    TEST word CQ POTADEW3RA -> CQ POTA DE W3RA. A word is split only when the whole of it reads
+    as keywords, an event tag and a call; anything else is kept. de_rejoin (spot_rule_de_rejoin):
+    see _de_rejoin."""
+    out: list[str] = []
+    words = text.split()
+    i = 0
+    while i < len(words):
+        w = words[i]
         u = w.upper()
-        parts = None if CALL_RE.match(u) else _split_run_together(u, None)
+        prev = out[-1].upper() if out and out[-1].upper() in KEYWORDS else None
+        if de_rejoin and i + 1 < len(words) and not CALL_RE.match(u):
+            joined = _de_rejoin(u, prev, words[i + 1].upper())
+            if joined:
+                out.extend(joined)
+                i += 2
+                continue
+        parts = None if CALL_RE.match(u) else _split_run_together(u, prev)
         out.extend(parts if parts and len(parts) > 1 else [w])
+        i += 1
     return " ".join(out)
 
 
@@ -507,7 +533,7 @@ class RepeatSpotRule:
                  owner_listed: bool = False, la1d: bool = False, gluek: bool = False,
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
-                 window_join: bool = False) -> None:
+                 window_join: bool = False, de_rejoin: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -522,6 +548,7 @@ class RepeatSpotRule:
         self.cq_groups = cq_groups
         self.lockon = lockon
         self.split_runs = split_runs
+        self.de_rejoin = split_runs and de_rejoin  # CQ POTADEW D9DWX reads CQ POTA DE WD9DWX
         self.cq_qualifiers = cq_qualifiers
         self.doubled = doubled and validation is None           # validation scores a doubled call itself
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
@@ -577,7 +604,7 @@ class RepeatSpotRule:
         self._expire(now)
         owned = self.owner(freq_khz, now, self.takeover_idle_s) if self.owned_two_windows else None
         if self.split_runs:
-            text = split_runs(text)
+            text = split_runs(text, self.de_rejoin)
         if self.window_join:
             text = self._joined(window, freq_khz, text, now)
         if self.threshold is not None:

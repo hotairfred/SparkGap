@@ -16,6 +16,7 @@ const CALL_SOURCES = [["scp", "SCP"], ["rbn", "RBN"], ["rbn+skcc", "RBN + SKCC"]
 // Decoder Options: [config key, label, hint, values ([value, label]; none: on/off)]; null is off
 const DECODER_OPTIONS = [
   ["spot_rule_split_runs", "Split runs", "Words sent with no gap are split before the rule reads them: CQCQDE becomes CQ CQ DE (hand-sent CW)."],
+  ["spot_rule_de_rejoin", "DE rejoin", "With Split runs: letters run into DE belong to the call after them when the gap fell inside the call: CQ POTADEW D9DWX becomes CQ POTA DE WD9DWX."],
   ["spot_rule_contest_words", "Contest words", "CWT, SST or MST right before a call opens a CQ group as CQ does: runners who send CWT K5AX without the CQ."],
   ["spot_rule_cq_repeats", "CQ repeats", "Back-to-back CQs from one call count as separate copies, so a runner is spotted sooner."],
   ["spot_rule_doubled_calls", "Doubled calls", "A call sent twice in one CQ (CQ K8TLJ K8TLJ) counts as two copies. Used only while call validation is off; validation scores it itself."],
