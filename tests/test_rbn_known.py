@@ -1,13 +1,14 @@
 """RBN known calls (rbn_known.py): counts per day, own spotter left out, cache, missing days."""
 
 import io
+import threading
 import urllib.error
 import zipfile
 from datetime import date
 from email.message import Message
 from pathlib import Path
 
-from rbn_known import base_call, day_counts, known_calls, refresh, spotter
+from rbn_known import _write, base_call, day_counts, known_calls, refresh, spotter
 
 HEADER = "callsign,de_pfx,de_cont,freq,band,dx,dx_pfx,dx_cont,mode,db,date,speed,tx_mode\n"
 
@@ -114,3 +115,28 @@ def test_refresh_stops_when_rbn_refuses_and_skips_a_truncated_day(tmp_path: Path
     assert refresh(tmp_path, "WX7V", today=date(2026, 10, 14), fetch=refusing,
                    sleep=_nap) == set()
     assert fetched == [date(2026, 10, 13), date(2026, 10, 12)]   # stops at the refusal
+
+
+def test_two_writers_sharing_the_cache_never_collide(tmp_path: Path) -> None:
+    """Two SparkGap copies refreshing one rbn_known_dir at once (two replays started together)."""
+    path = tmp_path / "rbn_known.txt"
+    texts = ("A\t1\n" * 500, "B\t2\n" * 500)
+    errors: list[BaseException] = []
+    start = threading.Barrier(2)
+
+    def writer(text: str) -> None:
+        start.wait()
+        try:
+            for _ in range(300):
+                _write(path, text)
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(t,)) for t in texts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert path.read_text() in texts
+    assert [p.name for p in tmp_path.iterdir()] == ["rbn_known.txt"]

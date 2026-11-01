@@ -7,6 +7,8 @@ the cached copy is used.
 """
 
 import logging
+import os
+import tempfile
 import time
 import urllib.request
 from collections.abc import Callable
@@ -36,6 +38,19 @@ def _fetch() -> bytes:
         return resp.read()
 
 
+def _write(path: Path, text: str) -> None:
+    """Write through a temp file of this writer's own: copies sharing the cache never collide."""
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        tmp.replace(path)                 # a crash mid-write never leaves a short roster
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def refresh(cache_dir: Path, fetch: Callable[[], bytes] = _fetch,
             now: Callable[[], float] = time.time) -> set[str]:
     """Member calls, from a roster fetched at most once a day; the cache when offline."""
@@ -46,9 +61,7 @@ def refresh(cache_dir: Path, fetch: Callable[[], bytes] = _fetch,
             data = fetch().decode("utf-8", errors="replace")
             if not data.startswith("SKCCNR|CALL|"):
                 raise ValueError("not an SKCC roster")
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(data)
-            tmp.replace(path)
+            _write(path, data)
         except Exception as e:                   # offline, refused, truncated or not a roster
             log.warning("skcc_roster: no roster download (%r); using the cache", e)
     calls = member_calls(path.read_text(errors="replace")) if path.exists() else set()
