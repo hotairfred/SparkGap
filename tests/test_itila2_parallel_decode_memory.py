@@ -7,7 +7,8 @@ import pytest
 
 from tests.test_itila2_parallel_decode import DEC, SC, _run
 
-GROWTH_MB_MAX = 4.0   # over four runs after warm-up; the leak guarded against grew 13 MB per run
+GROWTH_MB_MAX = 16.0  # over four runs after warm-up; the leak guarded against grew 13 MB per run (52 MB here).
+# 4 MB was too tight inside the full suite on CI's 3.12 runner (+4.6 MB twice, flat on its own: +0.3 MB in 12 runs)
 
 
 def _rss_mb() -> float:
