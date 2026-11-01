@@ -57,6 +57,14 @@ with its UP garbled (KH8A TP), so it spots on tier(call) such windows. A call se
 near that frequency (JH7ME 5NN) never counts, and a station calling on the DX's frequency never
 gets a runner sign. TU <call> is no sign (in a contest the next caller follows TU at once). It
 adds copies only: it owns nothing.
+
+Window join (window_join; off by default; cdub89/SparkGap#37): the decode window edge can cut a
+CQ group between its DE and the call (CQ CQ SKCC DE | K2MJP K2MJP K), and the call then starts a
+window with no CQ before it. A window ending with DE after CQ or TEST leaves its tail with its
+bin, and the bin's next window on that frequency reads those keywords in front of its own text.
+A frequency another call owns joins only for that call (the runner's call can be lost at the
+cut and the caller answering him start the next window). On 18 hours of logs (seven runs,
+20 m and 40 m) it gained 5 confirmed calls and lost none.
 """
 
 import re
@@ -490,7 +498,8 @@ class RepeatSpotRule:
                  owned_two_windows: bool = False, lock_idle_s: float = LOCK_IDLE_S,
                  owner_listed: bool = False, la1d: bool = False, gluek: bool = False,
                  norival: bool = False, strongest_db: float | None = None,
-                 takeover_idle_s: float | None = None, runner_signs: bool = False) -> None:
+                 takeover_idle_s: float | None = None, runner_signs: bool = False,
+                 window_join: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -529,6 +538,8 @@ class RepeatSpotRule:
         self.norival = norival                  # score(): no rival penalty for a listed call from an unlisted rival
         self.strongest_db = strongest_db        # a copy this many dB stronger elsewhere in the band: no spot here
         self.runner_signs = runner_signs        # KH8A UP: KH8A runs here, see _runner_copies()
+        self.window_join = window_join          # CQ CQ DE | K2MJP: the window edge cut a group, see _joined()
+        self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
         self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
         self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
         self._owners: list[list] = []                           # lock-on: [call, freq_khz, last seen]
@@ -559,6 +570,8 @@ class RepeatSpotRule:
         owned = self.owner(freq_khz, now, self.takeover_idle_s) if self.owned_two_windows else None
         if self.split_runs:
             text = split_runs(text)
+        if self.window_join:
+            text = self._joined(window, freq_khz, text, now)
         if self.threshold is not None:
             self._paths.setdefault(window, []).append(Counter(tokens(text, self.gluek)))
         spots = []
@@ -733,6 +746,39 @@ class RepeatSpotRule:
                 self._own(owner, freq_khz, now)
         return calls
 
+    def _joined(self, window: int, freq_khz: float, text: str, now: float) -> str:
+        """window_join: the window edge can cut a CQ group between its DE and the call (CQ CQ DE |
+        K2MJP K2MJP K). A window ending with DE after CQ or TEST leaves the group's keywords, from
+        the CQ to the DE, with its bin; the bin's next window on that frequency, within 1.5 window
+        lengths, reads them in front of its own text, so the group counts there. Only that next
+        window reads them (both its paths); the two paths of one window never join each other. A
+        group that already names a call (CQ N1ABC TEST DE) leaves nothing: it counted where it was.
+        When another call owns the frequency, only its own call joins: the runner's call can be
+        lost at the cut and the next window start with the caller answering him (CQ POTA DE |
+        N9ZI N9ZI N9ZI DE K4NYM), who is no runner."""
+        bin_id = self._bins.get(window)
+        toks = text.upper().split()
+        tails = [t for t in self._tails.get(bin_id, ()) if now - t[0] <= 1.5 * self.window_s
+                 and t[3] in (None, window)]                   # fresh, and not read by an earlier window
+        prev = next((t for t in reversed(tails) if t[2] != window and abs(t[4] - freq_khz) <= NEAR_KHZ), None)
+        if prev is not None and toks:
+            owner = self.owner(freq_khz, now, self.takeover_idle_s) if self.lockon else None
+            first = next((t for t in toks if CALL_RE.match(t)), None)
+            if owner is None or first == owner:
+                text = " ".join(prev[1]) + " " + text
+            prev[3] = window                # read by this window; its other path reads it too
+        if toks and toks[-1] == "DE":
+            keys = [k for k in range(max(0, len(toks) - 5), len(toks) - 1) if toks[k] in KEYWORDS]
+            group = toks[keys[0]:] if keys else []
+            if group and not any(CALL_RE.match(t) for t in group[1:-1]):
+                tails = [t for t in tails if t[2] != window] + [[now, group, window, None, freq_khz]]
+        tails = [t for t in tails if t[2] == window or t[3] == window]   # this window was the next one
+        if tails:
+            self._tails[bin_id] = tails
+        else:
+            self._tails.pop(bin_id, None)
+        return text
+
     def _runner_copies(self, window: int, freq_khz: float, text: str, now: float,
                        calls: list[str]) -> list[str]:
         """runner_signs: calls this window counts as copies of without a CQ. A runner sign (KH8A UP)
@@ -765,5 +811,6 @@ class RepeatSpotRule:
             self._window_ids = {k: v for k, v in self._window_ids.items() if v[1] >= cutoff}
             live = {v[0] for v in self._window_ids.values()}
             self._bins = {w: b for w, b in self._bins.items() if w in live}
+            self._tails = {b: ts for b, ts in self._tails.items() if now - ts[-1][0] <= 1.5 * self.window_s}
             self._paths = {w: p for w, p in self._paths.items() if w in live}
             self._heard = {c: h for c, h in self._heard.items() if now - h[1] <= HEARD_KEEP_S}

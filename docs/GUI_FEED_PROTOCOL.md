@@ -87,6 +87,7 @@ Who this SparkGap is and the settings it runs with.
             "spot_rule_split_runs": true, "spot_rule_contest_words": false,
             "spot_rule_cq_repeats": false, "spot_rule_doubled_calls": false,
             "spot_rule_split_up": false, "spot_rule_runner_signs": false,
+            "spot_rule_window_join": false,
             "spot_rule_fragments": "off",
             "spot_rule_owner_cell": false, "spot_rule_owned_two_windows": false,
             "itila_window_sec": 30.0, "itila_max_bins": 400,
