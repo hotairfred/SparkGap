@@ -13,7 +13,9 @@ import argparse
 import csv
 import io
 import logging
+import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -92,9 +94,16 @@ def _load(path: Path) -> Counter[str] | None:
 
 
 def _write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text)
-    tmp.replace(path)                     # a crash mid-write never leaves a short day
+    """Write through a temp file of this writer's own: copies sharing the cache never collide."""
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        tmp.replace(path)                 # a crash mid-write never leaves a short day
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None = None,

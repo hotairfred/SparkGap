@@ -39,3 +39,31 @@ def test_refresh_daily_and_offline(tmp_path: Path) -> None:
 
 def test_refresh_rejects_a_page_that_is_not_the_roster(tmp_path: Path) -> None:
     assert refresh(tmp_path, fetch=lambda: b"<html>maintenance</html>") == set()
+
+
+def test_two_writers_sharing_the_cache_never_collide(tmp_path: Path) -> None:
+    """Two SparkGap copies refreshing one cache directory at once (both restarted together)."""
+    import threading
+
+    from skcc_roster import _write
+    path = tmp_path / "skccdata.txt"
+    texts = ("SKCCNR|CALL|\n" + "1|A1A|\n" * 500, "SKCCNR|CALL|\n" + "2|B2B|\n" * 500)
+    errors: list[BaseException] = []
+    start = threading.Barrier(2)
+
+    def writer(text: str) -> None:
+        start.wait()
+        try:
+            for _ in range(300):
+                _write(path, text)
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(t,)) for t in texts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert path.read_text() in texts
+    assert [p.name for p in tmp_path.iterdir()] == ["skccdata.txt"]
