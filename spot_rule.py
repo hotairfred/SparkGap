@@ -185,7 +185,7 @@ def split_runs(text: str, de_rejoin: bool = False) -> str:
     """Text with words run together split apart (spot_rule_split_runs): hand-sent CW often
     drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA, and after a CQ or
     TEST word CQ POTADEW3RA -> CQ POTA DE W3RA. A word is split only when the whole of it reads
-    as keywords, an event tag and a call; anything else is kept. de_rejoin (spot_rule_de_rejoin):
+    as keywords, an event tag and a call; anything else is kept. de_rejoin (on whenever the rule splits runs):
     see _de_rejoin."""
     out: list[str] = []
     words = text.split()
@@ -533,7 +533,7 @@ class RepeatSpotRule:
                  owner_listed: bool = False, la1d: bool = False, gluek: bool = False,
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
-                 window_join: bool = False, de_rejoin: bool = False) -> None:
+                 window_join: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -548,7 +548,7 @@ class RepeatSpotRule:
         self.cq_groups = cq_groups
         self.lockon = lockon
         self.split_runs = split_runs
-        self.de_rejoin = split_runs and de_rejoin  # CQ POTADEW D9DWX reads CQ POTA DE WD9DWX
+        self.de_rejoin = split_runs  # with split runs, CQ POTADEW D9DWX reads CQ POTA DE WD9DWX
         self.cq_qualifiers = cq_qualifiers
         self.doubled = doubled and validation is None           # validation scores a doubled call itself
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy

@@ -1,4 +1,4 @@
-"""Split runs after a CQ word, and spot_rule_de_rejoin (cdub89/SparkGap#37 SR3)."""
+"""Split runs after a CQ word, and DE rejoin with split runs (cdub89/SparkGap#37 SR3)."""
 import pytest
 
 from spot_rule import RepeatSpotRule, split_runs
@@ -57,11 +57,10 @@ def _spots(rule: RepeatSpotRule, texts: list[str]) -> list[tuple[str, float]]:
 
 def test_rule_reads_the_rejoined_call() -> None:
     texts = ["CQ POTADEW D9DWX CQ POTADEW D9DWX"] * 3
-    off = RepeatSpotRule(_tier2, cq_groups=True, split_runs=True)
-    on = RepeatSpotRule(_tier2, cq_groups=True, split_runs=True, de_rejoin=True)
-    assert {c for c, _ in _spots(off, texts)} == {"D9DWX"}
-    assert {c for c, _ in _spots(on, texts)} == {"WD9DWX"}
+    rule = RepeatSpotRule(_tier2, cq_groups=True, split_runs=True)
+    assert {c for c, _ in _spots(rule, texts)} == {"WD9DWX"}
 
 
-def test_de_rejoin_needs_split_runs() -> None:
-    assert RepeatSpotRule(_tier2, de_rejoin=True).de_rejoin is False
+def test_de_rejoin_rides_with_split_runs() -> None:
+    assert RepeatSpotRule(_tier2, split_runs=True).de_rejoin is True
+    assert RepeatSpotRule(_tier2).de_rejoin is False
