@@ -526,3 +526,28 @@ def test_decode_weighted_keyer_letter_gap() -> None:
     text = call_decode_runs(WA8VTD_WINDOW_RUNS, 20.5)
     assert text.count("WA8VTD") >= 2
     assert "?8VZ" not in text
+
+
+# N1DE on the 40m CWT of 2026-10-08 (lake replay, 7033.0 kHz, 30 s window, EM unit 8.74): dahs
+# outnumber dits, so pass 0's noise floor (half the median mark) dropped every 7 to 9 sample dit
+# and the two-means fit took the 21 sample dahs as dits (usp 22.1). cdub89/SparkGap#30 NW6.
+N1DE_DAH_HEAVY = (
+    "-215 +21 -6 +8 -6 +22 -5 +8 -20 +9 -6 +21 -5 +22 -20 +21 -52 +22 -5 +8 -20 "
+    "+9 -5 +21 -6 +22 -5 +22 -6 +22 -19 +22 -6 +7 -6 +8 -20 +8 -87 +5 -791 +9 -6 "
+    "+20 -6 +22 -6 +7 -20 +9 -5 +22 -19 +8 -6 +8 -6 +8 -5 +22 -6 +21 -20 +8 -6 "
+    "+21 -20 +8 -6 +21 -20 +9 -5 +8 -6 +7 -6 +22 -59 +21 -5 +8 -5 +7 -19 +8 -5 "
+    "+21 -18 +20 -6 +7 -39 +19 -6 +21 -18 +7 -763 +22 -19 +8 -6 +8 -6 +21 -432 "
+    "+22 -6 +8 -5 +22 -6 +8 -19 +9 -5 +22 -6 +21 -20 +22 -51 +22 -6 +8 -19 +9 -5 "
+    "+22 -6 +21 -6 +22 -5 +22 -20 +21 -6 +8 -6 +8 -20 +7 -86 +9 -5 +23 -5 +24 -19 "
+    "+24 -6 +8 -7 +23 -7 +7 -5 +24 -6 +110 -6 +51 -5 +43 -3 +108 -6 +24 -158 +7 "
+    "-6 +22 -6 +21 -125 +8 -5 +24 -5 +24 -19 +24 -5 +10 -5 +9 -5 +10 -19 +9 -6 +9 "
+    "-5 +24 -5 +24 -5 +24 -19 +10 -5 +9 -6 +23 -5 +10 -19 +24 -5 +10 -5 +23 -20 "
+    "+24 -5 +24 -5 +23 -276 "
+)
+
+
+def test_fit_unit_n1de_dropped_dits_are_the_dits() -> None:
+    unit, fitted, dah = call_fit_unit(N1DE_DAH_HEAVY, 8.74)
+    assert fitted == 1
+    assert 7.0 <= unit <= 10.0, unit        # the dits, not the dahs
+    assert 19.0 <= dah <= 25.0, dah
