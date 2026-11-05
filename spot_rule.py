@@ -168,15 +168,41 @@ def _split_merged(tok: str) -> list[str]:
     return out
 
 
-def split_runs(text: str) -> str:
+def _de_rejoin(u: str, prev: str | None, nxt: str) -> list[str] | None:
+    """de_rejoin: a word ending DE plus one or two letters that are not a call, followed by the
+    rest of the call: CQ POTADEW D9DWX -> CQ POTA DE WD9DWX (the gap fell inside the call)."""
+    for k in (1, 2):
+        head, lead = u[:-k], u[-k:]
+        if not (lead.isalpha() and head.endswith("DE")) or not CALL_RE.match(lead + nxt):
+            continue
+        parts = _split_run_together(head, prev)
+        if parts and parts[-1] == "DE" and (len(parts) > 1 or prev in KEYWORDS):
+            return parts + [lead + nxt]
+    return None
+
+
+def split_runs(text: str, de_rejoin: bool = False) -> str:
     """Text with words run together split apart (spot_rule_split_runs): hand-sent CW often
-    drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA. A word is split only
-    when the whole of it reads as keywords, an event tag and a call; anything else is kept."""
-    out = []
-    for w in text.split():
+    drops the word gap, CQCQDE -> CQ CQ DE, CQPADEW3RA -> CQ PA DE W3RA, and after a CQ or
+    TEST word CQ POTADEW3RA -> CQ POTA DE W3RA. A word is split only when the whole of it reads
+    as keywords, an event tag and a call; anything else is kept. de_rejoin (on whenever the rule splits runs):
+    see _de_rejoin."""
+    out: list[str] = []
+    words = text.split()
+    i = 0
+    while i < len(words):
+        w = words[i]
         u = w.upper()
-        parts = None if CALL_RE.match(u) else _split_run_together(u, None)
+        prev = out[-1].upper() if out and out[-1].upper() in KEYWORDS else None
+        if de_rejoin and i + 1 < len(words) and not CALL_RE.match(u):
+            joined = _de_rejoin(u, prev, words[i + 1].upper())
+            if joined:
+                out.extend(joined)
+                i += 2
+                continue
+        parts = None if CALL_RE.match(u) else _split_run_together(u, prev)
         out.extend(parts if parts and len(parts) > 1 else [w])
+        i += 1
     return " ".join(out)
 
 
@@ -364,6 +390,14 @@ def runner_signs_of(text: str, gluek: bool = False) -> tuple[set[str], set[str]]
     return runners - worked, worked
 
 
+def has_runner_sign(text: str, gluek: bool = False) -> bool:
+    """A split runner is sending here: a runner sign (runner_signs_of) or a bare TU UP, the split
+    runner's sign-off (JH7ME 5NN TU UP). Bin liveness only: it names no call, so it spots nothing."""
+    toks = tokens(text, gluek)
+    return bool(runner_signs_of(text, gluek)[0]) or any(
+        a == "TU" and b == "UP" for a, b in zip(toks, toks[1:], strict=False))
+
+
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
                   cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,
@@ -514,6 +548,7 @@ class RepeatSpotRule:
         self.cq_groups = cq_groups
         self.lockon = lockon
         self.split_runs = split_runs
+        self.de_rejoin = split_runs  # with split runs, CQ POTADEW D9DWX reads CQ POTA DE WD9DWX
         self.cq_qualifiers = cq_qualifiers
         self.doubled = doubled and validation is None           # validation scores a doubled call itself
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
@@ -539,6 +574,7 @@ class RepeatSpotRule:
         self.strongest_db = strongest_db        # a copy this many dB stronger elsewhere in the band: no spot here
         self.runner_signs = runner_signs        # KH8A UP: KH8A runs here, see _runner_copies()
         self.window_join = window_join          # CQ CQ DE | K2MJP: the window edge cut a group, see _joined()
+        self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
         self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
         self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
@@ -569,7 +605,7 @@ class RepeatSpotRule:
         self._expire(now)
         owned = self.owner(freq_khz, now, self.takeover_idle_s) if self.owned_two_windows else None
         if self.split_runs:
-            text = split_runs(text)
+            text = split_runs(text, self.de_rejoin)
         if self.window_join:
             text = self._joined(window, freq_khz, text, now)
         if self.threshold is not None:
@@ -646,7 +682,7 @@ class RepeatSpotRule:
         w = self.weights
         n = counts[call]
         windows = {c.window for c in near if c.call == call}
-        paths = [self._paths.get(win, []) for win in windows]
+        paths = [self._best_paths(call, win) for win in windows]
         both = [all(p[call] for p in ps) for ps in paths if len(ps) > 1]
         agree = sum(both) / len(both) if both else None
         tier = self.tier(call)
@@ -678,8 +714,22 @@ class RepeatSpotRule:
                 if snr is not None and snr > c.snr:
                     self._copies[i] = _Copy(c.time, c.window, call, freq_khz, snr, c.nth,
                                             report if report is not None else c.report)
+                if self.threshold is not None:
+                    self._same.setdefault(c.window, set()).add(window)
                 return True
         return False
+
+    def _best_paths(self, call: str, window: int) -> list[Counter]:
+        """score(): the paths of the window in window's same-audio group that copied call best (both
+        paths, then doubled, then paths with the call): one transmission is scored on its better copy,
+        whichever bin's window came first."""
+        group = [window, *sorted(self._same.get(window, ()))]
+
+        def quality(win: int) -> tuple[bool, bool, int]:
+            ps = self._paths.get(win, [])
+            return (len(ps) > 1 and all(p[call] for p in ps), any(p[call] >= 2 for p in ps),
+                    sum(1 for p in ps if p[call]))
+        return self._paths.get(max(group, key=quality), [])
 
     def owner(self, freq_khz: float, now: float, idle_s: float | None = None) -> str | None:
         """Lock-on: the call owning the frequency nearest freq_khz (within NEAR_KHZ), else None.
@@ -813,4 +863,5 @@ class RepeatSpotRule:
             self._bins = {w: b for w, b in self._bins.items() if w in live}
             self._tails = {b: ts for b, ts in self._tails.items() if now - ts[-1][0] <= 1.5 * self.window_s}
             self._paths = {w: p for w, p in self._paths.items() if w in live}
+            self._same = {w: g for w, g in self._same.items() if w in live}
             self._heard = {c: h for c, h in self._heard.items() if now - h[1] <= HEARD_KEEP_S}

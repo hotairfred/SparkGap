@@ -1,7 +1,7 @@
 """Runner signs (spot_rule_runner_signs, cdub89/SparkGap#37). Texts are lake2's 40m decodes of
 KH8A on 7002.0, 2026-10-31, after the move to the 40m antenna: split DX that never sends CQ."""
 
-from spot_rule import RepeatSpotRule, runner_signs_of
+from spot_rule import RepeatSpotRule, has_runner_sign, runner_signs_of
 
 KH8A_WINDOWS = (
     "JH7ME 5NN OH7ME 5NN KH8A UP E",
@@ -103,3 +103,11 @@ def test_a_bare_up_before_a_call_is_no_runner_sign() -> None:
     assert runner_signs_of("WV OY E W9G? G U? UP E KD2SC") == (set(), set())
     texts = ("KD2SC KD2SC E KD2SC I", "WV OY E W9G? G U? UP E KD2SC", "KD2SC KD2SC W")
     assert _feed(RepeatSpotRule(_tier2, runner_signs=True), texts, 14020.5) == []
+
+
+def test_a_split_runner_keeps_its_bin_without_a_call() -> None:
+    assert has_runner_sign("I K3RA 5NN TU UP ?Q 5NN E E K1ZZ TU ?")       # TU UP: no call needed
+    assert has_runner_sign("JH7ME 5NN OH7ME 5NN KH8A UP E")
+    assert not has_runner_sign("KH8A TP V BZO 5? TU S F")
+    assert not has_runner_sign("WV OY E W9G? G U? UP E KD2SC")
+    assert not has_runner_sign("CQ CWT K0TQ")
