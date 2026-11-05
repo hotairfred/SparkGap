@@ -1,8 +1,8 @@
 """flex_station.py holds the station, writes its health and exits with a code the launcher reads."""
 
 import json
-import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -35,10 +35,26 @@ def test_it_holds_the_station_writes_health_and_stops_cleanly(
         return real_beat(self)
 
     monkeypatch.setattr(FlexStation, "_beat", beat)
-    status = tmp_path / "station.json"
-    assert flex_station.main(["--config", str(_config(tmp_path)), "--status", str(status)]) == 0
-    health = json.loads(status.read_text())
-    assert health["station"] == "SparkGap-Dallas" and health["state"] == "stopped"
+    sent: list[dict[str, Any]] = []
+
+    class Link:
+        def __init__(self, role: str, name: str, on_command: Any) -> None:
+            assert (role, name) == ("station", "192.0.2.1")
+
+        def start(self) -> "Link":
+            return self
+
+        def status(self, **h: Any) -> None:
+            sent.append(h)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(flex_station, "ProcessLink", Link)
+    assert flex_station.main(["--config", str(_config(tmp_path))]) == 0
+    health = sent[-1]
+    assert len(sent) >= 3 and health["station"] == "SparkGap-Dallas"
+    assert health["state"] == "stopped"
     assert health["rtt_ms"] is not None and not radio.clients
 
 
@@ -54,16 +70,3 @@ def test_it_refuses_a_config_that_is_not_a_flex(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="not a Flex config"):
         flex_station.main(["--config", str(cfg)])
 
-
-def test_a_status_file_that_cannot_be_written_is_logged_not_raised(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A full disk must not stop the station and every copy bound to it (audit 2026-10-22)."""
-    missing = tmp_path / "gone" / "station.json"
-    with caplog.at_level(logging.INFO, logger="sparkgap.flex"):
-        flex_station.write_status(missing, {"state": "live"})
-        flex_station.write_status(missing, {"state": "live"})
-        missing.parent.mkdir()
-        flex_station.write_status(missing, {"state": "live"})
-    assert caplog.text.count("not written") == 1 and "written to" in caplog.text
-    assert json.loads(missing.read_text()) == {"state": "live"}

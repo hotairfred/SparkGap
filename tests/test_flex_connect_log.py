@@ -125,7 +125,7 @@ def test_a_channel_a_bound_copy_streams_names_its_station_and_pan(monkeypatch: M
 
 def test_a_free_channel_goes_ahead(monkeypatch: Monkey) -> None:
     sent = _build_to_pan(4, [MAESTRO, LAKE_GUI], LAKE_PANS)
-    assert sent[-2:] == ["sub tx all", "display pan create x=1 y=1"]   # nothing removed first
+    assert sent[-3:] == ["sub tx all", "sub radio all", "display pan create x=1 y=1"]   # nothing removed first
 
 
 def test_an_unknown_owner_is_named_by_handle(monkeypatch: Monkey) -> None:

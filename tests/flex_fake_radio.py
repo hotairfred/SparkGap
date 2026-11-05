@@ -72,6 +72,7 @@ class FakeRadio:
     loops: bool = False  # loopa/loopb in pan status (all models report them; some have the jacks)
     model: str = "FLEX-6400M"
     rfgain_info: str = "-8,32,8"  # low,high,step
+    pll_done: bool = True  # False while the radio calibrates its frequency
     conns: list["FakeConnection"] = field(default_factory=list)
     log: list[tuple[int, str]] = field(default_factory=list)  # (client handle, command)
     _next_handle: int = 0x1000_0001
@@ -140,6 +141,8 @@ class FakeRadio:
             ]
         if what == "pan":
             return [self.pan_line(p) for p in self.pans]
+        if what == "radio":
+            return [self.radio_line()]
         if what == "slice":
             return [
                 f"S0|slice {n} in_use=1 RF_frequency={s.freq:.6f} "
@@ -153,6 +156,9 @@ class FakeRadio:
                 for s, st in self.streams.items()
             ]
         return []
+
+    def radio_line(self) -> str:
+        return f"S0|radio slices=2 panadapters=2 pll_done={int(self.pll_done)} cal_freq=15.000000"
 
     def pan_line(self, p: int) -> str:
         pan = self.pans[p]

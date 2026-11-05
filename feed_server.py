@@ -10,7 +10,7 @@ Config block (off unless present):
 A join code is required whenever bind is not a loopback address: 6 characters, case, spaces and
 dashes ignored. A fresh one: python3 feed_server.py --new-code
 "web": true also serves the browser console (web/) at http://<bind>:<port>/.
-"port": "auto" (the default) takes the first free port of AUTO_PORTS, 7321 to 7339: 7320 is the
+"port": "auto" (the default) takes the first free port of AUTO_PORTS, 7321 to 7329: 7320 is the
 machine's SparkGap server (sparkgap_server.py), which passes each copy's feed through to
 SparkGap Web.
 """
@@ -77,7 +77,7 @@ CLIENT_QUEUE_MAX = 5_000  # text messages queued for one client before it is dro
 MAX_CLIENTS = 16
 MAX_PENDING = 32  # connections still sending their request; more are closed at once
 TLS_HANDSHAKE = b"\x16"  # first byte of every TLS connection
-PROBLEMS_KEPT = 5  # last errors shown on the status page
+PROBLEMS_KEPT = 10  # last errors and warnings shown on the status page
 PROBLEM_CHARS = 200
 CLOCK_CHECK_S = 60.0
 CPU_AVG_S = 60.0  # status CPU averaged this long: decoding is bursty, a 2 s sample swings
@@ -93,7 +93,7 @@ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # accepted on entry
 CODE_LENGTH = 6
 LOCKOUT_TRIES = 5  # wrong codes from one address ...
 SERVER_PORT = 7320  # the machine's SparkGap server (sparkgap_server.py); a copy's feed keeps off it
-AUTO_PORTS = range(7321, 7340)  # "port": "auto", the default
+AUTO_PORTS = range(7321, 7330)  # "port": "auto", the default; 7330-7339 are receivers' telnet (seat.py)
 NAME_LOOKUP_S = 2.0  # reverse DNS for a console's name; it stays nameless past this
 LOCKOUT_S = 600.0  # ... within this long refuse that address until they age out
 
@@ -231,7 +231,7 @@ class FeedServer:
         self.bind = str(cfg.get("bind", "127.0.0.1"))
         port = cfg.get("port", "auto")
         if port == SERVER_PORT:
-            log.warning("GUI feed: port %d is the server's (sparkgap_server.py); use \"auto\" or 7321-7339",
+            log.warning("GUI feed: port %d is the server's (sparkgap_server.py); use \"auto\" or 7321-7329",
                         SERVER_PORT)
         if port != "auto" and (isinstance(port, bool) or not isinstance(port, int)
                                or not 0 <= port <= 65_535):
@@ -925,15 +925,19 @@ class SpectrumTap:
 
 
 class ProblemLog(logging.Handler):
-    """Counts SparkGap's errors and keeps the last few, for the status page (warnings stay in the log)."""
+    """Counts SparkGap's errors and warnings and keeps the last few, for the status page."""
 
     def __init__(self) -> None:
-        super().__init__(logging.ERROR)
+        super().__init__(logging.WARNING)
         self.errors = 0
+        self.warnings = 0
         self.last: collections.deque[dict[str, Any]] = collections.deque(maxlen=PROBLEMS_KEPT)
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.errors += 1
+        if record.levelno >= logging.ERROR:
+            self.errors += 1
+        else:
+            self.warnings += 1
         try:
             text = record.getMessage()[:PROBLEM_CHARS]
         except Exception:  # a bad format string must not break logging
@@ -941,7 +945,7 @@ class ProblemLog(logging.Handler):
         self.last.append({"utc": round(record.created), "level": record.levelname, "msg": text})
 
     def summary(self) -> dict[str, Any]:
-        return {"errors": self.errors, "last": list(self.last)}
+        return {"errors": self.errors, "warnings": self.warnings, "last": list(self.last)}
 
 
 def log_file() -> str | None:

@@ -2,6 +2,7 @@
 stand-in sparkgap.py and flex_station.py scripts in a temporary root."""
 
 import json
+import socket
 import os
 import signal
 from collections.abc import Iterator
@@ -20,11 +21,8 @@ signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
 while True:
     time.sleep(0.1)
 """
-STATION = """import json, signal, sys, time
-status = sys.argv[sys.argv.index("--status") + 1]
+STATION = """import signal, sys, time
 print("12:00:00 INFO [Flex] Station SparkGap-Test holds the GUI client (client 0x1)", flush=True)
-json.dump({"station": "SparkGap-Test", "state": "live", "rtt_ms": 2.0,
-           "losses": [[time.time() - 60, "No ping reply for 23 s"]]}, open(status, "w"))
 signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
 while True:
     time.sleep(0.1)
@@ -82,8 +80,7 @@ def test_status_reads_the_log_config_and_station(seat: Seat) -> None:
     d1 = next(i for i in snap["instances"] if i["name"] == "dallas1")
     assert d1["state"] == "running" and d1["band"] == "17m" and d1["feed_port"] == 7321
     assert d1["feed_code"] == "ABCDEF" and d1["spots"] == 1 and d1["top_calls"] == [("K8TLJ", 1)]
-    st = snap["stations"][0]
-    assert st["live"] == "live" and st["rtt_ms"] == 2.0 and st["losses_hour"] == 1
+    assert snap["stations"] == [{"radio": "192.0.2.9", "state": "running"}]  # health: its link
 
 
 def test_a_setting_is_written_and_a_running_copy_restarted(seat: Seat) -> None:
@@ -357,17 +354,154 @@ def test_a_receive_path_value_of_the_wrong_kind_is_refused(
     assert not any(k.startswith("flex_") for k in _cfg(seat, "dallas1"))
 
 
-def test_startup_writes_the_config_and_leaves_a_running_copy_alone(seat: Seat) -> None:
-    seat.start("dallas2")
-    pid = seat.pid("dallas2")
-    out = seat.startup("dallas2", {"antenna": "RX_B", "rf_gain": 16})
-    cfg = _cfg(seat, "dallas2")
-    assert cfg["flex_rxant"] == "RX_B" and cfg["flex_rfgain"] == 16 and seat.pid("dallas2") == pid
-    assert out == "dallas2: starts with antenna RX_B, rf_gain 16"
+def test_a_flex_station_is_named_by_its_radio(seat: Seat) -> None:
+    """radio (the nickname Discover found) names the station; without it, sdr_ip."""
+    i = seat.instance("dallas1")
+    write_config(i.config, {"radio": "Dallas"})
+    assert seat.radio(i) == "Dallas"
+    write_config(i.config, {"radio": None})
+    assert seat.radio(i) == "192.0.2.9"
 
 
-@pytest.mark.parametrize("settings", [{}, {"band": "20m"}, {"rf_gain": "16"}, {"antenna": "ANT 1"}])
-def test_startup_takes_only_a_valid_receive_path(seat: Seat, settings: dict[str, object]) -> None:
-    with pytest.raises(SeatError):
-        seat.startup("dallas2", settings)
-    assert "flex_rxant" not in _cfg(seat, "dallas2")
+def with_radio(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> Seat:
+    """The seat with a Flex radio file and shipped defaults; added receivers run the stand-in code."""
+    monkeypatch.setattr(seat_mod, "CODE", seat.root / "code")
+    monkeypatch.setattr(seat_mod, "_port_free", lambda port, **_: True)  # not this machine's ports
+    radio = {"type": "flex", "model": "FLEX-6400M", "callsign": "N0CALL-5", "grid": "EM12ou",
+             "max_panadapters": 2, "max_slices": 2, "daxiq_channels": 2}
+    (seat.root / "config" / "Dallas.radio.json").write_text(json.dumps(radio))
+    template = {"sdr_type": "flex", "sdr_ip": "192.0.2.10", "callsign": "N0CALL", "skimmer_suffix": "-1",
+                "telnet_port": 7300, "flex_udp_port": 7791, "flex_daxiq_channel": 2, "bands": ["20m"],
+                "gui_feed": {"bind": "127.0.0.1", "port": 7321}}
+    (seat.root / "code" / "skimmer_flex.example.json").write_text(json.dumps(template))
+    return seat
+
+
+@pytest.fixture
+def radio_seat(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> Seat:
+    return with_radio(seat, monkeypatch)
+
+
+def test_add_writes_a_receiver_that_runs_the_servers_code(radio_seat: Seat) -> None:
+    assert radio_seat.add("Dallas-1", "40m") == "Dallas-1: added on DAX-IQ 1, 40m, from the shipped defaults"
+    cfg = _cfg(radio_seat, "Dallas-1")
+    assert (cfg["radio"], cfg["flex_daxiq_channel"], cfg["bands"]) == ("Dallas", 1, ["40m"])
+    assert not {"callsign", "grid", "skimmer_suffix"} & set(cfg)  # its radio file's
+    assert "sdr_ip" not in cfg and "flex_rxant" not in cfg and cfg["gui_feed"]["port"] == "auto"
+    i = radio_seat.instance("Dallas-1")
+    assert i.code == radio_seat.root / "code" and i.config.name == "Dallas-1.local.json"
+    assert (cfg["telnet_port"], cfg["flex_udp_port"]) == (7331, 7792)  # 7791 is dallas1's default
+    radio_seat.add("Dallas-2", "20m")
+    two = _cfg(radio_seat, "Dallas-2")
+    assert (two["telnet_port"], two["flex_udp_port"]) == (7332, 7793)
+
+
+@pytest.mark.parametrize(
+    "name, band, error",
+    [
+        ("Dallas", "40m", "<radio>-<n>"),
+        ("Dallas-1", "6m", "band must be"),
+        ("Lake-1", "40m", "no radio file"),
+        ("Dallas-3", "40m", "channels 1 to 2"),
+    ],
+)
+def test_add_refuses_what_it_cannot_make(radio_seat: Seat, name: str, band: str, error: str) -> None:
+    with pytest.raises(SeatError, match=error):
+        radio_seat.add(name, band)
+    assert all(i.name != name for i in radio_seat.instances())
+
+
+def test_add_refuses_a_full_radio_and_a_name_in_use(radio_seat: Seat) -> None:
+    path = radio_seat.root / "config" / "Dallas.radio.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "daxiq_channels": 4}))
+    radio_seat.add("Dallas-1", "40m")
+    with pytest.raises(SeatError, match="already exists"):
+        radio_seat.add("Dallas-1", "20m")
+    radio_seat.add("Dallas-2", "20m")
+    with pytest.raises(SeatError, match="holds 2 receivers"):
+        radio_seat.add("Dallas-3", "17m")
+
+
+def test_remove_keeps_the_config_and_adding_again_reuses_it(radio_seat: Seat) -> None:
+    radio_seat.add("Dallas-1", "40m")
+    write_config(radio_seat.instance("Dallas-1").config, {"spot_validation": "normal"})
+    assert radio_seat.remove("Dallas-1") == "Dallas-1: removed; its config stays in config/Dallas-1.local.json"
+    assert all(i.name != "Dallas-1" for i in radio_seat.instances())
+    assert radio_seat.add("Dallas-1", "20m").endswith("from its earlier config")
+    cfg = _cfg(radio_seat, "Dallas-1")
+    assert cfg["spot_validation"] == "normal" and cfg["bands"] == ["20m"]
+
+
+def test_a_running_receiver_is_not_removed(radio_seat: Seat) -> None:
+    radio_seat.add("Dallas-1", "40m")
+    radio_seat.start("Dallas-1")
+    with pytest.raises(SeatError, match="running"):
+        radio_seat.remove("Dallas-1")
+    assert any(i.name == "Dallas-1" for i in radio_seat.instances())
+
+
+def test_only_a_flex_receiver_of_a_radio_file_is_removed(radio_seat: Seat) -> None:
+    with pytest.raises(SeatError, match="only a Flex receiver"):
+        radio_seat.remove("dallas1")  # set up by hand, no radio file
+    assert any(i.name == "dallas1" for i in radio_seat.instances())
+
+
+def test_add_counts_a_receiver_set_up_by_address_and_default_ports(radio_seat: Seat) -> None:
+    path = radio_seat.root / "config" / "Dallas.radio.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "address": "192.0.2.9",
+                                "max_panadapters": 4, "max_slices": 4, "daxiq_channels": 4}))
+    write_config(radio_seat.instance("dallas1").config, {"flex_daxiq_channel": 1})  # sdr_ip 192.0.2.9
+    with pytest.raises(SeatError, match="DAX-IQ 1 is already used by dallas1"):
+        radio_seat.add("Dallas-1", "40m")
+    radio_seat.add("Dallas-2", "40m")  # dallas1 and dallas2 run on the defaults 7300 and 7791
+    cfg = _cfg(radio_seat, "Dallas-2")
+    assert (cfg["telnet_port"], cfg["flex_udp_port"]) == (7332, 7792)
+
+
+def test_add_skips_a_port_another_program_holds(radio_seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(seat_mod, "_port_free", lambda port, **_: port != 7331)  # Aggregator-style squatter
+    radio_seat.add("Dallas-1", "40m")
+    assert _cfg(radio_seat, "Dallas-1")["telnet_port"] == 7332
+
+
+def test_port_free_sees_a_listening_port() -> None:
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        assert not seat_mod._port_free(busy.getsockname()[1], host="127.0.0.1")
+
+
+def test_add_leaves_the_templates_antenna_and_gain_out(radio_seat: Seat) -> None:
+    path = radio_seat.root / "code" / "skimmer_flex.example.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "flex_rxant": "ANT2", "flex_rfgain": 16}))
+    radio_seat.add("Dallas-1", "40m")
+    assert not {"flex_rxant", "flex_rfgain"} & set(_cfg(radio_seat, "Dallas-1"))
+
+
+def test_add_refuses_an_earlier_config_of_another_channel(radio_seat: Seat) -> None:
+    conf = radio_seat.root / "config" / "Dallas-1.local.json"
+    conf.write_text(json.dumps({"sdr_type": "flex", "radio": "Dallas", "flex_daxiq_channel": 2}))
+    with pytest.raises(SeatError, match="is for Dallas DAX-IQ 2"):
+        radio_seat.add("Dallas-1", "40m")
+
+
+def test_a_radio_name_with_a_hyphen_takes_receivers(radio_seat: Seat) -> None:
+    src = radio_seat.root / "config" / "Dallas.radio.json"
+    (radio_seat.root / "config" / "FLEX-6400M-1234.radio.json").write_text(src.read_text())
+    assert radio_seat.add("FLEX-6400M-1234-1", "40m").startswith("FLEX-6400M-1234-1: added on DAX-IQ 1")
+
+
+def test_add_ignores_a_machines_template_for_the_shipped_defaults(radio_seat: Seat) -> None:
+    (radio_seat.root / "config" / "template.json").write_text(json.dumps({"spot_validation": "off"}))
+    radio_seat.add("Dallas-1", "40m")
+    assert "spot_validation" not in _cfg(radio_seat, "Dallas-1")
+    assert radio_seat.default_settings()["validation"] == "off"  # left unset: off
+
+
+def test_a_removed_receivers_settings_are_offered_back(radio_seat: Seat) -> None:
+    radio_seat.add("Dallas-1", "40m")
+    write_config(radio_seat.instance("Dallas-1").config, {"itila2_afc": True})
+    assert radio_seat.removed_settings({"Dallas-1"}) == {}
+    radio_seat.remove("Dallas-1")
+    back = radio_seat.snapshot()["removed"]
+    assert list(back) == ["Dallas-1"] and back["Dallas-1"]["afc"] is True

@@ -2,7 +2,7 @@
 
 The run folder (docs/SERVER_SETUP.md):
 <root>/instances (name, code folder, config, python), config/<name>.local.json, logs/<name>.pid,
-logs/<name>_<band>_<UTC>.log, logs/station_<radio>.{pid,json,lock}, rec/.  Every function blocks
+logs/<name>_<band>_<UTC>.log, logs/station_<radio>.{pid,lock}, rec/.  Every function blocks
 (a start waits for the copy to go live); the server calls them from one worker thread.
 """
 
@@ -15,7 +15,9 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
+import sys
 import threading
 import time
 from collections import Counter
@@ -23,6 +25,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import radios
 
 START_WAIT_S = 45  # longest a copy takes to reach the radio and go live
 STOP_WAIT_S = 30
@@ -35,11 +39,23 @@ FEED_PORT_RE = re.compile(r"GUI feed on wss?://\S+?:(\d+)/")
 ERROR_RE = re.compile(r"^[0-9:]+ ERROR |^[A-Za-z_.]*(Error|Exception): ")
 SPOT_RE = re.compile(r"SPOT:")
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+RECEIVER_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)-([1-9])$")  # <radio>-<DAX-IQ channel>
+PORT_KEYS = ("flex_udp_port", "telnet_port", "telnet_local_port")
+PORT_DEFAULTS = {"flex_udp_port": 7791, "telnet_port": 7300}  # sparkgap.py's, when a key is left out
+# an added receiver's ports: base + DAX-IQ channel. SparkGap's block is 7320-7339 (server 7320,
+# feeds 7321-7329, telnet 7330 + channel), clear of the Aggregator's 7300 and CW Skimmer's ports.
+ADD_PORT_BASES = {"flex_udp_port": 7790, "telnet_port": 7330}
+CODE = Path(__file__).resolve().parent  # the code this server runs: what an added receiver runs
+# from the shipped defaults: the radio file's, or set per receiver by add
+NOT_FROM_TEMPLATE = ("sdr_ip", "callsign", "grid", "op_name", "qth", "radio", "rbn_upload",
+                     "flex_station", "_radio", "_comment_radio")
 RADIO_RE = re.compile(
     r"^[A-Za-z0-9.:-]{1,64}$"
 )  # it goes into file names: a host name or address only
 VALIDATION = ("off", "permissive", "normal", "aggressive")
 CALL_SOURCES = ("scp", "rbn", "rbn+skcc")
+DISCOVER_S = radios.DISCOVER_S
+RBN_MODES = ("off", "dry", "live")  # rbn_upload: dry logs what it would post, live posts
 # decoder options by config key: on/off ones, and ones with a few values (None: off, key removed)
 OPTION_FLAGS = (
     "spot_rule_split_runs",
@@ -64,8 +80,8 @@ OPTION_CHOICES: dict[str, tuple[Any, ...]] = {
     "itila_window_sec": (60, 30, 15, 7.5),
 }
 OPTION_DEFAULTS: dict[str, Any] = {"itila_window_sec": 60}  # where the key is read
-# a Flex copy's receive path: setting -> (the copy's live key, its config key).  The radio's
-# state is the truth: a running copy changes it live; startup values change while it is stopped
+# a Flex copy's receive path: setting -> (the copy's live key, its config key).  SparkGap follows
+# the radio: a running copy changes it live; the config keys are the operator's startup values
 RX_SETTINGS = {
     "antenna": ("rxant", "flex_rxant"),
     "loop_a": ("loopa", "flex_loopa"),
@@ -120,8 +136,49 @@ class LogStats:
                 self.iq_trimmed = m.group(1)
 
 
+def station_view(radio: str, running: bool, health: dict[str, Any] | None) -> dict[str, Any]:
+    """A radio's station as the server shows it, from its health (its link's status)."""
+    out: dict[str, Any] = {"radio": radio, "state": "running" if running else "stopped"}
+    if not health:
+        return out
+    hour = [loss for loss in health.get("losses", []) if time.time() - loss[0] < 3600]
+    out.update(
+        station=health.get("station"),
+        live=health.get("state"),
+        rtt_ms=health.get("rtt_ms"),
+        losses_hour=len(hour),
+        last_loss=hour[-1] if hour else None,
+    )
+    return out
+
+
 class SeatError(RuntimeError):
     """A request the seat refuses or could not carry out; the message says why."""
+
+
+def bands_in(code: Path) -> list[str]:
+    """Band names a code folder's sparkgap.py accepts, from its BANDS line."""
+    def parse(text: str) -> list[str]:
+        m = re.search(r"^BANDS = dict\(zip\((.*)$", text, re.M)
+        return re.findall(r"'(\d+m)'", m.group(1)) if m else []
+
+    try:
+        return list(cached(code / "sparkgap.py", parse))
+    except OSError:
+        return []
+
+
+def decoder_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """A config's decoder, spot rule and recording settings, as SparkGap Web shows them."""
+    return {
+        "validation": cfg.get("spot_validation") or "off",
+        "call_source": cfg.get("spot_validation_calls") or "scp",
+        "afc": bool(cfg.get("itila2_afc", False)),
+        "decoder": cfg.get("cw_decoder", "itila2"),  # shown only: AFC acts with itila2
+        **{k: bool(cfg.get(k, False)) for k in OPTION_FLAGS},
+        **{k: cfg.get(k, OPTION_DEFAULTS.get(k)) for k in OPTION_CHOICES},
+        "record": bool(cfg.get("record_wav")),
+    }
 
 
 @dataclass(frozen=True)
@@ -180,6 +237,27 @@ def cached(path: Path, parse: Callable[[str], Any]) -> Any:
     with _CACHE_LOCK:
         _CACHE[path] = (key, value)
     return value
+
+
+def _port_free(port: int, udp: bool = False, host: str | None = None) -> bool:
+    """Whether this machine has port free (TCP on the telnet address, or UDP), as sparkgap.py binds it."""
+    with socket.socket(type=socket.SOCK_DGRAM if udp else socket.SOCK_STREAM) as s:
+        if not udp:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # asyncio's servers set it too
+        try:
+            s.bind(("" if udp else host or "0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def _ports(c: dict[str, Any]) -> list[int]:
+    """The ports a receiver's config takes: UDP, telnet and its feed when fixed."""
+    feed = c.get("gui_feed", {}).get("port") if isinstance(c.get("gui_feed"), dict) else None
+    ports = [p for k in PORT_KEYS if isinstance(p := c.get(k, PORT_DEFAULTS.get(k)), int)]
+    if c.get("sdr_type") != "flex" and "flex_udp_port" not in c:
+        ports.remove(PORT_DEFAULTS["flex_udp_port"])  # only a Flex copy takes it
+    return ports + ([feed] if isinstance(feed, int) else [])
 
 
 def write_config(path: Path, changes: dict[str, Any]) -> None:
@@ -298,11 +376,14 @@ class Seat:
         return len(self.config(i).get("bands") or []) > 1
 
     def radio(self, i: Instance) -> str | None:
-        """The Flex radio an instance uses (its sdr_ip), None for any other receiver."""
+        """The Flex radio an instance uses, by the name its station goes by: radio (the radio's
+        nickname, its radio file from Discover), else its sdr_ip; None for any other receiver."""
         cfg = self.config(i)
-        if cfg.get("sdr_type") != "flex" or not cfg.get("sdr_ip"):
+        if not radios.capabilities(cfg.get("sdr_type")).station:
             return None
-        radio = str(cfg["sdr_ip"])
+        if not (cfg.get("radio") or cfg.get("sdr_ip")):
+            return None
+        radio = str(cfg.get("radio") or cfg["sdr_ip"])
         if not RADIO_RE.match(radio):
             raise SeatError(f"{i.name}: sdr_ip {radio!r} is not a host name or address")
         return radio
@@ -310,19 +391,15 @@ class Seat:
     @staticmethod
     def bands_known(i: Instance) -> list[str]:
         """Band names the instance's sparkgap.py accepts, from its BANDS line."""
-        def parse(text: str) -> list[str]:
-            m = re.search(r"^BANDS = dict\(zip\((.*)$", text, re.M)
-            return re.findall(r"'(\d+m)'", m.group(1)) if m else []
-
-        try:
-            return list(cached(i.code / "sparkgap.py", parse))
-        except OSError:
-            return []
+        return bands_in(i.code)
 
     # ---- process files ----
 
     def pid(self, name: str) -> int | None:
         return self._alive(self.logs / f"{name}.pid", "sparkgap.py")
+
+    def feeder_pid(self, name: str) -> int | None:
+        return self._alive(self.logs / f"rbn2_{name}.pid", "rbn2_feeder.py")
 
     def station_pid(self, radio: str) -> int | None:
         return self._alive(self.logs / f"station_{radio}.pid", "flex_station.py")
@@ -396,8 +473,6 @@ class Seat:
                 "flex_station.py",
                 "--config",
                 str(i.config),
-                "--status",
-                str(self.logs / f"station_{radio}.json"),
             ],
         )
         if self._wait_for(log, STATION_MARK, lambda: self.station_pid(radio), STATION_WAIT_S):
@@ -494,16 +569,34 @@ class Seat:
             "band": self.band(i),
             "bands_known": self.bands_known(i),
             "multi_band": self.multi_band(i),
-            "validation": cfg.get("spot_validation") or "off",
-            "call_source": cfg.get("spot_validation_calls") or "scp",
-            "afc": bool(cfg.get("itila2_afc", False)),
-            "decoder": cfg.get("cw_decoder", "itila2"),  # shown only: AFC acts with itila2
-            **{k: bool(cfg.get(k, False)) for k in OPTION_FLAGS},
-            **{k: cfg.get(k, OPTION_DEFAULTS.get(k)) for k in OPTION_CHOICES},
-            "record": bool(cfg.get("record_wav")),
+            **decoder_settings(cfg),
+            "rbn_upload": self.upload_mode(i),
             # a Flex copy's receive path as its config sets it at start (None: the radio's own)
             **{k: cfg.get(c) for k, (_, c) in RX_SETTINGS.items()},
         }
+
+    def removed_settings(self, listed: set[str]) -> dict[str, dict[str, Any]]:
+        """Receivers removed but whose config stays, by name: what adding the name again brings
+        back."""
+        out: dict[str, dict[str, Any]] = {}
+        for path in sorted((self.root / "config").glob("*.local.json")):
+            name = path.name.removesuffix(".local.json")
+            if name in listed or not RECEIVER_RE.match(name):
+                continue
+            try:
+                cfg = cached(path, json.loads)
+            except (OSError, ValueError):
+                continue
+            if isinstance(cfg, dict) and cfg.get("radio"):
+                out[name] = decoder_settings(cfg)
+        return out
+
+    def default_settings(self) -> dict[str, Any]:
+        """The shipped defaults an added receiver starts with and Reset goes back to."""
+        try:
+            return decoder_settings(self._template())
+        except SeatError:
+            return {}
 
     def change(
         self,
@@ -516,8 +609,8 @@ class Seat:
         alone first goes to live(name, band), which moves the running copy in place and returns its
         answer, None when it could not (then the copy restarts, onto the band just written), or
         raises SeatError while the copy recovers from a radio outage (nothing written).
-        Receive path settings (RX_SETTINGS) on a running copy go to live_rx(name, change) only: the
-        config holds startup values, written while the copy is stopped."""
+        Receive path settings (RX_SETTINGS) on a running copy go to live_rx(name, change) only;
+        given to a stopped copy, they are written as its startup values."""
         i = self.instance(name)
         changes: dict[str, Any] = {}
         rx: dict[str, Any] = {}
@@ -596,8 +689,9 @@ class Seat:
             return f"{done}; {self._start(i)}"
 
     def _check_rx(self, i: Instance, key: str, value: Any) -> None:
-        if self.radio(i) is None:
-            raise SeatError(f"{key} is a FlexRadio setting")
+        sdr = self.config(i).get("sdr_type")
+        if key not in radios.capabilities(sdr).rx_settings or self.radio(i) is None:
+            raise SeatError(f"{key}: a {sdr or 'this'} receiver has no {key} setting")
         if key == "antenna" and not (isinstance(value, str) and ANTENNA_RE.match(value)):
             raise SeatError("antenna must be one the radio lists")
         if key in ("loop_a", "loop_b") and not isinstance(value, bool):
@@ -605,17 +699,183 @@ class Seat:
         if key == "rf_gain" and (isinstance(value, bool) or not isinstance(value, int)):
             raise SeatError("rf_gain must be a whole number of dB")
 
-    def startup(self, name: str, settings: dict[str, Any]) -> str:
-        """Write receive path startup values (RX_SETTINGS) to name's config: the radio and a
-        running copy are left as they are."""
+    # ---- receivers added and removed (SparkGap Web) ----
+
+    @contextlib.contextmanager
+    def _instances_lock(self) -> Iterator[None]:
+        self.logs.mkdir(parents=True, exist_ok=True)
+        with open(self.logs / "instances.lock", "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+
+    def add(self, name: str, band: str) -> str:
+        """A new Flex receiver <radio>-<n> on DAX-IQ channel n: its config from the shipped defaults (or
+        the one it had before it was removed) and its instances line, running the server's code.
+        Antenna and RF gain are left out (it starts with the radio's); spotter ID and grid are
+        its radio file's."""
+        m = RECEIVER_RE.match(name)
+        if not m:
+            raise SeatError("name must be <radio>-<n>: the radio's name and its DAX-IQ channel")
+        rn, num = m.group(1), int(m.group(2))
+        bands = bands_in(CODE)
+        if band not in bands:
+            raise SeatError(f"band must be one of: {' '.join(bands)}")
+        try:
+            radio = json.loads((self.root / "config" / f"{rn}.radio.json").read_text())
+        except (OSError, ValueError):
+            raise SeatError(f"no radio file for {rn}: Discover it in Setup first") from None
+        if radio.get("type") != "flex":
+            raise SeatError(f"{rn} is not a FlexRadio: only Flex receivers can be added here")
+        if missing := [k for k in ("callsign", "grid") if not radio.get(k)]:
+            raise SeatError(f"{rn} has no {' or '.join(missing)}: set them in Setup first")
+        chans = radio.get("daxiq_channels")
+        if isinstance(chans, int) and num > chans:
+            raise SeatError(f"the {radio.get('model') or rn} has DAX-IQ channels 1 to {chans}")
+        conf = self.root / "config" / f"{name}.local.json"
+        with self._instances_lock():
+            existing = self.instances()
+            if any(i.name == name for i in existing):
+                raise SeatError(f"{name} already exists")
+            cfgs = {i.name: self.config(i) for i in existing}
+            mine = [n for n, c in cfgs.items() if c.get("radio") == rn or (  # or set up by address
+                c.get("sdr_type") == "flex" and not c.get("radio") and c.get("sdr_ip") == radio.get("address"))]
+            caps = [radio.get(k) for k in ("max_panadapters", "max_slices", "daxiq_channels")]
+            limit = min([v for v in caps if isinstance(v, int) and v > 0], default=None)
+            if limit is not None and len(mine) >= limit:
+                raise SeatError(f"the {radio.get('model') or rn} holds {limit} receivers: all in use")
+            for n in mine:
+                if cfgs[n].get("flex_daxiq_channel") == num:
+                    raise SeatError(f"DAX-IQ {num} is already used by {n}")
+            used = {p for c in cfgs.values() for p in _ports(c)}
+            reused = conf.exists()
+            if reused:
+                c = json.loads(conf.read_text())
+                if c.get("radio") not in (None, rn) or c.get("flex_daxiq_channel") not in (None, num):
+                    raise SeatError(f"{conf.name} is for {c.get('radio')} DAX-IQ "
+                                    f"{c.get('flex_daxiq_channel')}, not {rn} {num}")
+            else:
+                c = self._template()
+                if isinstance(c.get("gui_feed"), dict):
+                    c["gui_feed"]["port"] = "auto"
+                c["rbn_known_dir"] = str(self.root / "rbn_known")
+                if c.get("record_wav"):
+                    c["record_wav"] = str(self.rec / f"{name}_{{band}}_{{ts}}.wav")
+            for k, base in ADD_PORT_BASES.items():  # base + channel, or the next one free on this machine
+                c[k] = base + num
+                while c[k] in used or not _port_free(c[k], udp=k == "flex_udp_port", host=c.get("telnet_host")):
+                    c[k] += 1
+                used.add(c[k])
+            c.update(radio=rn, flex_daxiq_channel=num, bands=[band])
+            for k in ("callsign", "grid", "skimmer_suffix"):  # the radio file's spotter ID and grid
+                c.pop(k, None)
+            c.pop("sdr_ip", None)  # the radio file's address
+            new = conf.with_name(conf.name + ".new")
+            new.write_text(json.dumps(c, indent=2) + "\n")
+            os.replace(new, conf)
+            with open(self.root / "instances", "a") as f:
+                f.write(f"{name} {CODE} {conf.name} {sys.executable}\n")
+        how = "its earlier config" if reused else "the shipped defaults"
+        return f"{name}: added on DAX-IQ {num}, {band}, from {how}"
+
+    def _template(self) -> dict[str, Any]:
+        """The shipped defaults (the code's Flex example) without what the radio file holds: an
+        update moves the baseline for every install."""
+        path = CODE / "skimmer_flex.example.json"
+        try:
+            c = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            raise SeatError(f"no shipped defaults: {e}") from None
+        for k in NOT_FROM_TEMPLATE:
+            c.pop(k, None)
+        if not (c.get("flex_loopa") or c.get("flex_loopb")):  # a loop keeps its antenna (README)
+            for k in ("flex_rxant", "flex_rfgain"):  # it starts with the radio's
+                c.pop(k, None)
+        c["sdr_type"] = "flex"
+        return c
+
+    def remove(self, name: str) -> str:
+        """Take a stopped receiver out of instances; its config, logs and recordings stay, so
+        adding the same name again brings its settings back."""
         i = self.instance(name)
-        if not settings or not set(settings) <= set(RX_SETTINGS):
-            raise SeatError(f"startup values here are: {', '.join(RX_SETTINGS)}")
-        for key, value in settings.items():
-            self._check_rx(i, key, value)
-        with self.lock(i):
-            write_config(i.config, {RX_SETTINGS[k][1]: v for k, v in settings.items()})
-        return f"{name}: starts with {', '.join(f'{k} {v}' for k, v in settings.items())}"
+        if self.config(i).get("sdr_type") != "flex" or not self.radio_file(i):
+            raise SeatError(f"{name}: only a Flex receiver of a radio file is removed here")
+        path = self.root / "instances"
+        with self.lock(i), self._instances_lock():  # start holds lock(i): not removed mid-start
+            if self.pid(name):
+                raise SeatError(f"{name} is running; stop it first")
+            lines = path.read_text().splitlines()
+            keep = [x for x in lines if x.split()[:1] != [name] or x.lstrip().startswith("#")]
+            new = path.with_name(path.name + ".new")
+            new.write_text("".join(x + "\n" for x in keep))
+            os.replace(new, path)
+        return f"{name}: removed; its config stays in config/{i.config.name}"
+
+    # ---- the RBN feeder: the server starts it with its copy and stops it through its link ----
+
+    def radio_file(self, i: Instance) -> Path | None:
+        """The radio file of an instance that names its radio, else None."""
+        name = self.config(i).get("radio")
+        if not isinstance(name, str) or not name:
+            return None
+        return self.root / "config" / f"{name}.radio.json"
+
+    def node(self, i: Instance) -> dict[str, Any]:
+        """The node settings an instance feeds RBN under: its radio file, else its own config."""
+        path = self.radio_file(i)
+        if path is None:
+            return self.config(i)
+        try:
+            st: Any = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return st if isinstance(st, dict) else {}
+
+    def feeder_name(self, i: Instance) -> str:
+        """The RBN feeder an instance feeds: its radio's (one per radio), else its own."""
+        return str(self.config(i)["radio"]) if self.radio_file(i) else i.name
+
+    def upload_mode(self, i: Instance) -> str:
+        v = self.node(i).get("rbn_upload")
+        return v if v in ("dry", "live") else "off"
+
+    def set_upload(self, i: Instance, mode: str | None) -> None:
+        """rbn_upload in the radio file for a radio's node, else in the instance's config."""
+        path = self.radio_file(i)
+        if path is None:
+            write_config(i.config, {"rbn_upload": mode})
+            return
+        try:
+            st = {k: v for k, v in json.loads(path.read_text()).items() if k != "rbn_upload"}
+        except (OSError, ValueError, AttributeError) as e:
+            raise SeatError(f"{path.name}: {e}: run Discover") from None
+        radios.write_radio(path, {**st, **({"rbn_upload": mode} if mode else {})})
+
+    def spawn_feeder(self, i: Instance, receivers: list[str] | None = None) -> Path:
+        """Start the RBN feeder (rbn2_feeder.py) for i: its radio's node, fed from receivers, or
+        i's own; it links to the server's hub, which is how the server knows it runs. Its log."""
+        name = self.feeder_name(i)
+        path = self.radio_file(i)
+        src = ["--config", str(i.config)] if path is None else ["--radio", str(path)]
+        rx = [a for r in receivers or [i.name] for a in ("--receiver", r)] if path else []
+        log = self.logs / f"rbn2_{name}_{utc_stamp()}.log"
+        self._launch(i.code, self.logs / f"rbn2_{name}.pid", log,
+                     [i.python, "rbn2_feeder.py", *src, *rx])
+        return log
+
+    # ---- radios ----
+
+    def discover(self, seconds: float = DISCOVER_S, address: str | None = None) -> str:
+        """Every back end's radios on the local network (or the one at `address`), each written
+        to its radio file (config/<name>.radio.json; the node settings stay); what was found and
+        changed."""
+        return radios.discover(self.root / "config", seconds, address)
+
+    def set_node(self, radio: str, callsign: str, grid: str, op_name: str) -> str:
+        """A radio's node settings as sparkgap.sh setup sets them (radios.set_node); what changed,
+        and which receivers take it at their next restart.  ValueError: refused, nothing written."""
+        lines, receivers = radios.set_node(self.root / "config", radio, callsign, grid, op_name)
+        restart = f"; restart {', '.join(receivers)} to use it" if receivers else ""
+        return "; ".join(lines) + restart
 
     # ---- status ----
 
@@ -693,28 +953,31 @@ class Seat:
         return None
 
     def station_status(self, radio: str) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "radio": radio,
-            "state": "running" if self.station_pid(radio) else "stopped",
+        """Running or not; its health comes from its link (the server adds it)."""
+        return station_view(radio, bool(self.station_pid(radio)), None)
+
+    def radio_view(self, i: Instance) -> dict[str, Any]:
+        """A radio as SparkGap Web and the command line show it: from its radio file."""
+        st = self.node(i)
+        caps = radios.capabilities(st.get("type"))
+        return {
+            "name": self.feeder_name(i),
+            **{k: st.get(k) for k in ("type", "model", "address", "callsign", "grid", "op_name",
+                                      "num_scu", "max_panadapters")},
+            "rbn_upload": self.upload_mode(i),
+            "rx_settings": list(caps.rx_settings),
         }
-        try:
-            health = json.loads((self.logs / f"station_{radio}.json").read_text())
-        except (OSError, ValueError):
-            return out
-        hour = [loss for loss in health.get("losses", []) if time.time() - loss[0] < 3600]
-        out.update(
-            station=health.get("station"),
-            live=health.get("state"),
-            rtt_ms=health.get("rtt_ms"),
-            losses_hour=len(hour),
-            last_loss=hour[-1] if hour else None,
-        )
-        return out
 
     def snapshot(self) -> dict[str, Any]:
         instances = self.instances()
-        radios = sorted({r for i in instances if (r := self.radio(i))})
+        stations = sorted({r for i in instances if (r := self.radio(i))})
+        nodes = {self.feeder_name(i): i for i in instances if self.radio_file(i)}
         return {
             "instances": [self.status(i) for i in instances],
-            "stations": [self.station_status(r) for r in radios],
+            "stations": [self.station_status(r) for r in stations],
+            "radios": [self.radio_view(i) for _, i in sorted(nodes.items())],
+            "radio_files": radios.radio_files(self.root / "config"),  # every radio, for setup
+            "bands": bands_in(CODE),  # what an added receiver can run
+            "default_settings": self.default_settings(),
+            "removed": self.removed_settings({i.name for i in instances}),
         }

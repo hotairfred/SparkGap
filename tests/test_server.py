@@ -15,7 +15,7 @@ from feed_server import OP_CLOSE, OP_TEXT, FeedServer
 from seat import Seat
 from sparkgap_server import SERVER_PROTOCOL, Server, load_settings
 from tests.test_feed_server import WS
-from tests.test_seat import seat  # noqa: F401  (the fixture: a temporary root with stand-ins)
+from tests.test_seat import seat, with_radio  # noqa: F401  (the fixture: a temporary root with stand-ins)
 
 CODE = "ACDEFH"
 
@@ -215,7 +215,7 @@ def test_the_server_log_comes_on_connect_and_line_by_line(server: Server) -> Non
     )
     while True:
         msg = ws.json("log")
-        if any("asks stop dallas2" in line["msg"] for line in msg["lines"]):
+        if any("stop dallas2 by a client" in line["msg"] for line in msg["lines"]):
             break
 
 
@@ -421,3 +421,129 @@ def test_an_unknown_own_name_still_serves_localhost(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(sparkgap_server.socket, "getaddrinfo", fail)
     assert sparkgap_server.own_addresses("192.168.0.10", "nowhere") == ["127.0.0.1"]
+
+
+def test_discover_takes_an_address_and_refuses_anything_else(
+        seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    asked: list[str | None] = []
+    monkeypatch.setattr(seat, "discover",
+                        lambda seconds=0, address=None: asked.append(address) or "ok")
+    a = Server(seat.root, {"bind": "127.0.0.1", "port": 0, "join_code": CODE})
+    a.seat = seat
+    assert a._run_op("discover", "discover", {"address": "192.0.2.101"}) == "ok"
+    assert a._run_op("discover", "discover", {}) == "ok"
+    with pytest.raises(ValueError):
+        a._run_op("discover", "discover", {"address": "192.0.2.101; reboot"})
+    assert asked == ["192.0.2.101", None]
+
+
+def test_node_writes_what_sparkgap_sh_setup_writes(seat: Seat, tmp_path: Path) -> None:  # noqa: F811
+    """The web's setup and sparkgap.sh setup: the same answers, the same radio file."""
+    import json as j
+
+    from tools import setup_node
+    cfg = seat.root / "config"
+    (cfg / "Lake.radio.json").write_text(j.dumps({"nickname": "Lake", "model": "FLEX-6600"}))
+    a = Server(seat.root, {"bind": "127.0.0.1", "port": 0, "join_code": CODE})
+    a.seat = seat
+    answers_web = {"radio": "Lake", "callsign": "n0call-2", "grid": "em12ub", "op_name": "Op"}
+    out = a._run_op("node", "node", answers_web)
+    assert "Lake.radio.json: N0CALL-2 EM12ub Op" in out
+    by_web = j.loads((cfg / "Lake.radio.json").read_text())
+    (cfg / "Lake.radio.json").write_text(j.dumps({"nickname": "Lake", "model": "FLEX-6600"}))
+    answers = iter(["n0call-2", "em12ub", "Op", "y"])
+    setup_node.setup(seat.root, "Lake", lambda _p: next(answers))
+    assert j.loads((cfg / "Lake.radio.json").read_text()) == by_web
+    with pytest.raises(ValueError, match="a callsign"):
+        a._run_op("node", "node", {**answers_web, "callsign": "bad call"})
+
+
+@pytest.mark.parametrize("by, want", [
+    ("SparkGap Web", "SparkGap Web (192.0.2.7)"), ("sparkgap.sh", "sparkgap.sh (192.0.2.7)"),
+    (None, "a client (192.0.2.7)"), ("<b>x</b>\nfake line", "bxbfake line (192.0.2.7)"),
+])
+def test_the_log_names_who_asked(by: object, want: str) -> None:
+    assert sparkgap_server.requester(by, "192.0.2.7") == want
+
+
+def test_a_request_in_words() -> None:
+    assert sparkgap_server.what_asked("stop", "Dallas-2", {}) == "stop Dallas-2"
+    assert sparkgap_server.what_asked("set", "Dallas-2", {"rf_gain": 0}) == "set Dallas-2 rf_gain 0"
+    assert sparkgap_server.what_asked("discover", "discover", {}) == "discover"
+
+
+def test_a_refused_request_is_logged(server: Server) -> None:
+    """The web's footer shows the server log, so a refusal must reach it."""
+    ws = _ws(server)
+    ws.json("log")
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 3, "cmd": "explode", "name": "dallas2",
+                                 "by": "SparkGap Web"}).encode())
+    while True:
+        msg = ws.json("log")
+        if any("explode dallas2 refused: unknown command" in line["msg"] for line in msg["lines"]):
+            break
+
+
+def test_add_then_remove_through_the_server(server: Server, seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    with_radio(seat, monkeypatch)
+    ws = _ws(server)
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 7, "cmd": "add", "name": "Dallas-1",
+                                 "settings": {"band": "40m"}}).encode())
+    r = _result(ws, 7)
+    assert r["ok"] and r["message"].startswith("Dallas-1: added on DAX-IQ 1, 40m"), r
+    assert seat.pid("Dallas-1")
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 8, "cmd": "remove", "name": "Dallas-1"}).encode())
+    r = _result(ws, 8)
+    assert r["ok"] and "removed" in r["message"], r
+    assert not seat.pid("Dallas-1") and all(i.name != "Dallas-1" for i in seat.instances())
+
+
+def test_add_writes_its_settings_and_a_refused_one_adds_nothing(
+    server: Server, seat: Seat, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    with_radio(seat, monkeypatch)
+    ws = _ws(server)
+    msg = {"type": "server", "id": 9, "cmd": "add", "name": "Dallas-2",
+           "settings": {"band": "20m", "validation": "off", "afc": True}}
+    ws.send(OP_TEXT, json.dumps(msg).encode())
+    assert _result(ws, 9)["ok"]
+    cfg = json.loads((seat.root / "config" / "Dallas-2.local.json").read_text())
+    assert cfg["spot_validation"] == "off" and cfg["itila2_afc"] is True
+    msg = {"type": "server", "id": 10, "cmd": "add", "name": "Dallas-1",
+           "settings": {"band": "40m", "validation": "loose"}}
+    ws.send(OP_TEXT, json.dumps(msg).encode())
+    r = _result(ws, 10)
+    assert not r["ok"] and "validation must be" in r["error"]
+    assert all(i.name != "Dallas-1" for i in seat.instances()) and not seat.pid("Dallas-1")
+
+
+def test_a_station_and_its_warnings_reach_the_server(server: Server) -> None:
+    # Dallas 11-05: the station's health carries type flex-station, which hid every status message,
+    # and its warnings showed only in the receiver's problems, never in the server log
+    import logging
+
+    from process_link import ProcessLink
+
+    ws = _ws(server)
+    ws.json("log")
+    link = ProcessLink("station", "Lake", port=server.port).start()
+    try:
+        assert link.connected.wait(5)
+        link.status(type="flex-station", state="reconnecting")
+        logging.getLogger("sparkgap.flex").warning("[Flex] Radio 192.0.2.1 unreachable for 3 s")
+        want = {"Server: radio Lake reconnecting", "Station Lake: [Flex] Radio 192.0.2.1 unreachable for 3 s"}
+        seen: set[str] = set()
+        while not want <= seen:
+            seen |= {line["msg"] for line in ws.json("log")["lines"]}
+        assert server.procs[("station", "Lake")].status["state"] == "reconnecting"
+    finally:
+        link.close()
+
+
+@pytest.mark.parametrize("cmd, settings, want", [
+    ("node", {"callsign": "WX7V-5"}, "saving the node"), ("stop", {}, "stopping"), ("start", {}, "starting"),
+    ("set", {"band": "20m"}, "changing band"), ("set", {"rbn_upload": "dry"}, "changing its rbn feeder"),
+    ("set", {"record": True}, "restarting"), ("discover", {}, "discovering"),
+])
+def test_a_request_shows_its_own_word_while_it_runs(cmd: str, settings: dict, want: str) -> None:
+    assert sparkgap_server.busy_word(cmd, settings) == want

@@ -1,13 +1,13 @@
 # SparkGap Web (experimental)
 
-SparkGap Web shows your SparkGap skimmers in a web browser. You see the band
-as a waterfall, every call SparkGap hears marked by frequency, and the CW it
-copies from the station you pick. From the same page you can start and stop a
-skimmer, move it to another band, and change how it spots. Nothing to install:
+SparkGap Web shows your SparkGap receivers in a web browser. You see the band as
+a waterfall, every call SparkGap hears marked by frequency, and the CW it copies
+from the station you pick. From the same page you can add, start and stop a
+receiver, move it to another band, and change how it spots. Nothing to install:
 any browser on your network will do, and closing the page does not affect the
-skimmers.
+receivers.
 
-![SparkGap Web on 40m](web.png)
+![SparkGap Web on 15m](web.png)
 
 ## Getting connected
 
@@ -16,12 +16,10 @@ page's address (for example `http://192.168.1.20:7320/`) and a six-character
 join code (for example `KTR-49X`).
 
 1. Open the address in your browser.
-2. Click **+ Add server**, enter the address and the join code, and save.
-3. The waterfall starts. If the computer runs more than one skimmer, pick one
-   from the band list at the top.
-
-**⚙**, **Settings**, **Servers** lists each server you added, with the
-skimmers it runs.
+2. Click **⚙**, then **+ Add a server**, enter the address and the join
+   code, and save.
+3. The waterfall starts. If the computer runs more than one receiver, pick
+   one from the band list at the top.
 
 The page remembers the server, so next time it opens straight to the
 waterfall. A wrong code five times in a row locks your browser out for ten
@@ -29,7 +27,7 @@ minutes.
 
 ## The main screen
 
-- **Waterfall**: the whole band the skimmer listens to. Signals are the bright
+- **Waterfall**: the whole band the receiver listens to. Signals are the bright
   traces.
 - **Call ladder**, beside the waterfall: every signal by frequency. Spotted
   calls stand out, calls heard but not spotted are dimmer, and signals with no
@@ -39,56 +37,81 @@ minutes.
   strength. You can select the text, or **Copy** all of it. With both readings
   shown, the one SparkGap is surer of (the lower timing cost) is in bold; a
   reading that copied nothing shows as *(nothing decoded)*.
-- **Switching skimmers**: each skimmer comes back on the signal you last
-  picked on it. Two skimmers that hear the same frequency (two antennas or
+- **Switching receivers**: each receiver comes back on the signal you last
+  picked on it. Two receivers that hear the same frequency (two antennas or
   radios on one band) keep the same signal, so you can compare their copy
   back and forth.
 - **Search** (Ctrl+F): type a call, some text or a frequency in kHz to jump to
   it. With the ⚙ dialog open, Ctrl+F is the browser's own find instead.
 - **Zoom**: drag to move along the band; Ctrl+scroll or pinch to zoom. The
   **Zoom** button steps through the whole band, half and a quarter. Each
-  skimmer opens at the zoom you last left it at, in this browser.
-- **Bottom bar**: the connection (a green dot and Live when all is well),
-  how hard the computer is working, how many calls the skimmer
-  has spotted, and how long it has been running.
+  receiver opens at the zoom you last left it at, in this browser.
+- **Bottom bar**: the connection (a green dot and Live when all is well;
+  **Reconnecting to radio** or **Radio not connected** when the receiver is
+  running but its radio is not), how hard the computer is working, how many
+  calls the receiver has spotted, and how long it has been running. On the
+  right, the server log's newest line; click it to open the log.
 - **?** (inside the ⚙ dialog): this guide and what's new.
 
-## Running a skimmer
+## Radios and receivers
 
-Click **⚙**, then the skimmer's tab (its name, such as `shack40`).
+Click **⚙**. The top line shows the radio: **Connected**, **Connecting**,
+**Reconnecting** or **Not connected**, its model, address and pans in use.
+The left side lists each server's radios. Under each radio:
 
-- The top card shows whether it runs. **Run** on starts it and off stops it;
-  off then on restarts it. **Recording** and **AFC** are there too. **Show**
-  on the **Servers** tab puts a skimmer on the main screen.
-- To change a setting, pick the new value and click **Apply**, which appears
-  in the top card. You can change several at once; they take effect together.
-  **Discard** forgets them.
-- **Radio**: the band, and on a FlexRadio the antenna, RF gain and loops as
-  the radio has them right now, however they were set: here, in SmartSDR or
-  Maestro, or by another skimmer. They follow the radio within a couple of
-  seconds. A change here goes to the radio straight away and does not touch
-  the skimmer's config.
-- **Startup Config**, at the top of the Radio card: the band, antenna and RF
-  gain the skimmer starts with (`the radio's` where none is set: it starts
-  with whatever the radio has). **Save Config** saves what the radio has now
-  as the startup values; it is greyed out when they already match.
+- **Node**: the spotter ID, grid and operator its spots go out under, and
+  whether RBN upload is off, dry or live.
+- **Feeder**: what sends those spots to RBN, and whether it is signed in.
+- **Receivers**: each one with its band and state. Click one to see its
+  settings on the right.
+- **+ Add a receiver**: pick a free DAX-IQ channel and a band, check the
+  recording and decoder options, and Apply. The receiver starts at once.
+
+Below the radios, **Server** holds the join code, Setup, RBN upload and the
+server's log.
+
+![The Server pane](web-server.png)
+
+A receiver's settings:
+
+- To change a setting, pick the new value. A bar at the top lists the changes
+  not applied yet, with **Apply** (it says whether the change is live or
+  restarts, starts or stops the receiver) and **Discard**. You can change
+  several at once; they take effect together.
+- **RUN**: on starts the receiver, off stops it.
+- **BAND**: changes straight away while the receiver runs, in about a
+  second, and the waterfall starts over on the new band. A receiver set up to
+  listen at an exact frequency rather than a band shows that frequency first
+  in the list, for example `7038.0 kHz`; picking a band name moves it to that
+  band.
+- **ANTENNA** and **RF GAIN** (FlexRadio, while the receiver runs): as the
+  radio has them right now, however they were set: here, in SmartSDR or
+  Maestro, or by another receiver. They follow the radio within a couple of
+  seconds, and a change here goes to the radio straight away. The receiver
+  starts with the antenna and RF gain set in its config, or the radio's where
+  none is set.
 - Antenna, loops and RF gain are shared: on a FlexRadio, every panadapter on
   the same receiver (SCU) has the same antenna and RF gain, and the radio
-  decides which SCU a panadapter uses. Changing one skimmer can change
+  decides which SCU a panadapter uses. Changing one receiver can change
   another, or an operator's panadapter in SmartSDR or Maestro.
-- **Decoder Options** (click to open): the decode window, call validation,
-  the known call list and the spot rule's options. The line beside it sums
-  them up.
+- **RECORDING**: restarts the receiver.
+- **DECODED TEXT**: SparkGap reads each signal twice, through a wide and a
+  narrow filter. **Lowest cost** (the default) shows whichever it is surer of;
+  you can show both, or only one. This is for this browser, all receivers.
+- **Decoder options** (click to open): the decode window, call validation,
+  the known call list, AFC and the spot rule's options. The line beside it
+  sums them up. Changes restart the receiver. **Reset to defaults** goes back
+  to the shipped settings.
 - **Window**: how much signal each decoded window holds. Shorter windows show
   text sooner but give the decoder less signal to work from and use more
   CPU; 15 and 7.5 s are untried.
-- **Band**: changes straight away while the skimmer runs, in about a second,
-  and the waterfall starts over on the new band. Other settings restart the
-  skimmer, which takes about half a minute. A skimmer set up to listen at an
-  exact frequency rather than a band shows that frequency first in the list,
-  for example `7038.0 kHz`; picking a band name moves it to that band.
+- **Details** (click to open): health, packets, reconnects, recent warnings
+  and errors.
+- **Remove**: stops the receiver and takes it off the radio's list, on
+  Apply. Its config, logs and recordings stay; adding the same receiver again
+  brings its settings back.
 
-![A skimmer's settings](web-settings.png)
+![A receiver's settings](web-settings.png)
 
 Settings, in plain terms:
 
@@ -101,7 +124,7 @@ Settings, in plain terms:
   once it is copied a set number of times (2, 3 or 4, by how common its
   pattern is), and the known call list is not used.
 - **AFC**: each signal's decoder follows the signal's own tone, which helps
-  weak signals and ones slightly off tune. Changing it restarts the skimmer.
+  weak signals and ones slightly off tune. Changing it restarts the receiver.
   It acts only with the itila2 decoder and is greyed out with any other.
 - **Known call list**: calls on this list count as more likely to be right.
   SCP is the contest call list; RBN adds calls other RBN skimmers heard in the
@@ -123,55 +146,52 @@ Settings, in plain terms:
 
 Hover over a setting for a one-line reminder.
 
-The **Servers** tab under Settings lists each server's skimmers, each with
-its run switch, and **Start all** and **Stop all**.
-
 ## When something looks wrong
 
-Click **⚙**, then **Info**. Each skimmer's tab has a line at the top: green
-means the radio is connected and decoding keeps up. Otherwise it says what is
-wrong, worst first. Common ones:
+- **The Radio line** at the top of ⚙ says whether SparkGap holds the radio:
+  - **Connecting**: starting; it turns Connected within a few seconds.
+  - **Reconnecting**: SparkGap lost the radio (rebooted, off the network)
+    and reconnects by itself once the radio has answered steadily for a
+    minute. If it stays this way, check the radio and its network cable.
+  - **Not connected**: no receiver runs on the radio, or SparkGap gave up
+    after 10 minutes. Fix the radio, then turn the receivers' **RUN** on.
+- **The server's log** (⚙, **Server**, Log): every start, stop and setting
+  change with its result, radio connection changes, and every warning and
+  error from the receivers, the station and the feeder. It is the first thing
+  to look at, and the thing to send along when asking for help.
+- **A receiver's Details** start with a line: green means the radio is live
+  and decoding keeps up. Otherwise it says what is wrong, worst first:
+  - **Radio reconnected**: SparkGap lost the radio for a moment, usually a
+    network hiccup, and reconnected by itself.
+  - **Decoder behind**: the computer is too busy to keep up. Close other
+    programs, or run fewer receivers.
+  - **Clock not NTP synchronised**: the computer's clock is not set from the
+    internet. Spot times will be off; turn on automatic time.
+- **A stopped receiver** shows its last error under its name. Turn **RUN**
+  on; if it stops again, send the message to whoever set it up.
 
-- **Radio reconnecting** or **Radio reconnected**: SparkGap lost the radio for
-  a moment, usually a network hiccup, and reconnects by itself. If it stays
-  down, check the radio and its network cable.
-- **Decoder behind**: the computer is too busy to keep up. Close other
-  programs, or run fewer skimmers.
-- **Clock not NTP synchronised**: the computer's clock is not set from the
-  internet. Spot times will be off; turn on automatic time.
-- **A stopped skimmer**: its tab shows why. Turn **Run** on; if it stops again,
-  send the message to whoever set it up.
-
-The **Servers** tab under Info shows each server's join code (masked: click
-it to show it, **Copy** puts it on the clipboard), its skimmers, and the
-server's log: every start, stop and setting change, with its result.
-The log is the first thing to look at, and the thing to send along when
-asking for help.
-
-Under each running skimmer, **running with** lists every setting it is using
-right now, as the skimmer itself reports it. That can differ from what
-Settings shows if a setting was changed but the skimmer has not restarted
-yet. Settings in full colour were set for this skimmer; dimmer ones are built
-into the spot rule; the dimmest are left at SparkGap's default. Hover over one
-to see which.
-
-A skimmer's own tab under Info shows its health, counts, radio and SparkGap.
-On a FlexRadio the radio card shows the skimmer's slice (with the letter
-SmartSDR shows), its antenna and RF gain as the radio has them, and its DAX-IQ
-channel. A stopped skimmer shows the same cards, empty.
-
-![A skimmer under Info](web-info.png)
+On a FlexRadio, Details also show the receiver's slice (with the letter
+SmartSDR shows), its antenna and RF gain as the radio has them, and its
+DAX-IQ channel.
 
 ## This browser
 
-Under **⚙**, **Settings**, **Servers**:
-
-- **Theme**: dark or light.
-- **Decoded text**: SparkGap reads each signal twice, through a wide and a
-  narrow filter. **Lowest cost** (the default) shows whichever it is surer of;
-  you can show both, or only one.
+- **Theme**: the sun button at the top of ⚙, dark or light.
+- **Decoded text**: in each receiver's settings; it applies to every
+  receiver in this browser.
 
 ## What's new
+
+- **2026-11-05.** The ⚙ dialog is Radios: each radio with its node, feeder
+  and receivers, and **+ Add a receiver** under it; Remove keeps a receiver's
+  settings for the next Add. The Radio line and the bottom bar say
+  **Connecting**, **Connected**, **Reconnecting** or **Not connected** as the
+  radio is, and the server's log has every warning and error from the
+  receivers, station and feeder. Receivers added here take telnet 7330 plus
+  their DAX-IQ channel, clear of the RBN Aggregator's 7300.
+- **2026-11-04.** SparkGap follows the radio: a running skimmer takes antenna,
+  RF gain and loop changes from here, SmartSDR, SmartControl or the radio, and
+  keeps them across a reconnect. Save Config is gone.
 
 - **2026-10-28.** The radio card follows the radio: antenna, RF gain and
   loops changed in SmartSDR, Maestro or by another skimmer show within a
@@ -192,5 +212,6 @@ Under **⚙**, **Settings**, **Servers**:
 
 ## Setting it up
 
-Installing SparkGap and its server, addresses, join codes and remote access
-are in [SERVER_SETUP.md](SERVER_SETUP.md).
+Installing SparkGap and its server, addresses, join codes and remote access are
+in [SERVER_SETUP.md](SERVER_SETUP.md). Sending spots to RBN:
+[sending-spots.md](sending-spots.md).
