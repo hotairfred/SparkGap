@@ -2,7 +2,7 @@
 
 import pytest
 
-from spot_rule import LOCK_IDLE_S, REPEAT_S, RepeatSpotRule, _regap, runner_calls, runner_groups, split_runs
+from spot_rule import LOCK_IDLE_S, REPEAT_S, RESPOT_S, RepeatSpotRule, _regap, runner_calls, runner_groups, split_runs
 
 SCP = {"K0TQ", "WX7V", "W1AW", "VE7KW", "K3JT", "K1ABC", "K1AJ", "AA3B", "NA2U"}
 
@@ -236,8 +236,9 @@ def test_one_spot_per_hold_unless_moved() -> None:
     assert r.feed(r.window_id(1, 2, 120.0), 14030.0, "CQ K0TQ", 120.0) == []
     assert r.feed(r.window_id(2, 0, 180.0), 14035.0, "CQ K0TQ", 180.0) == []
     assert r.feed(r.window_id(2, 1, 240.0), 14035.0, "CQ K0TQ", 240.0) == [("K0TQ", 14035.0)]
-    t = 240.0 + REPEAT_S
-    assert r.feed(r.window_id(2, 2, t), 14035.0, "CQ K0TQ", t) == [("K0TQ", 14035.0)]
+    t = 240.0 + RESPOT_S
+    assert r.feed(r.window_id(2, 2, t - 60.0), 14035.0, "CQ K0TQ", t - 60.0) == []   # inside the hold
+    assert r.feed(r.window_id(2, 3, t), 14035.0, "CQ K0TQ", t) == [("K0TQ", 14035.0)]
 
 
 def test_spot_on_the_strongest_nearby_bin() -> None:
