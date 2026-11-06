@@ -667,6 +667,24 @@ class RepeatSpotRule:
                 spots.append((call, spot_f))
         return spots
 
+    def last_spots(self) -> list[list]:
+        """The re-spot table, for spot_rule_memory: [[call, MHz, time, freq], ...]."""
+        return [[c, mhz, t, f] for (c, mhz), (t, f) in self._last_spot.items()]
+
+    def restore_last_spots(self, rows: list, now: float) -> int:
+        """Load a saved re-spot table: entries younger than REPEAT_S, so a restart does not spot
+        again a station spotted minutes before it. Returns how many were kept."""
+        kept = 0
+        for row in rows:
+            try:
+                call, mhz, t, f = str(row[0]), int(row[1]), float(row[2]), float(row[3])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if 0 <= now - t < REPEAT_S:
+                self._last_spot[(call, mhz)] = (t, f)
+                kept += 1
+        return kept
+
     def _stronger_elsewhere(self, best: _Copy, now: float) -> bool:
         """strongest_db: a copy of best's call in the same band, more than MOVE_KHZ away, read in
         the last STRONGEST_S at least strongest_db stronger. Copies without an SNR never count."""
