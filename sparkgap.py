@@ -2217,7 +2217,9 @@ def _make_spot_rule(config, tracker, local=None):
         owner_cell=bool(config.get('spot_rule_owner_cell', False)),
         owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)),
         runner_signs=bool(config.get('spot_rule_runner_signs', False)),   # cdub89/SparkGap#37
-        window_join=bool(config.get('spot_rule_window_join', False)))   # cdub89/SparkGap#37
+        window_join=bool(config.get('spot_rule_window_join', False)),   # cdub89/SparkGap#37
+        validation_threshold=(float(config['spot_validation_threshold'])
+                              if config.get('spot_validation_threshold') is not None else None))
 
 def _get_itila_lib():
     global _itila_lib
