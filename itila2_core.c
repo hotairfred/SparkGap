@@ -35,6 +35,7 @@
  * ---------------------------------------------------------------------- */
 #define BAYES_RATE      200
 #define N_SPEED_BINS    16
+#define EM_TOL          0.01  /* em_estimate: stop when A and nm move less than this of A - nm */
 #define WPM_MIN         8.0
 #define WPM_MAX         35.0     /* real CW is 15 to 25 WPM, never above 35 (WX7V) */
 #define MIN_MARK_RUN    7        /* dit at WPM_MAX; shorter mark runs are noise */
@@ -348,6 +349,47 @@ HOT_CLONES static double forward_backward_fast(
 }
 
 /* -------------------------------------------------------------------------
+ * forward_log_z: forward_backward_fast's log-likelihood alone. The backward pass only gives the
+ * posterior, so a caller that needs log Z (decode_marginal's speed weights) skips it. The same
+ * arithmetic in the same order as forward_backward_fast's forward pass: the same value to the bit.
+ * ---------------------------------------------------------------------- */
+HOT_CLONES static double forward_log_z(
+    itila_state_t *st,
+    const double *env, int T,
+    double wpm, double A, double noise_mean, double sigma2_obs)
+{
+    double p01, p10;
+    transition_probs(wpm, &p01, &p10);
+    const double a00 = 1.0 - p01 + 1e-300, a01 = p01 + 1e-300;
+    const double a10 = p10 + 1e-300,       a11 = 1.0 - p10 + 1e-300;
+
+    double log_norm = -0.5 * log(2.0 * M_PI * sigma2_obs);
+    double inv2s = 0.5 / sigma2_obs;
+    double *B = st->log_B;
+    double sum_m = 0.0;
+    for (int t = 0; t < T; t++) {
+        double d0 = env[t] - noise_mean, d1 = env[t] - A;
+        double lb0 = log_norm - d0 * d0 * inv2s, lb1 = log_norm - d1 * d1 * inv2s;
+        double m = lb0 > lb1 ? lb0 : lb1;
+        sum_m += m;
+        B[t*2+0] = exp(lb0 - m);
+        B[t*2+1] = exp(lb1 - m);
+    }
+
+    double x0 = 0.5 * B[0], x1 = 0.5 * B[1], s0 = x0 + x1;
+    double log_c = log(s0);
+    double p0 = x0 / s0, p1 = x1 / s0;
+    for (int t = 1; t < T; t++) {
+        x0 = (p0 * a00 + p1 * a10) * B[t*2];
+        x1 = (p0 * a01 + p1 * a11) * B[t*2+1];
+        s0 = x0 + x1;
+        p0 = x0 / s0; p1 = x1 / s0;
+        log_c += log(s0);
+    }
+    return log_c + sum_m;
+}
+
+/* -------------------------------------------------------------------------
  * estimate_wpm_from_gamma: GMM dit-component estimation
  *
  * Fits a 2-component Gaussian mixture to log mark-run durations.
@@ -489,6 +531,9 @@ HOT_CLONES static void em_estimate(
         half = 5;
     }
 
+    /* EM stops once A and nm move less than EM_TOL of the separation A - nm in one step:
+     * warm-started from the bin's last window it has usually settled in two or three of the 10. */
+    const double em_tol = EM_TOL;
     /* One EM step: update A, nm, s2 given current wpm */
     #define EM_STEP(wpm_val, n_iter)  do { \
         for (int _iter = 0; _iter < (n_iter); _iter++) { \
@@ -508,7 +553,9 @@ HOT_CLONES static void em_estimate(
             } \
             s2 = (vm/dm + vs/ds) / 2.0; \
             if (s2 < 1e-20) s2 = 1e-20; \
+            double _sep = A_new - nm_new, _moved = fabs(A_new - A) + fabs(nm_new - nm); \
             A = A_new; nm = nm_new; \
+            if (em_tol > 0.0 && _sep > 0.0 && _moved < em_tol * _sep) break; \
         } \
         forward_backward_fast(st, env, T, wpm_val, A, nm, s2, st->gamma); \
     } while(0)
@@ -583,10 +630,9 @@ static void decode_marginal(
     /* Results in st->gamma_marg[T*2], st->log_Z_bins[], st->speed_post[] */
 {
     /* Pass 1: compute log_Z for each speed bin */
-    for (int b = 0; b < N_SPEED_BINS; b++) {
-        st->log_Z_bins[b] = forward_backward_fast(
-            st, env, T, st->speed_bins[b], A, noise_mean, sigma2_obs,
-            st->gamma);
+    for (int b = 0; b < N_SPEED_BINS; b++) {    /* log Z only: the forward pass (forward_log_z) */
+        st->log_Z_bins[b] = forward_log_z(
+            st, env, T, st->speed_bins[b], A, noise_mean, sigma2_obs);
     }
 
     /* Compute speed posterior (uniform prior) */
