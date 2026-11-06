@@ -1974,9 +1974,18 @@ def _select_cw_decoder(name):
     log.info("CW decoder: %s (%s, %s)", name, _itila_lib_path, _scanner_lib_path)
     return _itila_lib_path
 
+def _prior_calls(calls):
+    """The calls that earn the known-call bonus, sorted. 1x1 calls (N3F, W6T) are left out: a pull
+    toward them split longer calls (W6TI as W6T I). So is a call that starts a longer known call
+    (AI5I beside AI5IN): it split the longer one (AI5I N)."""
+    calls = sorted({c.strip().upper() for c in calls if len(c.strip()) >= 4})
+    return [c for c, nxt in zip(calls, calls[1:] + ['']) if not nxt.startswith(c)]
+
 def _set_known_calls(config):
-    """Config itila_known_calls (a file, one call per line) and itila_known_bonus (log units, 0 =
-    off): itila2 favours calls heard on the air lately over callsign-shaped pieces of them."""
+    """Config itila_known_calls and itila_known_bonus (log units, 0 = off): itila2 favours calls heard
+    on the air lately over callsign-shaped pieces of them. itila_known_calls is a file (one call per
+    line), or 'rbn': the calls RBN heard lately, the list spot_validation_calls 'rbn' reads
+    (rbn_known_dir, rbn_known_days)."""
     bonus = float(config.get('itila_known_bonus', 0) or 0)
     path = config.get('itila_known_calls')
     if bonus <= 0 or not path:
@@ -1988,13 +1997,21 @@ def _set_known_calls(config):
         return 0
     lib.itila_set_known_calls.restype = _ct.c_int
     lib.itila_set_known_calls.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_double]
-    # 1x1 calls (N3F, W6T) are left out: a pull toward them split longer calls (W6TI as W6T I)
     try:
-        with open(path) as f:
-            calls = sorted({c for c in (l.strip().upper() for l in f if not l.startswith('#'))
-                            if len(c) >= 4})
+        if path == 'rbn':
+            import rbn_known
+            from pathlib import Path
+            calls = rbn_known.refresh(Path(config.get('rbn_known_dir', 'rbn_known')), config.get('callsign', ''),
+                                      int(config.get('rbn_known_days', rbn_known.DAYS)))
+        else:
+            with open(path) as f:
+                calls = [l for l in f if not l.startswith('#')]
     except OSError as e:
         log.warning("itila_known_calls: cannot read %s (%s); known-call prior off", path, e)
+        return 0
+    calls = _prior_calls(calls)
+    if not calls:
+        log.warning("itila_known_calls: no calls from %s; known-call prior off", path)
         return 0
     buf = '\n'.join(calls).encode()
     n = lib.itila_set_known_calls(buf, len(buf), bonus)
