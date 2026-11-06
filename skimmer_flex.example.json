@@ -1,5 +1,5 @@
 {
-    "_comment": "FlexRadio DAX-IQ example (flex_iq.py). Copy to <name>.local.json and set callsign, grid and sdr_ip. Each SparkGap copy uses one DAX-IQ channel, one pan, one slice and part of the radio's DAX-IQ budget: 16 units on a 6400, 6600 or 6700, of which a stream takes 2 at 48 kHz, 4 at 96 kHz and 8 at 192 kHz, shared with SmartSDR and DAX. So up to 4 copies at 96 kHz on a FLEX-6600 or 6700 (2 at 192 kHz) and 2 on a 6400; fewer while other programs stream DAX-IQ. Every copy needs its own flex_daxiq_channel, flex_udp_port, telnet_port and skimmer_suffix (the GUI feed takes the next free port from 7321 to 7339 (7320 is the SparkGap server's) by itself); a channel another program holds is refused at start. Tested at 96 kHz. telnet stays on localhost until you mean to feed a cluster.",
+    "_comment": "FlexRadio DAX-IQ example (flex_iq.py). With SparkGap Web, Add writes each receiver's config from this file, with its DAX-IQ channel and ports, and the spotter ID and grid come from the radio file (docs/SERVER_SETUP.md). Without the server: copy to <name>.local.json and set callsign, grid and sdr_ip. Each SparkGap copy uses one DAX-IQ channel, one pan, one slice and part of the radio's DAX-IQ budget: 16 units on a 6400, 6600 or 6700, of which a stream takes 2 at 48 kHz, 4 at 96 kHz and 8 at 192 kHz, shared with SmartSDR and DAX. So up to 4 copies at 96 kHz on a FLEX-6600 or 6700 (2 at 192 kHz) and 2 on a 6400; fewer while other programs stream DAX-IQ. Every copy needs its own flex_daxiq_channel, flex_udp_port, telnet_port and skimmer_suffix (the GUI feed takes the next free port from 7321 to 7329 (7320 is the SparkGap server's) by itself); a channel another program holds is refused at start. Tested at 96 kHz. telnet stays on localhost until you mean to feed a cluster.",
     "callsign": "N0CALL",
     "skimmer_suffix": "-1",
     "grid": "AA00aa",
@@ -51,7 +51,7 @@
     "gate_timing_cost": true,
     "timing_cost_max": 100.0,
     "telnet_host": "127.0.0.1",
-    "telnet_port": 7300,
+    "telnet_port": 7331,
     "_comment_gui_feed": "SparkGap Web (docs/SERVER_SETUP.md). On loopback only, with no join code; set bind and join_code to reach it from another machine.",
     "gui_feed": {
         "bind": "127.0.0.1",

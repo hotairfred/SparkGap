@@ -181,10 +181,13 @@ The local rule can also set its own `validation`, `validation_calls`, `cq_repeat
 keep another channel on the same radio. If another receiver hangs on one of the radio's receive
 loops, set `flex_loopa`/`flex_loopb` (and `flex_rxant`) to match: SparkGap's pan and slice come up
 with the radio's band setting, and a loop switched off there is off for the whole antenna.
-Several copies on one radio (one band each, each on its own
-`flex_daxiq_channel`) share one SparkGap station there: start
-`python3 flex_station.py --config <one of their configs>` before them and stop
-it after the last one. A copy started alone holds the station itself.
+To run a radio's receivers from SparkGap Web, run `tools/sparkgap.sh setup` on the machine
+beside the radio, then add receivers in SparkGap Web: the server runs each receiver, the radio's
+SparkGap station and its RBN feeder, and gives each receiver its ports
+([docs/SERVER_SETUP.md](docs/SERVER_SETUP.md), [docs/RADIOS.md](docs/RADIOS.md)). Without the
+server, several copies on one radio (one band each, each on its own `flex_daxiq_channel`) share
+one SparkGap station: start `python3 flex_station.py --config <one of their configs>` before them
+and stop it after the last one. A copy started alone holds the station itself.
 The decoders get silence while the radio is keyed, until 0.1 s after
 its key-up (which comes after the transmitting client's CW delay), so
 your own transmissions and their key clicks are not decoded.
@@ -213,9 +216,12 @@ CW and RTTY spots don't use MQTT.
 
 ### RBN
 
-RBN: SparkGap is not yet authorized to connect. The checks a node must make itself before a
+RBN: beta testers are running live uploads with `rbn2_feeder.py`; everyone else keeps `rbn_upload`
+off until their node holds up against other skimmers. The checks a node must make itself before a
 spot reaches RBN (CQ only, repeats, mode codes, beacons, frequency) and what we measured are in
-#49. `docs/rbn-feeding.md` describes `rbn_feeder.py` for when that work is done.
+hotairfred/SparkGap#49. How to send spots: [docs/sending-spots.md](docs/sending-spots.md). The
+feeders: [docs/rbn-feeding.md](docs/rbn-feeding.md). The RBN auth library the feeder needs:
+[docs/rbn-auth-library.md](docs/rbn-auth-library.md).
 
 ## Sharing one Red Pitaya between computers
 

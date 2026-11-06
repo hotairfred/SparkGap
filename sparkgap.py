@@ -42,6 +42,7 @@ from scipy.signal import decimate as scipy_decimate
 
 from hpsdr_receiver import HPSDRReceiver, discover
 from flex_iq import FlexIQReceiver
+import flex_iq
 from telnet_server import SpotTelnetServer
 
 log = logging.getLogger('sparkgap')
@@ -56,7 +57,10 @@ _mqtt_pub_init_failed = False
 
 # GUI feed (feed_server.FeedServer) when the gui_feed config block is set; None otherwise.
 _gui_feed = None
+# live mode's link to the SparkGap server's process hub (process_link.ProcessLink); None otherwise.
+_link = None
 _config_path = None   # the config file SparkGap runs with, for the GUI status page
+
 
 
 def _gui_settings(cfg, sample_rate):
@@ -127,6 +131,29 @@ def _start_gui_feed(cfg, bands, sample_rate, managers):
     _gui_feed.proc = feed_server.ProcessStats()
 
 
+def _start_link(skimmer, receivers):
+    """Link this live copy to the server's process hub as skimmer <config name>: its state and
+    receivers, and a stop command. Without a server the link keeps trying and the copy runs on."""
+    global _link
+    from process_link import ProcessLink
+
+    def on_command(cmd, args):
+        if cmd == 'note':    # who asked the server for what is about to happen to this copy
+            log.info("Server: %s", str(args.get('text', ''))[:200])
+            return True, "noted"
+        if cmd != 'stop':
+            return False, f"unknown command {cmd}"
+        log.info("Stop asked by the server: shutting down...")
+        skimmer.running = False
+        return True, "stopping"
+
+    name = os.path.basename(_config_path or 'sparkgap').split('.')[0]
+    _link = ProcessLink('skimmer', name, on_command).start()
+    _link.status(state='live', receivers=receivers,
+                 feed_port=_gui_feed.port if _gui_feed is not None and _gui_feed.server else None,
+                 telnet_port=skimmer.cfg.get('telnet_port', 7300), spots=0)
+
+
 def _publish_gui_status(managers, spots, uptime_s, extra=None):
     """Status for the GUI: bins across bands, spots, CPU and memory; extra: the station's health."""
     bins = 0
@@ -135,10 +162,12 @@ def _publish_gui_status(managers, spots, uptime_s, extra=None):
         sc = getattr(w, '_sc', None) if w else None
         if sc and sc._h:
             bins += sc._lib.itila_sc_bin_count(sc._h)
-    _gui_feed.publish_status(dict(_gui_feed.proc.sample(), bins=bins, spots=spots,
+    proc = _gui_feed.proc.sample()
+    _gui_feed.publish_status(dict(proc, bins=bins, spots=spots,
                                   uptime_s=round(uptime_s),
                                   decode_khz=[getattr(m, 'decode_khz', None) for m in managers],
                                   **(extra or {})))
+    return proc
 _GRID_RE = re.compile(r'^[A-R]{2}[0-9]{2}([a-x]{2})?$')
 
 def _get_mqtt_publisher():
@@ -7625,8 +7654,9 @@ class SparkGap:
         if record_wav:
             import wave as _wave, datetime as _dt
             ts = _dt.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
-            band_khz = self._resolve_band(self.cfg.get('bands', [0])[0],
-                                          self.cfg.get('sample_rate', 48000))[1] // 1000
+            center_hz = self._resolve_band(self.cfg.get('bands', [0])[0],
+                                           self.cfg.get('sample_rate', 48000))[1]
+            band_khz = center_hz // 1000
             rec_path = record_wav.format(ts=ts, band=band_khz)
             self._wav_base, self._wav_part, self._wav_bytes = rec_path, 1, 0
             self._wav_record = _wave.open(rec_path, 'wb')
@@ -7634,6 +7664,7 @@ class SparkGap:
             self._wav_record.setsampwidth(2)
             self._wav_record.setframerate(self.cfg.get('sample_rate', 192000))
             self._wav_path = rec_path
+            self._write_rec_info(rec_path, center_hz, self.cfg.get('sample_rate', 192000))
             log.info("Recording IQ to %s", rec_path)
         calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
@@ -7745,7 +7776,11 @@ class SparkGap:
         sdr_port = self.cfg.get('sdr_port', 1024)
 
         sdr_ip = self.cfg.get('sdr_ip')
-        if sdr_ip:
+        radio_name = self.cfg.get('sdr_type') == 'flex' and self.cfg.get('radio')
+        if radio_name:   # the radio file (Discover): its address, and its serial if it moves
+            device_ip = flex_iq.bind_radio(flex_iq.radio_path(os.path.dirname(_config_path or '.'), radio_name))
+            log.info("Flex radio %s at %s (its radio file)", radio_name, device_ip)
+        elif sdr_ip:
             log.info("Using direct SDR IP: %s", sdr_ip)
             device_ip = sdr_ip
         else:
@@ -7890,6 +7925,7 @@ class SparkGap:
             log.info("SparkGap LIVE: %s (%.3f kHz) rx%d, telnet :%d",
                      name, cal_center_khz, rx_idx,
                      self.cfg.get('telnet_port', 7300))
+        _start_link(self, self._link_receivers())
         _log_rbn_node(_rbn_spotter(self.cfg), self.cfg.get('grid', ''))
         _log_rbn_span(time.time(), [self._corrected_freq_khz(c / 1000.0) for _n, c, _r in self._band_meta],
                       rx_sample_rate)
@@ -7976,8 +8012,19 @@ class SparkGap:
             mgr._spectrum_tap = feed_server.SpectrumTap(_gui_feed, rate, center_hz)
             _gui_feed.set_bands([{'name': name, 'center_khz': center_hz / 1000.0, 'span_khz': rate / 1000.0}])
         _log_rbn_span(time.time(), [self._corrected_freq_khz(center_hz / 1000.0)], rate)
+        if _link is not None:
+            _link.status(receivers=self._link_receivers(), spots=0)
         log.info("Live change: %s (%.3f kHz) -> %s (%.3f kHz)", old_name, old_hz / 1000.0, name, center_hz / 1000.0)
+        if self._wav_record:  # the recording goes on at the new centre
+            self._write_rec_info(self._wav_base, center_hz, rate,
+                                 retune={'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                                         'band': name, 'center_hz': int(center_hz)})
         return reply(True, "retuned to %s" % name)
+
+    def _link_receivers(self):
+        """Each band's receiver as the server's link reports it."""
+        return [{'band': n, 'centre_khz': round(self._corrected_freq_khz(c / 1000.0), 3), 'rx': r}
+                for n, c, r in self._band_meta]
 
     async def _live_rx(self, rx, reply):
         """Our pan's antenna, loops or RF gain, changed on the radio in place."""
@@ -8068,6 +8115,8 @@ class SparkGap:
 
     async def stop(self):
         self.running = False
+        if _link is not None:
+            _link.close()
         if self.receiver:
             if getattr(self, '_use_c_receiver', False):
                 self.receiver.stop()
@@ -8113,6 +8162,33 @@ class SparkGap:
                 self._wav_write(pcm.tobytes())
         except Exception:
             pass  # Don't let errors kill the receiver thread
+
+    def _write_rec_info(self, rec_path, center_hz, rate, retune=None):
+        """<recording>.json beside the WAV: centre, rate, build and the config it ran with, so a
+        replay can run as the live copy did.  A live band change is added to it (retunes)."""
+        path = os.path.splitext(rec_path)[0] + '.json'
+        try:
+            if retune:
+                with open(path) as f:
+                    info = json.load(f)
+                info.setdefault('retunes', []).append(retune)
+            else:
+                code = os.path.dirname(os.path.abspath(__file__))
+                try:
+                    build = subprocess.run(['git', '-C', code, 'rev-parse', '--short', 'HEAD'], capture_output=True,
+                                           text=True, timeout=5).stdout.strip() or None
+                except (OSError, subprocess.SubprocessError):
+                    build = None
+                info = {'start_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                        'center_hz': int(center_hz), 'sample_rate': int(rate),
+                        'band': (self.cfg.get('bands') or [None])[0],
+                        'receiver': os.path.basename(_config_path or '').split('.')[0] or None,
+                        'build': build, 'config': self.cfg}
+            with open(path + '.new', 'w') as f:
+                json.dump(info, f, indent=2, default=str)
+            os.replace(path + '.new', path)
+        except (OSError, ValueError) as e:
+            log.warning("Recording info %s not written: %s", path, e)
 
     def _wav_write(self, data):
         if self._wav_bytes + len(data) > RECORD_WAV_MAX_BYTES:
@@ -8525,10 +8601,15 @@ class SparkGap:
             # ----------------------------------------------------------------
             # Status — aggregate across all bands
             # ----------------------------------------------------------------
-            if _gui_feed and now - last_gui_status >= 2:
+            if (_gui_feed or _link) and now - last_gui_status >= 2:
                 last_gui_status = now
-                _publish_gui_status(self.managers, self.spot_count, now - self.start_time,
-                                    self._gui_health(live_rate))
+                proc = {}
+                if _gui_feed:
+                    proc = _publish_gui_status(self.managers, self.spot_count,
+                                               now - self.start_time, self._gui_health(live_rate))
+                if _link:
+                    _link.status(spots=self.spot_count, cpu=proc.get('cpu'),
+                                 rss_mb=proc.get('rss_mb'))
             if now - last_status >= status_interval:
                 last_status = now
                 elapsed = now - self.start_time
@@ -9055,6 +9136,16 @@ def load_config(path):
     if path and os.path.exists(path):
         with open(path) as f:
             defaults.update(json.load(f))
+    # a receiver of a radio file spots under its node: that file's spotter ID (whole) and grid
+    radio = defaults.get('radio')
+    if radio:
+        try:
+            with open(os.path.join(os.path.dirname(path) or '.', f"{radio}.radio.json")) as f:
+                node = json.load(f)
+        except (OSError, ValueError):
+            node = {}
+        if node.get('callsign') and node.get('grid'):
+            defaults.update(callsign=node['callsign'], grid=node['grid'], skimmer_suffix='')
     return defaults
 
 

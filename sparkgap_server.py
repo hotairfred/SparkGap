@@ -22,6 +22,7 @@ import collections
 import concurrent.futures
 import contextlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -67,14 +68,18 @@ from feed_server import (
     unmask,
     valid_code,
 )
-from seat import RX_SETTINGS, Seat, SeatError
+from process_link import PROCESS_PATH, PROCESS_PROTOCOL
+from seat import RBN_MODES, RX_SETTINGS, Instance, Seat, SeatError, station_view
 
 log = logging.getLogger("sparkgap.server")
+# a station's state in the server log, in the words the status bar uses
+RADIO_STATES = {"live": "connected", "connecting": "connecting", "reconnecting": "reconnecting",
+                "halted": "not connected (halted)", "stopped": "not connected"}
 
 SERVER_PROTOCOL = "sparkgap.server.v1"
 FEED_PROTOCOL = "sparkgap.v1"
 SERVER_VERSION = 1
-DEFAULT_PORT = SERVER_PORT  # 7320: the copies' feeds take 7321-7339
+DEFAULT_PORT = SERVER_PORT  # 7320: the copies' feeds take 7321-7329, their telnet 7330 + DAX-IQ channel
 SERVER_PATH = "/server"
 FEED_PREFIX = "/feed/"
 HELP_PATH = "/help"
@@ -87,8 +92,27 @@ MAX_PENDING = 32  # connections still sending their request: more are closed at 
 LOG_KEPT = 200  # server log lines kept for the web console
 REQUEST_WAIT_S = 5.0
 CONTROL_WAIT_S = 20.0  # a live band change: the radio's replies, then a new decoder
-COMMANDS = ("start", "stop", "restart", "set", "startup")
+FEED_LINK_S = 20.0  # longest an RBN feeder takes to start and link to the hub
+FEED_STOP_S = 30.0
+FEED_RELINK_S = 12.0  # a running feeder links again within its RECONNECT_S after a server restart
+COMMANDS = ("start", "stop", "restart", "set", "add", "remove")
+RADIO_COMMANDS = ("discover", "node")  # not tied to one instance
+BY_RE = re.compile(r"[^A-Za-z0-9 ._-]")  # what a client may call itself in the log
+
+
+def requester(by: Any, peer: str) -> str:
+    """Who asked, for the logs: the client's own name (SparkGap Web, sparkgap.sh) and its address."""
+    name = BY_RE.sub("", str(by or ""))[:32].strip() or "a client"
+    return f"{name} ({peer})"
+
+
+def what_asked(cmd: str, name: str, settings: dict[str, Any]) -> str:
+    """A request in words: stop Dallas-2; set Dallas-1 rf_gain 0; node Lake callsign N0CALL-2."""
+    shown = ", ".join(f"{k} {v}" for k, v in settings.items()) if settings else ""
+    target = "" if name == cmd else f" {name}"
+    return f"{cmd}{target}{f' {shown}' if shown else ''}"
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+PROC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")  # a station may be an address
 
 
 def default_root() -> Path:
@@ -125,6 +149,18 @@ def own_addresses(bind: str, hostname: str | None = None) -> list[str]:
     return found
 
 
+def busy_word(cmd: str, settings: dict[str, Any]) -> str:
+    """What a receiver or radio shows while a request for it runs."""
+    if cmd == "set" and set(settings) == {"rbn_upload"}:
+        return "changing its rbn feeder"
+    if cmd == "set" and set(settings) == {"band"}:
+        return "changing band"
+    if cmd == "set" and settings and set(settings) <= set(RX_SETTINGS):
+        return "changing the receive path"
+    return {"set": "restarting", "add": "adding", "remove": "removing", "stop": "stopping",
+            "node": "saving the node", "discover": "discovering"}.get(cmd, cmd + "ing")
+
+
 class LogRing(logging.Handler):
     """The server's last LOG_KEPT log lines, and each new one passed to `on_line` (any thread)."""
 
@@ -152,6 +188,23 @@ class Client:
     def __init__(self, writer: asyncio.StreamWriter, peer: str) -> None:
         self.writer = writer
         self.peer = peer
+
+
+class Proc:
+    """A process linked to the /process hub: who it is (its hello) and its last status."""
+
+    def __init__(self, writer: asyncio.StreamWriter, hello: dict[str, Any]) -> None:
+        self.writer = writer
+        self.role, self.name = str(hello.get("role")), str(hello.get("name"))
+        self.pid = hello.get("pid")
+        self.pgid = hello.get("pgid")
+        self.since = time.time()
+        self.status: dict[str, Any] = {}
+        self.pending: dict[str, asyncio.Future[tuple[bool, str]]] = {}
+
+    def view(self) -> dict[str, Any]:
+        return {"role": self.role, "name": self.name, "pid": self.pid, "since": self.since,
+                "status": self.status}
 
 
 class Server:
@@ -183,6 +236,8 @@ class Server:
         self.listener: asyncio.Server | None = None
         self.local_listener: asyncio.Server | None = None  # loopback, for a network bind
         self.busy: dict[str, str] = {}  # instance -> operation in progress or queued
+        self.procs: dict[tuple[str, str], Proc] = {}  # (role, name) -> its link to the hub
+        self.loop: asyncio.AbstractEventLoop | None = None
         self.state: dict[str, Any] = {}
         self.ready = threading.Event()  # set once listening (for tests and callers)
         self.hello = {
@@ -197,7 +252,7 @@ class Server:
 
     async def serve(self) -> None:
         server = await asyncio.start_server(self._handle, self.bind, self.port, ssl=self.tls)
-        loop = asyncio.get_running_loop()
+        loop = self.loop = asyncio.get_running_loop()
         self.log_ring.on_line = lambda line: loop.call_soon_threadsafe(
             self._broadcast, {"type": "log", "lines": [line]}
         )
@@ -248,10 +303,16 @@ class Server:
                     self.state = {}  # nobody watching: no reads, nothing stale for the next one
             except Exception:
                 log.exception("Server: state")
+            try:
+                await self._reap()
+            except Exception:
+                log.exception("Server: feeders")
             if time.monotonic() - last_ping > PING_EVERY_S:
                 last_ping = time.monotonic()
                 for c in list(self.clients):
                     self._send(c, encode_frame(OP_PING, b""))
+                for p in list(self.procs.values()):  # a process that died without closing goes
+                    p.writer.write(encode_frame(OP_PING, b""))
             await asyncio.sleep(STATE_EVERY_S)
 
     def _snapshot(self) -> dict[str, Any]:
@@ -259,7 +320,15 @@ class Server:
         for i in snap["instances"]:
             i.pop("feed_code", None)  # stays on this machine: the server proxies the feed
             i["busy"] = self.busy.get(i["name"])
-        return {"type": "seat", "utc": time.time(), **snap}
+            self._linked(i)
+        for s in snap["stations"]:
+            if p := self.procs.get(("station", s["radio"])):
+                s.update(station_view(s["radio"], True, p.status))
+        for r in snap["radios"]:
+            p = self.procs.get(("feeder", r["name"]))
+            r["feeder"] = p.status if p else None
+        procs = [p.view() for p in list(self.procs.values())]
+        return {"type": "seat", "utc": time.time(), **snap, "processes": procs}
 
     # ---- connections ----
 
@@ -291,6 +360,9 @@ class Server:
                 (p[len(CODE_PROTOCOL) :] for p in offered if p.startswith(CODE_PROTOCOL)),
                 headers.get("authorization", "").removeprefix("Bearer ").strip(),
             )
+            if path == PROCESS_PATH:  # a process of this machine: no join code, loopback only
+                await self._process_client(reader, writer, headers, offered, peer)
+                return
             if path != SERVER_PATH and not path.startswith(FEED_PREFIX):
                 # a copy-port search of this address lands here: not ours, so not a wrong code
                 FeedServer._reject(writer, 404, "Not Found")  # pyright: ignore[reportPrivateUsage]
@@ -399,6 +471,91 @@ class Server:
         )
         writer.write(encode_frame(OP_CLOSE, struct.pack("!H", code) + reason.encode()[:120]))
 
+    # ---- the process hub: this machine's copies, stations and feeders link here ----
+
+    async def _process_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        headers: dict[str, str],
+        offered: list[str],
+        peer: str,
+    ) -> None:
+        if not is_loopback(peer) or PROCESS_PROTOCOL not in offered:
+            FeedServer._reject(writer, 403, "Forbidden")  # pyright: ignore[reportPrivateUsage]
+            return
+        self._accept(writer, headers, PROCESS_PROTOCOL)
+        fin, op, data = await asyncio.wait_for(read_frame(reader), REQUEST_WAIT_S)
+        hello = json.loads(data) if op == OP_TEXT and fin else {}
+        if hello.get("type") != "hello" or not PROC_NAME_RE.match(str(hello.get("name", ""))):
+            return
+        p = Proc(writer, hello)
+        old = self.procs.get((p.role, p.name))
+        if old is not None:  # the same process again after a lost link, or a second copy of it
+            old.writer.close()
+        self.procs[(p.role, p.name)] = p
+        log.info("Server: %s %s linked (pid %s)", p.role, p.name, p.pid)
+        try:
+            while True:
+                fin, op, data = await read_frame(reader)
+                if op == OP_CLOSE:
+                    return
+                if op == OP_PING:
+                    writer.write(encode_frame(OP_PONG, data))
+                elif op == OP_TEXT and fin and len(data) <= MAX_CLIENT_MESSAGE:
+                    msg = json.loads(data)
+                    if msg.get("type") == "status":
+                        was = p.status.get("state")
+                        p.status = {k: v for k, v in msg.items() if k != "type"}
+                        if p.role == "station" and p.status.get("state") != was:
+                            log.info("Server: radio %s %s", p.name, RADIO_STATES.get(
+                                str(p.status.get("state")), str(p.status.get("state"))))
+                    elif msg.get("type") == "log":
+                        level = logging.ERROR if msg.get("level") in ("ERROR", "CRITICAL") else logging.WARNING
+                        log.log(level, "%s %s: %s", p.role.capitalize(), p.name, str(msg.get("msg")))
+                    elif msg.get("type") == "result":
+                        f = p.pending.pop(str(msg.get("id")), None)
+                        if f is not None and not f.done():
+                            text = str(msg.get("message") or msg.get("error"))
+                            f.set_result((bool(msg.get("ok")), text))
+        finally:
+            if self.procs.get((p.role, p.name)) is p:
+                del self.procs[(p.role, p.name)]
+                log.info("Server: %s %s unlinked", p.role, p.name)
+            for f in p.pending.values():
+                if not f.done():
+                    f.set_result((False, f"{p.role} {p.name} went away"))
+
+    async def command(
+        self, role: str, name: str, cmd: str, args: dict[str, Any] | None = None,
+        wait_s: float = CONTROL_WAIT_S,
+    ) -> tuple[bool, str] | None:
+        """Send a command to a linked process and wait for its answer; None when it is not linked
+        or does not answer in time."""
+        p = self.procs.get((role, name))
+        if p is None:
+            return None
+        rid = secrets.token_hex(8)
+        fut: asyncio.Future[tuple[bool, str]] = asyncio.get_running_loop().create_future()
+        p.pending[rid] = fut
+        msg = {"type": "command", "id": rid, "cmd": cmd, "args": args or {}}
+        p.writer.write(encode_frame(OP_TEXT, json.dumps(msg).encode()))
+        try:
+            return await asyncio.wait_for(fut, wait_s)
+        except asyncio.TimeoutError:
+            p.pending.pop(rid, None)
+            return None
+
+    def command_sync(
+        self, role: str, name: str, cmd: str, args: dict[str, Any] | None = None,
+        wait_s: float = CONTROL_WAIT_S,
+    ) -> tuple[bool, str] | None:
+        """command() from a worker thread (the seat operations run off the event loop)."""
+        if self.loop is None:
+            return None
+        coro = self.command(role, name, cmd, args, wait_s)
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(wait_s + 5)
+
     # ---- the server protocol ----
 
     async def _server_client(
@@ -458,26 +615,26 @@ class Server:
                 },
             )
 
-        if cmd not in COMMANDS or not isinstance(name, str) or not NAME_RE.match(name):
-            return result(False, "unknown command or instance")
-        if cmd in ("set", "startup") and not isinstance(settings, dict):
-            return result(False, "settings must be an object")
+        def refuse(text: str) -> None:  # logged, so the web's footer and log show it too
+            log.warning("Server: %s %s refused: %s", cmd, name, text)
+            result(False, text)
+
+        if cmd in RADIO_COMMANDS:
+            name = cmd   # busy and queued like an instance, under its own name
+        elif cmd not in COMMANDS or not isinstance(name, str) or not NAME_RE.match(name):
+            return refuse("unknown command or instance")
+        if cmd in ("set", "add", "discover", "node") and not isinstance(settings, dict):
+            return refuse("settings must be an object")
         if name in self.busy:
-            return result(False, f"{name} is busy: {self.busy[name]}")
+            return refuse(f"{name} is busy: {self.busy[name]}")
         if self.queued >= MAX_QUEUED_OPS:
-            return result(False, "too many requests waiting")
-        band_only = cmd == "set" and set(settings) == {"band"}
-        rx_only = cmd == "set" and bool(settings) and set(settings) <= set(RX_SETTINGS)
-        self.busy[name] = (
-            "changing band" if band_only else
-            "changing the receive path" if rx_only else
-            "saving its startup values" if cmd == "startup" else
-            {"set": "restarting"}.get(cmd, cmd + ("ing" if cmd != "stop" else "ping"))
-        )
+            return refuse("too many requests waiting")
+        self.busy[name] = busy_word(cmd, settings)
         self.queued += 1
-        log.info("Server: %s asks %s %s%s", c.peer, cmd, name, f" {settings}" if settings else "")
+        who = requester(msg.get("by"), c.peer)
+        log.info("Server: %s by %s", what_asked(cmd, name, settings), who)
         loop = asyncio.get_running_loop()
-        fut = loop.run_in_executor(self.ops, self._run_op, cmd, name, settings)
+        fut = loop.run_in_executor(self.ops, self._run_op, cmd, name, settings, who)
 
         def done(f: asyncio.Future[str]) -> None:
             self.queued -= 1
@@ -493,16 +650,163 @@ class Server:
         fut.add_done_callback(done)
         return None
 
-    def _run_op(self, cmd: str, name: str, settings: dict[str, Any]) -> str:
+    def _run_op(self, cmd: str, name: str, settings: dict[str, Any], who: str = "") -> str:
+        if who and cmd in COMMANDS:  # the receiver's own log says who asked, before it acts
+            with contextlib.suppress(Exception):  # a receiver not linked (stopped) has no log to tell
+                self.command_sync("skimmer", name, "note",
+                                  {"text": f"{what_asked(cmd, name, settings)} by {who}"}, 2.0)
+        if cmd == "discover":
+            address = settings.get("address")
+            if address is not None:
+                ipaddress.ip_address(address)  # ValueError: refused, nothing asked
+            return self.seat.discover(address=address)
+        if cmd == "node":  # sparkgap.sh setup's spotter ID, grid and operator, from the web
+            keys = ("radio", "callsign", "grid", "op_name")
+            return self.seat.set_node(*(str(settings.get(k) or "") for k in keys))
+        if cmd == "add":  # the rest of its settings are checked and written as a stopped one's
+            added = self.seat.add(name, str(settings.get("band") or ""))
+            rest = {key: v for key, v in settings.items() if key != "band"}
+            try:
+                if rest:
+                    self.seat.change(name, rest)
+            except SeatError:
+                self.seat.remove(name)  # not added after all: its config stays, as on a remove
+                raise
+            return self._with(added, self.seat.start(name), self._feeder_up(name))
+        if cmd == "remove":
+            down = self._feeder_down(name) if self._running(name) else ""
+            return self._with(down, self.seat.stop(name) if self._running(name) else "",
+                              self.seat.remove(name))
         if cmd == "start":
-            return self.seat.start(name)
+            return self._with(self.seat.start(name), self._feeder_up(name))
         if cmd == "stop":
-            return self.seat.stop(name)
+            return self._with(self._feeder_down(name), self.seat.stop(name))
         if cmd == "restart":
-            return self.seat.restart(name)
-        if cmd == "startup":
-            return self.seat.startup(name, settings)
+            down = self._feeder_down(name)
+            return self._with(down, self.seat.restart(name), self._feeder_up(name))
+        if cmd == "set" and set(settings) == {"rbn_upload"}:
+            return self._set_upload(name, settings["rbn_upload"])
         return self.seat.change(name, settings, live=self._live_band, live_rx=self._live_rx)
+
+    # ---- the RBN feeder, through its link to the hub ----
+
+    @staticmethod
+    def _with(*parts: str) -> str:
+        return "; ".join(p for p in parts if p)
+
+    def _wait_link(self, name: str, linked: bool, wait_s: float) -> bool:
+        end = time.monotonic() + wait_s
+        while time.monotonic() < end:
+            if (("feeder", name) in self.procs) == linked:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _running(self, name: str) -> bool:
+        return ("skimmer", name) in self.procs or bool(self.seat.pid(name))
+
+    def _feeds(self, i: Instance, without: str | None = None) -> list[str]:
+        """The running instances that feed i's feeder: the radio's receivers, or i alone."""
+        fname = self.seat.feeder_name(i)
+        return [j.name for j in self.seat.instances() if j.name != without
+                and self.seat.feeder_name(j) == fname and self._running(j.name)]
+
+    def _feeder_up(self, name: str) -> str:
+        """Start name's feeder when its rbn_upload is dry or live and it runs; a radio's feeder
+        that runs already is told its receivers."""
+        i = self.seat.instance(name)
+        mode = self.seat.upload_mode(i)
+        if mode == "off" or not self._running(name):
+            return ""
+        fname = self.seat.feeder_name(i)
+        if ("feeder", fname) not in self.procs and self.seat.feeder_pid(fname):
+            # running but not linked yet (the server restarted): never a second feeder
+            if not self._wait_link(fname, True, FEED_RELINK_S):
+                pid = self.seat.feeder_pid(fname)
+                return f"rbn feeder {fname} runs (pid {pid}) but has not linked"
+        if ("feeder", fname) in self.procs:
+            return self._tell_receivers(i) or "rbn feeder already running"
+        log_path = self.seat.spawn_feeder(i, self._feeds(i))
+        if self._wait_link(fname, True, FEED_LINK_S):
+            return f"rbn feeder {mode}"
+        return f"rbn feeder did not link within {FEED_LINK_S:.0f} s, see {log_path.name}"
+
+    def _tell_receivers(self, i: Instance, without: str | None = None) -> str:
+        if self.seat.radio_file(i) is None:
+            return ""
+        names = self._feeds(i, without)
+        answer = self.command_sync("feeder", self.seat.feeder_name(i), "receivers",
+                                   {"names": names}, wait_s=5.0)
+        return answer[1] if answer else "rbn feeder gave no answer"
+
+    def _feeder_down(self, name: str, all_receivers: bool = False) -> str:
+        """name stops: its feeder stops, unless other receivers of its radio still feed it (they
+        are its receivers now) or all_receivers; through its link, its process group if it does
+        not go."""
+        i = self.seat.instance(name)
+        fname = self.seat.feeder_name(i)
+        p = self.procs.get(("feeder", fname))
+        if p is None:
+            return ""
+        if not all_receivers and self._feeds(i, without=name):
+            return self._tell_receivers(i, without=name)
+        self.command_sync("feeder", fname, "stop", wait_s=5.0)
+        if self._wait_link(fname, False, FEED_STOP_S):
+            return "rbn feeder stopped"
+        if isinstance(p.pgid, int):
+            with contextlib.suppress(OSError):
+                os.killpg(p.pgid, signal.SIGTERM)
+        if self._wait_link(fname, False, 5.0):
+            return "rbn feeder stopped (it did not answer: signalled)"
+        raise SeatError(f"{name}: rbn feeder still running (pid {p.pid})")
+
+    def _set_upload(self, name: str, mode: Any) -> str:
+        """rbn_upload off, dry or live, for the radio's node (all its receivers) or the instance:
+        only the feeder follows it; the copies keep running."""
+        if mode not in RBN_MODES:
+            raise SeatError(f"rbn_upload must be one of: {', '.join(RBN_MODES)}")
+        i = self.seat.instance(name)
+        down = self._feeder_down(name, all_receivers=True)
+        self.seat.set_upload(i, None if mode == "off" else mode)
+        who = f"{self.seat.feeder_name(i)} (all its receivers)" if self.seat.radio_file(i) else name
+        feeds = self._feeds(i)
+        up = self._feeder_up(feeds[0]) if feeds else ""
+        return self._with(f"{who}: rbn upload {mode}", down, up)
+
+    def _radios_running(self) -> set[str]:
+        return {r for i in self.seat.instances()
+                if (r := self.seat.radio(i)) and self._running(i.name)}
+
+    async def _reap(self) -> None:
+        """A copy that stopped by itself (its radio lost for good, a crash) leaves a feeder with
+        nothing to post, and a station whose radio has no copy left: stop them."""
+        feeders = [name for role, name in list(self.procs) if role == "feeder"]
+        if feeders and not self.busy:
+            feeds = await asyncio.to_thread(self._feeding)
+            for name in feeders:
+                if self.busy:  # an operation began while this looked: it decides
+                    break
+                if not feeds.get(name):
+                    log.info("Server: nothing feeds rbn feeder %s (its copies stopped by "
+                             "themselves): stopping it", name)
+                    await self.command("feeder", name, "stop", wait_s=5.0)
+        stations = [name for role, name in list(self.procs) if role == "station"]
+        if stations and not self.busy:  # a start or stop under way may be bringing its copy up
+            running = await asyncio.to_thread(self._radios_running)
+            for name in stations:
+                if self.busy:
+                    break
+                if name not in running:
+                    log.info("Server: no copy runs on radio %s: stopping its station", name)
+                    await self.command("station", name, "stop", wait_s=5.0)
+
+    def _feeding(self) -> dict[str, list[str]]:
+        """Each feeder's running instances."""
+        out: dict[str, list[str]] = {}
+        for i in self.seat.instances():
+            if self._running(i.name):
+                out.setdefault(self.seat.feeder_name(i), []).append(i.name)
+        return out
 
     def _live_band(self, name: str, band: str) -> str | None:
         """Ask the running copy to move to band in place; its answer, None to restart it, or
@@ -614,12 +918,24 @@ class Server:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(up_w.wait_closed(), 2)
 
+    def _linked(self, st: dict[str, Any]) -> dict[str, Any]:
+        """An instance's status with what its skimmer's link says: running, its feed port and
+        receivers."""
+        p = self.procs.get(("skimmer", st["name"]))
+        st["linked"] = p is not None
+        if p is not None:
+            st["state"] = "running"
+            st["pid"] = st["pid"] or p.pid
+            for k in ("feed_port", "receivers", "cpu", "rss_mb"):
+                st[k] = p.status.get(k)
+        return st
+
     def _feed_target(self, name: str) -> tuple[str, int, str | None] | None:
         try:
             i = self.seat.instance(name)
         except SeatError:
             return None
-        st = self.seat.status(i)
+        st = self._linked(self.seat.status(i))
         if st["state"] != "running" or not st["feed_port"]:
             return None
         bind = str((self.seat.config(i).get("gui_feed") or {}).get("bind", "127.0.0.1"))

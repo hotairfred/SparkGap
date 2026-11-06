@@ -6,7 +6,9 @@ import os
 import queue
 import signal
 import threading
+import logging
 import zlib
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -497,3 +499,48 @@ def test_the_spotter_keeps_a_node_suffix_but_not_the_default() -> None:
     assert f.seat_settings({**SEAT, "callsign": "WF8Z", "skimmer_suffix": "-#"}).call == "WF8Z"
     assert f.seat_settings({**SEAT, "callsign": "WF8Z"}).call == "WF8Z"
     assert f.seat_settings({**SEAT, "skimmer_suffix": ""}).call == "N0CALL-2"
+
+
+def test_id_php_reads_the_band_list_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    # cdub89/SparkGap#33 O1: a seat that changed band reports its new bandLimits at the next id.php
+    monkeypatch.setattr(f, "ntp_synced", lambda: True)
+    probes = iter([[(14000.0, 14096.0)], [], [(7000.0, 7096.0)]])
+    sess = _session(None, dry_run=True)
+    sess.bands_of = lambda: next(probes)
+    bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(sess, "post", lambda path, body: bodies.append(body) or {})
+    assert sess.post_id() and sess.bands == [(14000.0, 14096.0)]   # moved to 20 m
+    assert sess.post_id() and sess.bands == [(14000.0, 14096.0)]   # an empty probe keeps the last
+    assert sess.post_id() and sess.bands == [(7000.0, 7096.0)]     # back on 40 m
+    assert [b["bandLimits"] for b in bodies] == [
+        "14000.0-14096.0", "14000.0-14096.0", "7000.0-7096.0"]
+
+
+def test_the_feeder_counts_warnings_and_errors_for_its_status() -> None:
+    levels = f.LevelCount()
+    lg = logging.getLogger("test-levels")
+    lg.addHandler(levels)
+    lg.warning("w")
+    lg.error("e")
+    lg.error("e")
+    assert (levels.warnings, levels.errors) == (1, 2)
+
+
+def test_the_feeder_sends_its_status_to_the_server() -> None:
+    """Mode, spotter, sign-in, bands and the post counts, every STATUS_S (cdub89/SparkGap#33)."""
+    sent: list[dict] = []
+
+    class Link:
+        def status(self, **fields: object) -> None:
+            sent.append(fields)
+
+    sess = SimpleNamespace(call="WX7V-5", registered=threading.Event(),
+                           bands=[(3490.4, 3586.4)],
+                           counts={"posts": 2, "sent": 5, "not signed in": 1})
+    stop = threading.Event()
+    stop.set()
+    seat = SimpleNamespace(mode="dry")
+    f.status_loop(Link(), sess, seat, f.LevelCount(), stop)  # type: ignore[arg-type]
+    assert sent == [{"mode": "dry", "spotter": "WX7V-5", "registered": False,
+                     "bands": [[3490.4, 3586.4]], "warnings": 0, "errors": 0,
+                     "posts": 2, "sent": 5, "not_signed_in": 1}]

@@ -72,6 +72,23 @@ def test_the_radio_moves_first_then_the_old_band_is_dropped() -> None:
     assert lo < center / 1000 < hi
 
 
+class Link:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def status(self, **fields: Any) -> None:
+        self.sent.append(fields)
+
+
+def test_the_server_link_hears_the_new_band(monkeypatch: pytest.MonkeyPatch) -> None:
+    link = Link()
+    monkeypatch.setattr("sparkgap._link", link)
+    sg = _copy([])
+    assert _change(sg, {"band": "20m"})[0]
+    assert [r["band"] for r in link.sent[-1]["receivers"]] == ["20m"]
+    assert link.sent[-1]["spots"] == 0
+
+
 def test_a_refused_retune_changes_nothing() -> None:
     events: list[str] = []
     sg = _copy(events, fail=True)

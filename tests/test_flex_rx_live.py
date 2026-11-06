@@ -6,7 +6,7 @@ import threading
 import pytest
 
 import flex_iq
-from flex_iq import FlexIQReceiver, pan_center, pan_rx, radio_loops, rfgain_steps, slice_letter
+from flex_iq import FlexIQReceiver, calibrating, pan_center, pan_rx, radio_loops, rfgain_steps, slice_letter
 from tests.flex_fake_radio import FakeConnection, FakeRadio, use_fake_radio
 
 Monkey = pytest.MonkeyPatch
@@ -125,7 +125,7 @@ def test_a_refusal_puts_back_what_the_radio_had(monkeypatch: Monkey) -> None:
     assert rx.rx["rxant"] == "ANT1" and "rxant=ANT1" in rx.rx_path
 
 
-def test_another_clients_change_is_shown_and_a_reconnect_restores_ours(monkeypatch: Monkey) -> None:
+def test_another_clients_change_is_followed_and_a_reconnect_restores_it(monkeypatch: Monkey) -> None:
     radio, rx = _live(monkeypatch, rxant="ANT1", loopb=True)
     conn = rx.conn
     assert isinstance(conn, FakeConnection) and radio.pans[PAN].loopb
@@ -133,10 +133,27 @@ def test_another_clients_change_is_shown_and_a_reconnect_restores_ours(monkeypat
     conn.queue.append("S0|display pan 0x40000000 rxant=RX_A loopb=0")  # changed in SmartSDR
     rx._poll()
     assert rx.rx["rxant"] == "RX_A" and rx.rx["loopb"] is False
-    assert rx.rx_path == " rxant=ANT1 loopa=0 loopb=1"
+    assert rx.rx_path == " rxant=RX_A loopa=0 loopb=0"
     conn.cut()
     rx._recover("lost", "link")
-    assert rx.state == "live" and rx._pan_id is not None and radio.pans[rx._pan_id].loopb
+    assert rx.state == "live" and rx._pan_id is not None
+    assert radio.pans[rx._pan_id].rxant == "RX_A" and not radio.pans[rx._pan_id].loopb
+
+
+def test_a_report_while_not_live_does_not_move_the_target(monkeypatch: Monkey) -> None:
+    _, rx = _live(monkeypatch, rxant="ANT1")
+    rx.state = "reconnecting"  # a new pan's first report is the radio's default, not a choice
+    rx._note_rx({**rx.rx, "rxant": "RX_A"})
+    assert rx.rx["rxant"] == "RX_A" and rx._target["rxant"] == "ANT1"
+    assert rx.rx_followed is None
+
+
+def test_calibration_holding_our_pan_is_not_followed(monkeypatch: Monkey) -> None:
+    _, rx = _live(monkeypatch, rxant="ANT1")
+    assert rx.rx_followed is not None and rx.rx_followed["rxant"] == "ANT1"
+    rx._cal_held = True
+    rx._note_rx({**rx.rx, "rxant": "RX_A"})
+    assert rx.rx_followed is None and rx._target["rxant"] == "ANT1"
 
 
 def test_loops_follow_the_model() -> None:
@@ -248,6 +265,79 @@ def test_a_pan_moved_by_another_client_halts(monkeypatch: Monkey) -> None:
     conn.queue.append(radio.pan_line(PAN))
     rx._poll()
     assert rx.state == "halted" and not radio.pans
+
+
+def test_calibrating_reads_pll_done() -> None:
+    assert calibrating(["S0|radio slices=2 pll_done=0 cal_freq=15.000000"]) is True
+    assert calibrating(["S0|radio pll_done=0", "S0|radio pll_done=1"]) is False
+    assert calibrating(["S0|display pan 0x40000000 center=14.1"]) is None
+
+
+def test_calibration_borrowing_our_pan_mutes_then_retunes_back(monkeypatch: Monkey) -> None:
+    # 2026-11-03 FLEX-6400M, both pans ours: calibration took one; removing it rebooted the radio
+    radio, rx = _live(monkeypatch)
+    conn = rx.conn
+    assert isinstance(conn, FakeConnection)
+    since = len(radio.log)
+    radio.pll_done = False
+    radio.pans[PAN].center = 15.0
+    conn.queue += [radio.radio_line(), radio.pan_line(PAN)]
+    rx._poll()
+    assert rx.state == "live" and rx._discard_until == float("inf")
+    assert not any(c.startswith(("display pan remove", "slice remove", "stream remove")) for c in _sent(radio, since))
+    conn.queue.append(radio.pan_line(PAN))  # still away: no halt
+    rx._poll()
+    assert rx.state == "live"
+    radio.pll_done = True
+    conn.queue.append(radio.radio_line())
+    rx._poll()
+    rx._cal_restore(1000.0)
+    assert rx.state == "live" and radio.pans[PAN].center == pytest.approx(14.044)
+    assert rx._discard_until < float("inf") and not rx._cal_held
+    assert not any(c.startswith(("display pan remove", "slice remove", "stream remove")) for c in _sent(radio, since))
+
+
+def _calibrated_away(monkeypatch: Monkey) -> tuple[FakeRadio, FlexIQReceiver]:
+    radio, rx = _live(monkeypatch)
+    conn = rx.conn
+    assert isinstance(conn, FakeConnection)
+    radio.pll_done = False
+    radio.pans[PAN].center = 15.0
+    conn.queue += [radio.radio_line(), radio.pan_line(PAN)]
+    rx._poll()
+    radio.pll_done = True
+    conn.queue.append(radio.radio_line())
+    rx._poll()
+    return radio, rx
+
+
+def test_a_slice_refused_right_after_calibration_is_tried_again(monkeypatch: Monkey) -> None:
+    # 2026-11-03 13:42:14: at pll_done=1 the radio refused slice unlock 0 (50000016)
+    radio, rx = _calibrated_away(monkeypatch)
+    radio.refuse["slice unlock"] = "50000016"
+    rx._cal_restore(1000.0)
+    assert rx.state == "live" and rx._cal_held and rx._discard_until == float("inf")
+    del radio.refuse["slice unlock"]
+    rx._cal_restore(1000.5)  # before the retry time: nothing
+    assert rx._cal_held
+    rx._cal_restore(1001.0)
+    assert rx.state == "live" and not rx._cal_held and radio.pans[PAN].center == pytest.approx(14.044)
+
+
+def test_a_slice_still_refused_after_calibration_halts(monkeypatch: Monkey) -> None:
+    radio, rx = _calibrated_away(monkeypatch)
+    radio.refuse["slice unlock"] = "50000016"
+    rx._cal_restore(1000.0)
+    rx._cal_restore(1000.0 + flex_iq.CAL_RESTORE_S)
+    assert rx.state == "halted"
+
+
+def test_no_recovery_after_a_halt(monkeypatch: Monkey) -> None:
+    radio, rx = _live(monkeypatch)
+    rx._halt("test")
+    since = len(radio.log)
+    rx._recover("No DAX-IQ packets for 10 s", "stream")
+    assert rx.state == "halted" and radio.log[since:] == []
 
 
 def test_our_own_retune_does_not_trip_the_guard(monkeypatch: Monkey) -> None:

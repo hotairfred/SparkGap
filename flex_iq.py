@@ -22,6 +22,7 @@ Protocol refs:
 """
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -32,6 +33,7 @@ import struct
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import numpy as np
 
@@ -65,6 +67,8 @@ STATION_WAIT_S = 600        # a copy whose own station left waits this long for 
 STATION_TAKEOVER_S = 10     # times the DAX-IQ channel: a copy waits this long for a lost station, then holds it
 STATION_POLL_S = 10
 LIVE_LOCK_WAIT_S = 2.0      # a live change waits this long for the receiver; a recovery holds it longer
+CAL_RESTORE_S = 10          # after calibration, keep trying to get our frequency back this long
+CAL_RETRY_S = 1             # between those tries (at pll_done=1 the radio refused our slice for a moment)
 RETUNE_SETTLE_S = 0.5       # IQ dropped this long after a retune's replies: still the old frequency
 PAN_MOVED_MHZ = 0.5e-6      # our pan's reported centre further than this (0.5 Hz; it reports 1 Hz) from ours: moved by someone else
 TX_STATES = ('PTT_REQUESTED', 'TRANSMITTING', 'UNKEY_REQUESTED')  # the radio's interlock while keyed
@@ -262,6 +266,146 @@ RX_KEYS = ('rxant', 'loopa', 'loopb', 'rfgain')   # our pan's receive path, as t
 LOOPS_BY_MODEL = {'FLEX-6500': ('loopa',), 'FLEX-6700': ('loopa', 'loopb'), 'FLEX-6700R': ('loopa', 'loopb')}
 
 
+DISCOVERY_PORT = 4992       # a radio broadcasts its discovery packet here (UDP) about once a second
+DISCOVERY_S = 3.0           # how long to listen for it when the radio's address does not answer
+_radio_serial = None        # the radio's serial (its radio file): looked for by its broadcast if it moves
+on_radio_moved = None       # called with the radio's new address when it was found by its broadcast
+
+
+def radio_path(config_dir, name):
+    """A radio's file: config/<nickname>.radio.json (type, nickname, model, serial, address), written by Discover."""
+    return Path(config_dir) / f"{name}.radio.json"
+
+
+def read_radio(path):
+    """The radio's file; SystemExit when Discover has not
+    made it yet."""
+    try:
+        st = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"{path}: no radio file for this radio ({e}): run Discover") from None
+    if not st.get('address'):
+        raise SystemExit(f"{path}: no address: run Discover")
+    if st.get('type', 'flex') != 'flex':
+        raise SystemExit(f"{path}: a {st['type']} radio, not a FlexRadio")
+    return st
+
+
+def write_radio(path, st):
+    """Write a radio file in one atomic replace."""
+    path = Path(path)
+    tmp = path.with_name(path.name + '.new')
+    tmp.write_text(json.dumps(st, indent=2) + '\n')
+    os.replace(tmp, path)
+
+
+def bind_radio(path):
+    """This process uses the radio in the file at path: its address now, its serial to find it
+    by its broadcast if it moves, and a move written back to the file.  Returns the address."""
+    st = read_radio(path)
+    set_radio_serial(st.get('serial'))
+
+    def moved(address):
+        try:
+            cur = read_radio(path)
+            if cur.get('address') != address:
+                write_radio(path, dict(cur, address=address))
+                log.info("[Flex] Station config %s: address %s", path, address)
+        except (OSError, SystemExit) as e:
+            log.warning("[Flex] Could not write the new address to %s: %s", path, e)
+
+    global on_radio_moved
+    on_radio_moved = moved
+    return st['address']
+
+
+def set_radio_serial(serial):
+    """The serial of the radio this process uses (its radio file), to find it if its address moves."""
+    global _radio_serial
+    _radio_serial = serial or None
+
+
+def parse_discovery(packet):
+    """The key=value fields of a radio's discovery packet, or None for anything else."""
+    text = packet.decode('ascii', 'replace')
+    start = text.find('discovery_protocol_version=')
+    if start < 0:
+        return None
+    kv = dict((k, v.strip('"')) for k, v in re.findall(r'([A-Za-z_0-9]+)=("[^"]*"|\S*)', text[start:].replace('\x00', ' ')))
+    return kv if kv.get('ip') and kv.get('serial') else None
+
+
+def parse_info(lines):
+    """The fields of the radio's reply to "info" (R<seq>|0|model="FLEX-6600",num_scu=2,...), {} for none."""
+    for line in lines:
+        m = re.match(r'R\d+\|0\|(.*)', line)
+        if m and 'model=' in m.group(1):
+            return dict((k, v.strip('"')) for k, v in re.findall(r'([A-Za-z_0-9]+)=("[^"]*"|[^,\s]*)', m.group(1)))
+    return {}
+
+
+def ask_info(ip, timeout=10.0):
+    """The radio's "info" fields (model, name, chassis_serial, num_scu, num_slice, software_ver), asked as a
+    plain client that makes nothing on the radio, as FlexLib's clients do before they register; {} when it
+    does not answer like a FlexRadio.  Raises OSError when nothing answers at ip."""
+    with socket.create_connection((ip, DISCOVERY_PORT), timeout=timeout) as s:
+        s.settimeout(0.3)
+        buf, got = b'', []
+        s.sendall(b'C1|info\n')
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end and not any(l.startswith('R1|') for l in got):
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            *lines, buf = (buf + chunk).split(b'\n')
+            got += [l.decode('utf-8', 'replace').strip() for l in lines]
+        s.sendall(b'\x04')    # FlexLib tells the radio it is leaving before it closes
+    return parse_info(got)
+
+
+def discover(seconds=DISCOVERY_S):
+    """The radios heard broadcasting within `seconds`: {serial: fields}.  Empty when the port can't be
+    opened (on Windows SmartSDR holds it)."""
+    radios = {}
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_REUSEPORT'):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        s.bind(('', DISCOVERY_PORT))
+    except OSError as e:
+        log.info("[Flex] Discovery not available: %s", e)
+        return radios
+    end = time.time() + seconds
+    with s:
+        while time.time() < end:
+            s.settimeout(max(0.05, end - time.time()))
+            try:
+                packet, _ = s.recvfrom(4096)
+            except (socket.timeout, OSError):
+                break
+            kv = parse_discovery(packet)
+            if kv:
+                radios[kv['serial']] = kv
+    return radios
+
+
+def locate(ip, radios=None):
+    """Where the radio is when `ip` does not answer: the address in its broadcast, found by the serial in
+    its radio file.  None without a serial or when it is not heard."""
+    if not _radio_serial:
+        return None
+    radios = discover() if radios is None else radios
+    found = radios.get(_radio_serial)
+    if found and found['ip'] != ip:
+        log.warning("[Flex] Radio %s (%s) found at %s by its broadcast; it was at %s",
+                    found.get('nickname') or '?', found.get('model', '?'), found['ip'], ip)
+    return found['ip'] if found else None
+
+
 def radio_loops(lines):
     """The receive loops the radio has, from its reply to "info" (model="FLEX-6700")."""
     for line in lines:
@@ -295,6 +439,12 @@ def pan_rx(lines, pan_id, out=None, loops=('loopa', 'loopb')):
         if 'ant_list' in kv:
             out['ant_list'] = [a for a in kv['ant_list'].split(',') if a]
     return out
+
+
+def calibrating(lines):
+    """True while the radio calibrates its frequency (radio pll_done=0), False once done; None if not reported."""
+    found = [m.group(1) == '0' for l in lines for m in [re.search(r'\|radio .*\bpll_done=([01])\b', l)] if m]
+    return found[-1] if found else None
 
 
 def pan_center(lines, pan_id):
@@ -367,7 +517,19 @@ class FlexConnection:
     def open(self):
         self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._tcp.settimeout(10)
-        self._tcp.connect((self.ip, self.port))
+        try:
+            self._tcp.connect((self.ip, self.port))
+        except OSError:
+            moved = locate(self.ip)          # the radio may be back on another address (DHCP)
+            if not moved or moved == self.ip:
+                raise
+            self._tcp.close()
+            self.ip = moved
+            if on_radio_moved:
+                on_radio_moved(moved)        # its radio file follows
+            self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._tcp.settimeout(10)
+            self._tcp.connect((self.ip, self.port))
         hello = self.drain(3)     # version, handle, status flood
         self.handle = next((l[1:].strip().upper() for l in hello if l.startswith('H')), '')
         self.version = next((l[1:].strip() for l in hello if l.startswith('V')), '?')
@@ -610,6 +772,7 @@ class FlexStation:
         self._unanswered = None   # time.time() of the first ping in a row without a reply
         self._ptt_warned = False
         self._stop = threading.Event()
+        self._on_beat = None
         self._thread = None
 
     def start(self, again=False, conn=None):
@@ -620,6 +783,7 @@ class FlexStation:
             if conn is None:
                 conn = FlexConnection(self.ip, self.control_port)
                 conn.open()
+            self.ip = conn.ip      # found by its broadcast if the configured address no longer answers
             self.station = station_name(conn, self._station_cfg)
             self.client_id = station_client_id(self.ip, self.station)
             register_program(conn)
@@ -666,7 +830,9 @@ class FlexStation:
 
     def run(self, on_beat=None):
         """Hold the station until stop(): ping each HEARTBEAT_S, read status, and register again
-        after a loss while the budget lasts.  on_beat(health) after each heartbeat."""
+        after a loss while the budget lasts.  on_beat(health) after each heartbeat and as a
+        recovery starts, so a radio that is down shows while we wait for it."""
+        self._on_beat = on_beat
         try:
             while not self._stop.is_set():
                 why = self._beat()
@@ -730,6 +896,8 @@ class FlexStation:
             return self._halt("%s, loss %d within %d min" % (why, self.budget.budget + 1, self.budget.window // 60))
         log.error("[Flex] Station %s: %s: registering again once the radio is steady", self.station, why)
         self.state = "reconnecting"
+        if self._on_beat:
+            self._on_beat(self.health())
         end = time.time() + OUTAGE_MAX_S
         while True:
             conn = await_radio(self.ip, self.control_port, stopping=self._stop.is_set, outage=True)
@@ -804,8 +972,8 @@ class FlexIQReceiver:
         # flex_rxant / flex_loopa / flex_loopb / flex_rfgain: the receive path our pan starts with;
         # None leaves the radio's (band-persistence) value.  A receive loop is shared by every pan on
         # that antenna and RF gain by every pan on the same SCU, so a pan that comes up with the loop
-        # off turns it off for whatever hangs on the loop.  The radio's state is what we show; the target
-        # moves only on our own live change (set_rx), so a reconnect restores ours, not another client's.
+        # off turns it off for whatever hangs on the loop.  SparkGap follows the radio: live, the target is
+        # what the radio last reported, whoever changed it, so a reconnect restores that.
         self._target = {'rxant': rxant, 'loopa': None if loopa is None else bool(loopa),
                         'loopb': None if loopb is None else bool(loopb),
                         'rfgain': None if rfgain is None else int(rfgain)}
@@ -832,6 +1000,10 @@ class FlexIQReceiver:
         self._start_missed = False    # the last failed start had a command without a reply
         self._clients = []            # client status at the last connect
         self._discard_until = 0.0     # IQ before this time is the old frequency (retune)
+        self._calibrating = False     # the radio is calibrating its frequency (pll_done=0)
+        self._cal_held = False        # calibration took our pan: muted until it is done, then retuned back
+        self._cal_done_at = None      # when the radio reported calibration done, while we are not back yet
+        self._cal_retry_at = 0.0
         self.last_packet = None       # time.time() of the newest DAX-IQ packet since the last stream
 
         # for the GUI status page (health())
@@ -892,7 +1064,10 @@ class FlexIQReceiver:
             self._own_station = None
         conn = self.conn = FlexConnection(self.ip, self.control_port)
         conn.open()
-        self.loops = radio_loops(conn.cmd("info"))
+        self.ip = conn.ip          # found by its broadcast if the configured address no longer answers
+        info = conn.cmd("info")
+        self.loops = radio_loops(info)
+
         dropped = [k for k in ('loopa', 'loopb') if self._target[k] is not None and k not in self.loops]
         if dropped:
             log.warning("[Flex] flex_%s set, but this radio model has no such loop: not sent", "/flex_".join(dropped))
@@ -948,6 +1123,7 @@ class FlexIQReceiver:
         status = (conn.cmd("sub pan all", settle=0.5) + conn.cmd("sub slice all", settle=0.5)
                   + conn.cmd("sub daxiq all", settle=0.5))
         conn.ok("transmit state for the GUI", conn.cmd("sub tx all", settle=0.3))  # key-down: an empty spectrum
+        self._calibrating = bool(calibrating(conn.cmd("sub radio all", settle=0.3)))
         log.info("[Flex] Decoding muted while the radio is keyed, until %d ms after its key-up",
                  round(TX_HOLD_S * 1000))
         # A DAX-IQ channel another station's pan holds (Maestro, SmartSDR, DAX) is not ours to take,
@@ -1132,27 +1308,67 @@ class FlexIQReceiver:
                 self._station_lost = True
         if self._slice_id is not None:
             self.slice_letter = slice_letter(lines, self._slice_id) or self.slice_letter
+        cal = calibrating(lines)
+        if cal is not None:
+            self._calibrating = cal
         if self._pan_id is not None:
             self._note_rx(pan_rx(lines, self._pan_id, self.rx, self.loops))
             centre = pan_center(lines, self._pan_id)
             # our own retune holds this lock and updates freq_mhz before _poll can read again
             if centre is not None and self.state == "live" and abs(centre - self.freq_mhz) > PAN_MOVED_MHZ:
-                log.warning("[Flex] Our pan was moved to %.6f MHz (ours %.6f) by another client", centre, self.freq_mhz)
-                self._halt("pan moved to %.6f MHz by another client: its spots would carry the wrong frequency" % centre)
-                return lines
+                if self._calibrating or self._cal_held:
+                    # removing our pan or slice mid-calibration rebooted a FLEX-6400M (2026-11-03)
+                    if not self._cal_held:
+                        log.warning("[Flex] The radio's calibration took our pan to %.6f MHz: muted until it is done", centre)
+                    self._cal_held = True
+                    self._discard_until = float('inf')
+                else:
+                    log.warning("[Flex] Our pan was moved to %.6f MHz (ours %.6f) by another client", centre, self.freq_mhz)
+                    self._halt("pan moved to %.6f MHz by another client: its spots would carry the wrong frequency" % centre)
+                    return lines
         if ptt_ours(lines) and not self._ptt_warned:
             self._ptt_warned = True
             log.warning("[Flex] The radio's key and PTT jacks now follow the SparkGap station, "
                         "not the operator's: set local PTT in SmartSDR")
         return lines
 
+    def _cal_restore(self, now):
+        """Once calibration is done, retune back to our frequency, muted until we are."""
+        if not self._cal_held or self._calibrating or now < self._cal_retry_at or self.state != "live":
+            return
+        if self._cal_done_at is None:
+            self._cal_done_at = now
+        try:
+            self.retune(self.freq_hz)
+        except RuntimeError as e:
+            if self.state == "halted":
+                return
+            if now - self._cal_done_at >= CAL_RESTORE_S:
+                self._halt("after calibration, %.6f MHz not restored: %s" % (self.freq_mhz, e))
+                return
+            log.info("[Flex] Calibration done, not back yet (%s): trying again", e)
+            self._cal_retry_at = now + CAL_RETRY_S
+            self._discard_until = float('inf')
+            return
+        self._cal_held, self._cal_done_at = False, None
+        log.info("[Flex] Calibration done: back to %.6f MHz", self.freq_mhz)
+
     def _note_rx(self, rx):
-        """The radio reported our pan's receive path: shown as it is; the target stays ours (set_rx)."""
+        """The radio reported our pan's receive path: shown as it is and, live, followed (the target)."""
         changed = {k: rx[k] for k in RX_KEYS if k in rx and rx.get(k) != self.rx.get(k)}
         if changed and self.rx:
             log.info("[Flex] Our pan now reports%s", rx_args(changed))
         self.rx = rx
-        self._target.update({k: rx[k] for k in RX_KEYS if self._target[k] is None and k in rx})  # unset: as first found
+        follow = self.rx_followed or {}
+        self._target.update({k: rx[k] for k in RX_KEYS if k in rx and (k in follow or self._target[k] is None)})
+
+    @property
+    def rx_followed(self):
+        """Our pan's receive path to follow (the target a reconnect restores), or None while it is
+        no one's choice: start() setting up a new pan, or calibration holding it."""
+        if self.state != "live" or self._calibrating or self._cal_held:
+            return None
+        return {k: self.rx[k] for k in RX_KEYS if k in self.rx}
 
     @contextlib.contextmanager
     def _live_lock(self):
@@ -1210,7 +1426,6 @@ class FlexIQReceiver:
                 return ok
 
             if send(want):
-                self._target.update({k: self.rx.get(k, v) for k, v in want.items()})  # as the radio reported
                 return "receive path" + rx_args({k: self.rx.get(k, want[k]) for k in want})
             back = not old or send(old)
             raise RuntimeError(f"[Flex] The radio refused{rx_args(want)}"
@@ -1243,7 +1458,7 @@ class FlexIQReceiver:
         kind: 'stream' (stall, connection alive): a new stream only; 'link' (connection lost): connect
         again and bind; 'station' (the station left, taking our pan): wait for it, bind, build again."""
         with self._lock:
-            if self._stopping:
+            if self._stopping or self.state == "halted":   # a halt in the same pass (2026-11-03): no rebuild
                 return
             now = time.time()
             if not self.budget.take(why, now):
@@ -1265,6 +1480,7 @@ class FlexIQReceiver:
                         self._halt("the radio did not come back within %d min" % (OUTAGE_MAX_S // 60), alive=False)
                         return
                     settled = True
+                    self.ip = conn.ip      # found by its broadcast if it came back on another address
                     station = find_station(conn.cmd("sub client all", settle=0.5), self.station, self.ip)
                     if conn is not self.conn:  # our connection did not last the outage
                         conn.close("ready")
@@ -1299,6 +1515,7 @@ class FlexIQReceiver:
                                 self._halt("the radio did not come back within %d min" % (OUTAGE_MAX_S // 60),
                                            alive=False)
                                 return
+                            self.ip = conn.ip
                             conn.close("ready")
                         settled = False
                         try:
@@ -1486,6 +1703,10 @@ class FlexIQReceiver:
             with self._lock:
                 if conn is self.conn and conn in ready and self._poll() is None:
                     why, kind = conn.lost, 'link'
+                elif conn is self.conn:
+                    self._cal_restore(time.time())
+            if self._cal_held:
+                last_pkt = time.time()    # the radio sends no IQ while it calibrates
             if not why and self._station_lost:
                 why, kind = "Station %s left the radio" % self.station, 'station'
             elif not why and pkt_count and time.time() - last_pkt > STALL_S:

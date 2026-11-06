@@ -154,3 +154,13 @@ def test_iq_while_keyed_reaches_the_decoders_as_silence(monkeypatch: Monkey, rad
         rx._tx_since, rx._tx_spans, rx._running = (0.0 if keyed else None), [], True
         rx.receive(take)
     assert not got[0].any() and got[1].any() and rx.muted_packets == 1
+
+
+def test_a_station_waiting_for_the_radio_reports_reconnecting(monkeypatch: Monkey) -> None:
+    # Dallas 11-05: the radio rebooted and the server kept the last beat's "live" for the whole outage
+    st, beats = FlexStation("192.0.2.1"), []
+    st._on_beat = beats.append
+    monkeypatch.setattr(flex_iq, "await_radio", lambda *a, **k: None)
+    st._recover("No ping reply for 15 s")
+    assert beats[0]["state"] == "reconnecting"
+    assert st.state == "halted"

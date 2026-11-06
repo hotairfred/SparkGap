@@ -426,7 +426,7 @@ def test_misses_kept_only_for_failures() -> None:
     assert set(f.misses) == {"100.64.0.4"}  # the stale address is pruned
 
 
-def test_problems_count_errors_only() -> None:
+def test_problems_keep_errors_and_warnings() -> None:
     log = logging.getLogger("sparkgap.test_problems")
     problems = feed_server.ProblemLog()
     log.addHandler(problems)
@@ -436,8 +436,9 @@ def test_problems_count_errors_only() -> None:
     finally:
         log.removeHandler(problems)
     s = problems.summary()
-    assert s["errors"] == 1 and "warnings" not in s
-    assert [e["level"] for e in s["last"]] == ["ERROR"]
+    assert (s["errors"], s["warnings"]) == (1, 1)
+    assert [e["level"] for e in s["last"]] == ["WARNING", "ERROR"]
+    assert s["last"][0]["msg"] == "[Flex] <<< R1|10000002|unknown client program"
 
 
 @pytest.mark.parametrize("frames", [
@@ -688,7 +689,7 @@ def test_auto_port_says_when_none_is_free(monkeypatch: pytest.MonkeyPatch,
 
 def test_7320_is_the_servers_and_auto_starts_after_it(caplog: pytest.LogCaptureFixture) -> None:
     assert FeedServer({"bind": "127.0.0.1"}, HELLO).ports[0] == 7321
-    assert list(feed_server.AUTO_PORTS) == list(range(7321, 7340))
+    assert list(feed_server.AUTO_PORTS) == list(range(7321, 7330))  # 7330-7339: telnet
     with caplog.at_level(logging.WARNING):
         FeedServer({"bind": "127.0.0.1", "port": 7320}, HELLO)
     assert "is the server's" in caplog.text

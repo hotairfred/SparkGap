@@ -10,7 +10,7 @@ Protocol `sparkgap.v1`, feed version 1.
 ## Connecting
 
 One endpoint per SparkGap: `ws://<host>:<port>/feed` (the port is the first free
-one from 7321 to 7339 unless the config sets one; 7320 is the machine's server's,
+one from 7321 to 7329 unless the config sets one; 7320 is the machine's server's,
 which passes the feed through as `/feed/<name>`), or `wss://` when the config
 has `tls_cert` and `tls_key`. A standard WebSocket handshake (RFC 6455,
 version 13):
@@ -26,7 +26,7 @@ version 13):
   server echoes only `sparkgap.v1`.
 - A feed without a join code accepts a request with an `Origin` header only
   when that origin is a loopback address (`localhost`, `127.0.0.1`, `::1`) on
-  the feed's own port or on 7321-7339 (another copy's page, which lists this
+  the feed's own port or on 7321-7329 (another copy's page, which lists this
   copy too), so a web page from elsewhere cannot read a feed on this machine,
   even through a name that resolves to 127.0.0.1.
 
@@ -180,7 +180,7 @@ Every 2 seconds.
  "decode_khz": [[7000.0, 7070.0]],
  "clients": [{"peer": "192.168.1.31:61718", "name": "shack", "via": null,
               "since": 1792018739, "dropped": 12}],
- "problems": {"errors": 8,
+ "problems": {"errors": 8, "warnings": 3,
               "last": [{"utc": 1792019013, "level": "ERROR",
                         "msg": "[Flex] The radio closed the control connection"}]}}
 ```
@@ -205,7 +205,7 @@ The station (absent in file mode except `radio`):
 
 - `radio`: `type` (`flex`, `hpsdr` or `file`), `address` (the radio's address,
   or the file being replayed) and `state` (`connecting`, `live`, `reconnecting`,
-  `waiting` or `replaying`). A Flex adds `packets`, `lost`, `reconnects`,
+  `halted`, `waiting` or `replaying`). A Flex adds `packets`, `lost`, `reconnects`,
   `last_reconnect` (UTC seconds or `null`), its `station` name, its
   `daxiq_channel`, the `others` stations on the radio at the last connect,
   how many packets it has silenced while the radio was keyed
@@ -227,8 +227,8 @@ The feed itself:
   (`null` when it has none), `via` (`"server"` for a browser the SparkGap
   server passes through, its address taken from the server; else `null`),
   connected since (UTC seconds), spectrum rows dropped because it fell behind.
-- `problems`: SparkGap's errors since start, with the last five
-  (UTC seconds, level, message).
+- `problems`: SparkGap's errors and warnings since start, with the last ten of
+  either (UTC seconds, level, message).
 
 ### Spectrum rows (binary)
 
