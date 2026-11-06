@@ -78,6 +78,7 @@ LOOKAHEAD = 3                 # tokens after a keyword searched for the sender's
 DE_LOOKBACK = 6               # tokens before DE searched for CQ or TEST
 NEAR_KHZ = 0.5                # copies within this of each other are one frequency
 REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call and band per 10 minutes
+RESPOT_S = REPEAT_S + 15.0     # re-spot after 10 minutes as RBN times them: its clock is the upload, a few s after ours
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
 OWNER_CELL_KHZ = 0.25         # owner_cell: a new owner replaces only the owner within this
 STRONGEST_S = 60.0            # strongest: a stronger copy of the call elsewhere in the band this recently
@@ -652,7 +653,7 @@ class RepeatSpotRule:
                 continue          # a spur or image of a stronger signal of the same call
             key = (call, int(spot_f // 1000))     # per band: a station running two bands
             last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
-            if last is None or now - last[0] >= REPEAT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
+            if last is None or now - last[0] >= RESPOT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
                 self._last_spot[key] = (now, spot_f)
                 best = max((c for c in near if c.call == call), key=lambda c: c.snr)   # the copy spot_f came from
                 reports = [c.report for c in near if c.call == call and c.report is not None]
@@ -666,6 +667,24 @@ class RepeatSpotRule:
                     self.spot_snr.pop(call, None)
                 spots.append((call, spot_f))
         return spots
+
+    def last_spots(self) -> list[list]:
+        """The re-spot table, for spot_rule_memory: [[call, MHz, time, freq], ...]."""
+        return [[c, mhz, t, f] for (c, mhz), (t, f) in self._last_spot.items()]
+
+    def restore_last_spots(self, rows: list, now: float) -> int:
+        """Load a saved re-spot table: entries younger than RESPOT_S, so a restart does not spot
+        again a station spotted minutes before it. Returns how many were kept."""
+        kept = 0
+        for row in rows:
+            try:
+                call, mhz, t, f = str(row[0]), int(row[1]), float(row[2]), float(row[3])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if 0 <= now - t < RESPOT_S:
+                self._last_spot[(call, mhz)] = (t, f)
+                kept += 1
+        return kept
 
     def _stronger_elsewhere(self, best: _Copy, now: float) -> bool:
         """strongest_db: a copy of best's call in the same band, more than MOVE_KHZ away, read in

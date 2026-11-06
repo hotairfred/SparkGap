@@ -2171,6 +2171,41 @@ def _validation_list(config, tracker, calls):
     cache[calls] = listed
     return listed
 
+def _spot_memory_rules(tracker):
+    """(name, rule) of the spot rules whose re-spot table spot_rule_memory keeps."""
+    return [(n, r) for n, r in (('rbn', getattr(tracker, 'spot_rule', None)),
+                                ('local', getattr(tracker, 'local_rule', None)))
+            if r is not None and hasattr(r, 'last_spots')]
+
+
+def _save_spot_memory(path, tracker):
+    """spot_rule_memory: write each spot rule's re-spot table (atomic)."""
+    if not path:
+        return
+    try:
+        data = {n: r.last_spots() for n, r in _spot_memory_rules(tracker)}
+        with open(path + '.new', 'w') as f:
+            json.dump(data, f)
+        os.replace(path + '.new', path)
+    except OSError as e:
+        log.warning("spot_rule_memory %s not written: %s", path, e)
+
+
+def _load_spot_memory(path, tracker, now):
+    """spot_rule_memory: restore the re-spot tables a previous run saved (entries under 10 min)."""
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        log.warning("spot_rule_memory %s not read: %s", path, e)
+        return 0
+    kept = sum(r.restore_last_spots(data.get(n, []), now) for n, r in _spot_memory_rules(tracker))
+    log.info("spot_rule_memory: %d recent spots restored from %s", kept, path)
+    return kept
+
+
 def _make_spot_rule(config, tracker, local=None):
     """The RepeatSpotRule SparkGap runs with spot_rule "repeat": tiers from patt3ch, lock-on,
     CQ groups and CQ qualifiers always on (measured on every recording we have), split_runs
@@ -7759,6 +7794,9 @@ class SparkGap:
             else:
                 log.info("Local telnet port %d: same spots as port %d",
                          self.cfg['telnet_local_port'], self.cfg.get('telnet_port', 7300))
+        # spot_rule_memory: a restart keeps the re-spot table, so a station spotted minutes
+        # before it is not spotted again (off by default)
+        _load_spot_memory(self.cfg.get('spot_rule_memory'), self.tracker, self.tracker.clock())
 
         # ----------------------------------------------------------------
         # Band configuration — supports single band (legacy) and multi-band
@@ -8132,6 +8170,7 @@ class SparkGap:
 
     async def stop(self):
         self.running = False
+        _save_spot_memory(self.cfg.get('spot_rule_memory'), self.tracker)
         if _link is not None:
             _link.close()
         if self.receiver:
@@ -8629,6 +8668,7 @@ class SparkGap:
                                  rss_mb=proc.get('rss_mb'))
             if now - last_status >= status_interval:
                 last_status = now
+                _save_spot_memory(self.cfg.get('spot_rule_memory'), self.tracker)
                 elapsed = now - self.start_time
                 total_decoders = sum(mgr.count for mgr in self.managers)
                 total_chars    = sum(
