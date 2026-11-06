@@ -534,13 +534,16 @@ class RepeatSpotRule:
                  owner_listed: bool = False, la1d: bool = False, gluek: bool = False,
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
-                 window_join: bool = False) -> None:
+                 window_join: bool = False, validation_threshold: float | None = None) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
             raise ValueError(f"listed_by must be one of {list(_WEIGHTS_LISTED)}, got {listed_by!r}")
         self.tier = tier
-        self.threshold = VALIDATION[validation] if validation else None
+        # validation_threshold (spot_validation_threshold): the score a call needs, in place of the level's
+        self.threshold = (None if not validation else
+                          float(validation_threshold) if validation_threshold is not None
+                          else VALIDATION[validation])
         self.listed = listed                                    # validation: call list lookup, or None
         self.weights = _WEIGHTS_LISTED[listed_by] if listed else _WEIGHTS
         self._paths: dict[int, list[Counter]] = {}              # validation: window -> token counts per path
