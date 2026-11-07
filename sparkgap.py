@@ -2077,6 +2077,18 @@ def _select_afc(on):
         log.info("ITILA scanner: bins follow the keyed tone (itila2_afc)")
     return _afc
 
+_fold_mask = False   # config itila2_fold_mask: the per-bin filters in the FFT mask, 2 kHz straight out
+
+def _select_fold_mask(on):
+    """Config key itila2_fold_mask (default off): the itila2 scanner folds stage 2 and the Hann / wide
+    filters into each bin's FFT mask and inverse-FFTs each path straight to 2 kHz (itila_sc_set_fold),
+    instead of a 12 kHz inverse FFT and the time-domain filters (about 30% less CPU at 192 kHz)."""
+    global _fold_mask
+    _fold_mask = bool(on)
+    if _fold_mask:
+        log.info("ITILA scanner: filters folded into the FFT mask (itila2_fold_mask)")
+    return _fold_mask
+
 _bin_liveness = False   # config itila2_bin_liveness: a window that copies a known runner keeps its bin
 
 
@@ -3109,6 +3121,14 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
             return None
         log.info("Loaded %s (sr=%d center=%.0f Hz bins=%d)", _scanner_lib_path,
                  sample_rate, center_hz, max_bins)
+        if _fold_mask:      # before any IQ: it sets the FFT front end's block size
+            if hasattr(lib, 'itila_sc_set_fold'):
+                lib.itila_sc_set_fold.restype = _ct.c_int
+                lib.itila_sc_set_fold.argtypes = [_ct.c_void_p, _ct.c_int]
+                if not lib.itila_sc_set_fold(_ct.c_void_p(h), 1):
+                    log.warning("itila2_fold_mask: the scanner kept the 12 kHz mask")
+            else:
+                log.warning("itila2_fold_mask: %s has no itila_sc_set_fold; off", _scanner_lib_path)
         # itila2 scanner only: split its per-bin DSP over the decode threads too
         if _itila_decode_threads > 1 and _scanner_pool and hasattr(lib, 'itila_sc_set_threads'):
             lib.itila_sc_set_threads.restype = _ct.c_int
@@ -7751,6 +7771,7 @@ class SparkGap:
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
         _select_snr_decoder(self.cfg.get('itila2_snr_decoder', False))
         _select_afc(self.cfg.get('itila2_afc', False))
+        _select_fold_mask(self.cfg.get('itila2_fold_mask', False))
         _select_parallel_decode(self.cfg.get('itila2_parallel_decode', False))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
             self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
@@ -8088,9 +8109,17 @@ class SparkGap:
         return reply(True, "retuned to %s" % name)
 
     def _link_receivers(self):
-        """Each band's receiver as the server's link reports it."""
-        return [{'band': n, 'centre_khz': round(self._corrected_freq_khz(c / 1000.0), 3), 'rx': r}
-                for n, c, r in self._band_meta]
+        """Each band's receiver as the server's link reports it, with its live bin count."""
+        return [{'band': n, 'centre_khz': round(self._corrected_freq_khz(c / 1000.0), 3), 'rx': r,
+                 'bins': self._bins_of(k)}
+                for k, (n, c, r) in enumerate(self._band_meta)]
+
+    def _bins_of(self, k):
+        try:
+            sc = self.managers[k]._itila_scanner._sc
+            return int(sc._lib.itila_sc_bin_count(sc._h)) if sc and sc._h else None
+        except (AttributeError, IndexError, TypeError):
+            return None
 
     async def _live_rx(self, rx, reply):
         """Our pan's antenna, loops or RF gain, changed on the radio in place."""
@@ -8676,7 +8705,7 @@ class SparkGap:
                                                now - self.start_time, self._gui_health(live_rate))
                 if _link:
                     _link.status(spots=self.spot_count, cpu=proc.get('cpu'),
-                                 rss_mb=proc.get('rss_mb'))
+                                 rss_mb=proc.get('rss_mb'), receivers=self._link_receivers())
             if now - last_status >= status_interval:
                 last_status = now
                 _save_spot_memory(self.cfg.get('spot_rule_memory'), self.tracker)
@@ -9214,6 +9243,8 @@ def load_config(path):
             node = {}
         if node.get('callsign') and node.get('grid'):
             defaults.update(callsign=node['callsign'], grid=node['grid'], skimmer_suffix='')
+        if node.get('type') == 'hpsdr' and node.get('address'):  # an HPSDR radio is known by its address
+            defaults['sdr_ip'] = node['address']
     return defaults
 
 
@@ -9338,6 +9369,7 @@ def run_file_mode(args, config):
     _select_decode_threads(config.get('itila_decode_threads', 1))
     _select_snr_decoder(config.get('itila2_snr_decoder', False))
     _select_afc(config.get('itila2_afc', False))
+    _select_fold_mask(config.get('itila2_fold_mask', False))
     _select_parallel_decode(config.get('itila2_parallel_decode', False))
     if _select_spot_rule(_spot_rule_name(config)):
         _trk = tracker

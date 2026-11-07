@@ -8,7 +8,7 @@ usage: sparkgap_ctl.py [--root R] status [name ...]
        sparkgap_ctl.py [--root R] start|stop|restart [name ...]      (no name: every instance)
        sparkgap_ctl.py [--root R] band <name> <band> | rec <name> on|off | rbn <name> off|dry|live
        sparkgap_ctl.py [--root R] set <name> key=value ...           (values as JSON, else text)
-       sparkgap_ctl.py [--root R] discover [address]
+       sparkgap_ctl.py [--root R] discover [flex|hpsdr] [address]      (no type: as sparkgap.sh setup)
 """
 
 from __future__ import annotations
@@ -130,12 +130,17 @@ def _uptime(started: float | None, now: float) -> str:
     return f"up {s // 3600}h {s % 3600 // 60}m" if s >= 3600 else f"up {s // 60}m {s % 60}s"
 
 
-def receiver_lines(i: dict[str, Any], now: float) -> list[str]:
-    """One receiver: its state line, then its detail."""
+def receiver_lines(i: dict[str, Any], now: float, rr: dict[str, Any] | None = None) -> list[str]:
+    """One receiver: its state line, then its detail; rr, one receiver of an HPSDR radio (the
+    detail is its radio's process, shared by all its receivers)."""
     state = i["state"] + (f" ({i['busy']})" if i.get("busy") else "")
     rx = i.get("receivers") or []
     where = ", ".join(f"{r['band']} {r['centre_khz']:.1f}" for r in rx) or i.get("band") or "?"
-    head = [i["name"], state, where, i.get("build") or ""]
+    if rr is not None:
+        where = rr["band"] + (f" {rr['centre_khz']:.1f}" if rr.get("centre_khz") else "")
+        where += f", spots {rr['spots']}" if rr.get("spots") is not None else ""
+        where += f", process {i['name']} (all {len(i['receiver_list'])} receivers)"
+    head = [rr["name"] if rr else i["name"], state, where, i.get("build") or ""]
     if i["state"] == "running":
         head += [_uptime(i.get("started"), now)]
         if i.get("cpu") is not None:
@@ -209,14 +214,33 @@ def receiver_row(i: dict[str, Any], now: float, paint: Paint) -> tuple[list[str]
 
 
 def receiver_block(mine: list[dict[str, Any]], now: float, paint: Paint) -> list[str]:
+    if mine and all(i.get("receiver_list") for i in mine):  # an HPSDR radio: its process is the skimmer row
+        head = [*COLUMNS[:5], "calls", "windows", "bins"]
+        cells = [head, *([rr["name"], receiver_row(i, now, paint)[0][1], rr["band"],
+                          f"{rr['centre_khz']:.1f}" if rr.get("centre_khz") and i["state"] == "running" else "",
+                          *(_cell(rr.get(k)) for k in ("spots", "calls", "windows")), _cell(_bins(i, rr))]
+                         for i in mine for rr in i["receiver_list"])]
+        return table(cells, [[paint(h, "34") for h in head],
+                             *([paint(c[0], "1"), paint.state(c[1]), *c[2:]] for c in cells[1:])])
     head: list[str] = list(COLUMNS)
     rows, shown = [head], [[paint(h, "34") for h in head]]
+    owners: list[dict[str, Any] | None] = [None]
     for i in mine:
         r, s = receiver_row(i, now, paint)
-        rows.append(r)
-        shown.append(s)
+        for n, rr in enumerate(i.get("receiver_list") or [None]):
+            if rr is None:
+                rows.append(r)
+                shown.append(s)
+            else:  # the process's state on each; its spots per band; up, cpu, mem and build once
+                spots = "" if rr.get("spots") is None else str(rr["spots"])
+                khz = f"{rr['centre_khz']:.1f}" if rr.get("centre_khz") and i["state"] == "running" else ""
+                rest = r[5:] if n == 0 else ["", "", "", "", "", ""]
+                rows.append([rr["name"], r[1], rr["band"], khz, spots, *rest])
+                shown.append([paint(rr["name"], "1"), s[1], rr["band"], khz, spots,
+                              *(s[5:] if n == 0 else rest)])
+            owners.append(i if n == 0 else None)
     out = []
-    for line, i in zip(table(rows, shown), [None, *mine], strict=True):
+    for line, i in zip(table(rows, shown), owners, strict=True):
         out.append(line)
         if i and i["state"] != "running" and i.get("last_error"):
             out.append("     " + paint(f"last error: {i['last_error']}", "31"))
@@ -230,23 +254,68 @@ def label(paint: Paint, text: str) -> str:
     return "   " + paint(text, "34") + " " * (LABEL_W - len(text) + 1)
 
 
+def discover_settings(args: list[str]) -> dict[str, str]:
+    """discover's words, in any order: an address (IPv4 or IPv6), a radio type, and name=<name>
+    for an HPSDR radio not set up yet."""
+    return {("name" if x.startswith("name=") else "address" if "." in x or ":" in x else "type"):
+            x.removeprefix("name=") for x in args}
+
+
+def _cell(v: Any) -> str:
+    return "" if v is None else str(v)
+
+
+def _bins(i: dict[str, Any], rr: dict[str, Any]) -> int | None:
+    """An HPSDR receiver's live bin count, as its process last sent it; None when stopped."""
+    if i["state"] != "running":
+        return None
+    return next((x.get("bins") for x in i.get("receivers") or [] if x.get("rx") == rr["receiver"] - 1), None)
+
+
+def _total(i: dict[str, Any], key: str) -> int | None:
+    """An HPSDR radio's total over its receivers, as SparkGap Web's tiles show it."""
+    vals = [(_bins(i, rr) if key == "bins" else rr.get(key)) for rr in i.get("receiver_list") or []]
+    return sum(v for v in vals if v is not None) if any(v is not None for v in vals) else None
+
+
+def skimmer_text(i: dict[str, Any], now: float, paint: Paint) -> str:
+    """An HPSDR radio's one process, for all its receivers: state, up, cpu, memory, errors,
+    warnings and build."""
+    state = i["state"] + (f" ({i['busy']})" if i.get("busy") else "")
+    run = i["state"] == "running"
+    err, warn = int(i.get("errors") or 0), int(i.get("warnings") or 0)
+    parts = [paint.state(state), _uptime(i.get("started"), now) if run else "",
+             f"cpu {i['cpu']}%" if run and i.get("cpu") is not None else "",
+             f"{i['rss_mb']} MB" if run and i.get("rss_mb") is not None else "",
+             *(f"{k} {_total(i, k)}" for k in ("spots", "calls", "windows", "bins") if _total(i, k) is not None),
+             f"err {paint.count(err, '31')}", f"warn {paint.count(warn, '33')}", str(i.get("build") or "")]
+    return "  ".join(x for x in parts if x)
+
+
 def radio_lines(r: dict[str, Any], station: dict[str, Any] | None, n: int,
-                paint: Paint) -> list[str]:
+                paint: Paint, skimmer: str = "") -> list[str]:
     """The radio's bar (connected or not, its nickname, model, address, SCUs, pans in use),
-    then its node and feeder, one labelled row each."""
+    then its node, its skimmer (an HPSDR radio's one process) and feeder, one labelled row each."""
     facts = [r.get("model") or r.get("type") or "", r.get("address") or ""]
     if r.get("num_scu"):
         facts.append(f"{r['num_scu']} SCU")
     if r.get("max_panadapters"):
         facts.append(f"pans {n}/{r['max_panadapters']}")
-    link = connection(station)
-    shown = paint(link, {"Connected": "32", "Not connected": "31"}.get(link, "33")) if link else ""
+    if r.get("board_id"):
+        facts.append(f"board {r['board_id']}")
+    if r.get("receivers"):
+        facts.append(f"{r['receivers']} receivers")
+    link = connection(station) or (("Running" if n else "Stopped") if r.get("type") == "hpsdr" else "")
+    shown = paint(link, {"Connected": "32", "Not connected": "31", "Running": "32",
+                         "Stopped": "2"}.get(link, "33")) if link else ""
     bar = f"{paint('━━ Radio:', '1')} {shown + ' ' if shown else ''}{paint(r['name'] + ' ━━', '1')}"
     out = [f"{bar}  " + "  ".join(f for f in facts if f)]
     node = [paint(r.get("callsign") or "no spotter ID", "1" if r.get("callsign") else "31"),
             r.get("grid") or "", r.get("op_name") or "",
             "rbn upload " + paint.upload(str(r.get("rbn_upload") or "off"))]
     out.append(label(paint, "node") + "  ".join(x for x in node if x))
+    if skimmer:
+        out.append(label(paint, "skimmer") + skimmer)
     out.append(label(paint, "feeder") + feeder_text(r.get("feeder"), str(r.get("rbn_upload")),
                                                      paint))
     return out
@@ -282,9 +351,9 @@ def render(snap: dict[str, Any], names: list[str] | None = None, color: bool = F
     with no radio file after them.  Named receivers: each one's full detail."""
     paint = Paint(color)
     now = float(snap.get("utc") or time.time())
-    inst = [i for i in snap.get("instances", []) if not names or i["name"] in names]
     if names:
-        return [line for i in inst for line in receiver_lines(i, now)]
+        return [line for n in names for line in named_lines(snap, n, now)]
+    inst = list(snap.get("instances", []))
     stations = {s["radio"]: s for s in snap.get("stations", [])}
     feeders = {p["name"]: p.get("status") for p in snap.get("processes", [])
                if p.get("role") == "feeder"}
@@ -297,7 +366,9 @@ def render(snap: dict[str, Any], names: list[str] | None = None, color: bool = F
         if not mine and r not in bare:
             continue
         running = sum(i["state"] == "running" for i in mine)
-        lines = radio_lines(r, stations.get(r["name"]), running, paint)
+        procs = [i for i in mine if i.get("receiver_list")]
+        lines = radio_lines(r, stations.get(r["name"]), running, paint,
+                            skimmer_text(procs[0], now, paint) if len(procs) == 1 else "")
         rows = receiver_block(mine, now, paint) if mine else [
             "   no receivers yet: add them in SparkGap Web"]
         out += [*lines, "", *rows, ""]
@@ -310,6 +381,40 @@ def render(snap: dict[str, Any], names: list[str] | None = None, color: bool = F
             out.append(f"   {i['name']}: {paint('feeder', '34')} "
                        + feeder_text(feeders.get(i["name"]), mode, paint))
     return out[:-1] if out and out[-1] == "" else out
+
+
+def receiver_of(snap: dict[str, Any], name: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The process and receiver an HPSDR receiver name (<radio>-<n>) stands for, else None."""
+    for i in snap.get("instances", []):
+        for rr in i.get("receiver_list") or []:
+            if rr["name"] == name:
+                return i, rr
+    return None
+
+
+def process_of(snap: dict[str, Any], name: str) -> str:
+    """The process a name starts or stops: an HPSDR receiver's is its radio's, as its card's Run."""
+    found = receiver_of(snap, name)
+    return found[0]["name"] if found else name
+
+
+def web_link(root: Path) -> str:
+    """The last line of status, start and stop: SparkGap Web, where everything else is."""
+    try:
+        cfg = json.loads((root / "server.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    web = "https" if cfg.get("tls_cert") else "http"
+    return (f"Bands, receivers, decoder options and Setup: SparkGap Web, "
+            f"{web}://{cfg.get('bind', '127.0.0.1')}:{cfg.get('port', 7320)}/")
+
+
+def named_lines(snap: dict[str, Any], name: str, now: float) -> list[str]:
+    for i in snap.get("instances", []):
+        if i["name"] == name:
+            return receiver_lines(i, now)
+    found = receiver_of(snap, name)
+    return receiver_lines(found[0], now, found[1]) if found else []
 
 
 def value(text: str) -> Any:
@@ -356,24 +461,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sparkgap_ctl: {e}", file=sys.stderr)
         return EXIT_NO_SERVER
     try:
+        link = web_link(a.root)
         if a.cmd == "status":
             color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-            print("\n".join(render(c.snapshot(), a.args or None, color)))
+            print("\n".join([*render(c.snapshot(), a.args or None, color), *([link] if link else [])]))
             return 0
         if a.cmd == "discover":
-            ok, text = c.request("discover", settings={"address": a.args[0]} if a.args else None)
+            ok, text = c.request("discover", settings=discover_settings(a.args) or None)
             print(text)
             return 0 if ok else EXIT_FAILED
+        snap = c.snapshot()
         if settings is not None:
             ok, text = c.request("set", a.args[0], settings)
             print(text)
             return 0 if ok else EXIT_FAILED
-        names = a.args or [i["name"] for i in c.snapshot().get("instances", [])]
+        names: list[str] = []
+        for n in a.args or [i["name"] for i in snap.get("instances", [])]:
+            n = process_of(snap, n)  # start Web888-3 starts its radio's process
+            if n not in names:
+                names.append(n)
         failed = False
         for name in names:
             ok, text = c.request(a.cmd, name)
             print(text if ok else f"{name}: {text}")
             failed |= not ok
+        if link and a.cmd in ("start", "stop"):
+            print(link)
         return EXIT_FAILED if failed else 0
     except NoServer as e:
         print(f"sparkgap_ctl: {e}", file=sys.stderr)

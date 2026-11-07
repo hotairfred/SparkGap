@@ -58,7 +58,7 @@ def test_a_name_that_cannot_be_a_file_name_is_skipped(tmp_path: Path) -> None:
 def test_what_a_receiver_can_change_comes_from_its_back_end() -> None:
     flex = radios.capabilities("flex")
     assert flex.station and flex.live_band and "antenna" in flex.rx_settings
-    other = radios.capabilities("hpsdr")  # no back end yet: nothing beyond band and options
+    other = radios.capabilities("hpsdr")  # one stream per radio: nothing beyond band and options
     assert (other.station, other.live_band, other.rx_settings) == (False, False, ())
 
 

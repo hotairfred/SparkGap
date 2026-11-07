@@ -96,7 +96,7 @@ FEED_LINK_S = 20.0  # longest an RBN feeder takes to start and link to the hub
 FEED_STOP_S = 30.0
 FEED_RELINK_S = 12.0  # a running feeder links again within its RECONNECT_S after a server restart
 COMMANDS = ("start", "stop", "restart", "set", "add", "remove")
-RADIO_COMMANDS = ("discover", "node")  # not tied to one instance
+RADIO_COMMANDS = ("discover", "node", "rename", "remove_radio")  # not tied to one instance
 BY_RE = re.compile(r"[^A-Za-z0-9 ._-]")  # what a client may call itself in the log
 
 
@@ -158,7 +158,8 @@ def busy_word(cmd: str, settings: dict[str, Any]) -> str:
     if cmd == "set" and settings and set(settings) <= set(RX_SETTINGS):
         return "changing the receive path"
     return {"set": "restarting", "add": "adding", "remove": "removing", "stop": "stopping",
-            "node": "saving the node", "discover": "discovering"}.get(cmd, cmd + "ing")
+            "node": "saving the node", "discover": "discovering", "rename": "renaming",
+            "remove_radio": "removing the radio"}.get(cmd, cmd + "ing")
 
 
 class LogRing(logging.Handler):
@@ -623,13 +624,14 @@ class Server:
             name = cmd   # busy and queued like an instance, under its own name
         elif cmd not in COMMANDS or not isinstance(name, str) or not NAME_RE.match(name):
             return refuse("unknown command or instance")
-        if cmd in ("set", "add", "discover", "node") and not isinstance(settings, dict):
+        if cmd in ("set", "add", "discover", "node", "rename", "remove_radio") and not isinstance(settings, dict):
             return refuse("settings must be an object")
-        if name in self.busy:
-            return refuse(f"{name} is busy: {self.busy[name]}")
+        key = name if cmd in RADIO_COMMANDS else self.seat.process_name(name)  # an HPSDR receiver: its radio
+        if key in self.busy:
+            return refuse(f"{key} is busy: {self.busy[key]}")
         if self.queued >= MAX_QUEUED_OPS:
             return refuse("too many requests waiting")
-        self.busy[name] = busy_word(cmd, settings)
+        self.busy[key] = busy_word(cmd, settings)
         self.queued += 1
         who = requester(msg.get("by"), c.peer)
         log.info("Server: %s by %s", what_asked(cmd, name, settings), who)
@@ -638,7 +640,7 @@ class Server:
 
         def done(f: asyncio.Future[str]) -> None:
             self.queued -= 1
-            self.busy.pop(name, None)
+            self.busy.pop(key, None)
             err = f.exception()
             if err is None:
                 log.info("Server: %s", f.result())
@@ -651,31 +653,46 @@ class Server:
         return None
 
     def _run_op(self, cmd: str, name: str, settings: dict[str, Any], who: str = "") -> str:
+        if cmd in ("start", "stop", "restart", "set"):
+            name = self.seat.process_name(name)  # an HPSDR receiver (<radio>-<n>): its radio's process
         if who and cmd in COMMANDS:  # the receiver's own log says who asked, before it acts
             with contextlib.suppress(Exception):  # a receiver not linked (stopped) has no log to tell
                 self.command_sync("skimmer", name, "note",
                                   {"text": f"{what_asked(cmd, name, settings)} by {who}"}, 2.0)
         if cmd == "discover":
-            address = settings.get("address")
+            address, kind = settings.get("address"), settings.get("type")
             if address is not None:
                 ipaddress.ip_address(address)  # ValueError: refused, nothing asked
-            return self.seat.discover(address=address)
+            return self.seat.discover(address=address, kind=kind, name=settings.get("name") or None)
+        if cmd == "remove_radio":  # a radio with no receivers left
+            return self.seat.remove_radio(str(settings.get("radio") or ""))
+        if cmd == "rename":  # an HPSDR radio's name, while it is stopped
+            return self.seat.rename_radio(str(settings.get("radio") or ""), str(settings.get("name") or ""))
         if cmd == "node":  # sparkgap.sh setup's spotter ID, grid and operator, from the web
             keys = ("radio", "callsign", "grid", "op_name")
             return self.seat.set_node(*(str(settings.get(k) or "") for k in keys))
         if cmd == "add":  # the rest of its settings are checked and written as a stopped one's
+            known = {i.name for i in self.seat.instances()}
             added = self.seat.add(name, str(settings.get("band") or ""))
+            proc = self.seat.process_name(name)  # an HPSDR receiver runs in its radio's process
             rest = {key: v for key, v in settings.items() if key != "band"}
             try:
                 if rest:
-                    self.seat.change(name, rest)
+                    self.seat.change(proc, rest)
             except SeatError:
-                self.seat.remove(name)  # not added after all: its config stays, as on a remove
+                if proc == name:
+                    self.seat.remove(name)  # not added after all: its config stays, as on a remove
+                elif proc not in known:
+                    self.seat.withdraw(proc)  # an HPSDR radio's first receiver: its process goes too
                 raise
-            return self._with(added, self.seat.start(name), self._feeder_up(name))
+            started = "" if self._running(proc) else self.seat.start(proc)  # added to a running radio: restarted
+            return self._with(added, started, self._feeder_up(proc))
         if cmd == "remove":
-            down = self._feeder_down(name) if self._running(name) else ""
-            return self._with(down, self.seat.stop(name) if self._running(name) else "",
+            proc = self.seat.process_name(name)  # an HPSDR receiver: its radio's process
+            if proc != name and self.seat.receiver_count(proc) > 1:
+                return self.seat.remove(name)  # the radio keeps its other receivers: restarted if it runs
+            down = self._feeder_down(proc) if self._running(proc) else ""
+            return self._with(down, self.seat.stop(proc) if self._running(proc) else "",
                               self.seat.remove(name))
         if cmd == "start":
             return self._with(self.seat.start(name), self._feeder_up(name))

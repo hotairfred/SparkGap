@@ -29,3 +29,12 @@ def test_without_a_radio_file_the_receivers_own_values_stay(tmp_path: Path) -> N
     alone = {"callsign": "N0CALL", "grid": "EM12"}
     cfg = load_config(str(_write(tmp_path, alone, {"callsign": "X"})))
     assert (cfg["callsign"], cfg["grid"]) == ("N0CALL", "EM12")  # no radio key: not a node's
+
+
+def test_an_hpsdr_receiver_takes_its_address_from_the_radio_file(tmp_path: Path) -> None:
+    radio = {"type": "hpsdr", "address": "192.0.2.120", "callsign": "N0CALL-1", "grid": "EM12ub"}
+    cfg = load_config(str(_write(tmp_path, {"radio": "Dallas", "sdr_ip": "192.0.2.9"}, radio)))
+    assert (cfg["sdr_ip"], cfg["callsign"]) == ("192.0.2.120", "N0CALL-1")
+    flex = {**radio, "type": "flex"}  # a Flex receiver finds its radio through flex_iq
+    cfg = load_config(str(_write(tmp_path, {"radio": "Dallas", "sdr_ip": "192.0.2.9"}, flex)))
+    assert cfg["sdr_ip"] == "192.0.2.9"
