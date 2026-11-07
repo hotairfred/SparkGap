@@ -252,11 +252,51 @@ def _is_trigger_like(t: str) -> bool:
     return t in _TRIGGER_WORDS or any(_one_sub_same_kind(t, w) for w in ("CWT", "TEST"))
 
 
-def sender(toks: list[str], i: int, la1d: bool = False) -> int | None:
+_NOISE_ONLY = frozenset("ETISH")      # dit-noise letters: E?TE or TTE5E is noise, no broken call
+_QUAL_PREFIXES = ("SKCC", "NAQP", "POTA", "SOTA", "WWFF", "IOTA", "CWT", "SST", "MST", "QRP", "TEST")
+_PARK_RE = re.compile(r"^[A-Z]{1,3}-?\d{4,5}$")    # a POTA / WWFF reference: US1234, K-1234
+
+
+def _garbled_call(t: str) -> bool:
+    """t reads as a callsign the decoder broke: 5+ characters of letters and a digit, or 4+ with a '?'
+    inside, that is no call, no report, no park reference and no run-together keyword: CQ POTAQ0SN
+    K5LG (K0SN), CQ W1AWNR5 N9NM (W1AW/5), CQ IK?VUT AJ8S. Not CQ?QDE (CQ CQ DE), GERL? (QRL?),
+    noise letters with a digit (E?TE, TTE5E), or a qualifier with a number (SKCC5, NAQP2, US1234); a
+    qualifier glued to a broken call is judged on the rest (POTAQ0SN: Q0SN)."""
+    for q in _QUAL_PREFIXES:
+        if t.startswith(q) and len(t) > len(q):
+            rest = t[len(q):]
+            return any(ch.isdigit() for ch in rest) and sum(ch.isalpha() for ch in rest) >= 2
+    core = t.replace("?", "")
+    letters = [ch for ch in core if ch.isalpha()]
+    digits = sum(ch.isdigit() for ch in core)
+    if (CALL_RE.match(t) or _RST_RE.match(t) or _PARK_RE.match(t) or len(letters) < 2 or not core.isalnum()
+            or any(k in t for k in ("CQ", "DE", "QRL", "QRZ", "TEST"))
+            or len(set(letters) - _NOISE_ONLY) < 2):
+        return False
+    return (len(t) >= 5 and digits >= 1) or ("?" in t[1:-1] and len(t) >= 4 and len(core) >= 3)
+
+
+def _same_station(garbled: str, call: str) -> bool:
+    """The broken token is a misread of call itself: call inside it (CQPOTAK0SN K0SN), the same
+    length with '?' for any character and one other difference at most (CQ K?9X KG9X), or a pair
+    with call's digit or call's last two characters in it (CQ DX YET2M YU2M, E?4ERU KQ4EFU,
+    EE?DB K7DB, N?EEIMF N2KMF). A caller's call shares none (CQ POTAQ0SN K5LG, CQ IK?VUT AJ8S)."""
+    g = garbled.replace("?", "")
+    if call in g or call[-2:] in g:
+        return True
+    if len(garbled) == len(call) and sum(a != b and a != "?" for a, b in zip(garbled, call)) <= 1:
+        return True
+    return any(call[i:i + 2] in g for i in range(len(call) - 1) if any(ch.isdigit() for ch in call[i:i + 2]))
+
+
+def sender(toks: list[str], i: int, la1d: bool = False, garbled: bool = False) -> int | None:
     """Index of the first callsign within LOOKAHEAD tokens after keyword toks[i]. la1d
     (spot_rule_la1d): a single noise letter (E T I S ?) takes no LOOKAHEAD slot and a sign-off
     prosign (K AR KN SK BK TU) ends the search: CQ CQ E E HFT ON6FT names ON6FT, CQ K W1AW
-    names nobody (a finished CQ, W1AW is the caller)."""
+    names nobody (a finished CQ, W1AW is the caller). garbled (spot_rule_garbled_runner): a token
+    that reads as a broken call ends the search too: the runner's call was misread and the call
+    after it is a caller (CQ POTAQ0SN K5LG names nobody)."""
     seen = 0
     for j in range(i + 1, len(toks)):
         t = toks[j]
@@ -264,6 +304,12 @@ def sender(toks: list[str], i: int, la1d: bool = False) -> int | None:
             continue
         if CALL_RE.match(t):
             return j
+        if (garbled and toks[i] != "DE" and _garbled_call(t)       # after DE the call is the sender's own
+                and not (j + 1 < len(toks) and toks[j + 1] == "DE")):
+            for j2 in range(j + 1, min(j + 1 + LOOKAHEAD, len(toks))):
+                if CALL_RE.match(toks[j2]):
+                    return j2 if _same_station(t, toks[j2]) else None
+            return None
         if la1d and t in _SIGNOFF:
             return None
         seen += 1
@@ -318,7 +364,8 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
                  doubled: bool = False, split_up: bool = False,
                  contest_words: bool = False, cq_repeats: bool = False,
                  stray: bool = False, words: frozenset[str] | None = None,
-                 grid: bool = False, la1d: bool = False, gluek: bool = False) -> list[str]:
+                 grid: bool = False, la1d: bool = False, gluek: bool = False,
+                 garbled: bool = False, stray_listed: Callable[[str], bool] | None = None) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -330,7 +377,7 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
     instead of one per call."""
     return [call for call, _after in runner_groups(text, every, qualifiers, doubled, split_up,
                                                    contest_words, cq_repeats, stray, words, grid,
-                                                   la1d, gluek)]
+                                                   la1d, gluek, garbled, stray_listed)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -415,8 +462,8 @@ def has_runner_sign(text: str, gluek: bool = False) -> bool:
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
                   cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,
-                  grid: bool = False, la1d: bool = False,
-                  gluek: bool = False) -> list[tuple[str, str | None]]:
+                  grid: bool = False, la1d: bool = False, gluek: bool = False, garbled: bool = False,
+                  stray_listed: Callable[[str], bool] | None = None) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller.
@@ -424,8 +471,8 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
     K5AX: runners who drop the CQ). cq_repeats: a closing CQ or TEST followed by the same call
     opens the next group instead of closing this one, so CQ CWT N1DC CQ CWT N1DC is two
     copies, not one. words: the contest words for contest_words (default CWT, SST, MST); grid:
-    a call followed by a grid square is being sent the exchange (is_exchange). la1d, gluek: see
-    sender() and tokens()."""
+    a call followed by a grid square is being sent the exchange (is_exchange). la1d, gluek, garbled:
+    see sender() and tokens(); stray_listed: which joined calls _stray_after takes for a 4-character call."""
     toks = tokens(text, gluek)
     cwords = CONTEST_WORDS if words is None else words
     out: list[tuple[str, str | None]] = []
@@ -445,7 +492,7 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
         if not (t in KEYWORDS or de or cw):
             i += 1
             continue
-        j = sender(toks, i, la1d)
+        j = sender(toks, i, la1d, garbled)
         if j is None or (de and toks.count(toks[j]) < 2):
             i += 1
             continue
@@ -453,19 +500,19 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
         while k < n and toks[k] == toks[j]:       # call sent twice before the closing keyword
             k += 1
         if t == "CQ" and j == i + 1 and k < n and toks[k] == "DE":
-            j2 = sender(toks, k, la1d)
+            j2 = sender(toks, k, la1d, garbled)
             if j2 is not None and toks[j2] != toks[j]:
                 i = k                             # CQ S52Y DE N8EM: S52Y is being called; after
                                                   # TEST or DE the call is the runner's
                 continue
-        if (not is_exchange(toks, j, qualifiers, grid) and not (stray and _stray_after(toks, j))
+        if (not is_exchange(toks, j, qualifiers, grid) and not (stray and _stray_after(toks, j, stray_listed))
                 and (every or all(toks[j] != c for c, _ in out))):
             out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
             if doubled and every:
                 out.extend([out[-1]] * (k - j - 1))   # doubled: each copy counts
         i = k
         while i < n and toks[i] in KEYWORDS:      # closing keywords end the group
-            if cq_repeats and sender(toks, i, la1d) is not None and toks[sender(toks, i, la1d)] == toks[j]:
+            if cq_repeats and sender(toks, i, la1d, garbled) is not None and toks[sender(toks, i, la1d, garbled)] == toks[j]:
                 break                             # ... unless the same call follows: a new CQ
             i += 1
     return out
@@ -481,22 +528,26 @@ def _lev1(a: str, b: str) -> bool:
     return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
 
 
-def _stray_after(toks: list[str], j: int) -> bool:
+def _stray_after(toks: list[str], j: int, listed: Callable[[str], bool] | None = None) -> bool:
     """The call toks[j] is followed (past repeats of it) by one or two single letters that
     complete a longer call: TEST K1V U T is K1VUT split at a gap. K is a prosign, not a letter,
     and the first letter is no E or T (CQ TEST K4TZ E E is K4TZ and noise). Only calls of 3
-    characters are checked: longer ones are followed by their own pieces (W0UI W 0 UI)."""
-    if len(toks[j]) > 3:
+    characters are checked: longer ones are followed by their own pieces (W0UI W 0 UI). listed
+    (spot_rule_stray_known): a 4-character call too, when the rule copied the joined call near
+    here in the last 10 minutes and the letter is no E, T or I: DE K1PU G after DE K1PUG is K1PUG
+    split at a gap; DE N2EP I after DE N2EPI stays N2EP (which of the two is the bust, the text
+    cannot tell; I is the likelier noise)."""
+    if len(toks[j]) > 3 and not (listed and len(toks[j]) == 4):
         return False
     k = j + 1
     while k < len(toks) and toks[k] == toks[j]:
         k += 1
     joined = toks[j]
     for m, t in enumerate(toks[k:k + 2]):
-        if len(t) != 1 or not t.isalpha() or t == "K" or (m == 0 and t in "ET"):
-            break
+        if len(t) != 1 or not t.isalpha() or t == "K" or (m == 0 and t in ("ETI" if len(toks[j]) == 4 else "ET")):
+            break                                 # a 4-character call takes no noise letter: DE N2EP I
         joined += t
-        if CALL_RE.match(joined) and len(joined) <= 7:
+        if CALL_RE.match(joined) and len(joined) <= 7 and (len(toks[j]) <= 3 or listed(joined)):
             return True
     return False
 
@@ -560,7 +611,8 @@ class RepeatSpotRule:
                  owner_listed: bool = False, la1d: bool = False, gluek: bool = False,
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
-                 window_join: bool = False, validation_threshold: float | None = None) -> None:
+                 window_join: bool = False, validation_threshold: float | None = None,
+                 garbled_runner: bool = False, stray_known: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -604,6 +656,8 @@ class RepeatSpotRule:
         self.strongest_db = strongest_db        # a copy this many dB stronger elsewhere in the band: no spot here
         self.runner_signs = runner_signs        # KH8A UP: KH8A runs here, see _runner_copies()
         self.window_join = window_join          # CQ CQ DE | K2MJP: the window edge cut a group, see _joined()
+        self.garbled = garbled_runner           # CQ POTAQ0SN K5LG: a broken call ends the sender search, see sender()
+        self.stray_known = stray_known          # DE K1PU G after a copy of K1PUG: see _stray_after()
         self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
         self._signed: dict[int, set[str]] = {}    # validation: window -> calls that signed a CQ in it
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
@@ -644,12 +698,15 @@ class RepeatSpotRule:
             self._paths.setdefault(window, []).append(Counter(toks))
             self._signed.setdefault(window, set()).update(signed_calls(toks))
         spots = []
+        self.stray_listed = ((lambda c: any(x.call == c and abs(x.freq_khz - freq_khz) <= 1.0 for x in self._copies))
+                             if self.stray_known else None)
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
                  else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers,
                                    doubled=self.doubled, split_up=self.split_up,
                                    contest_words=self.contest_words, cq_repeats=self.cq_repeats,
                                    stray=self.stray, words=self.words, grid=self.grid,
-                                   la1d=self.la1d, gluek=self.gluek))
+                                   la1d=self.la1d, gluek=self.gluek, garbled=self.garbled,
+                                   stray_listed=self.stray_listed))
         if self.runner_signs:
             calls = calls + self._runner_copies(window, freq_khz, text, now, calls)
         for call, n in Counter(calls).items():
@@ -818,7 +875,8 @@ class RepeatSpotRule:
                                          split_up=self.split_up, contest_words=self.contest_words,
                                          cq_repeats=self.cq_repeats, stray=self.stray,
                                          words=self.words, grid=self.grid,
-                                         la1d=self.la1d, gluek=self.gluek):
+                                         la1d=self.la1d, gluek=self.gluek, garbled=self.garbled,
+                                         stray_listed=self.stray_listed):
             owner = self.owner(freq_khz, now, self.takeover_idle_s)   # who may block or be challenged
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
