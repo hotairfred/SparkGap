@@ -73,6 +73,66 @@ def test_a_radio_file_s_size_shows_on_its_line() -> None:
     assert "2 SCU  pans 1/4" in ctl.render(snap)[0]
 
 
+
+def test_an_hpsdr_radio_shows_its_board_and_receivers() -> None:
+    web = {"name": "Web888", "type": "hpsdr", "model": "Web-888", "address": "192.0.2.120",
+           "board_id": 6, "receivers": 6, "callsign": "N0CALL-1"}
+    snap = {**SNAP, "radios": [], "radio_files": [web]}
+    assert "Web-888  192.0.2.120  board 6  6 receivers" in ctl.render(snap)[0]
+
+
+WEB888 = {"name": "Web888", "type": "hpsdr", "model": "Web-888", "address": "192.0.2.120",
+          "board_id": 6, "receivers": 6, "callsign": "N0CALL-1", "rbn_upload": "dry"}
+PROC = {"name": "Web888", "state": "running", "radio": "Web888", "band": "17m+20m", "build": "abc1234",
+        "started": NOW - 600, "cpu": 85, "rss_mb": 600, "spots": 12, "errors": 0, "warnings": 1,
+        "receiver_list": [
+            {"name": "Web888-1", "receiver": 1, "band": "17m", "centre_khz": 18144.7, "spots": 3,
+             "calls": 2, "windows": 40},
+            {"name": "Web888-2", "receiver": 2, "band": "20m", "centre_khz": 14076.7, "spots": 9,
+             "calls": 5, "windows": 70}],
+        "receivers": [{"band": "17m", "centre_khz": 18144.7, "rx": 0, "bins": 12},
+                      {"band": "20m", "centre_khz": 14076.7, "rx": 1, "bins": 30}]}
+HP_SNAP = {"utc": NOW, "instances": [PROC], "stations": [], "radios": [WEB888], "processes": []}
+
+
+def test_an_hpsdr_radio_shows_a_row_per_receiver_and_its_state() -> None:
+    lines = ctl.render(HP_SNAP)
+    assert lines[0].startswith("━━ Radio: Running Web888 ━━")
+    rows = [x.split() for x in lines if x.strip().startswith("Web888-")]
+    assert [(r[0], r[2], r[3], r[4]) for r in rows] == [("Web888-1", "17m", "18144.7", "3"),
+                                                        ("Web888-2", "20m", "14076.7", "9")]
+    assert [r[4:] for r in rows] == [["3", "2", "40", "12"], ["9", "5", "70", "30"]]  # spots calls windows bins
+    assert lines[2].split() == ["skimmer", "running", "up", "10m", "0s", "cpu", "85%", "600", "MB",
+                                "spots", "12", "calls", "7", "windows", "110", "bins", "42",
+                                "err", "0", "warn", "1", "abc1234"]  # the process: totals over its receivers
+    stopped = {**HP_SNAP, "instances": [{**PROC, "state": "stopped"}]}
+    assert ctl.render(stopped)[0].startswith("━━ Radio: Stopped Web888 ━━")
+
+
+def test_a_receiver_name_stands_for_its_radio_s_process() -> None:
+    assert ctl.render(HP_SNAP, ["Web888-2"])[0].startswith("  Web888-2, running, 20m 14076.7, spots 9")
+    assert ctl.process_of(HP_SNAP, "Web888-2") == "Web888"  # start, stop: its radio's process
+    assert ctl.process_of(HP_SNAP, "Lake-1") == "Lake-1"
+
+
+def test_status_start_and_stop_end_with_sparkgap_web(tmp_path: Path) -> None:
+    (tmp_path / "server.json").write_text(json.dumps({"bind": "192.0.2.5", "port": 7320, "join_code": "X"}))
+    assert ctl.web_link(tmp_path).endswith("SparkGap Web, http://192.0.2.5:7320/")
+    assert ctl.web_link(tmp_path / "none") == ""  # no server.json: no line
+
+
+@pytest.mark.parametrize("args, want", [
+    ([], {}),
+    (["192.0.2.120"], {"address": "192.0.2.120"}),
+    (["hpsdr"], {"type": "hpsdr"}),
+    (["hpsdr", "192.0.2.120"], {"type": "hpsdr", "address": "192.0.2.120"}),
+    (["fd00::120", "hpsdr"], {"type": "hpsdr", "address": "fd00::120"}),
+    (["hpsdr", "192.0.2.121", "name=Pitaya"], {"type": "hpsdr", "address": "192.0.2.121", "name": "Pitaya"}),
+])
+def test_discover_takes_a_type_and_an_address(args: list[str], want: dict[str, str]) -> None:
+    assert ctl.discover_settings(args) == want
+
+
 def test_status_of_named_receivers_only() -> None:
     lines = ctl.render(SNAP, ["hp1"])
     assert lines[0].startswith("  hp1") and not any("Lake" in x for x in lines)

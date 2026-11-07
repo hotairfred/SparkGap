@@ -224,14 +224,45 @@ static int cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+/* The k-th smallest of a[0..n-1] (0-based), a reordered so a[k] holds it, a[0..k-1] <= a[k] <= a[k+1..]:
+ * the element a full sort would put at k (quickselect, median of three). */
+static double select_kth(double *a, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (hi > lo) {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] < a[lo]) { double t = a[mid]; a[mid] = a[lo]; a[lo] = t; }
+        if (a[hi] < a[lo])  { double t = a[hi];  a[hi]  = a[lo]; a[lo] = t; }
+        if (a[hi] < a[mid]) { double t = a[hi];  a[hi]  = a[mid]; a[mid] = t; }
+        double piv = a[mid];
+        int i = lo, j = hi;
+        while (i <= j) {
+            while (a[i] < piv) i++;
+            while (a[j] > piv) j--;
+            if (i <= j) { double t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+        }
+        if (k <= j) hi = j;
+        else if (k >= i) lo = i;
+        else break;
+    }
+    return a[k];
+}
+
+/* pct-th percentile with linear interpolation between ranks lo and lo + 1, as numpy's default.
+ * Needs only those two order statistics, so it selects instead of sorting (same two values,
+ * same arithmetic: the result is bit-identical to sorting first). */
 static double percentile(const double *arr, int n, double pct, double *scratch) {
     memcpy(scratch, arr, n * sizeof(double));
-    qsort(scratch, n, sizeof(double), cmp_double);
     double idx = pct / 100.0 * (n - 1);
     int lo = (int)idx;
     int hi = lo + 1 < n ? lo + 1 : lo;
     double frac = idx - lo;
-    return scratch[lo] * (1.0 - frac) + scratch[hi] * frac;
+    double v_lo = select_kth(scratch, n, lo);
+    double v_hi = v_lo;
+    if (hi != lo) {                       /* the smallest value above rank lo */
+        v_hi = scratch[lo + 1];
+        for (int i = lo + 2; i < n; i++) if (scratch[i] < v_hi) v_hi = scratch[i];
+    }
+    return v_lo * (1.0 - frac) + v_hi * frac;
 }
 
 /* -------------------------------------------------------------------------
