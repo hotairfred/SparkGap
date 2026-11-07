@@ -107,19 +107,24 @@ _SIGNOFF = frozenset({"K", "AR", "KN", "SK", "BK", "TU"})    # la1d: ends the se
 # 10-12..10-14 dry run (cdub89/SparkGap#10), every spot checked against RBN; thresholds from
 # the curve with each leg scored by weights fitted on the other two.
 VALIDATION = {"permissive": 1.25, "normal": 3.0, "aggressive": 5.0}
+# validation: the call signed its own CQ (CQ ... DE WB8NER WB8NER K) in two windows or more, see
+# signed_calls(); one window alone is not enough.
+# Not fitted with the other weights: set by hand on WF8Z-1's 11-05 evening log, checked on the 11-06
+# 01:18-05:41Z hours, the PA 10-10 recording and four more (hotairfred/SparkGap PR text).
+SIGNED = 2.0
 _WEIGHTS = {"bias": 0.74, "single": -1.49, "three": 0.43, "four_plus": 0.42, "windows": 1.68,
             "tier3": -0.52, "tier4": -1.82, "heard_before": 1.87, "paths_agree": 0.65,
-            "paths_disagree": -0.63, "doubled": 2.48, "rival": -1.64}
+            "paths_disagree": -0.63, "doubled": 2.48, "rival": -1.64, "signed": SIGNED}
 _WEIGHTS_LISTED = {           # per call list (spot_validation_calls): scp, rbn, rbn+skcc
     "scp": {"bias": 0.29, "single": -1.52, "three": 0.42, "four_plus": 0.28, "windows": 1.58,
             "tier3": -0.27, "tier4": -1.46, "heard_before": 1.68, "paths_agree": 0.48,
-            "paths_disagree": -0.70, "doubled": 2.25, "rival": -1.62, "listed": 2.48},
+            "paths_disagree": -0.70, "doubled": 2.25, "rival": -1.62, "listed": 2.48, "signed": SIGNED},
     "rbn": {"bias": -0.22, "single": -1.57, "three": 0.24, "four_plus": 0.50, "windows": 1.30,
             "tier3": 0.0, "tier4": -1.90, "heard_before": 1.45, "paths_agree": 0.56,
-            "paths_disagree": -0.79, "doubled": 1.90, "rival": -0.88, "listed": 4.18},
+            "paths_disagree": -0.79, "doubled": 1.90, "rival": -0.88, "listed": 4.18, "signed": SIGNED},
     "rbn+skcc": {"bias": -0.60, "single": -1.58, "three": 0.38, "four_plus": 0.72, "windows": 1.35,
                  "tier3": -0.05, "tier4": -1.55, "heard_before": 1.44, "paths_agree": 0.28,
-                 "paths_disagree": -0.72, "doubled": 1.77, "rival": -0.89, "listed": 3.92},
+                 "paths_disagree": -0.72, "doubled": 1.77, "rival": -0.89, "listed": 3.92, "signed": SIGNED},
 }
 HEARD_KEEP_S = 12 * 3600.0    # validation: a call unheard this long is forgotten
 _MORSE = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/",
@@ -518,6 +523,19 @@ class _Copy:
     report: float | None = None   # the SNR a spot from this copy reports, when it differs from snr
 
 
+def signed_calls(toks: list[str]) -> set[str]:
+    """Calls that sign their own CQ in a window: CQ, TEST or QRZ, then within DE_LOOKBACK tokens and with
+    no other call between, DE and the call sent twice (CQ CQ DE WB8NER WB8NER K). A caller sends
+    the runner's call before DE (W3JPH DE K2AN), never a CQ."""
+    out = set()
+    for i in range(len(toks) - 2):
+        if toks[i] != "DE" or not CALL_RE.match(toks[i + 1]) or toks[i + 2] != toks[i + 1]:
+            continue
+        if _cq_before(toks, i):
+            out.add(toks[i + 1])
+    return out
+
+
 class RepeatSpotRule:
     """Feed every decode window; returns the spots the window completes."""
 
@@ -579,6 +597,7 @@ class RepeatSpotRule:
         self.runner_signs = runner_signs        # KH8A UP: KH8A runs here, see _runner_copies()
         self.window_join = window_join          # CQ CQ DE | K2MJP: the window edge cut a group, see _joined()
         self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
+        self._signed: dict[int, set[str]] = {}    # validation: window -> calls that signed a CQ in it
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
         self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
         self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
@@ -613,7 +632,9 @@ class RepeatSpotRule:
         if self.window_join:
             text = self._joined(window, freq_khz, text, now)
         if self.threshold is not None:
-            self._paths.setdefault(window, []).append(Counter(tokens(text, self.gluek)))
+            toks = tokens(text, self.gluek)
+            self._paths.setdefault(window, []).append(Counter(toks))
+            self._signed.setdefault(window, set()).update(signed_calls(toks))
         spots = []
         calls = (self._lockon_calls(freq_khz, text, now) if self.lockon
                  else runner_calls(text, every=self.cq_groups, qualifiers=self.cq_qualifiers,
@@ -718,7 +739,8 @@ class RepeatSpotRule:
              + w["tier3"] * (tier == 3) + w["tier4"] * (tier == 4) + w["heard_before"] * heard_before
              + w["paths_agree"] * (agree == 1.0) + w["paths_disagree"] * (agree is not None and agree < 0.5)
              + w["doubled"] * any(p[call] >= 2 for ps in paths for p in ps)
-             + w["rival"] * rival)
+             + w["rival"] * rival
+             + w["signed"] * (sum(call in self._signed.get(win, ()) for win in windows) >= 2))
         if self.listed:
             s += w["listed"] * self.listed(call)
         return s
@@ -885,5 +907,6 @@ class RepeatSpotRule:
             self._bins = {w: b for w, b in self._bins.items() if w in live}
             self._tails = {b: ts for b, ts in self._tails.items() if now - ts[-1][0] <= 1.5 * self.window_s}
             self._paths = {w: p for w, p in self._paths.items() if w in live}
+            self._signed = {w: c for w, c in self._signed.items() if w in live}
             self._same = {w: g for w, g in self._same.items() if w in live}
             self._heard = {c: h for c, h in self._heard.items() if now - h[1] <= HEARD_KEEP_S}
