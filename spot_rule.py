@@ -252,14 +252,27 @@ def _is_trigger_like(t: str) -> bool:
     return t in _TRIGGER_WORDS or any(_one_sub_same_kind(t, w) for w in ("CWT", "TEST"))
 
 
+_NOISE_ONLY = frozenset("ETISH")      # dit-noise letters: E?TE or TTE5E is noise, no broken call
+_QUAL_PREFIXES = ("SKCC", "NAQP", "POTA", "SOTA", "WWFF", "IOTA", "CWT", "SST", "MST", "QRP", "TEST")
+_PARK_RE = re.compile(r"^[A-Z]{1,3}-?\d{4,5}$")    # a POTA / WWFF reference: US1234, K-1234
+
+
 def _garbled_call(t: str) -> bool:
-    """t reads as a callsign the decoder broke: 5+ characters of letters and digits, or 4+ with a '?'
-    inside, that is no call, no report and no run-together keyword: CQ POTAQ0SN K5LG (K0SN), CQ
-    W1AWNR5 N9NM (W1AW/5), CQ IK?VUT AJ8S. Not CQ?QDE (CQ CQ DE) or GERL? (QRL?)."""
+    """t reads as a callsign the decoder broke: 5+ characters of letters and a digit, or 4+ with a '?'
+    inside, that is no call, no report, no park reference and no run-together keyword: CQ POTAQ0SN
+    K5LG (K0SN), CQ W1AWNR5 N9NM (W1AW/5), CQ IK?VUT AJ8S. Not CQ?QDE (CQ CQ DE), GERL? (QRL?),
+    noise letters with a digit (E?TE, TTE5E), or a qualifier with a number (SKCC5, NAQP2, US1234); a
+    qualifier glued to a broken call is judged on the rest (POTAQ0SN: Q0SN)."""
+    for q in _QUAL_PREFIXES:
+        if t.startswith(q) and len(t) > len(q):
+            rest = t[len(q):]
+            return any(ch.isdigit() for ch in rest) and sum(ch.isalpha() for ch in rest) >= 2
     core = t.replace("?", "")
-    letters, digits = sum(ch.isalpha() for ch in core), sum(ch.isdigit() for ch in core)
-    if (CALL_RE.match(t) or _RST_RE.match(t) or letters < 2 or not core.isalnum()
-            or any(k in t for k in ("CQ", "DE", "QRL", "QRZ", "TEST"))):
+    letters = [ch for ch in core if ch.isalpha()]
+    digits = sum(ch.isdigit() for ch in core)
+    if (CALL_RE.match(t) or _RST_RE.match(t) or _PARK_RE.match(t) or len(letters) < 2 or not core.isalnum()
+            or any(k in t for k in ("CQ", "DE", "QRL", "QRZ", "TEST"))
+            or len(set(letters) - _NOISE_ONLY) < 2):
         return False
     return (len(t) >= 5 and digits >= 1) or ("?" in t[1:-1] and len(t) >= 4 and len(core) >= 3)
 
@@ -521,7 +534,9 @@ def _stray_after(toks: list[str], j: int, listed: Callable[[str], bool] | None =
     and the first letter is no E or T (CQ TEST K4TZ E E is K4TZ and noise). Only calls of 3
     characters are checked: longer ones are followed by their own pieces (W0UI W 0 UI). listed
     (spot_rule_stray_known): a 4-character call too, when the rule copied the joined call near
-    here in the last 10 minutes: DE K1PU G after DE K1PUG is K1PUG split at a gap."""
+    here in the last 10 minutes and the letter is no E, T or I: DE K1PU G after DE K1PUG is K1PUG
+    split at a gap; DE N2EP I after DE N2EPI stays N2EP (which of the two is the bust, the text
+    cannot tell; I is the likelier noise)."""
     if len(toks[j]) > 3 and not (listed and len(toks[j]) == 4):
         return False
     k = j + 1
@@ -529,8 +544,8 @@ def _stray_after(toks: list[str], j: int, listed: Callable[[str], bool] | None =
         k += 1
     joined = toks[j]
     for m, t in enumerate(toks[k:k + 2]):
-        if len(t) != 1 or not t.isalpha() or t == "K" or (m == 0 and t in "ET"):
-            break
+        if len(t) != 1 or not t.isalpha() or t == "K" or (m == 0 and t in ("ETI" if len(toks[j]) == 4 else "ET")):
+            break                                 # a 4-character call takes no noise letter: DE N2EP I
         joined += t
         if CALL_RE.match(joined) and len(joined) <= 7 and (len(toks[j]) <= 3 or listed(joined)):
             return True

@@ -91,6 +91,8 @@ def _gui_settings(cfg, sample_rate):
         'spot_rule_split_up': repeat and bool(cfg.get('spot_rule_split_up', False)),
         'spot_rule_runner_signs': repeat and bool(cfg.get('spot_rule_runner_signs', False)),
         'spot_rule_window_join': repeat and bool(cfg.get('spot_rule_window_join', False)),
+        'spot_rule_garbled_runner': repeat and bool(cfg.get('spot_rule_garbled_runner', False)),
+        'spot_rule_stray_known': repeat and bool(cfg.get('spot_rule_stray_known', False)),
         'spot_rule_fragments': (cfg.get('spot_rule_fragments') or 'off') if repeat else 'off',
         'spot_rule_owner_cell': repeat and bool(cfg.get('spot_rule_owner_cell', False)),
         'spot_rule_owned_two_windows': repeat and bool(cfg.get('spot_rule_owned_two_windows', False)),

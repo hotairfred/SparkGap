@@ -34,6 +34,14 @@ def test_runner_after_its_own_misread_copy_is_kept() -> None:
         assert call in _calls(text), text
 
 
+def test_qualifier_or_noise_with_a_digit_is_no_broken_call() -> None:
+    """A qualifier with a number, a park reference, or noise letters with a digit or '?' before the
+    call are no misread runner call: the call after them is the runner (cdub89's review of #143)."""
+    for text in ("CQ CQ CQ E?TE K1ABC K1ABC", "CQ SKCC5 K1ABC", "CQ NAQP2 K1ABC", "CQ POTA US1234 K1ABC"):
+        assert "K1ABC" in _calls(text), text
+    assert "W1AW" in _calls("CQ CQ TTE5E W1AW W1AW K")
+
+
 def _rule(stray_known: bool) -> RepeatSpotRule:
     return RepeatSpotRule(lambda c: 2, cq_groups=True, cq_qualifiers=True, lockon=True,
                           fragments="any,stray", stray_known=stray_known)
@@ -47,6 +55,15 @@ def test_split_of_a_call_copied_here_is_no_copy() -> None:
         r.feed(r.window_id(1, 0, 0.0), 7054.7, "QRL ? CQ CQ CQ CQ DE K1PUG K", 0.0)
         r.feed(r.window_id(1, 1, 60.0), 7054.7, "DE K1PU G CQ K Q CQ DE K1PU G K", 60.0)
         assert sum(c.call == "K1PU" for c in r._copies) == want
+
+
+def test_noise_letter_after_a_four_character_call_is_kept() -> None:
+    """DE N2EPI read first, then DE N2EP I: the text cannot tell which is the bust, and I is the
+    likelier noise, so N2EP keeps its copy (cdub89's review of #143)."""
+    r = _rule(True)
+    r.feed(r.window_id(1, 0, 0.0), 7008.0, "CQ CQ DE N2EPI N2EPI K", 0.0)
+    r.feed(r.window_id(1, 1, 60.0), 7008.0, "CQ CQ DE N2EP I N2EP I K", 60.0)
+    assert any(c.call == "N2EP" for c in r._copies)
 
 
 def test_four_character_call_alone_is_kept() -> None:
