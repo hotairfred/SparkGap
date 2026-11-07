@@ -5,7 +5,6 @@ import ctypes as ct
 
 import numpy as np
 import pytest
-
 from test_scanner_fft_front import _keyed_iq, _scanner
 
 P = ct.POINTER(ct.c_double)
