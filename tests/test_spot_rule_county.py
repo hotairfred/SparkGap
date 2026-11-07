@@ -25,3 +25,10 @@ def test_report_and_number_still_an_exchange() -> None:
 
 def test_two_letters_after_the_report_are_not_a_county() -> None:
     assert _calls("CQ OA4EFA TEST SN3A 5NN AT TU") == ["OA4EFA"]
+
+
+def test_noise_or_a_common_word_after_the_report_is_not_a_county() -> None:
+    """Dit noise (EEE, TTTT) and words or qualifiers (QTH, QRL, POTA, SKCC) after a report are no
+    county: the call before them keeps its copy (cdub89's review of #138)."""
+    for word in ("EEE", "TTTT", "SIE", "QTH", "QRL", "POTA", "SKCC"):
+        assert _calls(f"CQ CQ DE K1ABC K1ABC 5NN {word}") == ["K1ABC"], word
