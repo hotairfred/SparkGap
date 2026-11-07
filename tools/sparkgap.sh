@@ -129,7 +129,7 @@ clone_of() {  # the clone, on a branch, that a code folder shares its repository
 UPSTREAM=https://github.com/hotairfred/SparkGap.git
 radio_field() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$1" "$2" 2>/dev/null; }
 setup() {  # setup: the run folder, server, radio and node settings, asking only what is missing; rerun any time
-  local repo br out rc addr radio r top files=()
+  local repo br out rc addr radio r top kind="" name="" files=()
   if [ ! -d "$CODE/.git" ] || [ ! -f "$R/instances" ]; then
     read -r -p "Repository to clone [$UPSTREAM]: " repo
     read -r -p "Branch [main]: " br
@@ -138,30 +138,32 @@ setup() {  # setup: the run folder, server, radio and node settings, asking only
   top=$(source_clone) || die "no code/ clone"
   server_pid > /dev/null || server start || die "the server did not start"
   shopt -s nullglob; files=("$R"/config/*.radio.json); shopt -u nullglob
-  [ ${#files[@]} -eq 1 ] && addr=$(radio_field "${files[0]}" address)   # asked directly: works where broadcasts do not
-  out=$(ctl discover ${addr:+"$addr"}); rc=$?; echo "$out"
+  until [[ $kind == flex || $kind == hpsdr ]]; do read -r -p "Radio type (flex or hpsdr): " kind; done
+  [ "$kind" = hpsdr ] && read -r -p "Its name, if not set up yet (Enter: as found): " name
+  [ ${#files[@]} -eq 1 ] && [ "$(radio_field "${files[0]}" type)" = "$kind" ] && addr=$(radio_field "${files[0]}" address)   # asked directly: works where broadcasts do not
+  out=$(ctl discover "$kind" ${addr:+"$addr"} ${name:+"name=$name"}); rc=$?; echo "$out"
   while [ $rc -ne 0 ] || [[ $out == "no radio heard"* ]]; do
     [ $rc -eq 2 ] && exit 2   # no server
     read -r -p "Radio address (Enter to stop): " addr
     [ -n "$addr" ] || die "no radio found; run sparkgap.sh setup again and give its address"
-    out=$(ctl discover "$addr"); rc=$?; echo "$out"
+    out=$(ctl discover "$kind" "$addr" ${name:+"name=$name"}); rc=$?; echo "$out"
   done
   shopt -s nullglob; files=("$R"/config/*.radio.json); shopt -u nullglob
   [ ${#files[@]} -gt 0 ] || die "no radio file was written"
   radio=$(basename "${files[0]}" .radio.json)
+  [ -f "$R/config/${out%%:*}.radio.json" ] && radio=${out%%:*}   # the radio just found, not the first file
   if [ ${#files[@]} -gt 1 ]; then
     echo "Radios: $(for f in "${files[@]}"; do basename "$f" .radio.json; done | tr '\n' ' ')"
     read -r -p "Which radio [$radio]: " r; radio=${r:-$radio}
     [ -f "$R/config/$radio.radio.json" ] || die "no radio file for $radio"
   fi
-  local said r rx mode rcv
+  local said r rx mode
   said=$(mktemp) || die "no temporary file"
   python3 "$top/tools/setup_node.py" "$R" "$radio" | tee "$said"; [ "${PIPESTATUS[0]}" -eq 0 ] || { rm -f "$said"; exit 2; }
   rx=$(sed -n 's/^restart: //p' "$said"); r=$(sed -n 's/^restart-feeder: //p' "$said"); rm -f "$said"
   [ -z "$rx" ] || { ctl stop $rx && ctl start $rx; }   # what the answer above agreed to
   if [ -n "$r" ]; then mode=$(radio_field "$R/config/$radio.radio.json" rbn_upload); ctl rbn "$r" "${mode:-dry}"; fi
-  rcv=$(awk -v r="$radio-" 'index($1, r) == 1 {printf "%s ", $1}' "$R/instances")
-  echo "receivers of $radio: ${rcv:-none yet}"
+  ctl status | awk -v r=" $radio ━━" '/^━━ /{p = index($0, r) > 0} p'   # the radio as status shows it
   echo "add receivers in SparkGap Web:"; server_status
 }
 init() {  # init <repository> <branch>: what is missing, nothing replaced

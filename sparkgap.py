@@ -8086,9 +8086,17 @@ class SparkGap:
         return reply(True, "retuned to %s" % name)
 
     def _link_receivers(self):
-        """Each band's receiver as the server's link reports it."""
-        return [{'band': n, 'centre_khz': round(self._corrected_freq_khz(c / 1000.0), 3), 'rx': r}
-                for n, c, r in self._band_meta]
+        """Each band's receiver as the server's link reports it, with its live bin count."""
+        return [{'band': n, 'centre_khz': round(self._corrected_freq_khz(c / 1000.0), 3), 'rx': r,
+                 'bins': self._bins_of(k)}
+                for k, (n, c, r) in enumerate(self._band_meta)]
+
+    def _bins_of(self, k):
+        try:
+            sc = self.managers[k]._itila_scanner._sc
+            return int(sc._lib.itila_sc_bin_count(sc._h)) if sc and sc._h else None
+        except (AttributeError, IndexError, TypeError):
+            return None
 
     async def _live_rx(self, rx, reply):
         """Our pan's antenna, loops or RF gain, changed on the radio in place."""
@@ -8674,7 +8682,7 @@ class SparkGap:
                                                now - self.start_time, self._gui_health(live_rate))
                 if _link:
                     _link.status(spots=self.spot_count, cpu=proc.get('cpu'),
-                                 rss_mb=proc.get('rss_mb'))
+                                 rss_mb=proc.get('rss_mb'), receivers=self._link_receivers())
             if now - last_status >= status_interval:
                 last_status = now
                 _save_spot_memory(self.cfg.get('spot_rule_memory'), self.tracker)
@@ -9212,6 +9220,8 @@ def load_config(path):
             node = {}
         if node.get('callsign') and node.get('grid'):
             defaults.update(callsign=node['callsign'], grid=node['grid'], skimmer_suffix='')
+        if node.get('type') == 'hpsdr' and node.get('address'):  # an HPSDR radio is known by its address
+            defaults['sdr_ip'] = node['address']
     return defaults
 
 

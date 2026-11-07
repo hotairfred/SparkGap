@@ -204,6 +204,7 @@ class Client:
     )
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     spectrum_hz: float = DEFAULT_SPECTRUM_HZ
+    band_khz: float | None = None  # the band its waterfall shows (its centre); None: every band
     spectrum_credit: float = 0.0
     last_heard: float = field(default_factory=time.monotonic)
     since: float = field(default_factory=time.time)
@@ -264,6 +265,7 @@ class FeedServer:
         self.started = threading.Event()
         self.thread: threading.Thread | None = None
         self.n_clients = 0  # read without the loop by the spectrum tap
+        self.watched: frozenset[float] | None = None  # band centres (kHz) shown, None: all; read by the tap
         self.pending = 0  # connections in _handshake; touched only on the loop
         # status page counters, kept on the loop
         self.n_windows = 0
@@ -403,7 +405,7 @@ class FeedServer:
             )
             + bins
         )
-        self._call(self._on_spectrum, encode_frame(OP_BINARY, msg))
+        self._call(self._on_spectrum, encode_frame(OP_BINARY, msg), first_bin_hz + hz_per_bin * len(bins) / 2)
 
     # ---- loop side ----
 
@@ -463,8 +465,20 @@ class FeedServer:
             c.text.extend(frames)
             c.ready.set()
 
-    def _on_spectrum(self, frame: bytes) -> None:
+    def _watch(self) -> None:
+        """The bands the clients' waterfalls show, for the taps: one that never said shows them all."""
+        shown = [c.band_khz for c in self.clients if not c.closed]
+        self.watched = None if any(b is None for b in shown) else frozenset(round(b, 1) for b in shown if b is not None)
+
+    def watching(self, center_hz: float) -> bool:
+        """Whether a band's waterfall is on some client's screen (any thread)."""
+        w = self.watched
+        return w is None or any(abs(b - center_hz / 1000) < BAND_MATCH_KHZ for b in w)
+
+    def _on_spectrum(self, frame: bytes, center_hz: float | None = None) -> None:
         for c in self.clients:
+            if c.band_khz is not None and center_hz is not None and abs(c.band_khz - center_hz / 1000) >= BAND_MATCH_KHZ:
+                continue  # another band's row: its waterfall shows one band
             # thin by count, not arrival time: rows from one IQ block arrive together
             c.spectrum_credit += c.spectrum_hz / SPECTRUM_ROWS_HZ
             if c.spectrum_credit < 1.0 - 1e-9:
@@ -693,6 +707,7 @@ class FeedServer:
         c.ready.set()
         self.clients.add(c)
         self.n_clients = len(self.clients)
+        self._watch()
         log.info("GUI feed: %s connected (%d clients)", peer, self.n_clients)
         namer = asyncio.ensure_future(self._name(c, host))
         sender = asyncio.ensure_future(self._send(c))
@@ -707,6 +722,7 @@ class FeedServer:
             c.ready.set()
             self.clients.discard(c)
             self.n_clients = len(self.clients)
+            self._watch()
             namer.cancel()
             await asyncio.gather(sender, namer, return_exceptions=True)
             writer.close()
@@ -760,6 +776,9 @@ class FeedServer:
             hz = msg.get("spectrum_hz", DEFAULT_SPECTRUM_HZ)
             if isinstance(hz, (int, float)):
                 c.spectrum_hz = max(0.5, min(SPECTRUM_ROWS_HZ, float(hz)))
+            band = msg.get("band_khz")  # the band on screen; absent: every band, as an older page
+            c.band_khz = float(band) if isinstance(band, (int, float)) and not isinstance(band, bool) else None
+            self._watch()
         elif isinstance(msg, dict) and msg.get("type") == "control":
             self._on_control(c, msg)
 
@@ -855,6 +874,7 @@ class FeedServer:
 SPECTRUM_RES_HZ = 50.0  # target FFT resolution
 SPECTRUM_MAX_BINS = 2_048
 SPECTRUM_ROWS_HZ = 60.0  # rows produced; each client is thinned to its own rate
+BAND_MATCH_KHZ = 1.0  # a waterfall's band and a tap's centre within this are the same band
 DB_PER_UNIT = 0.25  # u8 steps: 0.25 dB, 0 .. 63.75 dB over the noise floor
 # noise floor per block, so the radio's IQ roll-off at the edges is not drawn black
 FLOOR_BLOCK_HZ = 1_500.0
@@ -881,7 +901,7 @@ class SpectrumTap:
         self.floor: np.ndarray | None = None
 
     def feed_iq(self, i_samples: Any, q_samples: Any) -> None:
-        if not self.feed.n_clients:
+        if not self.feed.n_clients or not self.feed.watching(self.center_hz):  # no waterfall shows it
             self.since = 0
             return
         t0 = time.thread_time()
