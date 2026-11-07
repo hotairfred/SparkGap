@@ -7659,6 +7659,11 @@ class SparkGap:
         # Replaces a hardware GPSDO until/unless we add the R25/R26
         # mod + Bodnar 125 MHz reference.
         self.ppm_offset = float(self.cfg.get('ppm_offset', 0.0))
+        # ppm_offset_file: a file holding the offset (one number), read at start and again whenever
+        # it changes, so a calibration job can correct the reports without a restart
+        self._ppm_file = self.cfg.get('ppm_offset_file')
+        self._ppm_mtime = None
+        self._read_ppm_file()
 
     def broadcast(self, stream='all', **spot):
         """Send a spot to the telnet ports. stream 'all' (FT8, RTTY, CW without spot_rule):
@@ -7684,6 +7689,33 @@ class SparkGap:
             if bn == band_name and scanner is not None and getattr(scanner, '_sc', None):
                 return scanner._sc.exclude(lo_hz, hi_hz, hold_sec)
         return False
+
+    PPM_FILE_MAX = 20.0      # a larger offset in ppm_offset_file is a mistake, not a calibration
+
+    def _read_ppm_file(self):
+        """ppm_offset_file changed since the last read: take its number as ppm_offset. A missing
+        file, or one that is not a number within PPM_FILE_MAX, leaves the offset as it is."""
+        path = self._ppm_file
+        if not path or not os.path.exists(path):
+            return
+        mtime = os.path.getmtime(path)
+        if mtime == self._ppm_mtime:
+            return
+        self._ppm_mtime = mtime
+        try:
+            with open(path) as f:
+                text = next((ln.split('#')[0].strip() for ln in f if ln.split('#')[0].strip()), '')
+            ppm = float(text)
+        except (OSError, ValueError):
+            log.warning("ppm_offset_file %s: no number in it; ppm_offset stays %+.3f", path, self.ppm_offset)
+            return
+        if abs(ppm) > self.PPM_FILE_MAX:
+            log.warning("ppm_offset_file %s: %+.3f ppm is past %.0f; ppm_offset stays %+.3f",
+                        path, ppm, self.PPM_FILE_MAX, self.ppm_offset)
+            return
+        if ppm != self.ppm_offset:
+            log.info("ppm_offset %+.3f -> %+.3f (from %s)", self.ppm_offset, ppm, path)
+            self.ppm_offset = ppm
 
     def _corrected_freq_khz(self, raw_khz):
         """Apply ppm_offset calibration to a freq emission. No-op when 0."""
@@ -8558,6 +8590,8 @@ class SparkGap:
             if now - last_scan >= scan_interval:
                 last_scan = now
                 self.tracker.reset_cycle()
+
+                self._read_ppm_file()      # ppm_offset_file: a calibration job's new offset
 
                 # Hot-reload add_calls.txt if file changed since last scan
                 if os.path.exists(self._add_calls_path):
