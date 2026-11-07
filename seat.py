@@ -75,6 +75,8 @@ OPTION_FLAGS = (
     "spot_rule_la1d",
     "spot_rule_gluek",
     "spot_rule_norival",
+    "spot_rule_garbled_runner",
+    "spot_rule_stray_known",
     "itila2_snr_decoder",
 )
 OPTION_CHOICES: dict[str, tuple[Any, ...]] = {
