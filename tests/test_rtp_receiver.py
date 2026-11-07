@@ -96,3 +96,13 @@ def test_close_while_receiving_ends_the_loop() -> None:
     rx.close()
     t.join(timeout=2)
     assert not t.is_alive()
+
+
+def test_group_names_hash_as_radiod_does() -> None:
+    """radiod hashes a group name to its address unless dns = yes (ka9q-radio make_maddr, FNV-1):
+    the same names give the same addresses as UberSDR's copy of the function."""
+    from rtp_receiver import radiod_maddr
+    for name in ("pcm.local", "hf-status.local", "sparkgap-iq.local"):
+        a = radiod_maddr(name)
+        assert a.startswith("239.") and a == radiod_maddr(name)
+    assert radiod_maddr("pcm.local") != radiod_maddr("hf-status.local")

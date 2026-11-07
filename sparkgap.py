@@ -7893,7 +7893,8 @@ class SparkGap:
             self.receiver = RtpReceiver(group, port=self.cfg.get('rtp_port', 5004),
                                         sample_rate=rx_sample_rate,
                                         encoding=self.cfg.get('rtp_encoding', 'f32le'),
-                                        iface=self.cfg.get('rtp_iface'))
+                                        iface=self.cfg.get('rtp_iface'),
+                                        use_dns=bool(self.cfg.get('rtp_use_dns', False)))
             for _name, center_hz, rx_idx in self._band_meta:
                 self.receiver.set_frequency(rx_idx, center_hz)
             log.info("Using radiod RTP channels from %s (SSRC = centre in kHz: %s)", group,

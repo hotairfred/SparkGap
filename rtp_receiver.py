@@ -59,6 +59,22 @@ def decode(payload: bytes, encoding: str) -> np.ndarray:
     raise ValueError(f"rtp_encoding must be one of {ENCODINGS}, got {encoding!r}")
 
 
+def radiod_maddr(name: str) -> str:
+    """The multicast address radiod gives a group name (ka9q-radio multicast.c make_maddr): FNV-1
+    of the name in 239.0.0.0/8, off the two /24s that share Ethernet addresses with 224.0.0.0/24.
+    radiod hashes names unless its config says dns = yes, so SparkGap does too (rtp_use_dns)."""
+    h = 0x811C9DC5
+    for b in name.encode():
+        h = (h * 0x01000193) & 0xFFFFFFFF
+        h ^= b
+    addr = (239 << 24) | (h & 0xFFFFFF)
+    if addr & 0x007FFF00 == 0:
+        addr |= (addr & 0xFF) << 8
+    if addr & 0x007FFF00 == 0:
+        addr |= 0x00100000
+    return socket.inet_ntoa(struct.pack("!I", addr))
+
+
 def ssrc_for(freq_hz: float) -> int:
     """radiod's default SSRC for a channel: its frequency in kHz."""
     return round(freq_hz / 1000.0)
@@ -76,7 +92,7 @@ class RtpReceiver:
     """
 
     def __init__(self, group, port=5004, sample_rate=192000, encoding="f32le", iface=None,
-                 ssrcs=None):
+                 ssrcs=None, use_dns=False):
         if encoding not in ENCODINGS:
             raise ValueError(f"rtp_encoding must be one of {ENCODINGS}, got {encoding!r}")
         self.group = group
@@ -84,6 +100,7 @@ class RtpReceiver:
         self.sample_rate = int(sample_rate)
         self.encoding = encoding
         self.iface = iface
+        self.use_dns = use_dns         # a group name: look it up, else hash it as radiod does
         self._fixed_ssrc = dict(ssrcs or {})   # rx_index -> SSRC, when radiod's config sets its own
         self.frequencies = {}                  # rx_index -> Hz
         self._by_ssrc = {}                     # SSRC -> rx_index
@@ -111,7 +128,10 @@ class RtpReceiver:
 
     # -- lifecycle --
     def _open(self):
-        addr = socket.gethostbyname(self.group)
+        try:
+            addr = str(ipaddress.ip_address(self.group))
+        except ValueError:
+            addr = socket.gethostbyname(self.group) if self.use_dns else radiod_maddr(self.group)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
@@ -136,8 +156,8 @@ class RtpReceiver:
     def start(self):
         if self.sock is None:
             self.sock = self._open()
-            log.info("RTP: listening on %s:%d (%s, %d Hz), SSRCs %s", self.group, self.port,
-                     self.encoding, self.sample_rate, sorted(self._by_ssrc))
+            log.info("RTP: listening on %s:%d (%s, %s, %d Hz), SSRCs %s", self.group, self.port,
+                     self.sock.getsockname()[0], self.encoding, self.sample_rate, sorted(self._by_ssrc))
         self._running = True
 
     def stop(self):
