@@ -272,6 +272,14 @@ def sender(toks: list[str], i: int, la1d: bool = False) -> int | None:
     return None
 
 
+def _county(tok: str) -> bool:
+    """A report followed by a county code (W0ZQ/CLRK ... K0PC K0PC 5NN CLRK, state QSO parties):
+    3 to 5 letters that are not a stop word, prosign or keyword. Two letters (5NN AT) are too often
+    a garble to count."""
+    return (tok.isalpha() and 3 <= len(tok) <= 5
+            and tok not in _STOP_WORDS and tok not in _PROSIGNS and tok not in KEYWORDS)
+
+
 def is_exchange(toks: list[str], j: int, qualifiers: bool = False, grid: bool = False) -> bool:
     """toks[j] is followed by NAME then a number or 2-letter state, or by a report (5NN) then
     a number: a caller being sent the exchange. Repeats of the call and 1-character or '?'
@@ -288,7 +296,7 @@ def is_exchange(toks: list[str], j: int, qualifiers: bool = False, grid: bool = 
         return False
     name, num = toks[k], toks[k + 1]
     if _RST_RE.match(name):                      # CQ WW, WPX: report then zone or serial
-        return any(ch.isdigit() for ch in num)
+        return any(ch.isdigit() for ch in num) or _county(num)
     if qualifiers and (name in _qualifiers(toks) or num in _STOP_WORDS):
         return False
     return (name.isalpha() and 2 <= len(name) <= 6 and name not in _STOP_WORDS
