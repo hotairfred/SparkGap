@@ -120,6 +120,11 @@ class RtpReceiver:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
         except OSError:
             pass
+        got = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        if got < RCVBUF // 2:      # Linux reports double what it grants; capped by net.core.rmem_max
+            log.warning("RTP: receive buffer %d kB, not %d kB: packets may be lost on busy bands; raise it "
+                        "with 'sudo sysctl -w net.core.rmem_max=16777216' (and /etc/sysctl.d/ to keep it)",
+                        got // 1024, RCVBUF // 1024)
         if ipaddress.ip_address(addr).is_multicast:
             s.bind((addr, self.port))
             local = socket.inet_aton(socket.gethostbyname(self.iface) if self.iface else "0.0.0.0")

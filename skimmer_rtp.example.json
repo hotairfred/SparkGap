@@ -11,6 +11,7 @@
   "rtp_group": "sparkgap-iq.local",
   "rtp_port": 5004,
   "rtp_encoding": "f32le",
+  "_comment_rtp_iface": "radiod on this computer with ttl = 0: set rtp_iface to 127.0.0.1 (loopback); on another computer: this computer's address on that network, or leave it out",
   "sample_rate": 192000,
   "ppm_offset": 0.0,
   "bands": ["80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m"],
