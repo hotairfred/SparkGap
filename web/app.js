@@ -199,7 +199,7 @@ class Instance {
       this.since = now();
       this.retry = 0;
       this.error = "";
-      ws.send(JSON.stringify({ type: "subscribe", spectrum_hz: SPECTRUM_HZ }));
+      this.subscribe();
       this.setState("live");
     };
     ws.onmessage = e => (typeof e.data === "string" ? this.onText(e.data) : this.onBinary(e.data));
@@ -254,6 +254,7 @@ class Instance {
       if (this.moved) { this.selKhz = null; this.selCall = null; this.lastPick = null; }
       this.hello = m;
       if (!this.bands[this.band]) this.band = 0;
+      this.subscribe();  // now the band on screen is known: only its spectrum is computed and sent
       this.windows = []; this.spots.clear(); this.signals.clear(); this.recent.clear(); this.runners.clear();
       this.on("hello");
     } else if (m.type === "snapshot") {
@@ -378,9 +379,15 @@ class Instance {
   // host and band from hello; empty until the first hello. No address: that is for Settings.
   get bands() { return this.hello.bands || []; }
   bandAt(khz) { return this.bands.findIndex(b => Math.abs(khz - b.center_khz) <= b.span_khz / 2); }
+  // the row rate, and the band whose waterfall is on screen (before the hello: every band)
+  subscribe() {
+    const b = this.bands[this.band];
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "subscribe", spectrum_hz: SPECTRUM_HZ, ...(b ? { band_khz: b.center_khz } : {}) }));
+  }
   setBand(n) {
     if (n === this.band || !this.bands[n]) return;
     this.band = n;
+    this.subscribe();
     this.nBins = 0;  // the next row of the new band starts a fresh history
     this.ring = null; this.pending = []; this.head = this.cols = this.total = 0;
     this.selKhz = null; this.selCall = "";
@@ -1148,15 +1155,17 @@ function copyText(text) {
 
 // a copy's status from its own feed, as HTML; a: what its server says of it (top calls), or null
 // a copy's six headline boxes: uptime, spots, calls, windows, bins, CPU (dashes while stopped)
-function statusTilesHtml(s) {
+// all: an HPSDR receiver's pane: its radio's totals and their label, under each count
+function statusTilesHtml(s, all) {
   const num = v => (v === null || v === undefined ? "-" : Number(v).toLocaleString("en-US"));
+  const of = k => (all && all[k] !== null && all[k] !== undefined ? `of ${num(all[k])}, ${all.label}` : "");
   const tile = (k, v, sub, bad, primary) => `<div class="stat${bad ? " bad" : ""}${primary ? " primary" : ""}"><div class="label">${k}</div><div class="mono">${esc(dash(v))}</div>`
     + `${sub ? `<div class="tsub">${esc(sub)}</div>` : ""}</div>`;
-  const tiles = [tile("UPTIME", s.uptime_s === undefined ? null : duration(s.uptime_s)),
-    tile("SPOTS", num(s.spots), s.spots_hour !== undefined ? `${s.spots_hour} last hour` : "", false, true),
-    tile("CALLS", num(s.calls), "", false, true), tile("WINDOWS", num(s.windows), "", false, true),
-    tile("BINS", num(s.bins), s.bins_peak !== undefined ? `peak ${s.bins_peak}` : ""),
-    tile("CPU", s.cpu !== undefined && s.cpu !== null ? s.cpu + "%" : "-", "of a core" + (s.rss_mb ? ` · ${s.rss_mb} MB` : ""))];
+  const tiles = [tile("UPTIME", s.uptime_s === undefined ? null : duration(s.uptime_s), all ? all.label : ""),
+    tile("SPOTS", num(s.spots), of("spots") || (s.spots_hour !== undefined ? `${s.spots_hour} last hour` : ""), false, true),
+    tile("CALLS", num(s.calls), of("calls"), false, true), tile("WINDOWS", num(s.windows), of("windows"), false, true),
+    tile("BINS", num(s.bins), of("bins") || (s.bins_peak !== undefined ? `peak ${s.bins_peak}` : "")),
+    tile("CPU", s.cpu !== undefined && s.cpu !== null ? s.cpu + "%" : "-", "of a core" + (s.rss_mb ? ` · ${s.rss_mb} MB` : "") + (all ? `, ${all.label}` : ""))];
   return `<div class="stats stiles">${tiles.join("")}</div>`;
 }
 
@@ -1450,7 +1459,7 @@ function renderSettings() {
   renderConnForm();
   if (help) { renderHelp(); return; }
   const box = $("radiosBody"), focus = document.activeElement;
-  if (selecting(box) || (focus && box.contains(focus) && (focus.tagName === "SELECT" || focus.tagName === "INPUT"))) return;
+  if (selecting(box) || (focus && (box.contains(focus) || $("radioHead").contains(focus)) && (focus.tagName === "SELECT" || focus.tagName === "INPUT"))) return;
   // the log keeps its place: at the bottom it follows new lines, scrolled up it stays
   const was = {};
   for (const c of box.querySelectorAll("[data-console]")) was[c.dataset.console] = c.scrollHeight - c.scrollTop - c.clientHeight < 4 ? -1 : c.scrollTop;
@@ -1503,11 +1512,25 @@ function feederState(f, mode) {
   return f.registered ? '<span class="good">signed in</span>' : '<span class="bad">not signed in</span>';
 }
 
+// an HPSDR radio's one process, for all its receivers, as sparkgap_ctl's skimmer row
+function skimmerText(i, utc) {
+  const run = i.state === "running", s = run && i.started ? Math.max(0, Math.floor((utc || Date.now() / 1000) - i.started)) : null;
+  const up = s === null ? "" : s >= 3600 ? `up ${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : `up ${Math.floor(s / 60)}m ${s % 60}s`;
+  const err = Number(i.errors) || 0, warn = Number(i.warnings) || 0;
+  return [dot(i.busy ? "busy" : i.state) + esc(i.busy ? `${i.busy}...` : i.state), esc(up), run && i.cpu != null ? `cpu ${i.cpu}%` : "",
+    run && i.rss_mb != null ? `${i.rss_mb} MB` : "", err ? `<span class="bad">err ${err}</span>` : "err 0",
+    warn ? `<span class="warn">warn ${warn}</span>` : "warn 0", esc(i.build || "")].filter(Boolean).join(" · ");
+}
+
 // what the right pane shows: {k, kind: "rx"|"rbn"|"node"|"server"|"browser", name}; the receiver on screen first
 function radioPick() {
   const servers = app.servers.filter(sv => sv.link && sv.link.seat);
   const all = servers.flatMap(sv => (sv.link.seat.instances || []).map(i => ({ k: app.servers.indexOf(sv), name: i.name })));
   const p = app.pick;
+  if (p && p.kind === "rx" && p.rx) {  // an HPSDR receiver removed (elsewhere too): its radio's first
+    const i = ((app.servers[p.k] && app.servers[p.k].link && app.servers[p.k].link.seat) || {}).instances?.find(x => x.name === p.name);
+    if (i && !(i.receiver_list || []).some(r => r.receiver === p.rx)) p.rx = 1;
+  }
   if (p && (p.kind !== "rx" || all.some(x => x.k === p.k && x.name === p.name))) return p;
   const i = inst(), here = i && all.find(x => app.servers[x.k] === i.server && x.name === copyName(i));
   return app.pick = here ? { ...here, kind: "rx" } : all[0] ? { ...all[0], kind: "rx" } : { k: app.servers.indexOf(servers[0]), kind: "server" };
@@ -1539,6 +1562,12 @@ function decoderOptions(at, st, pend) {
 // room on radio rn for another receiver: its free DAX-IQ channels, or why there is none
 function addRoom(seat, rn) {
   const rf = (seat.radio_files || []).find(x => x.name === rn) || {};
+  if (rf.type === "hpsdr") {  // one process: the next receiver, up to the radio's count
+    const proc = (seat.instances || []).find(i => i.name === rn), n = ((proc && proc.receiver_list) || []).length + 1;
+    const limit = Number.isInteger(rf.receivers) && rf.receivers > 0 ? rf.receivers : null;
+    return limit !== null && n > limit ? { free: [], why: `the ${rf.model || rn} holds ${limit} receivers: all in use`, hpsdr: true, proc }
+      : { free: [n], why: "", hpsdr: true, proc };
+  }
   const mine = (seat.instances || []).filter(i => i.radio === rn);
   const used = new Set(mine.map(i => Number((/-(\d)$/.exec(i.name) || [])[1])));
   const caps = [rf.max_panadapters, rf.max_slices, rf.daxiq_channels].filter(v => Number.isInteger(v) && v > 0);
@@ -1559,7 +1588,7 @@ function addItem(k, seat, rn, on) {
 
 // Add a receiver: band and DAX-IQ channel, pending until Apply as other settings are
 function addPaneHtml(k, sv, rn) {
-  const seat = sv.link.seat || {}, { free, why } = addRoom(seat, rn), bands = seat.bands || [];
+  const seat = sv.link.seat || {}, { free, why, hpsdr, proc } = addRoom(seat, rn), bands = seat.bands || [];
   const head = `<div class="phead"><span class="ptitle">Add a receiver</span><span class="muted">${esc(rn)}</span></div>`;
   if (why) return head + `<div class="fhint">${esc(why)}</div>`;
   const d = app.addDraft && app.addDraft.radio === rn ? app.addDraft
@@ -1573,11 +1602,13 @@ function addPaneHtml(k, sv, rn) {
   return head + `<div class="fbar"><span>${esc(name)} not added yet</span><span class="grow"></span>`
     + `<button class="btn small primary" data-act="addapply" ${at}${app.adding ? " disabled" : ""}>Apply (adds ${esc(name)})</button>`
     + `<button class="btn small" data-act="addcancel" ${at}>Cancel</button></div>`
-    + `<div class="form">${row("BAND", `<select class="fsel" data-add="band">${opts(bands, d.band)}</select>`)}`
-    + row("DAX-IQ", `<select class="fsel" data-add="channel">${opts(free, d.channel)}</select>`, `<span class="fnote">its name: ${esc(name)}</span>`)
+    + `<div class="form">${row("BAND", `<select class="fsel" data-add="band">${opts(bands, d.band)}</select>`, hpsdr ? `<span class="fnote">its name: ${esc(name)}</span>` : "")}`
+    + (hpsdr ? `</div><div class="fhint">${proc ? `It joins ${esc(rn)}'s other receivers: their decoder options are its, and ${esc(rn)} restarts if it runs.` : `${esc(rn)} starts with it, from the shipped HPSDR defaults; change them here.`}</div>`
+      + (proc ? "" : `<div class="fold"><div class="form">${decRows.join("")}</div></div>`) : "")
+    + (hpsdr ? "" : row("DAX-IQ", `<select class="fsel" data-add="channel">${opts(free, d.channel)}</select>`, `<span class="fnote">its name: ${esc(name)}</span>`)
     + row("RECORDING", choose("record", [[false, "off"], [true, "on"]], !!st.record))
     + `</div><div class="fhint">It starts with the radio's antenna and RF gain, and ${back ? `the settings ${esc(name)} had before it was removed` : "the shipped default decoder options"}; change them here.</div>`
-    + `<div class="fold"><div class="form">${decRows.join("")}</div></div>`;
+    + `<div class="fold"><div class="form">${decRows.join("")}</div></div>`);
 }
 
 // Reset to defaults: every decoder option that differs from the shipped defaults goes pending, for Apply
@@ -1605,15 +1636,65 @@ async function addReceiver(sv, rn) {
   const k = pendKey(sv, addKey(rn));
   const ok = await seatRequest(sv.link, "add", name, { ...(app.pending[k] || {}), band: d.band });
   app.adding = false;
-  if (ok) { app.addDraft = null; delete app.pending[k]; app.pick = { k: app.servers.indexOf(sv), kind: "rx", name }; }
+  const hp = addRoom(sv.link.seat || {}, rn).hpsdr;  // an HPSDR receiver: its radio's process, its number
+  if (ok) { app.addDraft = null; delete app.pending[k]; app.pick = hp ? { k: app.servers.indexOf(sv), kind: "rx", name: rn, rx: d.channel } : { k: app.servers.indexOf(sv), kind: "rx", name }; }
   renderSettings();
 }
 
+// every radio on the connected servers, for the switch: {k, name, label}; name "" = receivers with no radio file
+function radioList() {
+  return app.servers.flatMap((sv, k) => {
+    const seat = sv.link && sv.link.seat;
+    if (!seat) return [];
+    const files = seat.radio_files || [], list = seat.instances || [], all = [...(seat.radios || []), ...files.filter(f => !(seat.radios || []).some(x => x.name === f.name))];
+    const shown = all.filter(r => list.some(i => i.radio === r.name) || files.some(f => f.name === r.name));
+    const out = shown.map(r => ({ k, name: r.name, label: [r.name, r.model || r.type, r.callsign].filter(Boolean).join(" \u00b7 ") }));
+    if (list.some(i => !shown.some(r => r.name === i.radio))) out.push({ k, name: "", label: "Receivers with no radio file" });
+    return out;
+  });
+}
+
+// the radio the switch shows: the one picked in this browser, else the picked receiver's, else the first
+function radioSel(pick) {
+  const all = radioList(), same = x => all.find(r => r.k === x.k && r.name === x.name);
+  const saved = app.radioSel || load("radioSel", null);  // {address, name}: the server's address, not its place in the list
+  const kept = saved && all.find(r => app.servers[r.k].address === saved.address && r.name === saved.name);
+  if (kept) return kept;
+  const sv = pick && app.servers[pick.k], i = pick && pick.kind === "rx" && sv && sv.link && ((sv.link.seat || {}).instances || []).find(x => x.name === pick.name);
+  return (i && same({ k: pick.k, name: i.radio || "" })) || (pick && pick.kind !== "rx" && pick.name && same({ k: pick.k, name: pick.name })) || all[0] || null;
+}
+
+// what the right pane opens on for a radio: its first receiver, else its Add pane
+function firstPick(x) {
+  const named = radioList().filter(r => r.k === x.k && r.name).map(r => r.name);
+  const first = (((app.servers[x.k].link || {}).seat || {}).instances || []).find(i => x.name ? i.radio === x.name : !named.includes(i.radio));
+  return first ? { k: x.k, kind: "rx", name: first.name } : x.name ? { k: x.k, kind: "add", name: x.name } : { k: x.k, kind: "server" };
+}
+
+// a receiver of another radio than the switch shows gives way to that radio's first
+function fitPick(pick) {
+  if (radioList().length < 2 || pick.kind !== "rx") return pick;
+  const sel = radioSel(pick), sv = app.servers[pick.k], i = sv && sv.link && ((sv.link.seat || {}).instances || []).find(x => x.name === pick.name);
+  const named = radioList().filter(r => r.k === pick.k && r.name).map(r => r.name);
+  const mine = i && sel && sel.k === pick.k && (sel.name ? i.radio === sel.name : !named.includes(i.radio));
+  return mine || !sel ? pick : (app.pick = firstPick(sel));
+}
+
 function leftPaneHtml(pick) {
+  const sel = radioList().length > 1 ? radioSel(pick) : null, only = (k, name) => !sel || (sel.k === k && sel.name === name);
   return app.servers.filter(sv => sv.link).map(sv => {
     const k = app.servers.indexOf(sv), seat = sv.link.seat || { instances: [], stations: [], radios: [] }, list = seat.instances || [];
     const is = (kind, name) => pick.k === k && pick.kind === kind && (name === undefined || pick.name === name);
     const rxItem = i => {
+      if (i.receiver_list) return i.receiver_list.map(r => {  // an HPSDR radio: one card per receiver, one process
+        const on = pick.k === k && pick.kind === "rx" && pick.name === i.name && (pick.rx || 1) === r.receiver;
+        const run = i.state === "running", bins = run ? ((i.receivers || []).find(x => x.rx === r.receiver - 1) || {}).bins : null;
+        const st = i.busy ? `${i.busy}...` : i.state, spots = run && r.spots !== null && r.spots !== undefined ? ` · ${r.spots} spots` : "";
+        const open = bins !== null && bins !== undefined ? ` · ${bins} bins` : "";
+        return `<button class="navrx${on ? " on" : ""}" data-act="pick" data-server="${k}" data-kind="rx" data-pick="${esc(i.name)}" data-rx="${r.receiver}">`
+          + `<span class="rxtop">${dot(i.busy ? "busy" : i.state)}<b>${esc(r.name)}</b><span class="rxband">${esc(r.band)}</span><span class="chev">›</span></span>`
+          + `<span class="rxsub">${esc(st)}${esc(open)}${esc(spots)}</span></button>`;
+      }).join("");
       const pend = app.pending[pendKey(sv, i.name)];
       const band = (i.receivers && i.receivers.length ? i.receivers.map(r => r.band).join(", ") : String(i.band || ""));
       return `<button class="navrx${is("rx", i.name) ? " on" : ""}" data-act="pick" data-server="${k}" data-kind="rx" data-pick="${esc(i.name)}">`
@@ -1626,18 +1707,20 @@ function leftPaneHtml(pick) {
       const mine = list.filter(i => i.radio === r.name);
       if (!mine.length && !files.some(f => f.name === r.name)) continue;
       mine.forEach(i => shown.add(i.name));
+      if (!only(k, r.name)) continue;
       const st = (seat.stations || []).find(x => x.radio === r.name), f = r.feeder;
       blocks.push(`<div class="navradio">`
         + `<div class="infoblock">`
         + `<div class="info"><span class="ilabel">Node</span><span>${esc([r.callsign || "no spotter ID", r.grid, r.op_name].filter(Boolean).join(" · "))} · rbn upload ${esc(upMode(r.rbn_upload))}</span></div>`
-        + `<div class="info"><span class="ilabel">Feeder</span><span>${feederState(f, r.rbn_upload)}</span></div>`
+        + (r.type === "hpsdr" && mine.length === 1 ? `<div class="info"><span class="ilabel">Skimmer</span><span>${skimmerText(mine[0], seat.utc)}</span></div>` : "")
+        + `<div class="info"><span class="ilabel">Feeder</span><span>${feederState(f, r.rbn_upload)}${f && (r.rbn_upload || "off") !== "off" ? esc(` · ${Number(f.sent) || 0} spots sent`) : ""}</span></div>`
         + `</div>`
         + `<div class="navhead">RECEIVERS</div>${mine.map(rxItem).join("")}`
         + addItem(k, seat, r.name, is("add", r.name))
         + `</div>`);
     }
     const rest = list.filter(i => !shown.has(i.name));
-    if (rest.length) blocks.push(`<div class="navradio"><div class="navhead">RECEIVERS WITH NO RADIO FILE</div>${rest.map(rxItem).join("")}</div>`);
+    if (rest.length && only(k, "")) blocks.push(`<div class="navradio"><div class="navhead">RECEIVERS WITH NO RADIO FILE</div>${rest.map(rxItem).join("")}</div>`);
     const host = (sv.link.hello && sv.link.hello.host) || sv.address;
     const radio = (seat.radios || []).find(r => list.some(i => i.radio === r.name));
     const card = (kind, name, top, sub) => `<div class="navrx${is(kind, name) ? " on" : ""}" role="button" tabindex="0" data-act="pick" data-server="${k}" data-kind="${kind}" data-pick="${esc(name)}">`
@@ -1649,8 +1732,10 @@ function leftPaneHtml(pick) {
 }
 
 // the picked receiver: header, facts, its settings (each showing what it was while a change waits), Apply
-function receiverPaneHtml(k, sv, i) {
+function receiverPaneHtml(k, sv, i, rxNum) {
   const run = i.state === "running", busy = i.busy, saved = i.settings || {};
+  const list = i.receiver_list, rr = list ? list.find(r => r.receiver === rxNum) || list[0] : null;  // an HPSDR receiver
+  const radioName = i.radio || i.name, all = list ? `all ${list.length} receivers of ${radioName}` : "";
   const pend = app.pending[pendKey(sv, i.name)] || {}, st = { ...saved, ...pend }, n = Object.keys(pend).length;
   const rx = run && i.radio ? rxOf(sv, i.name) : null, rs = rx ? { ...rx, ...pend } : {};
   const at = `data-server="${k}" data-name="${esc(i.name)}"`;
@@ -1664,8 +1749,11 @@ function receiverPaneHtml(k, sv, i) {
   const bandOpts = known.includes(saved.band) || saved.band === undefined ? known : [saved.band, ...known];
   const gains = rx && rx.range ? Array.from({ length: Math.floor((rx.range[1] - rx.range[0]) / rx.range[2]) + 1 }, (_, g) => rx.range[0] + g * rx.range[2]) : [];
   const row = (label, control, note = "") => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}${note}</span></div>`;
-  const rows = [row("RUN", segOf("run", [[false, "off"], [true, "on"]], "run" in pend ? pend.run : run)),
-    row("BAND", saved.multi_band ? esc(String(saved.band)) : sel("band", bandOpts.map(b => [b, String(b)]), st.band),
+  const rows = [row("RUN", segOf("run", [[false, "off"], [true, "on"]], "run" in pend ? pend.run : run), rr ? `<span class="fnote">${esc(all)}</span>` : ""),
+    rr ? row("BAND", `<select class="fsel${(pend.rx_bands || {})[rr.receiver] ? " pend" : ""}" ${at} data-key="rx_bands" data-rx="${rr.receiver}"${busy ? " disabled" : ""}>${
+        (known.includes(rr.band) ? known : [rr.band, ...known]).map(b => `<option value="${esc(b)}"${b === ((pend.rx_bands || {})[rr.receiver] || rr.band) ? " selected" : ""}>${esc(b)}</option>`).join("")}</select>`,
+      (pend.rx_bands || {})[rr.receiver] ? `<span class="fnote">was ${esc(rr.band)}</span>` : `<span class="fnote">${run ? `restarts ${esc(all)}` : "used at its next start"}</span>`)
+    : row("BAND", saved.multi_band ? esc(String(saved.band)) : sel("band", bandOpts.map(b => [b, String(b)]), st.band),
       "band" in pend ? was("band", saved.band) : `<span class="fnote">${run ? "changes live" : "used at its next start"}</span>`)];
   if (rx && rxHas(rx, "antenna")) rows.push(row("ANTENNA", sel("antenna", rx.ant_list.map(a => [a, a]), rs.antenna), was("antenna", rx.antenna)));
   if (rx && rxHas(rx, "rf_gain")) rows.push(row("RF GAIN", sel("rf_gain", gains.map(g => [g, `${g} dB`]), rs.rf_gain), was("rf_gain", rx.rf_gain, g => `${g} dB`)));
@@ -1675,7 +1763,7 @@ function receiverPaneHtml(k, sv, i) {
     const note = r.num_scu === 1 ? `Antenna and RF gain are one setting for ${[i.name, ...mates].join(", ")} and the SmartSDR pan (1 SCU): they follow.`
       : r.num_scu > 1 ? `Antenna and RF gain are shared by the receivers on the same SCU (${r.num_scu} SCUs; the radio does not say which): check the others after a change.` : SHARED_NOTE;
     rows.push(`<div class="frow"><span></span><span class="fhint">${esc(note)}</span></div>`);
-  } else if (i.radio && !run) rows.push(`<div class="frow"><span></span><span class="fhint">Antenna and RF gain show while ${esc(i.name)} runs.</span></div>`);
+  } else if (i.radio && !run && radioOf(sv, i).rx_settings && radioOf(sv, i).rx_settings.length) rows.push(`<div class="frow"><span></span><span class="fhint">Antenna and RF gain show while ${esc(i.name)} runs.</span></div>`);
   rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">restarts ${esc(i.name)}</span>` : "")
     .replace('<div class="frow"', `<div class="frow" title="${esc(HINTS.record)}"`));
   rows.push(row("DECODED TEXT", `<div class="seg" title="Click for the next: Both, Wide, Narrow, Lowest cost"><span class="on" data-act="cycledecoded">${esc(["Both", "Wide", "Narrow", "Lowest cost"][DECODED.indexOf(app.decoded)] || "Both")}</span></div>`,
@@ -1684,7 +1772,7 @@ function receiverPaneHtml(k, sv, i) {
   const fold = app.fold || {}, decOpen = !!fold.decoder, detOpen = !!fold.details;
   const feed = app.instances.find(x => x.server === sv && copyName(x) === i.name) || null;
   const entries = `<button class="fentry" data-act="fold" data-fold="decoder" aria-expanded="${decOpen}"><span>Decoder options</span><span class="fnote">${esc(`${win} s windows · validation ${valid} · ${ons} of ${DECODER_OPTIONS.length + 1} on`)}</span><span class="chev">${decOpen ? "\u25BE" : "\u25B8"}</span></button>`
-    + (decOpen ? `<div class="fold"><div class="form">${decRows.join("")}</div><div class="fhint">Changes restart ${esc(i.name)}. Hover over an option for more.</div>`
+    + (decOpen ? `<div class="fold"><div class="form">${decRows.join("")}</div><div class="fhint">${rr ? `Shared by ${esc(all)}: changes restart them all.` : `Changes restart ${esc(i.name)}.`} Hover over an option for more.</div>`
       + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div></div>` : "")
     + `<button class="fentry" data-act="fold" data-fold="details" aria-expanded="${detOpen}"><span>Details</span><span class="fnote">packets, reconnects, warnings, log</span><span class="chev">${detOpen ? "\u25BE" : "\u25B8"}</span></button>`
     + (detOpen ? `<div class="fold details">${feed && feed.status ? statusHtml(feed, i, false) : stoppedInfoHtml(i)}</div>` : "");
@@ -1692,59 +1780,75 @@ function receiverPaneHtml(k, sv, i) {
   const live = run && (!others.length || (others.length === 1 && others[0] === "band"));
   const label = { run: "run", band: "band", antenna: "antenna", rf_gain: "RF gain", record: "recording", afc: "AFC", itila_window_sec: "window",
     validation: "call validation", call_source: "known call list", ...Object.fromEntries(DECODER_OPTIONS.map(([key, l]) => [key, l])) };
-  const what = pend.remove ? "remove" : Object.entries(pend).map(([key, v]) => `${label[key] || key} ${v === true ? "on" : v === false ? "off" : key === "rf_gain" ? `${v} dB` : v}`).join(", ");
+  const what = pend.remove ? "remove" : Object.entries(pend).map(([key, v]) => key === "rx_bands" ? Object.entries(v).map(([n, b]) => `${radioName}-${n} ${b}`).join(", ")
+    : `${label[key] || key} ${v === true ? "on" : v === false ? "off" : key === "rf_gain" ? `${v} dB` : v}`).join(", ");
   const bar = n ? `<div class="fbar"><span>${n} change${n > 1 ? "s" : ""} not applied: ${esc(what)}</span><span class="grow"></span>`
-    + `<button class="btn small primary" ${at} data-cmd="apply"${busy ? " disabled" : ""}>${pend.remove ? `Apply (removes ${esc(i.name)})` : "run" in pend ? `Apply (${pend.run ? "starts" : "stops"} ${esc(i.name)})` : live ? "Apply (live)" : run ? `Apply (restarts ${esc(i.name)})` : "Save"}</button>`
+    + `<button class="btn small primary" ${at} data-cmd="apply"${busy ? " disabled" : ""}>${pend.remove ? `Apply (removes ${esc(typeof pend.remove === "string" ? pend.remove : i.name)})` : "run" in pend ? `Apply (${pend.run ? "starts" : "stops"} ${esc(i.name)})` : live ? "Apply (live)" : run ? `Apply (restarts ${esc(i.name)})` : "Save"}</button>`
     + `<button class="btn small" ${at} data-cmd="discard">Discard</button></div>` : "";
   const where = run ? (i.receivers || []).map(r => `${r.band} ${Number(r.centre_khz).toFixed(1)} kHz`).join(", ") : "";
-  const facts = statusTilesHtml((run && feed && feed.status) || {});
+  const shown = (run && feed && feed.status) || {};  // an HPSDR receiver: its own band's spots; the feeder has the total
+  const binsOf = r => ((i.receivers || []).find(x => x.rx === r.receiver - 1) || {}).bins;
+  const total = key => list.some(r => (key === "bins" ? binsOf(r) : r[key]) != null) ? list.reduce((n, r) => n + (Number(key === "bins" ? binsOf(r) : r[key]) || 0), 0) : null;
+  const facts = rr ? statusTilesHtml({ ...shown, spots: rr.spots, calls: rr.calls, windows: rr.windows, bins: binsOf(rr), spots_hour: undefined, bins_peak: undefined },
+    { label: all, spots: total("spots"), calls: total("calls"), windows: total("windows"), bins: total("bins") }) : statusTilesHtml(shown);
   const state = busy ? `${busy}...` : run ? `running${where ? ` · ${where}` : ""}` : "stopped";
   const err = !run && i.last_error ? `<div class="small err">${esc(i.last_error)}</div>` : "";
-  return `<div class="phead"><span class="ptitle">${esc(i.name)}</span>${dot(busy ? "busy" : i.state)}<span class="muted">${esc(state)}</span></div>`
+  const head = rr ? `${state.split(" · ")[0]} · ${rr.band}${rr.centre_khz ? ` ${Number(rr.centre_khz).toFixed(1)} kHz` : ""}${run && rr.spots !== null ? ` · ${rr.spots} spots` : ""}` : state;
+  return `<div class="phead"><span class="ptitle">${esc(rr ? rr.name : i.name)}</span>${dot(busy ? "busy" : i.state)}<span class="muted">${esc(head)}</span></div>`
     + bar + facts + err + `<div class="form">${rows.join("")}</div><div class="fentries">${entries}</div>`
-    + (!i.radio ? "" : `<div class="fremove"><button class="btn small${pend.remove ? " pend" : ""}" ${at} data-value="true" data-key="remove"${busy ? " disabled" : ""}>`
-    + `${pend.remove ? "Removed on Apply" : `Remove ${esc(i.name)}`}</button></div>`);
+    + (!i.radio || (radioOf(sv, i).type !== "flex" && !rr) ? "" : `<div class="fremove"><button class="btn small${pend.remove ? " pend" : ""}" ${at} data-value="${esc(JSON.stringify(rr ? rr.name : true))}" data-key="remove"${busy ? " disabled" : ""}>`
+    + `${pend.remove ? "Removed on Apply" : `Remove ${esc(rr ? rr.name : i.name)}`}</button></div>`);
 }
 
-function radioPaneHtml(k, sv, pick, head = "phead", title = "ptitle") {
-  const seat = sv.link.seat || {}, r = (seat.radios || []).find(x => x.name === pick.name);
-  if (!r) return "";
-  const target = (seat.instances || []).find(i => i.radio === r.name);
-  if (pick.kind === "rbn") {
-    const mode = r.rbn_upload || "off", pend = srvPend(sv, r.name), shown = pend.rbn_upload || mode;
-    const f = r.feeder;
-    return `<div class="${head}"><span class="${title}">RBN upload</span><span class="muted">${esc(r.name)}, every receiver</span></div>`
-      + `<div class="form"><div class="frow"><span class="flabel">UPLOAD</span><span class="fctl"><div class="seg${"rbn_upload" in pend ? " pend" : ""}">${["off", "dry", "live"].map(m =>
-        `<span data-act="srvpick" data-server="${k}" data-radio="${esc(r.name)}" data-key="rbn_upload" data-v="${m}"${m === shown ? ' class="on"' : ""}>${m}</span>`).join("")}</div></span></div>`
-      + `<div class="frow"><span></span><span class="fhint">Dry logs what would be posted. Live posts this node's spots to RBN. Only the feeder restarts.</span></div>`
-      + `<div class="frow"><span class="flabel">FEEDER</span><span class="fctl">${feederState(f, mode)}${f && mode !== "off" ? esc(` · ${Number(f.posts) || 0} posts · ${Number(f.sent) || 0} spots sent`) : ""}</span></div></div>`;
-  }
-  const line = (l, v) => `<div class="frow"><span class="flabel">${l}</span><span class="fctl">${esc(v || "not set")}</span></div>`;
-  return `<div class="${head}"><span class="${title}">Spotter ID and grid</span><span class="muted">${esc(r.name)}</span></div>`
-    + `<div class="form">${line("SPOTTER ID", r.callsign)}${line("GRID", r.grid)}${line("OPERATOR", r.op_name)}`
-    + `<div class="frow"><span></span><span class="fhint">To change them, run sparkgap.sh setup on ${esc((sv.link.hello && sv.link.hello.host) || "the server's machine")}. A form here comes next.</span></div></div>`;
-}
+const RADIO_TYPES = [["flex", "FlexRadio"], ["hpsdr", "HPSDR (Web-888)"]];  // radios.BACKENDS
 
-// Setup: sparkgap.sh setup's radio and node steps, run by the server (discover, node), the same words
+// Setup: the radio picked in the header switch (its type, node, RBN upload, name, removal), then Add a radio.
+// The same steps as sparkgap.sh setup, run by the server (discover, node, rename, remove_radio).
+const TYPE_NAMES = { flex: "FlexRadio", hpsdr: "HPSDR" };
 function setupHtml(k, sv) {
   const seat = sv.link.seat || {}, files = seat.radio_files || [];
   const d = app.setupDraft || (app.setupDraft = {});
-  const r = files.find(x => x.name === d.radio) || files[0];
-  const pend = r ? srvPend(sv, r.name) : {};
-  const field = (label, key, value, ph) => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">`
-    + `<input class="finput short${key in pend ? " pend" : ""}" data-node="${key}" data-server="${k}" data-radio="${esc(r.name)}" value="${esc(key in pend ? pend[key] : value || "")}" placeholder="${esc(ph)}" spellcheck="false"></span></div>`;
-  const pick = files.length > 1 ? `<select class="fsel" data-setup="radio">${files.map(x => `<option value="${esc(x.name)}"${r && x.name === r.name ? " selected" : ""}>${esc(x.name)}</option>`).join("")}</select>`
-    : `<b>${esc(r ? r.name : "none found")}</b>`;
-  const address = d.address !== undefined ? d.address : (r && r.address) || load("radioAddress", "");
-  const radioRow = `<div class="frow"><span class="flabel">Radio</span><span class="fctl">${pick}${r ? `<span class="fnote">${esc(`${r.model || r.type || "radio"} at ${r.address || "-"}`)}</span>` : ""}</span></div>`
-    + `<div class="frow"><span class="flabel">Address</span><span class="fctl"><input class="finput short" data-setup="address" value="${esc(address)}" placeholder="Radio's IP address" spellcheck="false">`
-    + `<button class="btn small" data-act="setupask" data-server="${k}">Check</button></span></div>`;
-  const head = `<div class="psec"><span class="psectitle">Setup</span><span class="grow"></span><button class="btn small" data-act="setupfind" data-server="${k}">Discover</button></div>`;
-  if (!r) return `${head}<div class="form">${radioRow}</div>`;
-  return `${head}<div class="form">${radioRow}`
-    + field("Spotter ID", "callsign", r.callsign, "the callsign RBN shows (N0CALL-2)")
-    + field("Grid", "grid", r.grid, "EM12 or EM12ub")
-    + field("Operator", "op_name", r.op_name, "the operator's name") + `</div>`;
+  // a radio Find just wrote becomes the picked radio: the section above shows it, ready for its node
+  const found = d.found && files.find(x => x.type === d.found.type && (!d.found.name || x.name === d.found.name) && (!d.found.address || x.address === d.found.address));
+  if (found) { app.radioSel = { address: sv.address, name: found.name }; save("radioSel", app.radioSel); delete d.found; }
+  const sel = radioList().length ? radioSel(app.pick) : null;
+  const r = files.find(x => sel && sel.k === k && x.name === sel.name) || files[0];
+  const row = (label, control, note = "") => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}${note ? `<span class="fnote">${note}</span>` : ""}</span></div>`;
+  let mine = "";
+  if (r) {
+    const pend = srvPend(sv, r.name), users = (seat.instances || []).filter(i => i.radio === r.name), runs = users.some(i => i.state === "running");
+    const field = (label, key, value, ph) => row(label, `<input class="finput short${key in pend ? " pend" : ""}" data-node="${key}" data-server="${k}" data-radio="${esc(r.name)}" value="${esc(key in pend ? pend[key] : value || "")}" placeholder="${esc(ph)}" spellcheck="false">`);
+    const facts = [TYPE_NAMES[r.type] || r.type || "radio", r.model, r.address, r.board_id ? `board ${r.board_id}` : "", r.receivers ? `${r.receivers} receivers` : ""].filter(Boolean).join(" · ");
+    const mode = pend.rbn_upload || r.rbn_upload || "off";
+    const upload = `<div class="seg${"rbn_upload" in pend ? " pend" : ""}">${["off", "dry", "live"].map(m =>
+      `<span data-act="srvpick" data-server="${k}" data-radio="${esc(r.name)}" data-key="rbn_upload" data-v="${m}"${m === mode ? ' class="on"' : ""}>${m}</span>`).join("")}</div>`;
+    const [what, restart, feeder] = srvPlan(sv, r.name);
+    const how = "name" in pend ? `Apply (renames ${r.name})` : restart.length ? `Apply (restarts ${restart.join(", ")})` : feeder ? "Apply (restarts the feeder)" : "Apply";
+    const err = (app.srvError || {})[`${sv.address}|${r.name}`];
+    const bar = (!what ? "" : `<div class="fbar"><span>not applied: ${esc(what)}</span><span class="grow"></span>`
+      + `<button class="btn small primary" data-act="srvapply" data-server="${k}" data-radio="${esc(r.name)}">${esc(how)}</button>`
+      + `<button class="btn small" data-act="srvcancel" data-server="${k}" data-radio="${esc(r.name)}">Cancel</button></div>`)
+      + (err ? `<div class="small err">${esc(r.name)}: ${esc(err)}</div>` : "");
+    mine = `<div class="psec"><span class="psectitle">Setup</span><span class="muted">${esc(r.name)}</span></div>${bar}<div class="form">`
+      + row("Type", esc(facts))
+      + field("Spotter ID", "callsign", r.callsign, "the callsign RBN shows (N0CALL-2)")
+      + field("Grid", "grid", r.grid, "EM12 or EM12ub")
+      + field("Operator", "op_name", r.op_name, "the operator's name")
+      + row("RBN upload", upload, users.length ? "dry logs what it would post; only the feeder restarts" : "used once it has receivers")
+      + (r.type !== "hpsdr" ? "" : row("Name", `<input class="finput short${"name" in pend ? " pend" : ""}" data-node="name" data-server="${k}" data-radio="${esc(r.name)}" value="${esc("name" in pend ? pend.name : r.name)}" spellcheck="false"${runs ? " disabled" : ""}>`,
+        runs ? `stop ${esc(r.name)} to rename it` : "its receivers and process follow"))
+      + row("Remove", `<button class="btn small" data-act="setupremove" data-server="${k}" data-radio="${esc(r.name)}"${users.length ? " disabled" : ""}>Remove ${esc(r.name)}</button>`,
+        users.length ? `remove its receivers first (${esc(users.map(i => i.name).join(", "))})` : "its file is kept, renamed")
+      + `</div>`;
+  }
+  const kind = d.type || "";
+  const add = `<div class="psec"><span class="psectitle">Add a radio</span></div><div class="form">`
+    + row("Type", `<select class="fsel" data-setup="type">` + [["", "choose a type"], ...RADIO_TYPES].map(([v, l]) => `<option value="${v}"${v === kind ? " selected" : ""}${v ? "" : " disabled"}>${esc(l)}</option>`).join("") + `</select>`)
+    + (kind === "hpsdr" ? row("Name", `<input class="finput short" data-setup="name" value="${esc(d.name || "")}" placeholder="Pitaya" spellcheck="false">`, "empty: Web888 or HPSDR") : "")
+    + row("Address", `<input class="finput short" data-setup="address" value="${esc(d.address || "")}" placeholder="its IP address" spellcheck="false">`, "empty: search the network")
+    + row("", `<button class="btn small primary" data-act="setupfind" data-server="${k}"${kind ? "" : " disabled"}>Find</button>`)
+    + `</div>`;
+  return mine + add;
 }
 
 // the server pane's settings, waiting for Apply as a receiver's do: {address|radio: {key: value}}
@@ -1753,7 +1857,8 @@ function srvPend(sv, radio) { return (app.srvPending || {})[`${sv.address}|${rad
 function srvPick(sv, radio, key, value) {
   const all = app.srvPending || (app.srvPending = {}), id = `${sv.address}|${radio}`, p = all[id] || (all[id] = {});
   const r = ((sv.link.seat && sv.link.seat.radio_files) || []).find(x => x.name === radio) || {};
-  const now = key === "rbn_upload" ? r.rbn_upload || "off" : r[key] || "";
+  const now = key === "rbn_upload" ? r.rbn_upload || "off" : key === "name" ? radio : r[key] || "";
+  if (app.srvError) delete app.srvError[id];  // a new choice: the last refusal no longer applies
   if (String(value).trim() === String(now)) delete p[key]; else p[key] = String(value).trim();
   if (!Object.keys(p).length) delete all[id];
 }
@@ -1764,20 +1869,31 @@ function srvPlan(sv, radio) {
   const running = (seat.instances || []).filter(i => i.radio === radio && i.state === "running").map(i => i.name);
   const node = "callsign" in p || "grid" in p;
   const feeder = !node && running.length > 0 && ("op_name" in p || "rbn_upload" in p);
-  const label = { callsign: "spotter ID", grid: "grid", op_name: "operator", rbn_upload: "RBN upload" };
+  const label = { callsign: "spotter ID", grid: "grid", op_name: "operator", rbn_upload: "RBN upload", name: "name" };
   return [Object.entries(p).map(([key, v]) => `${label[key]} ${v}`).join(", "), node ? running : [], feeder];
 }
 
 // Apply: write the node settings and the upload mode, then restart what they need (one step)
 async function srvApply(sv, radio) {
-  const link = sv.link, p = { ...srvPend(sv, radio) }, [, restart, feeder] = srvPlan(sv, radio);
+  const link = sv.link, p = { ...srvPend(sv, radio) }, [, restart, feeder] = srvPlan(sv, radio), id = `${sv.address}|${radio}`;
   const r = ((link.seat && link.seat.radio_files) || []).find(x => x.name === radio) || {};
+  const refused = res => { (app.srvError || (app.srvError = {}))[id] = res.error || "refused"; renderSettings(); };  // shown in Setup
+  const was = radio;
+  if ("name" in p) {  // the rename first: the rest then goes to the new name, in the same Apply
+    const res = await link.request("rename", "rename", { radio, name: p.name });
+    if (!res.ok) return refused(res);
+    delete (app.srvPending || {})[id];
+    app.radioSel = { address: sv.address, name: p.name };
+    save("radioSel", app.radioSel);
+    radio = p.name;
+    delete p.name;
+  }
   if ("callsign" in p || "grid" in p || "op_name" in p) {
-    const ok = await seatRequest(link, "node", "node", { radio, callsign: p.callsign ?? r.callsign ?? "", grid: p.grid ?? r.grid ?? "", op_name: p.op_name ?? r.op_name ?? "" });
-    if (!ok) return;
+    const res = await link.request("node", "node", { radio, callsign: p.callsign ?? r.callsign ?? "", grid: p.grid ?? r.grid ?? "", op_name: p.op_name ?? r.op_name ?? "" });
+    if (!res.ok) return refused(res);
   }
   for (const n of restart) { await seatRequest(link, "stop", n); await seatRequest(link, "start", n); }
-  const first = ((link.seat && link.seat.instances) || []).find(i => i.radio === radio);
+  const first = ((link.seat && link.seat.instances) || []).find(i => i.radio === radio || i.radio === was);  // a rename: the snapshot may still say the old name
   if (first && ("rbn_upload" in p || feeder)) await seatRequest(link, "set", first.name, { rbn_upload: p.rbn_upload || r.rbn_upload || "off" });
   delete (app.srvPending || {})[`${sv.address}|${radio}`];
   renderSettings();
@@ -1787,21 +1903,11 @@ function serverPaneHtml(k, sv) {
   const a = sv.link, host = `${(a.hello && a.hello.host) || sv.address}${a.hello && a.hello.build ? ` (${a.hello.build})` : ""}`;
   const lines = (a.log || []).map(l => `<div class="cl ${l.level === "ERROR" || l.level === "CRITICAL" ? "bad" : l.level === "WARNING" ? "warn" : ""}">`
     + `<span class="t">${esc(utcTime(l.utc))}</span> ${esc(String(l.msg))}</div>`).join("");
-  const radios = ((a.seat && a.seat.radios) || []).filter(r => ((a.seat && a.seat.instances) || []).some(i => i.radio === r.name));
   const sec = html => `<section class="psection">${html}</section>`;
-  const bars = radios.map(r => {
-    const [what, restart, feeder] = srvPlan(sv, r.name);
-    if (!what) return "";
-    const how = restart.length ? `Apply (restarts ${restart.join(", ")})` : feeder ? "Apply (restarts the feeder)" : "Apply";
-    return `<div class="fbar"><span>${esc(r.name)}: not applied: ${esc(what)}</span><span class="grow"></span>`
-      + `<button class="btn small primary" data-act="srvapply" data-server="${k}" data-radio="${esc(r.name)}">${esc(how)}</button>`
-      + `<button class="btn small" data-act="srvcancel" data-server="${k}" data-radio="${esc(r.name)}">Cancel</button></div>`;
-  }).join("");
-  return bars + `<div class="phead"><span class="ptitle">Server</span><span class="muted">${esc(host)}</span><span class="grow"></span>`
+  return `<div class="phead"><span class="ptitle">Server</span><span class="muted">${esc(host)}</span><span class="grow"></span>`
     + `<button class="btn small" data-act="editserver" data-server="${k}">Edit</button><button class="btn small" data-act="removeserver" data-server="${k}">Remove</button></div>`
     + sec(`<div class="psec"><span class="psectitle">Join code</span></div>${joinCodeRow(sv)}`)
     + sec(setupHtml(k, sv))
-    + radios.map(r => sec(radioPaneHtml(k, sv, { kind: "rbn", name: r.name }, "psec", "psectitle"))).join("")
     + sec(`<div class="psec"><span class="psectitle">Log</span></div><div class="console mono" data-console="r${k}">${lines || '<div class="cl faint">nothing logged yet</div>'}</div>`);
 }
 
@@ -1817,13 +1923,23 @@ function radioLink(seat, radio) {
 function radioHeadHtml(pick) {
   const sv = app.servers[pick.k], seat = sv && sv.link && sv.link.seat;
   if (!seat) return "";
+  const all = radioList(), sel = all.length > 1 ? radioSel(pick) : null;
+  const pickHtml = () => `<select class="fsel" id="radioSwitch" title="Show another radio">${all.map((x, n) =>
+    `<option value="${n}"${sel && x.k === sel.k && x.name === sel.name ? " selected" : ""}>${esc(x.label)}</option>`).join("")}</select>`;
+  if (sel && sel.name === "") return `<span class="rhlabel">Radio:</span>${pickHtml()}`;
+  const seatOf = sel ? (app.servers[sel.k].link.seat || {}) : seat;
   const i = pick.kind === "rx" ? (seat.instances || []).find(x => x.name === pick.name) : null;
-  const r = (seat.radios || []).find(x => x.name === (i ? i.radio : pick.name)) || (seat.radios || [])[0];
+  const radiosOf = [...(seatOf.radios || []), ...(seatOf.radio_files || [])];
+  const r = sel ? radiosOf.find(x => x.name === sel.name) : (seat.radios || []).find(x => x.name === (i ? i.radio : pick.name)) || (seat.radios || [])[0];
   if (!r) return "";
-  const running = (seat.instances || []).filter(x => x.radio === r.name && x.state === "running").length;
-  const facts = [r.model || r.type, r.address, r.num_scu ? `${r.num_scu} SCU` : "", r.max_panadapters ? `${running} of ${r.max_panadapters} pans in use` : ""].filter(Boolean);
-  const link = { up: '<span class="good">Connected</span>', down: '<span class="bad">Not connected</span>', wait: '<span class="warn">Reconnecting</span>', first: '<span class="warn">Connecting</span>' }[radioLink(seat, r.name)] || "";
-  return `<span class="rhlabel">Radio:</span>${link}<span class="rhname">${esc(r.name)}</span><span class="rhfacts">${esc(facts.join(" · "))}</span>`;
+  const mine = (seatOf.instances || []).filter(x => x.radio === r.name && x.state === "running"), running = mine.length;
+  const inUse = mine.reduce((n, x) => n + ((x.receivers || []).length || 1), 0);
+  const facts = [r.model || r.type, r.address, r.num_scu ? `${r.num_scu} SCU` : "", r.max_panadapters ? `${running} of ${r.max_panadapters} pans in use` : "",
+    r.type === "hpsdr" && r.board_id ? `board ${r.board_id}` : "", r.type === "hpsdr" && r.receivers ? `${inUse} of ${r.receivers} receivers in use` : ""].filter(Boolean);
+  const state = radioLink(seatOf, r.name);
+  const link = { up: '<span class="good">Connected</span>', down: '<span class="bad">Not connected</span>', wait: '<span class="warn">Reconnecting</span>', first: '<span class="warn">Connecting</span>' }[state]
+    || (r.type === "hpsdr" ? (running ? '<span class="good">Running</span>' : '<span class="muted">Stopped</span>') : "");
+  return `<span class="rhlabel">Radio:</span>${link}${sel ? pickHtml() : `<span class="rhname">${esc(r.name)}</span>`}<span class="rhfacts">${esc(facts.join(" · "))}</span>`;
 }
 
 // a page served by one copy (no server): that copy, and its join code
@@ -1842,15 +1958,14 @@ function radiosHtml() {
       + `<div class="fhint">Add the server running on the machine beside the radio: its address and its join code (sparkgap.sh status shows both).</div>`
       + (app.editing === -2 ? '<div><button class="btn" data-act="addserver">+ Add a server</button></div>' : "") + `</div></div>`;
   }
-  const pick = radioPick(), sv = app.servers[pick.k];
+  const pick = fitPick(radioPick()), sv = app.servers[pick.k];
   $("radioHead").innerHTML = radioHeadHtml(pick);
   let right = "";
   if (sv && sv.link) {
     if (pick.kind === "rx") {
       const i = ((sv.link.seat && sv.link.seat.instances) || []).find(x => x.name === pick.name);
-      right = i ? receiverPaneHtml(pick.k, sv, i) : "";
+      right = i ? receiverPaneHtml(pick.k, sv, i, pick.rx) : "";
     } else if (pick.kind === "add") right = addPaneHtml(pick.k, sv, pick.name);
-    else if (pick.kind === "rbn") right = radioPaneHtml(pick.k, sv, pick);
     else right = serverPaneHtml(pick.k, sv);
   }
   return `<div class="panes"><nav class="lpane">${leftPaneHtml(pick)}</nav><div class="rpane">${right}</div></div>`;
@@ -1946,6 +2061,7 @@ function dropPending(address, gone) {
 }
 
 // a running Flex copy's receive path as its radio reports it (the copy's own feed status), or null
+function radioOf(sv, i) { return (((sv.link && sv.link.seat) || {}).radios || []).find(r => r.name === i.radio) || {}; }
 function rxOf(sv, name) {
   const c = app.instances.find(x => x.server === sv && copyName(x) === name);
   const r = c && c.status && c.status.radio && c.status.radio.rx;
@@ -2008,7 +2124,7 @@ async function applySettings(link, name) {
     return;
   }
   if (settings.remove) {  // its config, logs and recordings stay
-    if (await seatRequest(link, "remove", name)) { delete app.pending[k]; app.pick = null; }
+    if (await seatRequest(link, "remove", typeof settings.remove === "string" ? settings.remove : name)) { delete app.pending[k]; app.pick = null; }
     renderSettings();
     return;
   }
@@ -2104,17 +2220,23 @@ function bindInput() {
       renderSettings();
       return;
     }
-    const su = e.target.closest('[data-act="setupfind"], [data-act="setupask"]');
+    const su = e.target.closest('[data-act="setupfind"], [data-act="setupremove"]');
     if (su) {
       const link = app.servers[Number(su.dataset.server)] && app.servers[Number(su.dataset.server)].link;
       if (!link) return;
       const d = app.setupDraft || {};
-      if (su.dataset.act === "setupfind") seatRequest(link, "discover", "radios");
-      else {
-        const input = $("radiosBody").querySelector('[data-setup="address"]'), address = ((input && input.value) || "").trim();
-        if (address) save("radioAddress", address);
-        seatRequest(link, "discover", "radios", { address });
+      if (su.dataset.act === "setupremove") {
+        if (confirm(`Remove ${su.dataset.radio} from SparkGap? Its radio file is kept, renamed.`)) {
+          seatRequest(link, "remove_radio", "radios", { radio: su.dataset.radio }).then(ok => { if (ok) app.setupDraft = { type: d.type }; renderSettings(); });
+        }
+        return;
       }
+      if (!d.type) return;
+      const named = d.type === "hpsdr" && (d.name || "").trim() ? { name: d.name.trim() } : {};
+      const input = $("radiosBody").querySelector('[data-setup="address"]'), address = ((input && input.value) || "").trim();
+      const at = address ? { address } : {};  // an address asks that radio; none searches the network
+      app.setupDraft = { type: d.type, found: { type: d.type, ...at, ...named } };
+      seatRequest(link, "discover", "radios", { type: d.type, ...at, ...named });
       return;
     }
     const f = e.target.closest('[data-act="fold"]');
@@ -2129,7 +2251,7 @@ function bindInput() {
       return;
     }
     const p = e.target.closest('[data-act="pick"]'), sv = e.target.closest('[data-act="addserver"], [data-act="editserver"], [data-act="removeserver"], [data-act="herecode"]');
-    if (p) { app.pick = { k: Number(p.dataset.server), kind: p.dataset.kind, name: p.dataset.pick }; renderSettings(); return; }
+    if (p) { app.pick = { k: Number(p.dataset.server), kind: p.dataset.kind, name: p.dataset.pick, rx: Number(p.dataset.rx) || undefined }; renderSettings(); return; }
     if (sv) {
       const act = sv.dataset.act, n = Number(sv.dataset.server);
       if (act === "addserver") editConn(-1);
@@ -2150,19 +2272,39 @@ function bindInput() {
     app.pressed = false;
     if (app.renderDue) { app.renderDue = false; setTimeout(renderSettings, 0); }
   };
-  for (const ev of ["pointerup", "pointercancel"]) document.addEventListener(ev, released);
+  // a dropdown's own list takes the release, so its change ends the press
+  for (const ev of ["pointerup", "pointercancel", "change"]) document.addEventListener(ev, released);
   $("radiosBody").oninput = e => {
     const ds = e.target.dataset || {};
     if (ds.setup) (app.setupDraft || (app.setupDraft = {}))[ds.setup] = e.target.value;
     if (ds.node) { const sv = app.servers[Number(ds.server)]; if (sv && sv.link) srvPick(sv, ds.radio, ds.node, e.target.value); }
   };
+  $("radioHead").onchange = e => {
+    if (e.target.id !== "radioSwitch") return;
+    e.target.blur();  // a focused switch holds off the redraw that shows the radio picked
+    const x = radioList()[Number(e.target.value)];
+    if (!x) return;
+    app.radioSel = { address: app.servers[x.k].address, name: x.name };
+    save("radioSel", app.radioSel);
+    app.pick = firstPick(x);
+    renderSettings();
+  };
   $("radiosBody").onchange = e => {
     const add = e.target.dataset && e.target.dataset.add;
     if (add && app.addDraft) { app.addDraft[add] = add === "channel" ? Number(e.target.value) : e.target.value; renderSettings(); return; }
-    if (e.target.dataset && e.target.dataset.setup === "radio") { app.setupDraft = { radio: e.target.value }; renderSettings(); return; }
+    if (e.target.dataset && e.target.dataset.setup === "type") { renderSettings(); return; }
     if (e.target.dataset && e.target.dataset.node) { renderSettings(); return; }
     const [link, name, holder] = seatTarget(e.target);
     const key = holder && holder.dataset.key;
+    if (link && key === "rx_bands") {
+      e.target.blur();
+      const i = ((link.seat && link.seat.instances) || []).find(x => x.name === name), rr = i && (i.receiver_list || []).find(r => String(r.receiver) === holder.dataset.rx);
+      if (!rr) return;
+      const cur = { ...((app.pending[pendKey(link.server, name)] || {}).rx_bands || {}) };
+      if (e.target.value === rr.band) delete cur[rr.receiver]; else cur[rr.receiver] = e.target.value;
+      pickSetting(link, name, "rx_bands", Object.keys(cur).length ? cur : undefined);
+      return;
+    }
     if (!link || !["band", "antenna", "rf_gain"].includes(key)) return;
     e.target.blur();
     pickSetting(link, name, key, key === "rf_gain" ? Number(e.target.value) : e.target.value);

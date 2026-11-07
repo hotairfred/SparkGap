@@ -58,8 +58,8 @@ def signal_handler(sig, frame):
     print("\nShutting down...", file=sys.stderr)
 
 
-def discover(interface=None, port=HPSDR_PORT, timeout=2.0):
-    """Discover HPSDR devices on the network."""
+def discover(interface=None, port=HPSDR_PORT, timeout=2.0, address='255.255.255.255'):
+    """Discover HPSDR devices on the network, or ask the one at address."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -70,7 +70,7 @@ def discover(interface=None, port=HPSDR_PORT, timeout=2.0):
 
     # Discovery packet: 0xEF 0xFE 0x02 + 57 zeros
     msg = bytes([0xEF, 0xFE, 0x02]) + bytes(57)
-    sock.sendto(msg, ('255.255.255.255', port))
+    sock.sendto(msg, (address, port))
 
     devices = []
     deadline = time.time() + timeout

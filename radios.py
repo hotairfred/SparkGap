@@ -13,7 +13,7 @@ import os
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -21,6 +21,13 @@ DISCOVER_S = 3.0  # a FlexRadio broadcasts about once a second
 # DAX-IQ channels by model (FlexLib ModelInfo.MaxDaxIqChannels); others have 4
 DAXIQ_CHANNELS = {"FLEX-6300": 2, "FLEX-6400": 2, "FLEX-6400M": 2, "FLEX-8400": 2, "FLEX-8400M": 2}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")  # a radio name usable as a file name
+
+
+def check_radio_name(v: str) -> str | None:
+    """An operator's radio name: usable in its receivers' names (<name>-<n>) and as a file name."""
+    if not re.match(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$", v):
+        return "a letter, then letters, digits, _ or -, up to 32 (Pitaya)"
+    return "not ending in -<number>: that names a receiver" if re.search(r"-\d+$", v) else None
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,7 @@ class Found:
     address: str
     identity: dict[str, str] = field(default_factory=dict)  # how it is found again (serial)
     facts: dict[str, Any] = field(default_factory=dict)  # what it holds (num_scu, max_slices, ...)
+    note: str = ""  # said when it is recorded, not kept (in use by another client)
 
 
 class Backend(Protocol):
@@ -117,7 +125,47 @@ def receiver_limit(radio: dict[str, Any]) -> int | None:
     return min(known) if known else None
 
 
-BACKENDS: dict[str, Backend] = {"flex": Flex()}
+HPSDR_BROADCAST = "255.255.255.255"
+HPSDR_BUSY = 3  # discovery reply byte 2 while a client holds the stream (2 when free)
+WEB888 = (6, 73)  # board ID and firmware the Web-888's HPSDR image answers with
+
+
+def hpsdr_model(board_id: int, firmware: int) -> str:
+    return "Web-888" if (board_id, firmware) == WEB888 else f"HPSDR board {board_id}"
+
+
+class Hpsdr:
+    """HPSDR Protocol 1 (Web-888 and other boards): discovery on UDP 1024; one stream per radio,
+    all its receivers in one skimmer, no station.  Known by its address: the Web-888's discovery
+    MAC is fixed text, the same on every unit."""
+
+    type = "hpsdr"
+    capabilities = Capabilities()
+
+    def __init__(self, heard: Callable[[float, str], list[dict[str, Any]]] | None = None) -> None:
+        self.heard = heard
+
+    def discover(self, seconds: float, address: str | None = None) -> list[Found]:
+        if self.heard:
+            heard = self.heard(seconds, address or HPSDR_BROADCAST)
+        else:
+            import hpsdr_receiver  # the copy's own module: the service runs from a code folder
+
+            heard = hpsdr_receiver.discover(timeout=seconds, address=address or HPSDR_BROADCAST)
+        if address and not heard:
+            raise RuntimeError(f"no HPSDR radio answers at {address}")
+        out = []
+        for d in heard:
+            model = hpsdr_model(d["board_id"], d["gateware"])
+            out.append(Found(self.type, "Web888" if model == "Web-888" else "HPSDR", model, d["ip"],
+                             {"address": d["ip"]},
+                             {"board_id": d["board_id"], "firmware": d["gateware"],
+                              "receivers": d["receivers"]},
+                             "in use by another client" if d.get("status") == HPSDR_BUSY else ""))
+        return sorted(out, key=lambda r: r.address)
+
+
+BACKENDS: dict[str, Backend] = {"flex": Flex(), "hpsdr": Hpsdr()}
 
 
 def backend(sdr_type: Any) -> Backend | None:
@@ -151,6 +199,9 @@ def record(config_dir: Path, r: Found) -> str:
         except (OSError, ValueError):
             continue
         if isinstance(st0, dict) and all(st0.get(k) == v for k, v in r.identity.items()):
+            if r.type == "hpsdr":  # named by the operator: a new name is a rename, in Setup
+                return (f"{r.name}: already set up as {other.name.removesuffix('.radio.json')}, "
+                        f"skipped: rename it in Setup")
             return (f"{r.name}: the radio {other.name} holds (renamed on the radio), skipped: "
                     f"set its name back, or rename that file and its receivers")
     try:
@@ -169,17 +220,53 @@ def record(config_dir: Path, r: Found) -> str:
     return f"{r.name}: {r.model} at {r.address}{moved}{'' if old else ', new'}"
 
 
-def discover(config_dir: Path, seconds: float = DISCOVER_S, address: str | None = None) -> str:
-    """Every back end's radios on the local network, or the radio at `address`, each written to its
-    radio file."""
-    if address:
-        heard = BACKENDS["flex"].discover(seconds, address)  # the one back end asked by address
-    else:
-        heard = [r for b in BACKENDS.values() for r in b.discover(seconds)]
+def free_name(config_dir: Path, r: Found) -> Found:
+    """A radio known by its address keeps its name unless that file holds another radio: then
+    <name>_<last part of its address> (then _2, _3, ...), so it never takes another radio's file."""
+    if set(r.identity) != {"address"}:
+        return r
+    tail = re.sub(r"[^A-Za-z0-9]", "", r.address.replace(":", ".").rsplit(".", 1)[-1]) or "x"
+    names = [r.name, f"{r.name}_{tail}", *(f"{r.name}_{tail}_{n}" for n in range(2, 100))]
+    for name in names:
+        try:
+            old: Any = json.loads((config_dir / f"{name}.radio.json").read_text())
+        except (OSError, ValueError):
+            return replace(r, name=name)  # no file yet
+        if isinstance(old, dict) and old.get("type") == r.type and old.get("address") == r.address:
+            return replace(r, name=name)  # its own file
+    return replace(r, name=names[-1])
+
+
+def discover(config_dir: Path, seconds: float = DISCOVER_S, address: str | None = None,
+             kind: str | None = None, name: str | None = None) -> str:
+    """The radios of one type (kind) on the local network, or the one at `address`, each written
+    to its radio file.  No type: a FlexRadio, as sparkgap.sh setup asks.  name: the operator's
+    name for the one HPSDR radio found (a FlexRadio keeps the nickname set on the radio)."""
+    if kind is not None and (not isinstance(kind, str) or kind not in BACKENDS):
+        raise ValueError(f"radio type must be one of: {', '.join(BACKENDS)}")
+    if name and (kind != "hpsdr" or not isinstance(name, str) or (why := check_radio_name(name))):
+        raise ValueError("only an HPSDR radio is named here" if kind != "hpsdr" else f"name: {why}")
+    heard = BACKENDS[kind or "flex"].discover(seconds, address)
+    if name and heard:
+        if len(heard) > 1:
+            raise ValueError(f"{len(heard)} radios answered: give the address of the one to name {name}")
+        try:
+            held: Any = json.loads((config_dir / f"{name}.radio.json").read_text())
+        except (OSError, ValueError):
+            held = None
+        if isinstance(held, dict) and held.get("address") != heard[0].address:
+            raise ValueError(f"{name} is another radio's name ({held.get('model') or 'radio'} at "
+                             f"{held.get('address')})")
+        heard = [replace(heard[0], name=name)]
     if not heard:
         return (f"no radio heard in {seconds:.0f} s: give its address "
                 "(Setup in SparkGap Web, or sparkgap.sh setup)")
-    return "; ".join(record(config_dir, r) for r in heard)
+    lines = []
+    for r in heard:
+        r = r if name else free_name(config_dir, r)
+        line = record(config_dir, r)
+        lines.append(f"{line} ({r.note})" if r.note else line)
+    return "; ".join(lines)
 
 
 # ---- a radio's node settings (sparkgap.sh setup and the server's "node" command) ----
@@ -268,5 +355,6 @@ def radio_files(config_dir: Path) -> list[dict[str, Any]]:
         if isinstance(st, dict):
             out.append({"name": path.name.removesuffix(".radio.json"), **{k: st.get(k) for k in (
                 "type", "model", "address", "callsign", "grid", "op_name", "rbn_upload",
-                "max_panadapters", "max_slices", "daxiq_channels")}})
+                "max_panadapters", "max_slices", "daxiq_channels", "board_id", "firmware",
+                "receivers")}})
     return out

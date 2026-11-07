@@ -37,6 +37,7 @@ from feed_server import (
     PROTOCOL,
     SPECTRUM_HEADER,
     SPECTRUM_ROWS_HZ,
+    Client,
     FeedServer,
     SpectrumTap,
     accept_key,
@@ -367,6 +368,34 @@ def test_tap_idle_without_clients() -> None:
     tap.feed_iq(np.zeros(96_000), np.zeros(96_000))
 
 
+def test_only_the_band_on_screen_is_tapped_and_sent() -> None:
+    f = FeedServer({"bind": "127.0.0.1", "port": 0}, HELLO)
+    f.n_clients = 2
+    w40 = SpectrumTap(f, 192_000, 7_076_800.0)
+    w40.row = lambda seg, utc: pytest.fail("a band no waterfall shows was computed")  # type: ignore[method-assign]
+    f.watched = frozenset({14076.7})  # both clients show 20m
+    w40.feed_iq(np.zeros(96_000), np.zeros(96_000))
+    assert f.watching(14_076_700.0) and not f.watching(7_076_800.0)
+    f.watched = None  # a page that never said which band: every band
+    assert f.watching(7_076_800.0)
+
+
+def test_rows_go_to_the_clients_showing_that_band() -> None:
+    f = FeedServer({"bind": "127.0.0.1", "port": 0}, HELLO)
+    on20, on40, old = (Client(writer=None, peer=p) for p in ("a", "b", "c"))  # type: ignore[arg-type]
+    on20.band_khz, on40.band_khz = 14076.7, 7076.8
+    for c in (on20, on40, old):
+        c.spectrum_hz = SPECTRUM_ROWS_HZ  # every row, no thinning
+    f.clients = {on20, on40, old}
+    f._watch()
+    assert f.watched is None  # the old page still sees every band
+    f._on_spectrum(b"row", 14_076_700.0)
+    assert (len(on20.spectrum), len(on40.spectrum), len(old.spectrum)) == (1, 0, 1)
+    f.clients = {on20, on40}
+    f._watch()
+    assert f.watched == frozenset({14076.7, 7076.8})
+
+
 def test_tap_rows_per_block() -> None:
     f = FeedServer({"bind": "127.0.0.1", "port": 0}, HELLO)
     f.n_clients = 1
@@ -384,6 +413,7 @@ def test_thinning_by_count() -> None:
 
     class Fake:
         spectrum_hz = 20.0
+        band_khz = None
         spectrum_credit = 0.0
         spectrum: collections.deque = collections.deque(maxlen=1_000)
         dropped_rows = 0
