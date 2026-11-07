@@ -113,6 +113,7 @@ static const double WIDE_TAPS[SC_WIDE_LEN] = {
     4.080655646582045e-04, 2.594227398493466e-04, 1.281421043742315e-04, 3.098960963239555e-05,
     -2.642351154647633e-05
 };
+#define SC_FOLD_FG     1000.0  /* folded masks: response table from -1 to +1 kHz */
 #define SC_PREROLL_SEC 1.0   /* IQ replayed into a new bin */
 #define SC_MAX_EXCL    64    /* exclusion zones (RTTY tones) at once */
 #define SC_MAX_THREADS 16    /* itila_sc_set_threads cap */
@@ -198,6 +199,12 @@ HOT_CLONES static void fft_exec(const FftPlan *p, double *re, double *im)
         }
     }
 }
+
+/* Forward FFT of fN = 3 x n2 points (folded masks): three n2-point FFTs of the samples taken
+ * every third, then one radix-3 pass.  Runs once per block on the feeding thread. */
+static void fft3_exec(const struct ItilaSc *sc, double *re, double *im);
+static int  front_init(struct ItilaSc *sc, int fold);
+static void front_free(struct ItilaSc *sc);
 
 /* ---- per-bin state ---- */
 typedef struct {
@@ -301,6 +308,16 @@ struct ItilaSc {
     int64_t *ring_a;           /* blk_start of each stored spectrum */
     double *scr_re[SC_MAX_THREADS], *scr_im[SC_MAX_THREADS];   /* per-stripe IFFT scratch */
     int     job_slot;
+    /* Folded masks (itila2_fold_mask, itila_sc_set_fold): stage 2 and the Hann / wide filters join the mask, and each
+     * path's inverse FFT gives 2 kHz directly.  fN = fM2 x fR (a 3 x 2^k block: forward FFT by
+     * fft3_exec); the first fP2 outputs of each block hold the filters' start-up and are dropped.
+     * fG: per path, the combined response with its delay fD taken out, every fG_step Hz from -SC_FOLD_FG;
+     * fE: e^(-j 2 pi f D) at the FFT bins; fJ: bins either side of the bin the path can pass. */
+    int     fold, fM2, fP2, fR;
+    FftPlan plan_n3;
+    double *f3_wr, *f3_wi, *f3_re, *f3_im;
+    double *fG_re[2], *fG_im[2], *fE_re[2], *fE_im[2], fD[2], fG_step;
+    int     fG_n, fJ[2];
 
     double iq_res_i[SC_DEC1];
     double iq_res_q[SC_DEC1];
@@ -714,40 +731,11 @@ static float fir_dotf(const float *dl, int pos, const float *h, int len)
     return acc;
 }
 
-/* Stages 2 and 3 for one 12 kHz sample of a bin: FIR2 (100/200 Hz paths) to 2 kHz, Hann and
- * channel filter, envelope, FIR3 to 200 Hz.  Returns 1 when the envelope buffer was full. */
-HOT_CLONES static int bin_push_12k(const ItilaSc *sc, ScBin *b, double s1_i, double s1_q)
+/* After the channel filters, one 2 kHz sample of each path: AFC phase step, envelope, FIR3 to
+ * 200 Hz.  Returns 1 when the envelope buffer was full. */
+static inline __attribute__((always_inline)) int bin_push_2k(const ItilaSc *sc, ScBin *b,
+        double s2_100i, double s2_100q, double s2_200i, double s2_200q)
 {
-    /* Stage 2: push into FIR2 delay lines (100 Hz + 200 Hz paths), decimate 6:1 */
-    int pos2_100 = b->dl2_count % FIR_S2_100_LEN;
-    int pos2_200 = b->dl2_count % FIR_S2_200_LEN;
-    b->dl2_100i[pos2_100] = b->dl2_100i[pos2_100 + FIR_S2_100_LEN] = s1_i;
-    b->dl2_100q[pos2_100] = b->dl2_100q[pos2_100 + FIR_S2_100_LEN] = s1_q;
-    b->dl2_200i[pos2_200] = b->dl2_200i[pos2_200 + FIR_S2_200_LEN] = s1_i;
-    b->dl2_200q[pos2_200] = b->dl2_200q[pos2_200 + FIR_S2_200_LEN] = s1_q;
-    if (++b->dl2_count == FIR_S2_100_LEN * FIR_S2_200_LEN * SC_DEC2) b->dl2_count = 0;
-
-    if (b->dl2_count % SC_DEC2 != 0) return 0;
-    /* Output one 2k sample per path */
-    double s2_100i = fir_dotf(b->dl2_100i, pos2_100, sc->s2_100f, FIR_S2_100_LEN);
-    double s2_100q = fir_dotf(b->dl2_100q, pos2_100, sc->s2_100f, FIR_S2_100_LEN);
-    double s2_200i = fir_dotf(b->dl2_200i, pos2_200, sc->s2_200f, FIR_S2_200_LEN);
-    double s2_200q = fir_dotf(b->dl2_200q, pos2_200, sc->s2_200f, FIR_S2_200_LEN);
-
-    /* Hann window on the 100 Hz path before the magnitude */
-    int ph = b->dlh_count;
-    b->dlh_i[ph] = b->dlh_i[ph + SC_HANN_LEN] = s2_100i;
-    b->dlh_q[ph] = b->dlh_q[ph + SC_HANN_LEN] = s2_100q;
-    if (++b->dlh_count == SC_HANN_LEN) b->dlh_count = 0;
-    s2_100i = fir_dotf(b->dlh_i, ph, sc->hannf, SC_HANN_LEN);
-    s2_100q = fir_dotf(b->dlh_q, ph, sc->hannf, SC_HANN_LEN);
-
-    int pw = b->dlw_count;
-    b->dlw_i[pw] = b->dlw_i[pw + SC_WIDE_LEN] = s2_200i;
-    b->dlw_q[pw] = b->dlw_q[pw + SC_WIDE_LEN] = s2_200q;
-    if (++b->dlw_count == SC_WIDE_LEN) b->dlw_count = 0;
-    s2_200i = fir_dotf(b->dlw_i, pw, sc->widef, SC_WIDE_LEN);
-    s2_200q = fir_dotf(b->dlw_q, pw, sc->widef, SC_WIDE_LEN);
     if (sc->afc) {      /* phase step and power of the wide path over this 200 Hz step */
         b->afc_re += s2_200i * b->afc_pi + s2_200q * b->afc_pq;
         b->afc_im += s2_200q * b->afc_pi - s2_200i * b->afc_pq;
@@ -803,6 +791,43 @@ HOT_CLONES static int bin_push_12k(const ItilaSc *sc, ScBin *b, double s1_i, dou
         return 1;
     }
     return 0;
+}
+
+/* Stages 2 and 3 for one 12 kHz sample of a bin: FIR2 (100/200 Hz paths) to 2 kHz, Hann and
+ * channel filter, envelope, FIR3 to 200 Hz.  Returns 1 when the envelope buffer was full. */
+HOT_CLONES static int bin_push_12k(const ItilaSc *sc, ScBin *b, double s1_i, double s1_q)
+{
+    /* Stage 2: push into FIR2 delay lines (100 Hz + 200 Hz paths), decimate 6:1 */
+    int pos2_100 = b->dl2_count % FIR_S2_100_LEN;
+    int pos2_200 = b->dl2_count % FIR_S2_200_LEN;
+    b->dl2_100i[pos2_100] = b->dl2_100i[pos2_100 + FIR_S2_100_LEN] = s1_i;
+    b->dl2_100q[pos2_100] = b->dl2_100q[pos2_100 + FIR_S2_100_LEN] = s1_q;
+    b->dl2_200i[pos2_200] = b->dl2_200i[pos2_200 + FIR_S2_200_LEN] = s1_i;
+    b->dl2_200q[pos2_200] = b->dl2_200q[pos2_200 + FIR_S2_200_LEN] = s1_q;
+    if (++b->dl2_count == FIR_S2_100_LEN * FIR_S2_200_LEN * SC_DEC2) b->dl2_count = 0;
+
+    if (b->dl2_count % SC_DEC2 != 0) return 0;
+    /* Output one 2k sample per path */
+    double s2_100i = fir_dotf(b->dl2_100i, pos2_100, sc->s2_100f, FIR_S2_100_LEN);
+    double s2_100q = fir_dotf(b->dl2_100q, pos2_100, sc->s2_100f, FIR_S2_100_LEN);
+    double s2_200i = fir_dotf(b->dl2_200i, pos2_200, sc->s2_200f, FIR_S2_200_LEN);
+    double s2_200q = fir_dotf(b->dl2_200q, pos2_200, sc->s2_200f, FIR_S2_200_LEN);
+
+    /* Hann window on the 100 Hz path before the magnitude */
+    int ph = b->dlh_count;
+    b->dlh_i[ph] = b->dlh_i[ph + SC_HANN_LEN] = s2_100i;
+    b->dlh_q[ph] = b->dlh_q[ph + SC_HANN_LEN] = s2_100q;
+    if (++b->dlh_count == SC_HANN_LEN) b->dlh_count = 0;
+    s2_100i = fir_dotf(b->dlh_i, ph, sc->hannf, SC_HANN_LEN);
+    s2_100q = fir_dotf(b->dlh_q, ph, sc->hannf, SC_HANN_LEN);
+
+    int pw = b->dlw_count;
+    b->dlw_i[pw] = b->dlw_i[pw + SC_WIDE_LEN] = s2_200i;
+    b->dlw_q[pw] = b->dlw_q[pw + SC_WIDE_LEN] = s2_200q;
+    if (++b->dlw_count == SC_WIDE_LEN) b->dlw_count = 0;
+    s2_200i = fir_dotf(b->dlw_i, pw, sc->widef, SC_WIDE_LEN);
+    s2_200q = fir_dotf(b->dlw_q, pw, sc->widef, SC_WIDE_LEN);
+    return bin_push_2k(sc, b, s2_100i, s2_100q, s2_200i, s2_200q);
 }
 
 /* ---- per-bin DSP: all-FIR linear-phase chain ---- */
@@ -898,13 +923,96 @@ HOT_CLONES static int process_bin_fft(ItilaSc *sc, ScBin *b, int slot, double *y
     return drops;
 }
 
+/* Folded masks: one block of a bin.  Per path, the FFT bins either side of the bin times the
+ * combined response of stage 2 and the Hann / wide filter, shifted by the residual offset (and
+ * itila2_afc) so the filter sits on the tone, then one inverse FFT of fM2 points straight to 2 kHz.
+ * The response is causal, so the first fP2 outputs (its start-up, which wraps round) are dropped;
+ * the oscillator then mixes the residual out at 2 kHz, as the 12 kHz chain does before stage 2. */
+HOT_CLONES static int process_bin_fold(ItilaSc *sc, ScBin *b, int slot, double *yr, double *yi)
+{
+    const double *xr = sc->ring_re[slot], *xi = sc->ring_im[slot];
+    int N = sc->fN, M = sc->fM2;
+    double df  = (double)sc->sample_rate / N;
+    double off = b->f_hz - sc->center_hz;
+    long k0 = lround(off / df);
+    double sh = off - k0 * df + (sc->afc ? b->afc_hz : 0.0);
+    for (int p = 0; p < 2; p++) {
+        double *ur = yr + p * M, *ui = yi + p * M;
+        memset(ur, 0, M * sizeof(double));
+        memset(ui, 0, M * sizeof(double));
+        int J = sc->fJ[p];
+        const double *Gr = sc->fG_re[p], *Gi = sc->fG_im[p];
+        const double *Er = sc->fE_re[p] + J, *Ei = sc->fE_im[p] + J;
+        double cs = cos(2.0 * M_PI * sh * sc->fD[p]), sn = sin(2.0 * M_PI * sh * sc->fD[p]);
+        double g0 = (-J * df - sh + SC_FOLD_FG) / sc->fG_step, gs = df / sc->fG_step;
+        for (int mm = -J; mm <= J; mm++) {
+            long src = k0 + mm;
+            if (src < 0) src += N; else if (src >= N) src -= N;
+            double fq = g0 + (mm + J) * gs;
+            int gi = (int)fq;
+            double a = fq - gi;
+            double gr = Gr[gi] + a * (Gr[gi+1] - Gr[gi]), gim = Gi[gi] + a * (Gi[gi+1] - Gi[gi]);
+            double hr = gr * Er[mm] - gim * Ei[mm], hi = gr * Ei[mm] + gim * Er[mm];
+            double qr = hr * cs - hi * sn, qi = hr * sn + hi * cs;
+            int m = mm < 0 ? mm + M : mm;
+            /* conjugate in, conjugate out: the forward FFT computes the inverse */
+            ur[m] =   xr[src] * qr - xi[src] * qi;
+            ui[m] = -(xr[src] * qi + xi[src] * qr);
+        }
+        fft_exec(&sc->plan_Nd, ur, ui);
+    }
+    long ph = (long)(((int64_t)k0 % N * (sc->ring_a[slot] % N)) % N);
+    double th = -2.0 * M_PI * (double)ph / N;
+    double pc = cos(th) / N, ps = sin(th) / N;
+    double step = -2.0 * M_PI * sh * sc->fR / sc->sample_rate;
+    double c_step = cos(step), s_step = sin(step);
+    double cp = b->c_phase, sp = b->s_phase;
+    int drops = 0;
+    int t0 = sc->fP2, t1 = M;
+    int64_t first = sc->ring_a[slot] + (int64_t)t0 * sc->fR;
+    if (first < b->start_in) {
+        int64_t skip = (b->start_in - first + sc->fR - 1) / sc->fR;
+        t0 = skip >= t1 - t0 ? t1 : t0 + (int)skip;
+    }
+    const double *ar1 = yr, *ai1 = yi, *ar2 = yr + M, *ai2 = yi + M;
+    for (int t = t0; t < t1; t++) {
+        double rc = pc*cp - ps*sp, rs = pc*sp + ps*cp;            /* block phase, then the residual */
+        double z1r = ar1[t], z1i = -ai1[t], z2r = ar2[t], z2i = -ai2[t];
+        double i100 = z1r*rc - z1i*rs, q100 = z1r*rs + z1i*rc;
+        double i200 = z2r*rc - z2i*rs, q200 = z2r*rs + z2i*rc;
+        double cn = cp*c_step - sp*s_step;
+        sp = sp*c_step + cp*s_step; cp = cn;
+        drops += bin_push_2k(sc, b, i100, q100, i200, q200);
+    }
+    double norm = 1.0 / sqrt(cp*cp + sp*sp);
+    b->c_phase = cp * norm;
+    b->s_phase = sp * norm;
+    return drops;
+}
+
+static void fft3_exec(const ItilaSc *sc, double *re, double *im)
+{
+    int N = sc->fN, n2 = N / 3;
+    double *tr = sc->f3_re, *ti = sc->f3_im;
+    for (int j = 0; j < 3; j++)
+        for (int m = 0; m < n2; m++) { tr[j*n2 + m] = re[3*m + j]; ti[j*n2 + m] = im[3*m + j]; }
+    for (int j = 0; j < 3; j++) fft_exec(&sc->plan_n3, tr + j*n2, ti + j*n2);
+    for (int k = 0; k < N; k++) {
+        int m = k % n2, k2 = (2 * k) % N;
+        double br = tr[n2 + m], bi = ti[n2 + m], cr = tr[2*n2 + m], ci = ti[2*n2 + m];
+        double w1r = sc->f3_wr[k], w1i = sc->f3_wi[k], w2r = sc->f3_wr[k2], w2i = sc->f3_wi[k2];
+        re[k] = tr[m] + br*w1r - bi*w1i + cr*w2r - ci*w2i;
+        im[k] = ti[m] + br*w1i + bi*w1r + cr*w2i + ci*w2r;
+    }
+}
+
 /* A new bin first gets the stored block spectra older than `slot`, oldest first (pre-roll). */
 static int preroll_fft(ItilaSc *sc, ScBin *b, int slot, double *yr, double *yi)
 {
     int drops = 0;
     for (int age = sc->ring_cnt - 1; age >= 1; age--) {
         int k = ((slot - age) % sc->ring_k + sc->ring_k) % sc->ring_k;
-        drops += process_bin_fft(sc, b, k, yr, yi);
+        drops += sc->fold ? process_bin_fold(sc, b, k, yr, yi) : process_bin_fft(sc, b, k, yr, yi);
     }
     return drops;
 }
@@ -924,7 +1032,8 @@ static int process_stripe(ItilaSc *sc, int stripe, const double *i_full, const d
                 b->need_preroll = 0;
                 drops += preroll_fft(sc, b, sc->job_slot, sc->scr_re[stripe], sc->scr_im[stripe]);
             }
-            drops += process_bin_fft(sc, b, sc->job_slot, sc->scr_re[stripe], sc->scr_im[stripe]);
+            drops += sc->fold ? process_bin_fold(sc, b, sc->job_slot, sc->scr_re[stripe], sc->scr_im[stripe])
+                              : process_bin_fft(sc, b, sc->job_slot, sc->scr_re[stripe], sc->scr_im[stripe]);
             continue;
         }
         if (b->need_preroll) {
@@ -1093,6 +1202,26 @@ int itila_sc_set_afc(ItilaSc *sc, int on)
     return r;
 }
 
+/* itila2_fold_mask: stage 2 and the Hann / wide filters folded into the FFT mask, each path's
+ * inverse FFT straight to 2 kHz (off: the 12 kHz mask and the time-domain filters).  Only before
+ * the first IQ is fed; returns the state in force (the FIR1 test path has no FFT front end: 0). */
+int itila_sc_set_fold(ItilaSc *sc, int on)
+{
+    if (!sc) return 0;
+    pthread_mutex_lock(&sc->lock);
+    on = on != 0;
+    if (sc->fft_front && sc->in_fed == 0 && sc->n_bins == 0 && on != sc->fold) {
+        front_free(sc);
+        if (!front_init(sc, on)) {          /* out of memory: back to the 12 kHz mask */
+            front_free(sc);
+            if (!front_init(sc, 0)) { front_free(sc); sc->fft_front = 0; }
+        }
+    }
+    int r = sc->fold;
+    pthread_mutex_unlock(&sc->lock);
+    return r;
+}
+
 /* itila2_afc: the offset a bin applies, tone above its frequency in Hz (0 for no such bin). */
 double itila_sc_get_afc_hz(ItilaSc *sc, double f_hz)
 {
@@ -1197,6 +1326,141 @@ static void preroll_push(ItilaSc *sc, const double *i_full, const double *q_full
 
 /* ---- public API ---- */
 
+/* Folded masks: the radix-3 twiddles and, per path, the combined response of stage 2 (12 kHz)
+ * and the Hann / wide filter (2 kHz, so at 12 kHz it repeats every 2 kHz), with its delay taken
+ * out so it varies slowly (fG, sampled finely for the residual shift), and how many FFT bins
+ * either side of the bin it passes above -100 dB, plus the largest itila2_afc offset. */
+static int fold_init(ItilaSc *sc)
+{
+    int N = sc->fN, M = sc->fM2;
+    double df = (double)sc->sample_rate / N;
+    sc->f3_wr = (double *)malloc(N * sizeof(double));
+    sc->f3_wi = (double *)malloc(N * sizeof(double));
+    sc->f3_re = (double *)malloc(N * sizeof(double));
+    sc->f3_im = (double *)malloc(N * sizeof(double));
+    if (!sc->f3_wr || !sc->f3_wi || !sc->f3_re || !sc->f3_im) return 0;
+    for (int k = 0; k < N; k++) { sc->f3_wr[k] = cos(-2.0 * M_PI * k / N); sc->f3_wi[k] = sin(-2.0 * M_PI * k / N); }
+    sc->fG_step = df / 8.0;
+    sc->fG_n = (int)(2.0 * SC_FOLD_FG / sc->fG_step) + 2;
+    for (int p = 0; p < 2; p++) {
+        const double *h2 = p ? FIR_S2_200 : FIR_S2_100, *hw = p ? WIDE_TAPS : sc->hann;
+        int l2 = p ? FIR_S2_200_LEN : FIR_S2_100_LEN, lw = p ? SC_WIDE_LEN : SC_HANN_LEN;
+        sc->fD[p] = 0.5 * (l2 - 1) / 12000.0 + 0.5 * (lw - 1) / 2000.0;
+        sc->fG_re[p] = (double *)malloc(sc->fG_n * sizeof(double));
+        sc->fG_im[p] = (double *)malloc(sc->fG_n * sizeof(double));
+        if (!sc->fG_re[p] || !sc->fG_im[p]) return 0;
+        double peak = 0.0, f_cut = 0.0;
+        for (int i = 0; i < sc->fG_n; i++) {
+            double f = -SC_FOLD_FG + i * sc->fG_step;
+            double ar = 0.0, ai = 0.0, br = 0.0, bi = 0.0;
+            for (int k = 0; k < l2; k++) { ar += h2[k] * cos(2.0*M_PI*f*k/12000.0); ai -= h2[k] * sin(2.0*M_PI*f*k/12000.0); }
+            for (int k = 0; k < lw; k++) { br += hw[k] * cos(2.0*M_PI*f*k/2000.0);  bi -= hw[k] * sin(2.0*M_PI*f*k/2000.0); }
+            double hr = ar*br - ai*bi, hi = ar*bi + ai*br;
+            double er = cos(2.0*M_PI*f*sc->fD[p]), ei = sin(2.0*M_PI*f*sc->fD[p]);     /* delay out */
+            sc->fG_re[p][i] = hr*er - hi*ei;
+            sc->fG_im[p][i] = hr*ei + hi*er;
+            double mag = hypot(hr, hi);
+            if (mag > peak) peak = mag;
+        }
+        for (int i = 0; i < sc->fG_n; i++) {
+            double f = fabs(-SC_FOLD_FG + i * sc->fG_step);
+            if (hypot(sc->fG_re[p][i], sc->fG_im[p][i]) > 1e-5 * peak && f > f_cut) f_cut = f;
+        }
+        int J = (int)ceil((f_cut + SC_AFC_MAX_HZ + df) / df);
+        if (J > M / 2 - 1) J = M / 2 - 1;
+        if ((J + 1) * df + SC_AFC_MAX_HZ + df >= SC_FOLD_FG) return 0;      /* the table must cover the shift */
+        sc->fJ[p] = J;
+        sc->fE_re[p] = (double *)malloc((2 * J + 1) * sizeof(double));
+        sc->fE_im[p] = (double *)malloc((2 * J + 1) * sizeof(double));
+        if (!sc->fE_re[p] || !sc->fE_im[p]) return 0;
+        for (int mm = -J; mm <= J; mm++) {
+            sc->fE_re[p][mm + J] = cos(-2.0 * M_PI * mm * df * sc->fD[p]);
+            sc->fE_im[p][mm + J] = sin(-2.0 * M_PI * mm * df * sc->fD[p]);
+        }
+    }
+    return 1;
+}
+
+/* The shared FFT front end's blocks, plans, ring and masks: the 12 kHz mask, or the folded masks
+ * to 2 kHz (fold).  Returns 0 when out of memory; front_free then releases what was made. */
+static int front_init(ItilaSc *sc, int fold)
+{
+    /* 11.7 Hz FFT bins at every rate; 1024 bins = 12 kHz per bin; 64 output samples of overlap
+     * (5.3 ms), 32 dropped at each end, hold the zero-phase mask's impulse response on both
+     * sides; 960 new 12 kHz samples per block, 2.7 ms behind the input. */
+    sc->fold = fold;
+    if (sc->fold) {
+        /* 2 kHz per path: 512 outputs per block, 128 (64 ms) of them the filters' start-up */
+        sc->fR  = SC_DEC2 * sc->dec1;
+        sc->fM2 = 512;
+        sc->fP2 = 128;
+        sc->fNd = sc->fM2;
+        sc->fN  = sc->fM2 * sc->fR;
+        sc->fP  = sc->fP2 * sc->fR;
+    } else {
+        sc->fNd = 1024;
+        sc->fN  = sc->fNd * sc->dec1;
+        sc->fP  = 64 * sc->dec1;
+    }
+    sc->fL  = sc->fN - sc->fP;
+    sc->ring_k = (sc->pre_len + sc->fL - 1) / sc->fL + 1;
+    int ok = (sc->fold ? fft_plan_init(&sc->plan_n3, sc->fN / 3) : fft_plan_init(&sc->plan_N, sc->fN))
+             && fft_plan_init(&sc->plan_Nd, sc->fNd);
+    if (ok && sc->fold) ok = fold_init(sc);
+    sc->fH    = (double *)calloc(sc->fNd, sizeof(double));
+    sc->blk_i = (double *)calloc(sc->fN, sizeof(double));
+    sc->blk_q = (double *)calloc(sc->fN, sizeof(double));
+    sc->ring_re = (double **)calloc(sc->ring_k, sizeof(double *));
+    sc->ring_im = (double **)calloc(sc->ring_k, sizeof(double *));
+    sc->ring_a  = (int64_t *)calloc(sc->ring_k, sizeof(int64_t));
+    ok = ok && sc->fH && sc->blk_i && sc->blk_q && sc->ring_re && sc->ring_im && sc->ring_a;
+    for (int k = 0; ok && k < sc->ring_k; k++) {
+        sc->ring_re[k] = (double *)malloc(sc->fN * sizeof(double));
+        sc->ring_im[k] = (double *)malloc(sc->fN * sizeof(double));
+        ok = sc->ring_re[k] && sc->ring_im[k];
+    }
+    for (int k = 0; ok && k < SC_MAX_THREADS; k++) {
+        sc->scr_re[k] = (double *)malloc(2 * sc->fNd * sizeof(double));     /* two paths when folded */
+        sc->scr_im[k] = (double *)malloc(2 * sc->fNd * sizeof(double));
+        ok = sc->scr_re[k] && sc->scr_im[k];
+    }
+    if (!ok) return 0;
+    /* Channel mask: flat to +-4.8 kHz, raised-cosine to zero at +-6 kHz (the 12 kHz edges).
+     * The old FIR1 droops < 0.03 dB at 300 Hz; downstream FIR2 only passes +-200 Hz. */
+    double df = (double)sc->sample_rate / sc->fN;
+    for (int m = 0; m < sc->fNd; m++) {
+        double f = fabs((m < sc->fNd / 2 ? m : m - sc->fNd) * df);
+        sc->fH[m] = f <= 4800.0 ? 1.0 : f >= 6000.0 ? 0.0 : 0.5 * (1.0 + cos(M_PI * (f - 4800.0) / 1200.0));
+    }
+    sc->blk_n = sc->fold ? sc->fP : sc->fP / 2;     /* silence before input sample 0: the first output is sample 0 */
+    sc->blk_start = -sc->blk_n;
+    return 1;
+}
+
+static void front_free(ItilaSc *sc)
+{
+    fft_plan_free(&sc->plan_N);
+    fft_plan_free(&sc->plan_Nd);
+    fft_plan_free(&sc->plan_n3);
+    for (int k = 0; k < sc->ring_k; k++) {
+        if (sc->ring_re) free(sc->ring_re[k]);
+        if (sc->ring_im) free(sc->ring_im[k]);
+    }
+    free(sc->ring_re); free(sc->ring_im); free(sc->ring_a);
+    sc->ring_re = sc->ring_im = NULL; sc->ring_a = NULL;
+    for (int k = 0; k < SC_MAX_THREADS; k++) { free(sc->scr_re[k]); free(sc->scr_im[k]); sc->scr_re[k] = sc->scr_im[k] = NULL; }
+    free(sc->fH); free(sc->blk_i); free(sc->blk_q);
+    sc->fH = sc->blk_i = sc->blk_q = NULL;
+    free(sc->f3_wr); free(sc->f3_wi); free(sc->f3_re); free(sc->f3_im);
+    sc->f3_wr = sc->f3_wi = sc->f3_re = sc->f3_im = NULL;
+    for (int p = 0; p < 2; p++) {
+        free(sc->fG_re[p]); free(sc->fG_im[p]); free(sc->fE_re[p]); free(sc->fE_im[p]);
+        sc->fG_re[p] = sc->fG_im[p] = sc->fE_re[p] = sc->fE_im[p] = NULL;
+    }
+    sc->ring_k = sc->ring_w = sc->ring_cnt = 0;
+    sc->fold = 0;
+}
+
 ItilaSc *itila_sc_create(int sample_rate, double center_hz,
                           int max_bins, double min_snr,
                           int window_samples, int energy_win,
@@ -1274,44 +1538,7 @@ ItilaSc *itila_sc_create(int sample_rate, double center_hz,
 
     const char *fir1_env = getenv("ITILA_SC_FIR1");
     sc->fft_front = !(fir1_env && fir1_env[0] == '1');
-    if (sc->fft_front) {
-        /* 11.7 Hz FFT bins at every rate; 1024 bins = 12 kHz per bin; 64 output samples of overlap
-         * (5.3 ms), 32 dropped at each end, hold the zero-phase mask's impulse response on both
-         * sides; 960 new 12 kHz samples per block, 2.7 ms behind the input. */
-        sc->fNd = 1024;
-        sc->fN  = sc->fNd * sc->dec1;
-        sc->fP  = 64 * sc->dec1;
-        sc->fL  = sc->fN - sc->fP;
-        sc->ring_k = (sc->pre_len + sc->fL - 1) / sc->fL + 1;
-        int ok = fft_plan_init(&sc->plan_N, sc->fN) && fft_plan_init(&sc->plan_Nd, sc->fNd);
-        sc->fH    = (double *)calloc(sc->fNd, sizeof(double));
-        sc->blk_i = (double *)calloc(sc->fN, sizeof(double));
-        sc->blk_q = (double *)calloc(sc->fN, sizeof(double));
-        sc->ring_re = (double **)calloc(sc->ring_k, sizeof(double *));
-        sc->ring_im = (double **)calloc(sc->ring_k, sizeof(double *));
-        sc->ring_a  = (int64_t *)calloc(sc->ring_k, sizeof(int64_t));
-        ok = ok && sc->fH && sc->blk_i && sc->blk_q && sc->ring_re && sc->ring_im && sc->ring_a;
-        for (int k = 0; ok && k < sc->ring_k; k++) {
-            sc->ring_re[k] = (double *)malloc(sc->fN * sizeof(double));
-            sc->ring_im[k] = (double *)malloc(sc->fN * sizeof(double));
-            ok = sc->ring_re[k] && sc->ring_im[k];
-        }
-        for (int k = 0; ok && k < SC_MAX_THREADS; k++) {
-            sc->scr_re[k] = (double *)malloc(sc->fNd * sizeof(double));
-            sc->scr_im[k] = (double *)malloc(sc->fNd * sizeof(double));
-            ok = sc->scr_re[k] && sc->scr_im[k];
-        }
-        if (!ok) { itila_sc_free(sc); return NULL; }
-        /* Channel mask: flat to +-4.8 kHz, raised-cosine to zero at +-6 kHz (the 12 kHz edges).
-         * The old FIR1 droops < 0.03 dB at 300 Hz; downstream FIR2 only passes +-200 Hz. */
-        double df = (double)sample_rate / sc->fN;
-        for (int m = 0; m < sc->fNd; m++) {
-            double f = fabs((m < sc->fNd / 2 ? m : m - sc->fNd) * df);
-            sc->fH[m] = f <= 4800.0 ? 1.0 : f >= 6000.0 ? 0.0 : 0.5 * (1.0 + cos(M_PI * (f - 4800.0) / 1200.0));
-        }
-        sc->blk_n = sc->fP / 2;          /* silence before input sample 0: the first output is sample 0 */
-        sc->blk_start = -sc->fP / 2;
-    }
+    if (sc->fft_front && !front_init(sc, 0)) { itila_sc_free(sc); return NULL; }
 
     return sc;
 }
@@ -1348,17 +1575,7 @@ void itila_sc_free(ItilaSc *sc)
     free(sc->pre_q);
     free(sc->lin_i);
     free(sc->lin_q);
-    if (sc->fft_front) {
-        fft_plan_free(&sc->plan_N);
-        fft_plan_free(&sc->plan_Nd);
-        for (int k = 0; k < sc->ring_k; k++) {
-            if (sc->ring_re) free(sc->ring_re[k]);
-            if (sc->ring_im) free(sc->ring_im[k]);
-        }
-        free(sc->ring_re); free(sc->ring_im); free(sc->ring_a);
-        for (int k = 0; k < SC_MAX_THREADS; k++) { free(sc->scr_re[k]); free(sc->scr_im[k]); }
-        free(sc->fH); free(sc->blk_i); free(sc->blk_q);
-    }
+    if (sc->fft_front) front_free(sc);
     free(sc);
 }
 
@@ -1463,7 +1680,8 @@ void itila_sc_feed_iq(ItilaSc *sc,
             int slot = sc->ring_w;
             memcpy(sc->ring_re[slot], sc->blk_i, sc->fN * sizeof(double));
             memcpy(sc->ring_im[slot], sc->blk_q, sc->fN * sizeof(double));
-            fft_exec(&sc->plan_N, sc->ring_re[slot], sc->ring_im[slot]);
+            if (sc->fold) fft3_exec(sc, sc->ring_re[slot], sc->ring_im[slot]);
+            else fft_exec(&sc->plan_N, sc->ring_re[slot], sc->ring_im[slot]);
             sc->ring_a[slot] = sc->blk_start;
             sc->ring_w = (slot + 1) % sc->ring_k;
             if (sc->ring_cnt < sc->ring_k) sc->ring_cnt++;
