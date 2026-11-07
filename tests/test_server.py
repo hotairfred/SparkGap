@@ -425,16 +425,17 @@ def test_an_unknown_own_name_still_serves_localhost(monkeypatch: pytest.MonkeyPa
 
 def test_discover_takes_an_address_and_refuses_anything_else(
         seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
-    asked: list[str | None] = []
+    asked: list[tuple[str | None, str | None]] = []
     monkeypatch.setattr(seat, "discover",
-                        lambda seconds=0, address=None: asked.append(address) or "ok")
+                        lambda seconds=0, address=None, kind=None, name=None: asked.append((address, kind)) or "ok")
     a = Server(seat.root, {"bind": "127.0.0.1", "port": 0, "join_code": CODE})
     a.seat = seat
     assert a._run_op("discover", "discover", {"address": "192.0.2.101"}) == "ok"
     assert a._run_op("discover", "discover", {}) == "ok"
+    assert a._run_op("discover", "discover", {"address": "192.0.2.120", "type": "hpsdr"}) == "ok"
     with pytest.raises(ValueError):
         a._run_op("discover", "discover", {"address": "192.0.2.101; reboot"})
-    assert asked == ["192.0.2.101", None]
+    assert asked == [("192.0.2.101", None), (None, None), ("192.0.2.120", "hpsdr")]
 
 
 def test_node_writes_what_sparkgap_sh_setup_writes(seat: Seat, tmp_path: Path) -> None:  # noqa: F811
@@ -515,6 +516,40 @@ def test_add_writes_its_settings_and_a_refused_one_adds_nothing(
     r = _result(ws, 10)
     assert not r["ok"] and "validation must be" in r["error"]
     assert all(i.name != "Dallas-1" for i in seat.instances()) and not seat.pid("Dallas-1")
+
+
+def test_an_hpsdr_receiver_is_added_to_its_radio_s_process_and_a_radio_renamed(
+    server: Server, seat: Seat, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    from tests.test_seat import with_hpsdr
+
+    with_hpsdr(seat, monkeypatch)
+    ws = _ws(server)
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 11, "cmd": "add", "name": "Web888-1",
+                                 "settings": {"band": "20m", "validation": "off"}}).encode())
+    r = _result(ws, 11)
+    assert r["ok"] and "Web888: live" in r["message"]
+    assert json.loads((seat.root / "config" / "Web888.local.json").read_text())["spot_validation"] == "off"
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 12, "cmd": "rename", "name": "rename",
+                                 "settings": {"radio": "Web888", "name": "Pitaya"}}).encode())
+    r = _result(ws, 12)
+    assert not r["ok"] and "stop Web888 first" in r["error"]
+    pitaya = {"type": "hpsdr", "address": "192.0.2.121", "receivers": 8, "callsign": "N0CALL-7", "grid": "EM12ub"}
+    (seat.root / "config" / "Pitaya.radio.json").write_text(json.dumps(pitaya))
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 13, "cmd": "add", "name": "Pitaya-1",
+                                 "settings": {"band": "40m", "validation": "loose"}}).encode())
+    r = _result(ws, 13)
+    assert not r["ok"] and "validation must be" in r["error"]
+    assert all(i.name != "Pitaya" for i in seat.instances())  # its process went with the refused add
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 16, "cmd": "stop", "name": "Web888-1"}).encode())
+    assert _result(ws, 16)["ok"] and not seat.pid("Web888")  # a receiver's name stops its radio's process
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 14, "cmd": "remove", "name": "Web888-1"}).encode())
+    r = _result(ws, 14)  # its last receiver: the feeder and process stop, then it is removed
+    assert r["ok"] and "Web888's last receiver" in r["message"]
+    assert all(i.name != "Web888" for i in seat.instances()) and not seat.pid("Web888")
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 15, "cmd": "remove_radio", "name": "remove_radio",
+                                 "settings": {"radio": "Web888"}}).encode())
+    assert _result(ws, 15)["ok"] and not (seat.root / "config" / "Web888.radio.json").exists()
 
 
 def test_a_station_and_its_warnings_reach_the_server(server: Server) -> None:

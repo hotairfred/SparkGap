@@ -38,6 +38,8 @@ STATION_HELD = "already has station"
 FEED_PORT_RE = re.compile(r"GUI feed on wss?://\S+?:(\d+)/")
 ERROR_RE = re.compile(r"^[0-9:]+ ERROR |^[A-Za-z_.]*(Error|Exception): ")
 SPOT_RE = re.compile(r"SPOT:")
+LIVE_RE = re.compile(r"SparkGap LIVE: (\S+) \(([\d.]+) kHz\) rx(\d+)")  # one receiver's band and centre
+RAW_RE = re.compile(r"ITILA raw ([\d.]+) kHz")  # one decoded window, at its frequency
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 RECEIVER_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)-([1-9])$")  # <radio>-<DAX-IQ channel>
 PORT_KEYS = ("flex_udp_port", "telnet_port", "telnet_local_port")
@@ -46,6 +48,8 @@ PORT_DEFAULTS = {"flex_udp_port": 7791, "telnet_port": 7300}  # sparkgap.py's, w
 # feeds 7321-7329, telnet 7330 + channel), clear of the Aggregator's 7300 and CW Skimmer's ports.
 ADD_PORT_BASES = {"flex_udp_port": 7790, "telnet_port": 7330}
 CODE = Path(__file__).resolve().parent  # the code this server runs: what an added receiver runs
+TEMPLATES = {"flex": "skimmer_flex.example.json", "hpsdr": "skimmer_hpsdr.example.json"}  # shipped defaults
+HPSDR_LISTEN_BASE = 1024  # each HPSDR radio's own local UDP port: the radio's, then the next free
 # from the shipped defaults: the radio file's, or set per receiver by add
 NOT_FROM_TEMPLATE = ("sdr_ip", "callsign", "grid", "op_name", "qth", "radio", "rbn_upload",
                      "flex_station", "_radio", "_comment_radio")
@@ -101,6 +105,10 @@ class LogStats:
     offset: int = 0
     partial: str = ""
     spots: Counter[str] = field(default_factory=Counter)
+    spot_khz: Counter[int] = field(default_factory=Counter)  # spots by kHz: an HPSDR receiver's own
+    spot_calls: set[tuple[int, str]] = field(default_factory=set)  # (kHz, call): its calls
+    raw_khz: Counter[int] = field(default_factory=Counter)  # decoded windows by kHz: its windows
+    live: dict[int, tuple[str, float]] = field(default_factory=dict)  # receiver index -> band, centre kHz
     errors: list[str] = field(default_factory=list)
     n_errors: int = 0
     warnings: int = 0
@@ -121,6 +129,14 @@ class LogStats:
         for line in lines:
             if SPOT_RE.search(line) and len(line.split()) > 5:
                 self.spots[line.split()[5]] += 1
+                with contextlib.suppress(ValueError):
+                    khz = int(float(line.split()[4]))
+                    self.spot_khz[khz] += 1
+                    self.spot_calls.add((khz, line.split()[5]))
+            elif m := RAW_RE.search(line):
+                self.raw_khz[int(float(m.group(1)))] += 1
+            elif m := LIVE_RE.search(line):
+                self.live[int(m.group(3))] = (m.group(1), float(m.group(2)))
             elif ERROR_RE.match(line):
                 self.errors = (self.errors + [line])[-ERRORS_KEPT:]
                 self.n_errors += 1
@@ -624,6 +640,8 @@ class Seat:
                 if value not in self.bands_known(i):
                     raise SeatError(f"band must be one of: {' '.join(self.bands_known(i))}")
                 changes["bands"] = [value]
+            elif key == "rx_bands":  # {receiver number: band}, an HPSDR radio's receivers
+                changes["bands"] = self._rx_bands(i, value)
             elif key == "validation":
                 if value not in VALIDATION:
                     raise SeatError(f"validation must be one of: {', '.join(VALIDATION)}")
@@ -688,6 +706,26 @@ class Seat:
             self._stop(i)
             return f"{done}; {self._start(i)}"
 
+    def _rx_bands(self, i: Instance, value: Any) -> list[str]:
+        """The bands list with some of an HPSDR radio's receivers moved; SeatError: refused."""
+        cfg = self.config(i)
+        bands = list(cfg.get("bands") or [])
+        if cfg.get("sdr_type") != "hpsdr" or not all(isinstance(b, str) for b in bands):
+            raise SeatError(f"{i.name}: only an HPSDR radio's receivers, with bands by name, move here")
+        if not isinstance(value, dict) or not value:
+            raise SeatError("rx_bands must be {receiver number: band}")
+        known = self.bands_known(i)
+        for n, band in value.items():
+            k = int(n) if str(n).isdigit() else 0
+            if not 1 <= k <= len(bands):
+                raise SeatError(f"{i.name} has receivers 1 to {len(bands)}")
+            if band not in known:
+                raise SeatError(f"band must be one of: {' '.join(known)}")
+            bands[k - 1] = band
+        if len(set(bands)) != len(bands):
+            raise SeatError("two receivers on one band")
+        return bands
+
     def _check_rx(self, i: Instance, key: str, value: Any) -> None:
         sdr = self.config(i).get("sdr_type")
         if key not in radios.capabilities(sdr).rx_settings or self.radio(i) is None:
@@ -724,10 +762,12 @@ class Seat:
             radio = json.loads((self.root / "config" / f"{rn}.radio.json").read_text())
         except (OSError, ValueError):
             raise SeatError(f"no radio file for {rn}: Discover it in Setup first") from None
-        if radio.get("type") != "flex":
-            raise SeatError(f"{rn} is not a FlexRadio: only Flex receivers can be added here")
         if missing := [k for k in ("callsign", "grid") if not radio.get(k)]:
             raise SeatError(f"{rn} has no {' or '.join(missing)}: set them in Setup first")
+        if radio.get("type") == "hpsdr":
+            return self._add_hpsdr(rn, num, radio, band)
+        if radio.get("type") != "flex":
+            raise SeatError(f"{rn} is a {radio.get('type')} radio: its receivers are not added here")
         chans = radio.get("daxiq_channels")
         if isinstance(chans, int) and num > chans:
             raise SeatError(f"the {radio.get('model') or rn} has DAX-IQ channels 1 to {chans}")
@@ -777,10 +817,149 @@ class Seat:
         how = "its earlier config" if reused else "the shipped defaults"
         return f"{name}: added on DAX-IQ {num}, {band}, from {how}"
 
-    def _template(self) -> dict[str, Any]:
-        """The shipped defaults (the code's Flex example) without what the radio file holds: an
-        update moves the baseline for every install."""
-        path = CODE / "skimmer_flex.example.json"
+    def _add_hpsdr(self, rn: str, num: int, radio: dict[str, Any], band: str) -> str:
+        """An HPSDR radio's next receiver: its one process gets the band (made from the shipped
+        HPSDR defaults with its first receiver, with its own telnet and listen ports) and
+        restarts if it runs. Receivers are numbered by their place in bands[]."""
+        conf = self.root / "config" / f"{rn}.local.json"
+        with self._instances_lock():
+            existing = self.instances()
+            i = next((x for x in existing if x.name == rn), None)
+            if i is not None and self.config(i).get("sdr_type") != "hpsdr":
+                raise SeatError(f"{rn} is already a receiver's name")
+            if i is None and (who := self.name_taken(rn)):
+                raise SeatError(f"{rn}'s receivers would share names with {who}: rename the radio in Setup")
+            bands = list(self.config(i).get("bands") or []) if i else []
+            limit = radio.get("receivers")
+            if num != len(bands) + 1:
+                raise SeatError(f"the next receiver of {rn} is {rn}-{len(bands) + 1}")
+            if isinstance(limit, int) and num > limit:
+                raise SeatError(f"the {radio.get('model') or rn} has receivers 1 to {limit}")
+            if band in bands:
+                raise SeatError(f"{rn} already has a receiver on {band}")
+            if i is None:
+                cfgs = [self.config(x) for x in existing]
+                reused = conf.exists()
+                c = json.loads(conf.read_text()) if reused else self._template("hpsdr")
+                if reused and c.get("radio") not in (None, rn):
+                    raise SeatError(f"{conf.name} is {c.get('radio')}'s, not {rn}'s")
+                if not reused:
+                    if isinstance(c.get("gui_feed"), dict):
+                        c["gui_feed"]["port"] = "auto"
+                    c["rbn_known_dir"] = str(self.root / "rbn_known")
+                    if (radio.get("board_id"), radio.get("firmware")) == radios.WEB888:
+                        c["ppm_offset"] = 3.9  # cancels the Red Pitaya correction in hpsdr_fast.c
+                    if isinstance(limit, int):
+                        c["max_receivers"] = limit
+                used = {p for x in cfgs for p in _ports(x)}
+                c["telnet_port"] = ADD_PORT_BASES["telnet_port"]
+                while c["telnet_port"] in used or not _port_free(c["telnet_port"], host=c.get("telnet_host")):
+                    c["telnet_port"] += 1
+                listens = {x.get("hpsdr_listen_port", x.get("sdr_port", HPSDR_LISTEN_BASE))
+                           for x in cfgs if x.get("sdr_type") == "hpsdr"}
+                c["hpsdr_listen_port"] = HPSDR_LISTEN_BASE
+                while c["hpsdr_listen_port"] in listens or not _port_free(c["hpsdr_listen_port"], udp=True):
+                    c["hpsdr_listen_port"] += 1
+                c.update(radio=rn, sdr_type="hpsdr", bands=[band])
+                for k in ("callsign", "grid", "skimmer_suffix", "sdr_ip"):  # its radio file's
+                    c.pop(k, None)
+                new = conf.with_name(conf.name + ".new")
+                new.write_text(json.dumps(c, indent=2) + "\n")
+                os.replace(new, conf)
+                with open(self.root / "instances", "a") as f:
+                    f.write(f"{rn} {CODE} {conf.name} {sys.executable}\n")
+                how = "its earlier config" if reused else "the shipped HPSDR defaults"
+                return f"{rn}-{num}: added, {band}; {rn} runs it, from {how}"
+        with self.lock(i):  # the radio's process: the band, then a restart if it runs
+            write_config(i.config, {"bands": [*bands, band]})
+            if not self.pid(rn):
+                return f"{rn}-{num}: added, {band}; used at {rn}'s next start"
+            self._stop(i)
+            return f"{rn}-{num}: added, {band}; {self._start(i)}"
+
+    def name_taken(self, name: str, own: str | None = None) -> str | None:
+        """Who already uses a radio name: a receiver or process named <name> or <name>-<n>, other
+        than the HPSDR process of the radio own; None when it is free."""
+        for i in self.instances():
+            c = self.config(i)
+            mine = own is not None and c.get("radio") == own and c.get("sdr_type") == "hpsdr"
+            if (i.name == name or re.match(rf"^{re.escape(name)}-\d+$", i.name)) and not mine:
+                return i.name
+        return None
+
+    def withdraw(self, name: str) -> None:
+        """Take a stopped copy's instances line out, its config kept (an add that did not finish)."""
+        with self._instances_lock():
+            if self.pid(name):
+                return
+            path = self.root / "instances"
+            lines = [x for x in path.read_text().splitlines() if x.split()[:1] != [name]]
+            tmp = path.with_name("instances.new")
+            tmp.write_text("\n".join(lines) + "\n")
+            os.replace(tmp, path)
+
+    def process_name(self, name: str) -> str:
+        """The instance a name stands for: an HPSDR receiver's (<radio>-<n>) is its radio's."""
+        if any(i.name == name for i in self.instances()):
+            return name
+        m = RECEIVER_RE.match(name)
+        if m and any(i.name == m.group(1) and self.config(i).get("sdr_type") == "hpsdr"
+                     for i in self.instances()):
+            return m.group(1)
+        return name
+
+    def rename_radio(self, old: str, new: str) -> str:
+        """An HPSDR radio's new name, while it is stopped: its radio file, its receivers' radio,
+        and its process's instances line and config. Logs keep their names."""
+        config = self.root / "config"
+        if not radios.NAME_RE.match(old):
+            raise SeatError(f"{old!r}: not a radio name")
+        path, to = config / f"{old}.radio.json", config / f"{new}.radio.json"
+        if why := radios.check_radio_name(new):
+            raise SeatError(f"name: {why}")
+        if who := self.name_taken(new):
+            raise SeatError(f"{new} is already used by {who}")
+        try:
+            st: Any = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise SeatError(f"no radio file for {old}") from None
+        if not isinstance(st, dict) or st.get("type") != "hpsdr":
+            raise SeatError(f"{old}: a FlexRadio takes its name from the radio (SmartSDR)")
+        if to.exists():
+            raise SeatError(f"{new} is another radio's name")
+        with self._instances_lock():
+            mine = [i for i in self.instances() if self.config(i).get("radio") == old]
+            if running := [i.name for i in mine if self.pid(i.name)]:
+                raise SeatError(f"stop {', '.join(running)} first")
+            if self.feeder_pid(old):
+                raise SeatError(f"{old}'s feeder runs: stop it first")
+            if (config / f"{new}.local.json").exists():
+                raise SeatError(f"config/{new}.local.json exists: another radio's")
+            # the process's instances line and config move first, the radio file last: a failure
+            # part way leaves a copy that still loads (its radio key then names the old file)
+            out, moved = [], None
+            for line in (self.root / "instances").read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == old:
+                    moved = config / parts[2]
+                    line = line.replace(old, new, 1).replace(parts[2], f"{new}.local.json", 1)
+                out.append(line)
+            if moved is not None:
+                os.replace(moved, config / f"{new}.local.json")
+            tmp = self.root / "instances.new"
+            tmp.write_text("\n".join(out) + "\n")
+            os.replace(tmp, self.root / "instances")
+            for i in self.instances():
+                if self.config(i).get("radio") == old:
+                    write_config(i.config, {"radio": new})
+            radios.write_radio(to, {**st, "nickname": new})
+            path.unlink()
+        return f"{old} renamed {new}: its radio file, {len(mine)} config(s) and its receivers"
+
+    def _template(self, kind: str = "flex") -> dict[str, Any]:
+        """The shipped defaults (the code's example for the radio type) without what the radio
+        file holds: an update moves the baseline for every install."""
+        path = CODE / TEMPLATES[kind]
         try:
             c = json.loads(path.read_text())
         except (OSError, ValueError) as e:
@@ -790,12 +969,15 @@ class Seat:
         if not (c.get("flex_loopa") or c.get("flex_loopb")):  # a loop keeps its antenna (README)
             for k in ("flex_rxant", "flex_rfgain"):  # it starts with the radio's
                 c.pop(k, None)
-        c["sdr_type"] = "flex"
+        c["sdr_type"] = kind
         return c
 
     def remove(self, name: str) -> str:
         """Take a stopped receiver out of instances; its config, logs and recordings stay, so
-        adding the same name again brings its settings back."""
+        adding the same name again brings its settings back.  An HPSDR receiver leaves its radio's
+        bands; the last one takes the radio's process out."""
+        if (proc := self.process_name(name)) != name:
+            return self._remove_hpsdr(name, proc)
         i = self.instance(name)
         if self.config(i).get("sdr_type") != "flex" or not self.radio_file(i):
             raise SeatError(f"{name}: only a Flex receiver of a radio file is removed here")
@@ -809,6 +991,51 @@ class Seat:
             new.write_text("".join(x + "\n" for x in keep))
             os.replace(new, path)
         return f"{name}: removed; its config stays in config/{i.config.name}"
+
+    def receiver_count(self, proc: str) -> int:
+        """How many receivers an HPSDR radio's process holds (its bands)."""
+        return len(self.config(self.instance(proc)).get("bands") or [])
+
+    def _remove_hpsdr(self, name: str, proc: str) -> str:
+        """One receiver out of its HPSDR radio's bands; the ones after it move up a number (they
+        are numbered by place). The radio restarts if it runs; the last receiver, stopped, takes
+        the process's instances line out, its config kept."""
+        i = self.instance(proc)
+        num = int(RECEIVER_RE.match(name).group(2))  # process_name matched it
+        with self.lock(i):
+            bands = list(self.config(i).get("bands") or [])
+            if not 1 <= num <= len(bands):
+                raise SeatError(f"{proc} has receivers 1 to {len(bands)}")
+            if len(bands) == 1:
+                if self.pid(proc):
+                    raise SeatError(f"{proc} is running; stop it first")
+                self.withdraw(proc)
+                return f"{name}: removed, {proc}'s last receiver; its config stays in config/{i.config.name}"
+            write_config(i.config, {"bands": bands[:num - 1] + bands[num:]})
+            moved = (f"; {proc}-{num + 1} to -{len(bands)} are now {proc}-{num} to -{len(bands) - 1}"
+                     if num < len(bands) else "")
+            done = f"{name}: removed ({bands[num - 1]}){moved}"
+            if not self.pid(proc):
+                return done
+            self._stop(i)
+            return f"{done}; {self._start(i)}"
+
+    def remove_radio(self, radio: str) -> str:
+        """A radio with no receivers left, out of Setup and the radio switch: its file renamed
+        <name>.radio.json.removed-<time>, kept for its node settings."""
+        if not radios.NAME_RE.match(radio):
+            raise SeatError(f"{radio!r}: not a radio name")
+        path = self.root / "config" / f"{radio}.radio.json"
+        if not path.exists():
+            raise SeatError(f"no radio file for {radio}")
+        with self._instances_lock():
+            if users := [i.name for i in self.instances() if self.config(i).get("radio") == radio]:
+                raise SeatError(f"{radio} still has {', '.join(users)}: remove them first")
+            if self.feeder_pid(radio) or self.station_pid(radio):
+                raise SeatError(f"{radio}'s feeder or station runs: stop it first")
+            to = path.with_name(f"{path.name}.removed-{utc_stamp()}")
+            os.replace(path, to)
+        return f"{radio}: removed; its radio file stays as config/{to.name}"
 
     # ---- the RBN feeder: the server starts it with its copy and stops it through its link ----
 
@@ -864,11 +1091,14 @@ class Seat:
 
     # ---- radios ----
 
-    def discover(self, seconds: float = DISCOVER_S, address: str | None = None) -> str:
-        """Every back end's radios on the local network (or the one at `address`), each written
+    def discover(self, seconds: float = DISCOVER_S, address: str | None = None,
+                 kind: str | None = None, name: str | None = None) -> str:
+        """The radios of one type on the local network (or the one at `address`), each written
         to its radio file (config/<name>.radio.json; the node settings stay); what was found and
         changed."""
-        return radios.discover(self.root / "config", seconds, address)
+        if name and (who := self.name_taken(name, own=name)):
+            raise SeatError(f"{name} is already used by {who}")
+        return radios.discover(self.root / "config", seconds, address, kind, name)
 
     def set_node(self, radio: str, callsign: str, grid: str, op_name: str) -> str:
         """A radio's node settings as sparkgap.sh setup sets them (radios.set_node); what changed,
@@ -900,7 +1130,7 @@ class Seat:
             "state": "running" if pid else "stopped",
             "pid": pid,
             "band": self.band(i),
-            "radio": self.radio(i),
+            "radio": self.radio(i) or (self.feeder_name(i) if self.radio_file(i) else None),
             "feed_port": port,
             "feed_failed": bool(pid and stats.feed_failed),
             "feed_code": feed.get("join_code") if feed else None,
@@ -917,12 +1147,34 @@ class Seat:
             "started": proc_started(pid) if pid else None,
             "build": self.build(i.code),
             "iq_trimmed": stats.iq_trimmed if pid else None,
+            "receiver_list": self.receiver_list(i, cfg, stats),
             "rec_free_gb": (
                 shutil.disk_usage(self.rec).free // 2**30
                 if cfg.get("record_wav") and self.rec.exists()
                 else None
             ),
         }
+        return out
+
+    @staticmethod
+    def receiver_list(i: Instance, cfg: dict[str, Any], stats: LogStats) -> list[dict[str, Any]] | None:
+        """An HPSDR radio's receivers, <radio>-1 on: one per bands[] entry, in order, with its spots
+        from the log while its band is the one the log started on; None for any other copy."""
+        if cfg.get("sdr_type") != "hpsdr":
+            return None
+        radio, half = cfg.get("radio") or i.name, float(cfg.get("sample_rate", 192_000)) / 2000
+        out = []
+        for n, b in enumerate(cfg.get("bands") or [], 1):
+            band = str(b.get("name") or b.get("center_khz")) if isinstance(b, dict) else str(b)
+            if isinstance(b, dict) and isinstance(b.get("rx_index"), int):  # sparkgap.py honours it
+                n = b["rx_index"] + 1
+            seen = stats.live.get(n - 1)
+            centre = seen[1] if seen and seen[0] == band else None
+            near = (lambda khz, c=centre: abs(khz - c) <= half) if centre is not None else None
+            out.append({"name": f"{radio}-{n}", "receiver": n, "band": band, "centre_khz": centre,
+                        "spots": sum(c for k, c in stats.spot_khz.items() if near(k)) if near else None,
+                        "calls": len({c for k, c in stats.spot_calls if near(k)}) if near else None,
+                        "windows": sum(c for k, c in stats.raw_khz.items() if near(k)) if near else None})
         return out
 
     @staticmethod
@@ -963,7 +1215,7 @@ class Seat:
         return {
             "name": self.feeder_name(i),
             **{k: st.get(k) for k in ("type", "model", "address", "callsign", "grid", "op_name",
-                                      "num_scu", "max_panadapters")},
+                                      "num_scu", "max_panadapters", "board_id", "receivers")},
             "rbn_upload": self.upload_mode(i),
             "rx_settings": list(caps.rx_settings),
         }

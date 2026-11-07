@@ -17,6 +17,7 @@ COPY = """import signal, sys, time
 print("12:00:00 INFO GUI feed on ws://127.0.0.1:7321/feed, join code ABC-DEF", flush=True)
 print("12:00:01 INFO SparkGap LIVE: 40m (7038.400 kHz) rx0, telnet :7300", flush=True)
 print("12:00:02 INFO *** SPOT:   7030.00  K8TLJ         12 dB  20 WPM  [repeat] ***", flush=True)
+print("12:00:03 INFO ITILA raw 7030.0 kHz cost=0.40: 'CQ K8TLJ K8TLJ K'", flush=True)
 signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
 while True:
     time.sleep(0.1)
@@ -354,6 +355,54 @@ def test_a_receive_path_value_of_the_wrong_kind_is_refused(
     assert not any(k.startswith("flex_") for k in _cfg(seat, "dallas1"))
 
 
+def test_an_hpsdr_receiver_shows_under_its_radio_and_gets_no_station(seat: Seat) -> None:
+    i = seat.instance("dallas1")
+    write_config(i.config, {"sdr_type": "hpsdr", "radio": "Web888"})
+    (seat.root / "config" / "Web888.radio.json").write_text(json.dumps(
+        {"type": "hpsdr", "model": "Web-888", "address": "192.0.2.120", "board_id": 6,
+         "receivers": 6, "callsign": "N0CALL-1", "grid": "EM12ub"}))
+    assert seat.radio(i) is None  # no Flex station for it
+    assert seat.status(i)["radio"] == "Web888"
+    snap = seat.snapshot()
+    (r,) = snap["radios"]
+    assert (r["name"], r["model"], r["board_id"], r["receivers"], r["rx_settings"]) == (
+        "Web888", "Web-888", 6, 6, [])
+    assert "192.0.2.120" not in {s["radio"] for s in snap["stations"]}
+
+
+def test_an_hpsdr_radio_lists_one_receiver_per_band_with_its_spots(seat: Seat) -> None:
+    i = seat.instance("dallas1")
+    write_config(i.config, {"sdr_type": "hpsdr", "radio": "Web888", "sample_rate": 192_000,
+                            "bands": ["40m", "20m"]})
+    assert [r["name"] for r in seat.status(i)["receiver_list"]] == ["Web888-1", "Web888-2"]
+    seat.start("dallas1")  # its log: 40m live on rx0 at 7038.4 kHz, one spot at 7030.0
+    r1, r2 = seat.status(i)["receiver_list"]
+    assert (r1["receiver"], r1["band"], r1["centre_khz"], r1["spots"]) == (1, "40m", 7038.4, 1)
+    assert (r1["calls"], r1["windows"]) == (1, 1)  # its calls and decoded windows, from the log
+    assert (r2["receiver"], r2["band"], r2["centre_khz"], r2["spots"], r2["windows"]) == (
+        2, "20m", None, None, None)
+    assert seat.status(seat.instance("dallas2"))["receiver_list"] is None  # a Flex copy
+
+
+def test_an_hpsdr_receiver_moves_band_alone(seat: Seat) -> None:
+    i = seat.instance("dallas1")
+    write_config(i.config, {"sdr_type": "hpsdr", "radio": "Web888", "bands": ["40m", "20m"]})
+    assert "rx_bands" in seat.change("dallas1", {"rx_bands": {"2": "17m"}})
+    assert _cfg(seat, "dallas1")["bands"] == ["40m", "17m"]
+    for value, error in (({"3": "17m"}, "receivers 1 to 2"), ({"2": "40m"}, "two receivers on one band"),
+                         ({"1": "6m"}, "band must be one of"), ({}, "receiver number: band"),
+                         ({"x": "17m"}, "receivers 1 to 2")):
+        with pytest.raises(SeatError, match=error):
+            seat.change("dallas1", {"rx_bands": value})
+    assert _cfg(seat, "dallas1")["bands"] == ["40m", "17m"]
+    with pytest.raises(SeatError, match="only an HPSDR radio's receivers"):
+        seat.change("dallas2", {"rx_bands": {"1": "20m"}})
+    seat.start("dallas1")
+    pid = seat.pid("dallas1")
+    assert "dallas1: live" in seat.change("dallas1", {"rx_bands": {"1": "20m"}})  # all its receivers restart
+    assert seat.pid("dallas1") not in (None, pid) and _cfg(seat, "dallas1")["bands"] == ["20m", "17m"]
+
+
 def test_a_flex_station_is_named_by_its_radio(seat: Seat) -> None:
     """radio (the nickname Discover found) names the station; without it, sdr_ip."""
     i = seat.instance("dallas1")
@@ -375,6 +424,131 @@ def with_radio(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> Seat:
                 "gui_feed": {"bind": "127.0.0.1", "port": 7321}}
     (seat.root / "code" / "skimmer_flex.example.json").write_text(json.dumps(template))
     return seat
+
+
+def with_hpsdr(seat: Seat, monkeypatch: pytest.MonkeyPatch, receivers: int = 2) -> Seat:
+    """The seat with a Web-888 radio file and the shipped HPSDR defaults."""
+    with_radio(seat, monkeypatch)
+    radio = {"type": "hpsdr", "model": "Web-888", "address": "192.0.2.120", "board_id": 6,
+             "firmware": 73, "receivers": receivers, "callsign": "N0CALL-1", "grid": "EM12ub"}
+    (seat.root / "config" / "Web888.radio.json").write_text(json.dumps(radio))
+    template = {"sdr_type": "hpsdr", "sdr_ip": "192.0.2.10", "callsign": "N0CALL", "sample_rate": 192_000,
+                "max_receivers": 6, "hpsdr_listen_port": 1024, "ppm_offset": 0.0, "telnet_port": 7330,
+                "bands": ["20m"], "gui_feed": {"bind": "127.0.0.1", "port": 7321}}
+    (seat.root / "code" / "skimmer_hpsdr.example.json").write_text(json.dumps(template))
+    return seat
+
+
+def test_an_hpsdr_radio_s_first_receiver_makes_its_process(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch)
+    assert s.add("Web888-1", "20m").startswith("Web888-1: added, 20m; Web888 runs it")
+    cfg = _cfg(s, "Web888")
+    assert (cfg["radio"], cfg["sdr_type"], cfg["bands"], cfg["max_receivers"]) == ("Web888", "hpsdr", ["20m"], 2)
+    assert (cfg["ppm_offset"], cfg["hpsdr_listen_port"], cfg["telnet_port"]) == (3.9, 1024, 7330)
+    assert not {"callsign", "grid", "sdr_ip"} & set(cfg) and cfg["gui_feed"]["port"] == "auto"
+    assert s.instance("Web888").config.name == "Web888.local.json"
+    assert s.process_name("Web888-1") == "Web888" and s.process_name("dallas1") == "dallas1"
+    assert s.add("Web888-2", "17m") == "Web888-2: added, 17m; used at Web888's next start"
+    assert _cfg(s, "Web888")["bands"] == ["20m", "17m"]
+    for name, band, error in (("Web888-3", "40m", "receivers 1 to 2"), ("Web888-5", "40m", "next receiver"),
+                              ("Web888-2", "20m", "next receiver")):
+        with pytest.raises(SeatError, match=error):
+            s.add(name, band)
+
+
+def test_an_hpsdr_receiver_added_to_a_running_radio_restarts_it(
+        seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch, receivers=6)
+    s.add("Web888-1", "20m")
+    s.start("Web888")
+    pid = s.pid("Web888")
+    with pytest.raises(SeatError, match="already has a receiver on 20m"):
+        s.add("Web888-2", "20m")
+    assert "Web888: live" in s.add("Web888-2", "17m")
+    assert s.pid("Web888") not in (None, pid)
+
+
+def test_an_hpsdr_receiver_is_removed_and_the_later_ones_move_up(
+        seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch, receivers=6)
+    for n, band in enumerate(("20m", "17m", "40m"), 1):
+        s.add(f"Web888-{n}", band)
+    with pytest.raises(SeatError, match="receivers 1 to 3"):
+        s.remove("Web888-4")
+    assert s.remove("Web888-2") == "Web888-2: removed (17m); Web888-3 to -3 are now Web888-2 to -2"
+    assert _cfg(s, "Web888")["bands"] == ["20m", "40m"]
+    s.start("Web888")
+    pid = s.pid("Web888")
+    assert "Web888: live" in s.remove("Web888-2")  # a running radio restarts with the rest
+    assert s.pid("Web888") not in (None, pid) and _cfg(s, "Web888")["bands"] == ["20m"]
+    with pytest.raises(SeatError, match="running; stop it first"):
+        s.remove("Web888-1")  # the last one takes the process: stopped first
+    s.stop("Web888")
+    assert s.remove("Web888-1").startswith("Web888-1: removed, Web888's last receiver")
+    assert all(i.name != "Web888" for i in s.instances()) and (s.root / "config" / "Web888.local.json").exists()
+
+
+def test_a_radio_with_no_receivers_is_removed(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch)
+    s.add("Web888-1", "20m")
+    with pytest.raises(SeatError, match="still has Web888: remove them first"):
+        s.remove_radio("Web888")
+    s.remove("Web888-1")
+    for radio, error in (("../x", "not a radio name"), ("Nope", "no radio file")):
+        with pytest.raises(SeatError, match=error):
+            s.remove_radio(radio)
+    assert s.remove_radio("Web888").startswith("Web888: removed; its radio file stays as config/Web888.radio.json.removed-")
+    assert not (s.root / "config" / "Web888.radio.json").exists()
+    assert [p.name for p in (s.root / "config").glob("Web888.radio.json.removed-*")]
+
+
+def test_an_hpsdr_radio_never_takes_a_receiver_s_name(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch)
+    clash = {"type": "hpsdr", "address": "192.0.2.122", "callsign": "N0CALL-8", "grid": "EM12ub"}
+    (s.root / "config" / "dallas1.radio.json").write_text(json.dumps(clash))
+    with pytest.raises(SeatError, match="dallas1 is already a receiver's name"):
+        s.add("dallas1-1", "20m")
+    s.add("Dallas-1", "40m")  # a Flex receiver <radio>-<n>
+    with pytest.raises(SeatError, match="already used by Dallas-1"):
+        s.discover(name="Dallas")
+    (s.root / "config" / "Dallas.radio.json").write_text(json.dumps({**clash, "address": "192.0.2.123"}))
+    with pytest.raises(SeatError, match="would share names with Dallas-1"):
+        s.add("Dallas-1", "20m")  # Dallas is now an HPSDR radio file: its process would be Dallas
+
+
+def test_a_second_hpsdr_radio_gets_its_own_listen_port(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch)
+    s.add("Web888-1", "20m")
+    pitaya = {"type": "hpsdr", "model": "HPSDR board 1", "address": "192.0.2.121", "receivers": 8,
+              "callsign": "N0CALL-7", "grid": "EM12ub"}
+    (s.root / "config" / "Pitaya.radio.json").write_text(json.dumps(pitaya))
+    s.add("Pitaya-1", "40m")
+    cfg = _cfg(s, "Pitaya")
+    assert (cfg["hpsdr_listen_port"], cfg["telnet_port"], cfg["ppm_offset"]) == (1025, 7331, 0.0)
+
+
+def test_an_hpsdr_radio_is_renamed_while_stopped(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = with_hpsdr(seat, monkeypatch)
+    s.add("Web888-1", "20m")
+    s.start("Web888")
+    with pytest.raises(SeatError, match="stop Web888 first"):
+        s.rename_radio("Web888", "Pitaya")
+    s.stop("Web888")
+    for new, error in (("Dallas", "another radio's name"), ("Pit-2", "names a receiver"), ("../x", "letters")):
+        (s.root / "config" / "Dallas.radio.json").touch()
+        with pytest.raises(SeatError, match=error):
+            s.rename_radio("Web888", new)
+    with pytest.raises(SeatError, match="takes its name from the radio"):
+        s.rename_radio("Dallas", "Shack")
+    with pytest.raises(SeatError, match="not a radio name"):
+        s.rename_radio("../../x", "Shack")  # never a file outside config/
+    with pytest.raises(SeatError, match="already used by dallas1"):
+        s.rename_radio("Web888", "dallas1")  # a receiver's name
+    assert s.rename_radio("Web888", "Lakeside").startswith("Web888 renamed Lakeside")
+    assert not (s.root / "config" / "Web888.radio.json").exists()
+    assert json.loads((s.root / "config" / "Lakeside.radio.json").read_text())["nickname"] == "Lakeside"
+    assert _cfg(s, "Lakeside")["radio"] == "Lakeside" and s.instance("Lakeside").config.name == "Lakeside.local.json"
+    assert [r["name"] for r in s.status(s.instance("Lakeside"))["receiver_list"]] == ["Lakeside-1"]
 
 
 @pytest.fixture
