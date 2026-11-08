@@ -7709,8 +7709,8 @@ class SparkGap:
         except (OSError, ValueError):
             log.warning("ppm_offset_file %s: no number in it; ppm_offset stays %+.3f", path, self.ppm_offset)
             return
-        if abs(ppm) > self.PPM_FILE_MAX:
-            log.warning("ppm_offset_file %s: %+.3f ppm is past %.0f; ppm_offset stays %+.3f",
+        if not np.isfinite(ppm) or abs(ppm) > self.PPM_FILE_MAX:        # nan passes a range test
+            log.warning("ppm_offset_file %s: %+.3f ppm is not finite or past %.0f; ppm_offset stays %+.3f",
                         path, ppm, self.PPM_FILE_MAX, self.ppm_offset)
             return
         if ppm != self.ppm_offset:

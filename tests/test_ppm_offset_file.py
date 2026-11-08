@@ -30,7 +30,7 @@ def test_missing_garbled_or_wild_file_leaves_the_offset(tmp_path) -> None:
     sg, _ = _sg(tmp_path)                    # no file
     sg._read_ppm_file()
     assert sg.ppm_offset == 0.5
-    for text in ("", "abc\n", "123\n"):      # empty, not a number, past PPM_FILE_MAX
+    for text in ("", "abc\n", "123\n", "nan\n", "inf\n"):   # empty, not a number, past PPM_FILE_MAX, not finite
         sg, _ = _sg(tmp_path, text)
         sg._read_ppm_file()
         assert sg.ppm_offset == 0.5, text
