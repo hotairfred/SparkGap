@@ -9,7 +9,10 @@ big-endian; radiod gives the payload type a dynamic number, so the encoding come
 RtpReceiver is a drop-in for hpsdr_receiver.HPSDRReceiver and flex_iq.FlexIQReceiver: start(), then
 receive(callback) calls callback(rx_index, iq) per packet with iq an (n, 2) float64 array at 1.0
 full scale.  A packet lost in transit (an RTP sequence gap) is filled with zeros up to MAX_FILL_S,
-so a band's time line stays whole; a late or repeated packet is dropped.
+so a band's time line stays whole; a late or repeated packet is dropped.  A stream that starts over
+(radiod restarted: its sequence and timestamp jump) is followed at once.  The first packets of each
+channel are checked against rtp_encoding (bytes per sample frame) and, after RATE_CHECK_S, against
+sample_rate (timestamp frames per second); a channel that stops for STALL_S is logged.
 """
 
 import ipaddress
@@ -26,6 +29,10 @@ log = logging.getLogger("sparkgap")
 ENCODINGS = ("f32le", "s16be")
 MAX_FILL_S = 0.5      # a sequence gap longer than this is a restart, not filled
 RCVBUF = 8 << 20
+FRAME_BYTES = {"f32le": 8, "s16be": 4}
+RESYNC_LATE = 50      # this many late packets in a row: the stream started over, follow it
+RATE_CHECK_S = 10.0   # wall-clock seconds of a channel before its timestamp rate is checked
+STALL_S = 10.0        # a channel silent this long mid-run is logged
 
 
 def parse_rtp(pkt: bytes):
@@ -112,13 +119,26 @@ class RtpReceiver:
         self.late = 0          # packets out of order or repeated, dropped
         self.other = 0         # packets for an SSRC no band has
         self.last_packet = None
+        self.resyncs = 0       # streams that started over (radiod restarted)
         self._seq = {}         # SSRC -> last sequence number
         self._ts = {}          # SSRC -> timestamp after the last packet's samples
+        self._late_run = {}    # SSRC -> late packets in a row
+        self._first = {}       # SSRC -> (wall time, timestamp, frames since) for the rate check
+        self._seen = {}        # SSRC -> wall time of its last packet
+        self._checked = set()  # SSRCs whose rate is checked
+        self._stalled = set()  # SSRCs logged as silent
 
     # -- tuning: radiod's config sets the channels; this only says which SSRC is which band --
     def set_frequency(self, rx_index, freq_hz):
         self.frequencies[rx_index] = freq_hz
-        self._by_ssrc = {self._fixed_ssrc.get(k, ssrc_for(f)): k for k, f in self.frequencies.items()}
+        self._by_ssrc = {}
+        for k, f in sorted(self.frequencies.items()):
+            ssrc = self._fixed_ssrc.get(k, ssrc_for(f))
+            if ssrc in self._by_ssrc:
+                log.warning("RTP: bands %d and %d both map to SSRC %d (%.0f and %.0f Hz): band %d gets "
+                            "none; give radiod's channels distinct kHz or set rtp_ssrcs", self._by_ssrc[ssrc], k,
+                            ssrc, self.frequencies[self._by_ssrc[ssrc]], f, self._by_ssrc[ssrc])
+            self._by_ssrc[ssrc] = k
 
     def retune(self, freq_hz):
         """One band: follow a channel at another frequency (radiod must carry it)."""
@@ -147,11 +167,26 @@ class RtpReceiver:
                         got // 1024, RCVBUF // 1024)
         if ipaddress.ip_address(addr).is_multicast:
             s.bind((addr, self.port))
-            local = socket.inet_aton(socket.gethostbyname(self.iface) if self.iface else "0.0.0.0")
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(addr) + local)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, self._membership(addr))
         else:
             s.bind((addr, self.port))          # unicast: a sender pointed at this address
         return s
+
+    def _membership(self, addr):
+        """IP_ADD_MEMBERSHIP for the group on rtp_iface: an address, a host name, or an interface name
+        (eth0, lo), joined by index (Linux ip_mreqn)."""
+        group = socket.inet_aton(addr)
+        if not self.iface:
+            return group + socket.inet_aton("0.0.0.0")
+        try:
+            return group + socket.inet_aton(str(ipaddress.ip_address(self.iface)))
+        except ValueError:
+            pass
+        try:
+            idx = socket.if_nametoindex(self.iface)
+        except OSError:
+            return group + socket.inet_aton(socket.gethostbyname(self.iface))
+        return struct.pack("=4s4si", group, socket.inet_aton("0.0.0.0"), idx)
 
     def start(self):
         if self.sock is None:
@@ -166,15 +201,15 @@ class RtpReceiver:
     def close(self):
         self._running = False
         if self.packets or self.other:
-            log.info("RTP: %d packets, %d lost (filled), %d late (dropped), %d for other SSRCs",
-                     self.packets, self.lost, self.late, self.other)
+            log.info("RTP: %d packets, %d lost (filled), %d late (dropped), %d for other SSRCs, %d restarts",
+                     self.packets, self.lost, self.late, self.other, self.resyncs)
         if self.sock is not None:
             self.sock.close()
             self.sock = None
 
     def health(self):
         return {"packets": self.packets, "lost": self.lost, "late": self.late, "other": self.other,
-                "last_packet": self.last_packet}
+                "resyncs": self.resyncs, "last_packet": self.last_packet}
 
     # -- receive --
     def handle(self, pkt, callback):
@@ -188,29 +223,89 @@ class RtpReceiver:
             self.other += 1
             return
         iq = decode(payload, self.encoding)
+        now = time.time()
         last = self._seq.get(ssrc)
         if last is not None:
             d = (seq - last) & 0xFFFF
+            jump = (ts - self._ts[ssrc]) & 0xFFFFFFFF
+            jump = min(jump, 0x100000000 - jump)         # timestamp distance either way
             if d == 0 or d >= 0x8000:              # a repeat, or older than the last one
-                self.late += 1
-                return
-            if d > 1:
+                run = self._late_run.get(ssrc, 0) + 1
+                if jump <= MAX_FILL_S * self.sample_rate and run < RESYNC_LATE:
+                    self._late_run[ssrc] = run
+                    self.late += 1
+                    return
+                self._restart(ssrc, rx, "sequence and timestamp jumped back" if run < RESYNC_LATE
+                              else f"{run} late packets in a row")
+            elif d > 1:
                 self.lost += d - 1
                 missing = (ts - self._ts[ssrc]) & 0xFFFFFFFF
                 if 0 < missing <= MAX_FILL_S * self.sample_rate:
                     callback(rx, np.zeros((missing, 2)))
+        self._late_run[ssrc] = 0
+        self._check(ssrc, rx, ts, len(payload), last is not None and d == 1, now)
         self._seq[ssrc] = seq
         self._ts[ssrc] = (ts + len(iq)) & 0xFFFFFFFF
         self.packets += 1
-        self.last_packet = time.time()
+        self.last_packet = now
+        self._seen[ssrc] = now
+        if ssrc in self._stalled:
+            self._stalled.discard(ssrc)
+            log.info("RTP: band %d (SSRC %d) packets again", rx, ssrc)
         if len(iq):
             callback(rx, iq)
+
+    def _restart(self, ssrc, rx, why):
+        """The stream started over: forget its sequence, timestamp and rate check."""
+        self.resyncs += 1
+        log.warning("RTP: band %d (SSRC %d) started over (%s): following the new stream", rx, ssrc, why)
+        self._first.pop(ssrc, None)
+        self._checked.discard(ssrc)
+
+    def _check(self, ssrc, rx, ts, nbytes, consecutive, now):
+        """Once per stream: bytes per sample frame against rtp_encoding (the timestamp step between two
+        consecutive packets), then the timestamp rate against sample_rate over RATE_CHECK_S."""
+        if ssrc in self._checked:
+            return
+        st = self._first.get(ssrc)
+        if st is None or now - st[4] > 1.0:                  # new, or after a pause: the rate restarts
+            self._first[ssrc] = [now, ts, ts, st[3] if st else False, now]   # wall start, first ts, last ts,
+            return                                                           # encoding checked, last wall
+        t0, ts0, prev, enc_ok, _ = st
+        st[2], st[4] = ts, now
+        step = (ts - prev) & 0xFFFFFFFF
+        if not enc_ok and consecutive and 0 < step < 1 << 16:
+            st[3] = True
+            if step * FRAME_BYTES[self.encoding] != nbytes:
+                per = nbytes / step
+                guess = {8: "f32le", 4: "s16be"}.get(round(per))
+                log.error("RTP: band %d (SSRC %d) packets carry %.1f bytes per sample frame, not %d for "
+                          "rtp_encoding %s%s: its IQ is garbage until the config matches radiod's", rx, ssrc,
+                          per, FRAME_BYTES[self.encoding], self.encoding,
+                          f" (looks like {guess})" if guess else "")
+                self._checked.add(ssrc)
+                return
+        if now - t0 >= RATE_CHECK_S:
+            self._checked.add(ssrc)
+            rate = ((ts - ts0) & 0xFFFFFFFF) / (now - t0)
+            if abs(rate / self.sample_rate - 1.0) > 0.15:     # a wrong samprate is off by 2x or more
+                log.error("RTP: band %d (SSRC %d) runs at about %.0f samples/s, not sample_rate %d: set "
+                          "radiod's samprate or SparkGap's sample_rate so they match (frequencies are wrong "
+                          "until then)", rx, ssrc, rate, self.sample_rate)
+
+    def _stalls(self, now):
+        for ssrc, t in self._seen.items():
+            if ssrc not in self._stalled and now - t > STALL_S:
+                self._stalled.add(ssrc)
+                log.warning("RTP: band %d (SSRC %d) no packets for %.0f s", self._by_ssrc.get(ssrc, -1), ssrc,
+                            now - t)
 
     def receive(self, callback, duration=None):
         """Receive until stop() or duration seconds; callback(rx_index, iq) per packet."""
         if self.sock is None:
             self.start()
         start, warned = time.time(), False
+        self._last_stall_check = start
         while self._running:
             if duration and time.time() - start >= duration:
                 break
@@ -219,6 +314,10 @@ class RtpReceiver:
                 log.warning("RTP: no packets for SSRCs %s on %s:%d after 10 s (%d for others): check "
                             "radiod's channel frequencies, the group and the interface",
                             sorted(self._by_ssrc), self.group, self.port, self.other)
+            now = time.time()
+            if now - self._last_stall_check >= 1.0:
+                self._last_stall_check = now
+                self._stalls(now)
             sock = self.sock
             try:
                 if sock is None or not select.select([sock], [], [], 0.2)[0]:

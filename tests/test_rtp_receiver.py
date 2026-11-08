@@ -106,3 +106,84 @@ def test_group_names_hash_as_radiod_does() -> None:
         a = radiod_maddr(name)
         assert a.startswith("239.") and a == radiod_maddr(name)
     assert radiod_maddr("pcm.local") != radiod_maddr("hf-status.local")
+
+
+def test_restarted_stream_is_followed() -> None:
+    """radiod restarted: sequence and timestamp start over; the next packet is taken, not dropped as late."""
+    rx, got = _receiver(), []
+    cb = lambda r, x: got.append(len(x))
+    for k in range(5):
+        rx.handle(rtp_packet(111, 30000 + k, 50_000_000 + 180 * k, 14090, encode(_iq(180, k), "f32le")), cb)
+    rx.handle(rtp_packet(111, 0, 0, 14090, encode(_iq(180, 9), "f32le")), cb)
+    rx.handle(rtp_packet(111, 1, 180, 14090, encode(_iq(180, 10), "f32le")), cb)
+    assert got == [180] * 7 and rx.late == 0 and rx.resyncs == 1 and rx.lost == 0
+
+
+def test_late_run_resyncs() -> None:
+    """A run of RESYNC_LATE packets that all look late (sequence restarted, timestamp near) is followed."""
+    import rtp_receiver as R
+    rx, got = _receiver(), []
+    rx.handle(rtp_packet(111, 100, 1000, 14090, encode(_iq(180), "f32le")), lambda r, x: got.append(x))
+    for k in range(R.RESYNC_LATE + 3):
+        rx.handle(rtp_packet(111, k, 1000 + 180 * k, 14090, encode(_iq(180, k), "f32le")), lambda r, x: got.append(x))
+    assert rx.resyncs == 1 and rx.late == R.RESYNC_LATE - 1 and len(got) == 1 + 4
+
+
+def test_wrong_encoding_is_reported(caplog) -> None:
+    """s16be packets (360 frames in 1440 bytes) read as f32le: logged once as an error naming the fix."""
+    rx = _receiver(encoding="f32le")
+    for k in range(3):
+        rx.handle(rtp_packet(112, k, 360 * k, 14090, encode(_iq(360, k), "s16be")), lambda r, x: None)
+    errs = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errs) == 1 and "looks like s16be" in errs[0].getMessage()
+
+
+def test_wrong_rate_is_reported(caplog, monkeypatch) -> None:
+    import rtp_receiver as R
+    rx, clock = _receiver(), [1000.0]
+    monkeypatch.setattr(R.time, "time", lambda: clock[0])
+    for k in range(int(R.RATE_CHECK_S * 48000 / 180) + 2):     # radiod at 48 kHz, SparkGap set to 192 kHz
+        clock[0] = 1000.0 + k * 180 / 48000
+        rx.handle(rtp_packet(111, k, 180 * k, 14090, encode(_iq(180, k), "f32le")), lambda r, x: None)
+    errs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errs) == 1 and "48000 samples/s" in errs[0]
+
+
+def test_right_stream_logs_no_error(caplog, monkeypatch) -> None:
+    import rtp_receiver as R
+    rx, clock = _receiver(), [1000.0]
+    monkeypatch.setattr(R.time, "time", lambda: clock[0])
+    for k in range(int(R.RATE_CHECK_S * 192000 / 180) + 2):
+        clock[0] = 1000.0 + k * 180 / 192000
+        rx.handle(rtp_packet(111, k, 180 * k, 14090, encode(_iq(180, k), "f32le")), lambda r, x: None)
+    assert not [r for r in caplog.records if r.levelname in ("ERROR", "WARNING")]
+
+
+def test_stall_is_logged_and_recovery(caplog, monkeypatch) -> None:
+    import rtp_receiver as R
+    caplog.set_level("INFO", logger="sparkgap")
+    rx, clock = _receiver(), [1000.0]
+    monkeypatch.setattr(R.time, "time", lambda: clock[0])
+    rx.handle(rtp_packet(111, 0, 0, 14090, encode(_iq(180), "f32le")), lambda r, x: None)
+    clock[0] += R.STALL_S + 1
+    rx._stalls(clock[0])
+    rx._stalls(clock[0] + 5)                                    # once per stall
+    rx.handle(rtp_packet(111, 1, 180, 14090, encode(_iq(180), "f32le")), lambda r, x: None)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("no packets" in m for m in msgs) == 1 and any("packets again" in m for m in msgs)
+
+
+def test_two_bands_on_one_ssrc_warn(caplog) -> None:
+    rx = RtpReceiver("127.0.0.1", port=0)
+    rx.set_frequency(0, 14_090_200)
+    rx.set_frequency(1, 14_089_900)
+    assert any("both map to SSRC 14090" in r.getMessage() for r in caplog.records)
+
+
+def test_iface_by_name() -> None:
+    """rtp_iface may name an interface (lo) as well as give an address."""
+    import struct
+    rx = RtpReceiver("239.1.2.3", iface="lo")
+    m = rx._membership("239.1.2.3")
+    assert len(m) == 12 and struct.unpack("=4s4si", m)[2] == socket.if_nametoindex("lo")
+    assert RtpReceiver("239.1.2.3", iface="127.0.0.1")._membership("239.1.2.3")[4:] == socket.inet_aton("127.0.0.1")
