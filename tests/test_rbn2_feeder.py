@@ -2,6 +2,7 @@
 posts on the upload tick, and the sign-in."""
 
 import ctypes
+import json
 import os
 import queue
 import signal
@@ -557,3 +558,18 @@ def test_rtty_seat_sends_its_ranges_as_rtty_too(monkeypatch: pytest.MonkeyPatch)
     assert body["bandLimits"] == body["cWBandLimits"] == body["rTTYBandLimits"] == "7000.0-7096.0"
     assert body["mIXEDBandLimits"] == ""
     assert f.seat_settings({"rbn_upload": "dry", "callsign": "N0CALL", "grid": "AA00", "enable_rtty": True}).rtty
+
+
+def test_rtty_follows_enable_rtty_on_both_paths(tmp_path) -> None:
+    """enable_rtty is on unless false, as in sparkgap.py; a server node (--radio) sends RTTY ranges
+    when any of its receivers spots RTTY."""
+    seat = {"rbn_upload": "dry", "callsign": "N0CALL", "grid": "AA00"}
+    assert f.seat_settings(seat).rtty
+    assert not f.seat_settings({**seat, "enable_rtty": False}).rtty
+    (tmp_path / "a.local.json").write_text(json.dumps({"telnet_port": 7310, "enable_rtty": False}))
+    (tmp_path / "b.local.json").write_text(json.dumps({"telnet_port": 7311}))
+    a, b = f.receiver_settings(tmp_path, "a"), f.receiver_settings(tmp_path, "b")
+    assert not a.rtty and b.rtty
+    radio = {"rbn_upload": "dry", "callsign": "N0CALL", "grid": "AA00"}
+    assert not f.node_settings(radio, [a]).rtty
+    assert f.node_settings(radio, [a, b]).rtty

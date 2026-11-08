@@ -161,7 +161,7 @@ class Seat:
     host: str
     port: int
     mode: str  # "dry" or "live"
-    rtty: bool = False  # enable_rtty: the seat spots RTTY too, so its ranges go in rTTYBandLimits
+    rtty: bool = True  # enable_rtty (on unless false, as in sparkgap.py): its ranges go in rTTYBandLimits too
 
 
 def spotter_id(cfg: dict[str, Any]) -> str:
@@ -187,7 +187,7 @@ def seat_settings(cfg: dict[str, Any]) -> Seat:
         host=cfg.get("telnet_host") or "127.0.0.1",
         port=int(cfg.get("telnet_port", 7300)),
         mode=mode,
-        rtty=bool(cfg.get("enable_rtty", False)),
+        rtty=bool(cfg.get("enable_rtty", True)),
     )
 
 
@@ -206,6 +206,7 @@ class Receiver:
     port: int
     respot_s: float
     validation: str
+    rtty: bool = True  # enable_rtty, on unless false as in sparkgap.py
 
 
 def receiver_settings(config_dir: Path, name: str) -> Receiver:
@@ -220,7 +221,8 @@ def receiver_settings(config_dir: Path, name: str) -> Receiver:
         respot = RESPOT_S
     if not math.isfinite(respot) or respot <= 0:
         respot = RESPOT_S
-    return Receiver(name, int(cfg.get("telnet_port", 7300)), respot, validation_of(cfg))
+    return Receiver(name, int(cfg.get("telnet_port", 7300)), respot, validation_of(cfg),
+                    bool(cfg.get("enable_rtty", True)))
 
 
 def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
@@ -236,7 +238,8 @@ def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
         raise ValueError("no receiver to feed from")
     level = min((r.validation for r in receivers), key=VALIDATION_ORDER.index)
     return Seat(call=call, grid=grid, name=radio.get("op_name") or "", qth=radio.get("qth") or "",
-                validation=level, host="127.0.0.1", port=receivers[0].port, mode=mode)
+                validation=level, host="127.0.0.1", port=receivers[0].port, mode=mode,
+                rtty=any(r.rtty for r in receivers))
 
 
 class Respot:
