@@ -559,9 +559,11 @@ def test_lockon_with_cq_groups_counts_each_group() -> None:
 def test_sparkgap_runs_lockon_cq_groups_and_qualifiers() -> None:
     import sparkgap
     tracker = sparkgap.SpotTracker(set(SCP), set())
-    for cfg, split in (({}, False), ({"spot_rule_split_runs": True, "spot_rule_lockon": False}, True)):
+    for cfg in ({}, {"spot_rule_split_runs": False, "spot_rule_lockon": False}):   # built in: keys not read
         rule = sparkgap._make_spot_rule(cfg, tracker)
-        assert (rule.lockon, rule.cq_groups, rule.cq_qualifiers, rule.split_runs) == (True, True, True, split)
+        assert (rule.lockon, rule.cq_groups, rule.cq_qualifiers, rule.split_runs) == (True, True, True, True)
+        assert (rule.runner_signs, rule.window_join, rule.takeover_idle_s) == (True, True, 180.0)
+        assert not rule.owner_listed                    # no known-call list
 
 
 def test_two_band_runner_is_not_respotted_at_each_switch() -> None:

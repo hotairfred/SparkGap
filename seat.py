@@ -60,18 +60,15 @@ VALIDATION = ("off", "permissive", "normal", "aggressive")
 CALL_SOURCES = ("scp", "rbn", "rbn+skcc")
 DISCOVER_S = radios.DISCOVER_S
 RBN_MODES = ("off", "dry", "live")  # rbn_upload: dry logs what it would post, live posts
-# decoder options by config key: on/off ones, and ones with a few values (None: off, key removed)
+# decoder options by config key: on/off ones, and ones with a few values (None: off, key removed).
+# split runs, runner signs, window join, owner listed and the takeover are built in (cdub89/SparkGap#46)
 OPTION_FLAGS = (
-    "spot_rule_split_runs",
     "spot_rule_contest_words",
     "spot_rule_cq_repeats",
     "spot_rule_doubled_calls",
     "spot_rule_split_up",
-    "spot_rule_runner_signs",
-    "spot_rule_window_join",
     "spot_rule_owner_cell",
     "spot_rule_owned_two_windows",
-    "spot_rule_owner_listed",
     "spot_rule_la1d",
     "spot_rule_gluek",
     "spot_rule_norival",
@@ -81,7 +78,6 @@ OPTION_FLAGS = (
 )
 OPTION_CHOICES: dict[str, tuple[Any, ...]] = {
     "spot_rule_fragments": (None, "any", "any,stray", "even", "even,stray"),
-    "spot_rule_takeover_idle_s": (None, 120, 180, 300),
     "spot_rule_strongest_db": (None, 3, 6, 10),
     "itila_window_sec": (60, 30, 15, 7.5),
 }

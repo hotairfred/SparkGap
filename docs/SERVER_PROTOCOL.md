@@ -53,7 +53,6 @@ one address lock it out for 10 minutes (close 4429).
                 "feed_port": 7321, "feed_web": true, "telnet_port": 7331,
                 "settings": {"band": "17m", "bands_known": ["160m", "80m"],
                              "validation": "normal", "call_source": "rbn+skcc",
-                             "spot_rule_split_runs": false,
                              "spot_rule_contest_words": false,
                              "spot_rule_cq_repeats": false, "record": false},
                 "spots": 12, "top_calls": [["K8TLJ", 3]], "errors": 0,
@@ -134,14 +133,13 @@ connected`).
   knows), `validation` (`off`, `permissive`, `normal`, `aggressive`),
   `call_source` (`scp`, `rbn`, `rbn+skcc`), `afc` (true or false, written as
   `itila2_afc`), `record` (true or false; recording on needs 5 GB free in
-  `rec/`), the on/off decoder options `spot_rule_split_runs`,
+  `rec/`), the on/off decoder options
   `spot_rule_contest_words`, `spot_rule_cq_repeats`, `spot_rule_doubled_calls`,
-  `spot_rule_split_up`, `spot_rule_runner_signs`, `spot_rule_window_join`,
-  `spot_rule_owner_cell`, `spot_rule_owned_two_windows`,
-  `spot_rule_owner_listed`, `spot_rule_la1d`, `spot_rule_gluek`,
+  `spot_rule_split_up`, `spot_rule_owner_cell`, `spot_rule_owned_two_windows`,
+  `spot_rule_la1d`, `spot_rule_gluek`,
   `spot_rule_norival` and `itila2_snr_decoder`, and `spot_rule_fragments`
-  (`any`, `any,stray`, `even`, `even,stray`), `spot_rule_takeover_idle_s`
-  (120, 180, 300) and `spot_rule_strongest_db` (3, 6, 10), where null is off
+  (`any`, `any,stray`, `even`, `even,stray`) and `spot_rule_strongest_db`
+  (3, 6, 10), where null is off
   and removes the key, and `itila_window_sec` (60, 30, 15, 7.5). Anything
   else is refused and nothing is written.
 - A running copy given the band alone is changed live: the server writes the
