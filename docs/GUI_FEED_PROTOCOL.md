@@ -80,6 +80,7 @@ Who this SparkGap is and the settings it runs with.
 {"type": "hello", "v": 1, "host": "shack-pc", "build": "06e710d",
  "call": "W1AW", "decoder": "itila2",
  "config": {"callsign": "W1AW", "cw_decoder": "itila2", "itila2_afc": false,
+            "itila2_tone_lock_hz": null,
             "sample_rate": 96000, "flex_daxiq_channel": 2,
             "telnet_port": 7300, "enable_ft8": false,
             "spot_rule": "repeat", "spot_rule_cq_groups": true,
@@ -109,7 +110,8 @@ Who this SparkGap is and the settings it runs with.
   checkout.
 - `config`: settings in effect, including defaults SparkGap applied.
   `flex_daxiq_channel` is `null` off a Flex; `rbn_known_days` is `null` unless
-  the known calls come from RBN.
+  the known calls come from RBN; `itila2_tone_lock_hz` is the gate in hertz, `null` when
+  the tone lock is off.
 - `config_defaults`: keys of `config` not set in the config file.
 - `config_built_in`: keys that follow from another setting (the repeat rule)
   rather than being set on their own.
