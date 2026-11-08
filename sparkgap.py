@@ -7897,7 +7897,9 @@ class SparkGap:
 
         sdr_ip = self.cfg.get('sdr_ip')
         radio_name = self.cfg.get('sdr_type') == 'flex' and self.cfg.get('radio')
-        if radio_name:   # the radio file (Discover): its address, and its serial if it moves
+        if self.cfg.get('sdr_type') == 'rtp':       # radiod's channels: no radio to find
+            device_ip = None
+        elif radio_name:   # the radio file (Discover): its address, and its serial if it moves
             device_ip = flex_iq.bind_radio(flex_iq.radio_path(os.path.dirname(_config_path or '.'), radio_name))
             log.info("Flex radio %s at %s (its radio file)", radio_name, device_ip)
         elif sdr_ip:
@@ -7913,7 +7915,23 @@ class SparkGap:
 
         n_bands = len(self._band_meta)
 
-        if sdr_type == 'flex':
+        if sdr_type == 'rtp':
+            # ka9q-radio radiod channels over RTP, one per band (hotairfred/SparkGap#146)
+            from rtp_receiver import RtpReceiver
+            group = self.cfg.get('rtp_group')
+            if not group:
+                log.error("sdr_type rtp needs rtp_group: radiod's data multicast address or name")
+                return False
+            self.receiver = RtpReceiver(group, port=self.cfg.get('rtp_port', 5004),
+                                        sample_rate=rx_sample_rate,
+                                        encoding=self.cfg.get('rtp_encoding', 'f32le'),
+                                        iface=self.cfg.get('rtp_iface'),
+                                        use_dns=bool(self.cfg.get('rtp_use_dns', False)))
+            for _name, center_hz, rx_idx in self._band_meta:
+                self.receiver.set_frequency(rx_idx, center_hz)
+            log.info("Using radiod RTP channels from %s (SSRC = centre in kHz: %s)", group,
+                     ", ".join(str(round(c / 1000)) for _n, c, _r in self._band_meta))
+        elif sdr_type == 'flex':
             # FlexRadio DAX-IQ path — single-band only for now
             _, center_hz, _ = self._band_meta[0]
             flex_port = self.cfg.get('flex_udp_port', 7791)
