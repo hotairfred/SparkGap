@@ -35,7 +35,7 @@
  * ---------------------------------------------------------------------- */
 #define BAYES_RATE      200
 #define N_SPEED_BINS    16
-#define EM_TOL          0.01  /* em_estimate: stop when A and nm move less than this of A - nm */
+#define EM_TOL          0.01  /* em_estimate: stop when A, nm and sd move less than this of A - nm */
 #define WPM_MIN         8.0
 #define WPM_MAX         35.0     /* real CW is 15 to 25 WPM, never above 35 (WX7V) */
 #define MIN_MARK_RUN    7        /* dit at WPM_MAX; shorter mark runs are noise */
@@ -562,7 +562,8 @@ HOT_CLONES static void em_estimate(
         half = 5;
     }
 
-    /* EM stops once A and nm move less than EM_TOL of the separation A - nm in one step:
+    /* EM stops once A, nm and the noise sd together move less than EM_TOL of the separation A - nm
+     * in one step (the sd too: a slow fit of a weak window would otherwise stop early):
      * warm-started from the bin's last window it has usually settled in two or three of the 10. */
     const double em_tol = EM_TOL;
     /* One EM step: update A, nm, s2 given current wpm */
@@ -582,9 +583,11 @@ HOT_CLONES static void em_estimate(
                 double da = env[_i]-A_new, dn = env[_i]-nm_new; \
                 vm += gm*da*da; vs += gs*dn*dn; \
             } \
+            double _sd_old = sqrt(s2); \
             s2 = (vm/dm + vs/ds) / 2.0; \
             if (s2 < 1e-20) s2 = 1e-20; \
-            double _sep = A_new - nm_new, _moved = fabs(A_new - A) + fabs(nm_new - nm); \
+            double _sep = A_new - nm_new, _moved = fabs(A_new - A) + fabs(nm_new - nm) \
+                                                   + fabs(sqrt(s2) - _sd_old); \
             A = A_new; nm = nm_new; \
             if (em_tol > 0.0 && _sep > 0.0 && _moved < em_tol * _sep) break; \
         } \
