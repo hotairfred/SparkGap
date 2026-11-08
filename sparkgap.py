@@ -76,6 +76,8 @@ def _gui_settings(cfg, sample_rate):
         'callsign': cfg.get('callsign', ''),
         'cw_decoder': cfg.get('cw_decoder', 'itila2'),
         'itila2_afc': bool(cfg.get('itila2_afc', False)) if cfg.get('cw_decoder', 'itila2') == 'itila2' else None,
+        'itila2_tone_lock_hz': (_tone_lock_gate(cfg.get('itila2_tone_lock_hz')) or None)
+                               if cfg.get('cw_decoder', 'itila2') == 'itila2' else None,
         'sample_rate': sample_rate,
         'flex_daxiq_channel': cfg.get('flex_daxiq_channel', 1) if cfg.get('sdr_type') == 'flex' else None,
         'telnet_port': cfg.get('telnet_port', 7300),
@@ -2091,6 +2093,31 @@ def _select_fold_mask(on):
         log.info("ITILA scanner: filters folded into the FFT mask (itila2_fold_mask)")
     return _fold_mask
 
+_tone_lock_hz = 0.0   # config itila2_tone_lock_hz: blank a caller's short over off the bin's lock; 0 off
+
+def _tone_lock_gate(hz):
+    """itila2_tone_lock_hz as a gate in hertz: 0 (off) for absent, zero, negative or not a number."""
+    try:
+        g = float(hz or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return g if 0.0 < g < float("inf") else 0.0
+
+def _select_tone_lock(hz):
+    """Config key itila2_tone_lock_hz (default 0, off): each itila2 bin locks on the tone that keys
+    most of its time (the runner) and blanks a short over sent more than this many hertz from it
+    (a caller answering off zero beat), so the caller's call is not read as a copy at the runner's
+    frequency (itila_sc_set_tone_lock).  Two stations taking turns, and overs longer than 6 s, are
+    left alone.  8 is the tested value."""
+    global _tone_lock_hz
+    _tone_lock_hz = _tone_lock_gate(hz)
+    if hz not in (None, 0, 0.0, False) and _tone_lock_hz == 0.0:
+        log.warning("itila2_tone_lock_hz: %r is not a gate in hertz; off", hz)
+    if _tone_lock_hz > 0.0:
+        log.info("ITILA scanner: tone lock, overs more than %.1f Hz off the lock blanked (itila2_tone_lock_hz)",
+                 _tone_lock_hz)
+    return _tone_lock_hz
+
 _bin_liveness = False   # config itila2_bin_liveness: a window that copies a known runner keeps its bin
 
 
@@ -3131,6 +3158,13 @@ def _get_itila_scanner(sample_rate, center_hz, max_bins, min_snr,
                     log.warning("itila2_fold_mask: the scanner kept the 12 kHz mask")
             else:
                 log.warning("itila2_fold_mask: %s has no itila_sc_set_fold; off", _scanner_lib_path)
+        if _tone_lock_hz > 0.0:
+            if hasattr(lib, 'itila_sc_set_tone_lock'):
+                lib.itila_sc_set_tone_lock.restype = _ct.c_double
+                lib.itila_sc_set_tone_lock.argtypes = [_ct.c_void_p, _ct.c_double]
+                lib.itila_sc_set_tone_lock(_ct.c_void_p(h), _tone_lock_hz)
+            else:
+                log.warning("itila2_tone_lock_hz: %s has no itila_sc_set_tone_lock; off", _scanner_lib_path)
         # itila2 scanner only: split its per-bin DSP over the decode threads too
         if _itila_decode_threads > 1 and _scanner_pool and hasattr(lib, 'itila_sc_set_threads'):
             lib.itila_sc_set_threads.restype = _ct.c_int
@@ -7806,6 +7840,7 @@ class SparkGap:
         _select_snr_decoder(self.cfg.get('itila2_snr_decoder', False))
         _select_afc(self.cfg.get('itila2_afc', False))
         _select_fold_mask(self.cfg.get('itila2_fold_mask', False))
+        _select_tone_lock(self.cfg.get('itila2_tone_lock_hz', 0))
         _select_parallel_decode(self.cfg.get('itila2_parallel_decode', False))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
             self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
@@ -9424,6 +9459,7 @@ def run_file_mode(args, config):
     _select_snr_decoder(config.get('itila2_snr_decoder', False))
     _select_afc(config.get('itila2_afc', False))
     _select_fold_mask(config.get('itila2_fold_mask', False))
+    _select_tone_lock(config.get('itila2_tone_lock_hz', 0))
     _select_parallel_decode(config.get('itila2_parallel_decode', False))
     if _select_spot_rule(_spot_rule_name(config)):
         _trk = tracker
