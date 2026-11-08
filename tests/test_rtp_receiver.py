@@ -187,3 +187,12 @@ def test_iface_by_name() -> None:
     m = rx._membership("239.1.2.3")
     assert len(m) == 12 and struct.unpack("=4s4si", m)[2] == socket.if_nametoindex("lo")
     assert RtpReceiver("239.1.2.3", iface="127.0.0.1")._membership("239.1.2.3")[4:] == socket.inet_aton("127.0.0.1")
+
+
+def test_restart_ahead_is_no_loss() -> None:
+    """A restart whose new sequence lands ahead of the old one (104 -> 20000, timestamp back to 0) is a
+    restart, not 19,895 lost packets."""
+    rx, got = _receiver(), []
+    rx.handle(rtp_packet(111, 104, 50_000_000, 14090, encode(_iq(180), "f32le")), lambda r, x: got.append(len(x)))
+    rx.handle(rtp_packet(111, 20000, 0, 14090, encode(_iq(180), "f32le")), lambda r, x: got.append(len(x)))
+    assert got == [180, 180] and rx.lost == 0 and rx.resyncs == 1

@@ -131,14 +131,15 @@ class RtpReceiver:
     # -- tuning: radiod's config sets the channels; this only says which SSRC is which band --
     def set_frequency(self, rx_index, freq_hz):
         self.frequencies[rx_index] = freq_hz
-        self._by_ssrc = {}
+        by_ssrc = {}           # built aside and swapped in one step: the receive thread reads it
         for k, f in sorted(self.frequencies.items()):
             ssrc = self._fixed_ssrc.get(k, ssrc_for(f))
-            if ssrc in self._by_ssrc:
+            if ssrc in by_ssrc:
                 log.warning("RTP: bands %d and %d both map to SSRC %d (%.0f and %.0f Hz): band %d gets "
-                            "none; give radiod's channels distinct kHz or set rtp_ssrcs", self._by_ssrc[ssrc], k,
-                            ssrc, self.frequencies[self._by_ssrc[ssrc]], f, self._by_ssrc[ssrc])
-            self._by_ssrc[ssrc] = k
+                            "none; give radiod's channels distinct kHz or set rtp_ssrcs", by_ssrc[ssrc], k,
+                            ssrc, self.frequencies[by_ssrc[ssrc]], f, by_ssrc[ssrc])
+            by_ssrc[ssrc] = k
+        self._by_ssrc = by_ssrc
 
     def retune(self, freq_hz):
         """One band: follow a channel at another frequency (radiod must carry it)."""
@@ -237,6 +238,8 @@ class RtpReceiver:
                     return
                 self._restart(ssrc, rx, "sequence and timestamp jumped back" if run < RESYNC_LATE
                               else f"{run} late packets in a row")
+            elif d > 1 and jump > MAX_FILL_S * self.sample_rate:
+                self._restart(ssrc, rx, "sequence jumped ahead, timestamp moved")   # not a loss
             elif d > 1:
                 self.lost += d - 1
                 missing = (ts - self._ts[ssrc]) & 0xFFFFFFFF
