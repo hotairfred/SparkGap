@@ -161,6 +161,7 @@ class Seat:
     host: str
     port: int
     mode: str  # "dry" or "live"
+    rtty: bool = False  # enable_rtty: the seat spots RTTY too, so its ranges go in rTTYBandLimits
 
 
 def spotter_id(cfg: dict[str, Any]) -> str:
@@ -186,6 +187,7 @@ def seat_settings(cfg: dict[str, Any]) -> Seat:
         host=cfg.get("telnet_host") or "127.0.0.1",
         port=int(cfg.get("telnet_port", 7300)),
         mode=mode,
+        rtty=bool(cfg.get("enable_rtty", False)),
     )
 
 
@@ -293,6 +295,7 @@ class Session:
         fingerprint: str,
         dry_run: bool,
         bands_of: Callable[[], list[tuple[float, float]]] | None = None,
+        rtty: bool = False,
     ) -> None:
         if auth is None and not dry_run:
             raise AuthError("no auth library: a session without one may only dry-run")
@@ -300,6 +303,7 @@ class Session:
         self.call, self.name, self.grid, self.qth = call, name, grid, qth
         self.validation, self.port, self.bands = validation, port, bands
         self.bands_of = bands_of  # read again before each id.php: a seat changes band while it runs
+        self.rtty = rtty
         self.auth, self.version, self.fingerprint, self.dry_run = (
             auth,
             version,
@@ -329,14 +333,16 @@ class Session:
             "ClockNtpDiff": 0,
             "SkimPort": str(self.port),
             "aggVersion": self.agg,
+            # As Aggregator 6.7 (hotairfred/SparkGap#148): every source's limits in bandLimits, and again
+            # in the field of each mode it spots; mIXEDBandLimits only for its "combine skimmers" option
             "bandLimits": bands,
-            "cWBandLimits": "",
+            "cWBandLimits": bands,
             "fTBandLimits": "",
             "fingerPrint": self.fingerprint,
             "justCQ": "1",
-            "mIXEDBandLimits": bands,
+            "mIXEDBandLimits": "",
             "masterSCPFilter": "0",
-            "rTTYBandLimits": "",
+            "rTTYBandLimits": bands if self.rtty else "",
             "showIP": "1",
             "skimCall": self.call,
             "skimGrid": self.grid,
@@ -735,6 +741,7 @@ def main() -> None:
         fingerprint=fingerprint,
         dry_run=dry_run,
         bands_of=bands_now,
+        rtty=seat.rtty,
     )
     mode = "dry run" if dry_run else "LIVE"
     log.info("SparkGap version %s, spotter %s, %s", sess.version, sess.call, mode)

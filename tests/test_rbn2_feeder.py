@@ -193,8 +193,9 @@ def test_the_sign_in_names_sparkgap(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["skimSignIn"] == sign_in and body["shortHash"] == fake_hash("s", sign_in)
     assert body["skimVersion"] == "SparkGap 1.2" and body["aggVersion"] == "6.7"
     assert body["justCQ"] == "1" and body["ClockNtp"] is True
-    assert body["bandLimits"] == body["mIXEDBandLimits"] == "7000.0-7096.0"
-    assert body["cWBandLimits"] == ""
+    # as Aggregator 6.7 for a CW source (hotairfred/SparkGap#148): bandLimits and cWBandLimits, no MIXED
+    assert body["bandLimits"] == body["cWBandLimits"] == "7000.0-7096.0"
+    assert body["mIXEDBandLimits"] == "" and body["rTTYBandLimits"] == ""
     spot = sess.spots_body([SPOT], 0.0)
     assert spot is not None and spot["nTP"] is True  # as the last id.php reported
 
@@ -544,3 +545,15 @@ def test_the_feeder_sends_its_status_to_the_server() -> None:
     assert sent == [{"mode": "dry", "spotter": "WX7V-5", "registered": False,
                      "bands": [[3490.4, 3586.4]], "warnings": 0, "errors": 0,
                      "posts": 2, "sent": 5, "not_signed_in": 1}]
+
+
+def test_rtty_seat_sends_its_ranges_as_rtty_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """enable_rtty: the ranges also go in rTTYBandLimits, as the Aggregator sends an RTTY Skimmer source's."""
+    monkeypatch.setattr(f, "ntp_synced", lambda: True)
+    sess = _session(_auth())
+    sess.rtty = True
+    body = sess.id_body()
+    assert body is not None
+    assert body["bandLimits"] == body["cWBandLimits"] == body["rTTYBandLimits"] == "7000.0-7096.0"
+    assert body["mIXEDBandLimits"] == ""
+    assert f.seat_settings({"rbn_upload": "dry", "callsign": "N0CALL", "grid": "AA00", "enable_rtty": True}).rtty
