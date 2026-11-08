@@ -278,7 +278,11 @@ typedef struct {
         int64_t hist_t;
         int     over_n, over_key;      /* the held off-lock over: words, key-down samples */
         int64_t over_k0[24], over_k1[24], over_end;
+        int     over_s0[24];           /* each word's start in the saved copy; -1 not blanked */
+        int     over_kept;             /* the over passed TL_OVER_MAX: restored, its later words left alone */
         double  over_tone;
+        float  *sv100, *sv200;         /* the held over's original envelope (TL_SAVE samples, made on first use) */
+        int     sv_n;
     } tl;
 } ScBin;
 #define TL_OVER_WORDS 24
@@ -732,7 +736,9 @@ HOT_CLONES static void run_scan(ItilaSc *sc, const double *seg_i, const double *
         if (slot < 0) continue;
 
         ScBin *bin = &sc->bins[slot];
+        float *sv100 = bin->tl.sv100, *sv200 = bin->tl.sv200;   /* the tone lock's buffers outlive the slot's use */
         memset(bin, 0, sizeof(ScBin));
+        bin->tl.sv100 = sv100; bin->tl.sv200 = sv200;
         if (sc->pow) { memset(sc->pow[slot].dl3, 0, sizeof(sc->pow[slot].dl3)); sc->pow[slot].n = 0; }
         bin->f_hz           = sc->cand[cand_idx].f_sum / sc->cand[cand_idx].n_avg;
         bin->created_sample = sc->total_samples;
@@ -773,10 +779,10 @@ static float fir_dotf(const float *dl, int pos, const float *h, int len)
  * often some hertz off it.  The bin measures the tone of each word on its wide path (the phase
  * steps over each element's key-down), keeps a decaying histogram of key-down time by tone, and
  * locks on its peak.  A short "over" (a caller's call or exchange) sent further than the gate from
- * the lock is blanked from both envelopes before the decoder reads them, so the caller's call
- * never reaches the spot rule as a copy at the runner's frequency.  Two stations taking turns (a
+ * the lock is blanked from both envelopes as each word is judged (before a window can take it),
+ * so the caller's call never reaches the spot rule as a copy at the runner's frequency.  Two stations taking turns (a
  * QSO, a net) are left alone: the lock must key TL_DOM times any other tone, and an over longer
- * than TL_OVER_MAX is the other side of a conversation, kept.  A caller within the gate (zero beat)
+ * than TL_OVER_MAX is the other side of a conversation: put back as it was.  A caller within the gate (zero beat)
  * is not separated.  All counts are 2 kHz samples. */
 #define TL_FS          2000.0  /* the wide path's rate */
 #define TL_ON_X        16.0    /* key-down: power 12 dB over the floor */
@@ -792,24 +798,73 @@ static float fir_dotf(const float *dl, int pos, const float *h, int len)
 #define TL_OVER_GAP    5000    /* 2.5 s of key-up ends an over */
 #define TL_OVER_MAX    12000   /* an off-lock over longer than 6 s is kept (a QSO) */
 #define TL_FIR3_DELAY  3       /* envelope samples the 200 Hz smoother lags the wide path */
+#define TL_SAVE        3000    /* envelope samples of a held over kept to put back (15 s) */
 
-/* The held off-lock over has ended: blank it if it was short, held at the level just before each word. */
+/* Blank word w of the held over, held at the level just before it, keeping the original to put back. */
+static void tone_blank(ScBin *b, int w)
+{
+    struct ScToneLock *t = &b->tl;
+    int64_t base = b->env_tot - b->env_n;
+    int64_t k0 = t->over_k0[w], k1 = t->over_k1[w];
+    if (k1 > b->env_tot) k1 = b->env_tot;
+    if (k0 < base + 1) k0 = base + 1;                    /* already drained, or the first sample */
+    t->over_s0[w] = -1;
+    if (k0 >= k1) return;
+    if (!t->sv100) {
+        t->sv100 = malloc(TL_SAVE * sizeof(float));
+        t->sv200 = malloc(TL_SAVE * sizeof(float));
+        if (!t->sv100 || !t->sv200) { free(t->sv100); free(t->sv200); t->sv100 = t->sv200 = NULL; return; }
+    }
+    if (t->sv_n + (k1 - k0) > TL_SAVE) return;           /* no room to put it back: leave it */
+    t->over_k0[w] = k0; t->over_k1[w] = k1; t->over_s0[w] = t->sv_n;
+    double h100 = b->env100[k0 - 1 - base], h200 = b->env200[k0 - 1 - base];
+    for (int64_t k = k0; k < k1; k++) {
+        t->sv100[t->sv_n] = (float)b->env100[k - base]; t->sv200[t->sv_n] = (float)b->env200[k - base]; t->sv_n++;
+        b->env100[k - base] = h100; b->env200[k - base] = h200;
+    }
+}
+
+/* The over is a QSO after all: put back what is still in the buffer, last word first. */
+static void tone_restore(ScBin *b)
+{
+    struct ScToneLock *t = &b->tl;
+    int64_t base = b->env_tot - b->env_n;
+    for (int w = t->over_n - 1; w >= 0; w--) {
+        if (t->over_s0[w] < 0) continue;
+        for (int64_t k = t->over_k0[w]; k < t->over_k1[w]; k++)
+            if (k >= base) {
+                int j = t->over_s0[w] + (int)(k - t->over_k0[w]);
+                b->env100[k - base] = t->sv100[j]; b->env200[k - base] = t->sv200[j];
+            }
+        t->over_s0[w] = -1;
+    }
+    t->over_kept = 1;
+}
+
+/* Add the closed word to the held over: blank it, unless the over has grown into a QSO. */
+static void tone_hold(ScBin *b)
+{
+    struct ScToneLock *t = &b->tl;
+    t->over_key += t->w_key;
+    t->over_end = t->n;
+    if (t->over_kept) return;
+    if (t->over_n < TL_OVER_WORDS) {
+        t->over_k0[t->over_n] = t->w_e0 + TL_FIR3_DELAY - 2;
+        t->over_k1[t->over_n] = t->w_e1 + TL_FIR3_DELAY + 3;
+        tone_blank(b, t->over_n);
+        t->over_n++;
+    }
+    if (t->over_key > TL_OVER_MAX) tone_restore(b);
+}
+
+/* The held over has ended: if it stayed short its words stay blank. */
 static void tone_over_flush(ItilaSc *sc, ScBin *b)
 {
-    if (b->tl.over_key <= TL_OVER_MAX) {
-        int64_t base = b->env_tot - b->env_n;
-        for (int w = 0; w < b->tl.over_n; w++) {
-            int64_t k0 = b->tl.over_k0[w], k1 = b->tl.over_k1[w];
-            if (k1 > b->env_tot) k1 = b->env_tot;
-            if (k0 < base + 1) k0 = base + 1;            /* already drained, or the first sample */
-            if (k0 >= k1) continue;
-            double h100 = b->env100[k0 - 1 - base], h200 = b->env200[k0 - 1 - base];
-            for (int64_t k = k0; k < k1; k++) { b->env100[k - base] = h100; b->env200[k - base] = h200; }
-            __atomic_add_fetch(&sc->tl_blanked, 1, __ATOMIC_RELAXED);
-        }
-    }
-    b->tl.over_n = 0;
-    b->tl.over_key = 0;
+    struct ScToneLock *t = &b->tl;
+    if (!t->over_kept)
+        for (int w = 0; w < t->over_n; w++)
+            if (t->over_s0[w] >= 0) __atomic_add_fetch(&sc->tl_blanked, 1, __ATOMIC_RELAXED);
+    t->over_n = 0; t->over_key = 0; t->over_kept = 0; t->sv_n = 0;
 }
 
 /* A word has ended: judge it against the lock, hold it with its over or let the over go, and add
@@ -828,7 +883,7 @@ static void tone_word_close(ItilaSc *sc, ScBin *b)
     t->hist_t = t->n;
     int same_over = t->over_n > 0 && fabs(t->w_tone - t->over_tone) <= TL_WORD_HZ && t->n - t->over_end <= TL_OVER_GAP;
     if (t->w_key < TL_WORD_MIN) {
-        if (same_over) { t->over_key += t->w_key; t->over_end = t->n; }   /* a short word of the held over */
+        if (same_over) tone_hold(b);                       /* a short word of the held over */
     } else if (best >= 0 && bw >= TL_LOCK_MIN_S) {
         double sw = 0.0, st = 0.0;
         for (int i = best - 1; i <= best + 1; i++)
@@ -845,16 +900,11 @@ static void tone_word_close(ItilaSc *sc, ScBin *b)
         __atomic_add_fetch(&sc->tl_words, 1, __ATOMIC_RELAXED);
         if (main_k >= TL_DOM * second && fabs(t->w_tone - lock) > sc->tl_gate_hz) {
             if (t->over_n > 0 && !same_over) tone_over_flush(sc, b);
-            if (t->over_n < TL_OVER_WORDS) {
-                t->over_k0[t->over_n] = t->w_e0 + TL_FIR3_DELAY - 2;
-                t->over_k1[t->over_n] = t->w_e1 + TL_FIR3_DELAY + 3;
-                t->over_n++;
-            }
             t->over_tone = t->w_tone;
-            t->over_key += t->w_key;
-            t->over_end = t->n;
-        } else if (same_over) {
-            t->over_key += t->w_key; t->over_end = t->n;   /* the same over goes on (the lock moved to it) */
+            tone_hold(b);
+        } else if (same_over) {                            /* the same over goes on (the lock moved to it) */
+            t->over_key += t->w_key; t->over_end = t->n;
+            if (t->over_key > TL_OVER_MAX && !t->over_kept) tone_restore(b);
         } else if (t->over_n > 0) {
             tone_over_flush(sc, b);
         }
@@ -879,7 +929,8 @@ static void tone_lock_step(ItilaSc *sc, ScBin *b, double zi, double zq)
     } else if (t->on) {
         t->on = 0;
         if (t->len >= TL_ELEM_MIN) {
-            double tone = atan2(t->ei, t->er) * TL_FS / (2.0 * M_PI);
+            double tone = atan2(t->ei, t->er) * TL_FS / (2.0 * M_PI)
+                        + (sc->afc ? b->afc_hz : 0.0);                 /* from the bin's frequency, not AFC's */
             if (t->w_n > 0 && (t->n - t->w_end > TL_WORD_GAP || fabs(tone - t->w_tone) > TL_WORD_HZ))
                 tone_word_close(sc, b);
             if (t->w_n == 0) { t->w_e0 = t->e0; t->w_tone = tone; t->w_key = 0; }
@@ -1368,9 +1419,6 @@ int itila_sc_set_afc(ItilaSc *sc, int on)
     return r;
 }
 
-/* itila2_fold_mask: stage 2 and the Hann / wide filters folded into the FFT mask, each path's
- * inverse FFT straight to 2 kHz (off: the 12 kHz mask and the time-domain filters).  Only before
- * the first IQ is fed; returns the state in force (the FIR1 test path has no FFT front end: 0). */
 /* itila2_tone_lock: blank a caller's short over sent further than gate_hz from the bin's lock;
  * 0 turns it off.  Returns the gate in force. */
 double itila_sc_set_tone_lock(ItilaSc *sc, double gate_hz)
@@ -1390,6 +1438,9 @@ void itila_sc_tone_lock_stats(ItilaSc *sc, unsigned long long *words, unsigned l
     *blanked = sc ? __atomic_load_n(&sc->tl_blanked, __ATOMIC_RELAXED) : 0;
 }
 
+/* itila2_fold_mask: stage 2 and the Hann / wide filters folded into the FFT mask, each path's
+ * inverse FFT straight to 2 kHz (off: the 12 kHz mask and the time-domain filters).  Only before
+ * the first IQ is fed; returns the state in force (the FIR1 test path has no FFT front end: 0). */
 int itila_sc_set_fold(ItilaSc *sc, int on)
 {
     if (!sc) return 0;
@@ -1738,8 +1789,10 @@ void itila_sc_free(ItilaSc *sc)
     pthread_mutex_unlock(&sc->dec_call);
     pthread_mutex_lock(&sc->lock);             /* wait out an in-flight feed */
     stop_workers(sc);
-    for (int i = 0; i < SC_MAX_BINS; i++)
+    for (int i = 0; i < SC_MAX_BINS; i++) {
         if (sc->bins[i].active) bin_free_decoders(sc, &sc->bins[i]);
+        free(sc->bins[i].tl.sv100); free(sc->bins[i].tl.sv200);
+    }
     pthread_mutex_unlock(&sc->lock);
     pthread_mutex_destroy(&sc->lock);
     pthread_mutex_destroy(&sc->pool_lock);

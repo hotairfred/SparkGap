@@ -76,7 +76,7 @@ def _gui_settings(cfg, sample_rate):
         'callsign': cfg.get('callsign', ''),
         'cw_decoder': cfg.get('cw_decoder', 'itila2'),
         'itila2_afc': bool(cfg.get('itila2_afc', False)) if cfg.get('cw_decoder', 'itila2') == 'itila2' else None,
-        'itila2_tone_lock_hz': (float(cfg.get('itila2_tone_lock_hz') or 0) or None)
+        'itila2_tone_lock_hz': (_tone_lock_gate(cfg.get('itila2_tone_lock_hz')) or None)
                                if cfg.get('cw_decoder', 'itila2') == 'itila2' else None,
         'sample_rate': sample_rate,
         'flex_daxiq_channel': cfg.get('flex_daxiq_channel', 1) if cfg.get('sdr_type') == 'flex' else None,
@@ -2095,6 +2095,14 @@ def _select_fold_mask(on):
 
 _tone_lock_hz = 0.0   # config itila2_tone_lock_hz: blank a caller's short over off the bin's lock; 0 off
 
+def _tone_lock_gate(hz):
+    """itila2_tone_lock_hz as a gate in hertz: 0 (off) for absent, zero, negative or not a number."""
+    try:
+        g = float(hz or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return g if 0.0 < g < float("inf") else 0.0
+
 def _select_tone_lock(hz):
     """Config key itila2_tone_lock_hz (default 0, off): each itila2 bin locks on the tone that keys
     most of its time (the runner) and blanks a short over sent more than this many hertz from it
@@ -2102,11 +2110,9 @@ def _select_tone_lock(hz):
     frequency (itila_sc_set_tone_lock).  Two stations taking turns, and overs longer than 6 s, are
     left alone.  8 is the tested value."""
     global _tone_lock_hz
-    try:
-        _tone_lock_hz = max(0.0, float(hz or 0.0))
-    except (TypeError, ValueError):
-        log.warning("itila2_tone_lock_hz: %r is not a number; off", hz)
-        _tone_lock_hz = 0.0
+    _tone_lock_hz = _tone_lock_gate(hz)
+    if hz not in (None, 0, 0.0, False) and _tone_lock_hz == 0.0:
+        log.warning("itila2_tone_lock_hz: %r is not a gate in hertz; off", hz)
     if _tone_lock_hz > 0.0:
         log.info("ITILA scanner: tone lock, overs more than %.1f Hz off the lock blanked (itila2_tone_lock_hz)",
                  _tone_lock_hz)
