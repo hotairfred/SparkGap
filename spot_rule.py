@@ -318,12 +318,18 @@ def sender(toks: list[str], i: int, la1d: bool = False, garbled: bool = False) -
     return None
 
 
+_NOT_COUNTY = frozenset({"QTH", "QRL", "QRZ", "QSL", "QRP", "QSY", "RST", "NAME", "POTA", "SOTA",
+                         "WWFF", "IOTA", "SKCC", "NAQP", "TNX", "AGN", "PSE"})
+
+
 def _county(tok: str) -> bool:
     """A report followed by a county code (W0ZQ/CLRK ... K0PC K0PC 5NN CLRK, state QSO parties):
     3 to 5 letters that are not a stop word, prosign or keyword. Two letters (5NN AT) are too often
-    a garble to count."""
+    a garble to count; nor do common words and qualifiers (QTH, QRL, POTA, SKCC) or dit noise, one
+    letter or only E T I S H (5NN EEE, TTTT)."""
     return (tok.isalpha() and 3 <= len(tok) <= 5
-            and tok not in _STOP_WORDS and tok not in _PROSIGNS and tok not in KEYWORDS)
+            and tok not in _STOP_WORDS and tok not in _PROSIGNS and tok not in KEYWORDS
+            and tok not in _NOT_COUNTY and len(set(tok)) > 1 and not set(tok) <= set("ETISH"))
 
 
 def is_exchange(toks: list[str], j: int, qualifiers: bool = False, grid: bool = False) -> bool:
