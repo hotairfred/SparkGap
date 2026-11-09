@@ -280,6 +280,7 @@ typedef struct {
         int64_t over_k0[24], over_k1[24], over_end;
         int     over_s0[24];           /* each word's start in the saved copy; -1 not blanked */
         int     over_kept;             /* the over passed TL_OVER_MAX: restored, its later words left alone */
+        int     over_wide;             /* the over is more than TL_NARROW_HZ off the lock: blank the 200 Hz path only */
         double  over_tone;
         float  *sv100, *sv200;         /* the held over's original envelope (TL_SAVE samples, made on first use) */
         int     sv_n;
@@ -799,6 +800,9 @@ static float fir_dotf(const float *dl, int pos, const float *h, int len)
 #define TL_OVER_MAX    12000   /* an off-lock over longer than 6 s is kept (a QSO) */
 #define TL_FIR3_DELAY  3       /* envelope samples the 200 Hz smoother lags the wide path */
 #define TL_SAVE        3000    /* envelope samples of a held over kept to put back (15 s) */
+#define TL_NARROW_HZ   50.0    /* an over further off the lock than this barely reaches the 100 Hz path: it is
+                                * blanked from the 200 Hz path only, so a runner keying under a neighbour's
+                                * words (they need not wait for him, as a caller does) keeps his copy there */
 
 /* Blank word w of the held over, held at the level just before it, keeping the original to put back. */
 static void tone_blank(ScBin *b, int w)
@@ -820,7 +824,8 @@ static void tone_blank(ScBin *b, int w)
     double h100 = b->env100[k0 - 1 - base], h200 = b->env200[k0 - 1 - base];
     for (int64_t k = k0; k < k1; k++) {
         t->sv100[t->sv_n] = (float)b->env100[k - base]; t->sv200[t->sv_n] = (float)b->env200[k - base]; t->sv_n++;
-        b->env100[k - base] = h100; b->env200[k - base] = h200;
+        if (!t->over_wide) b->env100[k - base] = h100;
+        b->env200[k - base] = h200;
     }
 }
 
@@ -900,6 +905,7 @@ static void tone_word_close(ItilaSc *sc, ScBin *b)
         __atomic_add_fetch(&sc->tl_words, 1, __ATOMIC_RELAXED);
         if (main_k >= TL_DOM * second && fabs(t->w_tone - lock) > sc->tl_gate_hz) {
             if (t->over_n > 0 && !same_over) tone_over_flush(sc, b);
+            if (t->over_n == 0) t->over_wide = fabs(t->w_tone - lock) > TL_NARROW_HZ;
             t->over_tone = t->w_tone;
             tone_hold(b);
         } else if (same_over) {                            /* the same over goes on (the lock moved to it) */
