@@ -46,8 +46,8 @@ libitila2_scanner.so: itila2_scanner.c itila_scanner.h itila_fir_coeffs.h
 	gcc -O3 $(ARCHFLAG) -ffast-math -shared -fPIC -pthread \
 	    -o $@ itila2_scanner.c -lm $(FASTMATH_CRT)
 
-librtty.so: rtty_core.c rtty_hmm.c
-	gcc -shared -O2 -fPIC $(ARCHFLAG) -o $@ rtty_core.c rtty_hmm.c -lm
+librtty.so: rtty_core.c frtty.c
+	gcc -shared -O2 -fPIC $(ARCHFLAG) -o $@ rtty_core.c frtty.c -lm
 
 # No recorded recipe for these two; -O2 is a guess.
 libuhsdr_cw.so: uhsdr_cw_lib.cpp uhsdr_cw_lib.h uhsdr_cw.h uhsdr_shim.h

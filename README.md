@@ -68,8 +68,8 @@ in `tools/eval/` and `tools/sim/`.
   rules: `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group
   even when the CQ itself was lost, and reads a call followed by a grid square as a caller being
   sent the exchange. Makrothen is the only contest defined so far (`RTTY_CONTESTS` in `sparkgap.py`).
-  `"rtty_decoder": "pick"` (off by default) decodes each signal twice, with `rtty_core.c` and with
-  `rtty_hmm.c`, a decoder that models the whole character frame and the sender's cadence, and keeps
+  `"rtty_decoder": "frtty"` (off by default) decodes each signal twice, with `rtty_core.c` and with
+  FRTTY (`frtty.c`), a decoder that models the whole character frame and the sender's cadence, and keeps
   the text that names more calls: weak and fading signals copy better, at about 6x the RTTY CPU.
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter

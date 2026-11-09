@@ -1,4 +1,4 @@
-/* rtty_hmm.c — RTTY decoder with a model of the whole character frame (rtty_decoder "pick").
+/* frtty.c — FRTTY, frame RTTY: a decoder that models the whole character frame (rtty_decoder "frtty").
  *
  * librtty (rtty_core.c) slices bits one by one and hunts for each start bit, so a fade on a start bit
  * loses the next characters. This decoder weighs whole frames instead (Mills, DSP-93):
@@ -15,7 +15,7 @@
  * On the JARTS and PA recordings, picking per candidate between this and librtty's text: real calls
  * 60 -> 67 and 91 -> 98 (hotairfred/SparkGap, RTTY decoder PR).
  *
- *   int rtty_hmm_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
+ *   int frtty_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
  * audio: rate_hz, mark at center + 85 Hz, space at center - 85 Hz.  Returns the text length.
  */
 #include <math.h>
@@ -182,7 +182,7 @@ static int text_out(const Model *m, const int *path, int T, char *out, int out_l
     return o;
 }
 
-int rtty_hmm_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
+int frtty_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
 {
     static Model loose, locked[2 * K + 1]; static int built;
     double rate = rate_hz;

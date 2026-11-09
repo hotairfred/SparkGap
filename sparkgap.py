@@ -2378,9 +2378,9 @@ def _get_rtty_lib():
                 _rtty_lib.rtty_fsk_seconds.argtypes = [_ct.c_void_p]
             except AttributeError:
                 pass
-            try:                                   # rtty_decoder "pick": the frame-model decoder (rtty_hmm.c)
-                _rtty_lib.rtty_hmm_decode.restype  = _ct.c_int
-                _rtty_lib.rtty_hmm_decode.argtypes = [_ct.POINTER(_ct.c_double), _ct.c_int, _ct.c_int,
+            try:                                   # rtty_decoder "frtty": the frame-model decoder (frtty.c)
+                _rtty_lib.frtty_decode.restype  = _ct.c_int
+                _rtty_lib.frtty_decode.argtypes = [_ct.POINTER(_ct.c_double), _ct.c_int, _ct.c_int,
                                                       _ct.c_double, _ct.c_char_p, _ct.c_int]
             except AttributeError:
                 pass
@@ -2510,13 +2510,13 @@ def _rtty_printable(text):
     return ''.join(c if c.isprintable() else ' ' for c in text)
 
 
-RTTY_DECODERS = ('librtty', 'pick')
+RTTY_DECODERS = ('librtty', 'frtty')
 _RTTY_CALLISH = re.compile(r'\b(?=[A-Z0-9]*\d)[A-Z0-9]{1,3}\d[A-Z]{1,4}\b')   # a call-shaped word (_rtty_pick)
 
 
 def _rtty_decoder(cfg):
     """Config rtty_decoder: "librtty" (default) decodes each RTTY candidate with rtty_core.c only;
-    "pick" also runs the frame-model decoder (rtty_hmm.c) and keeps whichever text names more
+    "frtty" also runs FRTTY, the frame-model decoder (frtty.c) and keeps whichever text names more
     calls (_rtty_pick). On the JARTS and PA recordings: real calls 60 -> 67 and 91 -> 98 for 2 and 3
     more unconfirmed, at about 6x the RTTY decode CPU."""
     name = (cfg.get('rtty_decoder') or 'librtty').strip().lower()
@@ -2655,7 +2655,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         log.info("RTTY %s: %d candidates, decoding the strongest %d (rtty_max_candidates)",
                  bn, len(cands), cap)
     cands = cands[:cap]
-    pick = _rtty_decoder(skimmer.cfg) == 'pick'
+    pick = _rtty_decoder(skimmer.cfg) == 'frtty'
     if not cands:
         return 0
     rate, audio_center = 12000, 1000.0
@@ -2690,9 +2690,9 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
                 fsk_s = rtty_lib.rtty_fsk_seconds(h)
         finally:
             rtty_lib.rtty_free(h)
-        if pick and hasattr(rtty_lib, 'rtty_hmm_decode'):
+        if pick and hasattr(rtty_lib, 'frtty_decode'):
             buf = _ct.create_string_buffer(8192)
-            rtty_lib.rtty_hmm_decode(audio.ctypes.data_as(_ct.POINTER(_ct.c_double)), _ct.c_int(len(audio)),
+            rtty_lib.frtty_decode(audio.ctypes.data_as(_ct.POINTER(_ct.c_double)), _ct.c_int(len(audio)),
                                      _ct.c_int(rate), _ct.c_double(audio_center), buf, _ct.c_int(len(buf)))
             text = _rtty_pick(text, buf.value.decode('latin-1', errors='replace').strip())
         c_hz = band_center_khz * 1000.0 + off_hz                    # centre between the tones

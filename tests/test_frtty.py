@@ -1,4 +1,4 @@
-"""rtty_decoder "pick": the frame-model RTTY decoder (rtty_hmm.c) and the per-candidate pick."""
+"""rtty_decoder "frtty": FRTTY, the frame-model RTTY decoder (frtty.c), and the per-candidate pick."""
 import ctypes as ct
 import os
 
@@ -31,10 +31,10 @@ def _afsk(text: str, snr_db: float, stop_bits: float = 1.5, seed: int = 0) -> np
 
 def _hmm(audio: np.ndarray) -> str:
     lib = sparkgap._get_rtty_lib()
-    if lib is None or not hasattr(lib, "rtty_hmm_decode"):
-        pytest.skip("librtty.so without rtty_hmm_decode")
+    if lib is None or not hasattr(lib, "frtty_decode"):
+        pytest.skip("librtty.so without frtty_decode")
     buf = ct.create_string_buffer(8192)
-    lib.rtty_hmm_decode(audio.ctypes.data_as(ct.POINTER(ct.c_double)), len(audio), RATE, CENTER, buf, len(buf))
+    lib.frtty_decode(audio.ctypes.data_as(ct.POINTER(ct.c_double)), len(audio), RATE, CENTER, buf, len(buf))
     return buf.value.decode("latin-1")
 
 
@@ -79,6 +79,6 @@ def test_pick_keeps_the_text_naming_more_calls() -> None:
 
 def test_config_key() -> None:
     assert sparkgap._rtty_decoder({}) == "librtty"
-    assert sparkgap._rtty_decoder({"rtty_decoder": "pick"}) == "pick"
-    assert sparkgap._rtty_decoder({"rtty_decoder": "PICK "}) == "pick"
+    assert sparkgap._rtty_decoder({"rtty_decoder": "frtty"}) == "frtty"
+    assert sparkgap._rtty_decoder({"rtty_decoder": "FRTTY "}) == "frtty"
     assert sparkgap._rtty_decoder({"rtty_decoder": "neural"}) == "librtty"
