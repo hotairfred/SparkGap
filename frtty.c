@@ -12,10 +12,12 @@
  *    fixed stop of 1, 1.5 (the ham standard) or 2 bits. Each is tried as a locked model, the next start
  *    right after the stop, and the best-fitting path kept.
  * 5. Baudot with LTRS / FIGS (unshift on space).
- * On the JARTS and PA recordings, picking per candidate between this and librtty's text: real calls
- * 60 -> 67 and 91 -> 98 (hotairfred/SparkGap, RTTY decoder PR).
+ * 6. Each over (a stretch of signal between pauses) on its own, with its own cadence (overs()).
+ * In place of librtty on the JARTS and PA recordings: real calls 60 -> 65 and 91 -> 97, unconfirmed
+ * 1 -> 3 and 5 -> 6 (hotairfred/SparkGap#155).
  *
  *   int frtty_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
+ *   int frtty_decode_fsk(..., int *fsk_seconds)   also the seconds of clear FSK, as rtty_fsk_seconds()
  * audio: rate_hz, mark at center + 85 Hz, space at center - 85 Hz.  Returns the text length.
  */
 #include <math.h>
@@ -182,37 +184,12 @@ static int text_out(const Model *m, const int *path, int T, char *out, int out_l
     return o;
 }
 
-int frtty_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
+/* One over (or the whole minute): the loose model, then the three locked cadences; the best path's text. */
+static int decode_d(const double *d, int T, char *out, int out_len)
 {
     static Model loose, locked[2 * K + 1]; static int built;
-    double rate = rate_hz;
     if (!built) { build(&loose, 0); for (int L = K; L <= 2 * K; L++) build(&locked[L], L); built = 1; }
-    double spb = rate / BAUD, step = spb / K; int L = (int)lround(spb), T = (int)(n / step);
     if (T < 4 * K || out_len < 1) { if (out_len) out[0] = 0; return 0; }
-    double *d = malloc(T * sizeof *d);
-    {
-        double fm = center + SHIFT / 2, fs = center - SHIFT / 2;
-        double cm = cos(2 * M_PI * fm / rate), sm = sin(2 * M_PI * fm / rate), cs = cos(2 * M_PI * fs / rate), ss = sin(2 * M_PI * fs / rate);
-        double ar = 1, ai = 0, br = 1, bi = 0;                     /* oscillators exp(-i w t) */
-        double *mr = malloc(n * sizeof *mr), *mi = malloc(n * sizeof *mi), *sr = malloc(n * sizeof *sr), *si = malloc(n * sizeof *si);
-        for (int i = 0; i < n; i++) {
-            mr[i] = audio[i] * ar; mi[i] = audio[i] * ai; sr[i] = audio[i] * br; si[i] = audio[i] * bi;
-            double t1 = ar * cm + ai * sm; ai = ai * cm - ar * sm; ar = t1;
-            double t2 = br * cs + bi * ss; bi = bi * cs - br * ss; br = t2;
-            if ((i & 1023) == 1023) { double g = 1 / hypot(ar, ai), h = 1 / hypot(br, bi); ar *= g; ai *= g; br *= h; bi *= h; }
-        }
-        double cmr = 0, cmi = 0, csr = 0, csi = 0; int ti = 0;
-        for (int i = 0; i < n && ti < T; i++) {
-            cmr += mr[i]; cmi += mi[i]; csr += sr[i]; csi += si[i];
-            if (i >= L) { cmr -= mr[i - L]; cmi -= mi[i - L]; csr -= sr[i - L]; csi -= si[i - L]; }
-            while (ti < T && (long)(ti * step) == i) {
-                double m = i >= L - 1 ? hypot(cmr, cmi) / L : 0.0, s = i >= L - 1 ? hypot(csr, csi) / L : 0.0;
-                d[ti++] = (m - s) / fmax(m + s, 1e-12);
-            }
-        }
-        for (; ti < T; ti++) d[ti] = 0.0;
-        free(mr); free(mi); free(sr); free(si);
-    }
     double *a = malloc(T * sizeof *a); for (int t = 0; t < T; t++) a[t] = fabs(d[t]);
     double mu0 = fmax(0.3, percentile(a, T, 0.80)), sigma = 0.3;
     double *mu = malloc(T * sizeof *mu); for (int t = 0; t < T; t++) mu[t] = mu0;
@@ -243,6 +220,95 @@ int frtty_decode(const double *audio, int n, int rate_hz, double center, char *o
         free(pbest); free(mu_save);
     }
     int o = text_out(m, path, T, out, out_len);
-    free(d); free(a); free(mu); free(num); free(den); free(tmp); free(path); free(back);
+    free(a); free(mu); free(num); free(den); free(tmp); free(path); free(back);
     return o;
+}
+
+/* Overs: the steps where the two tones together stand clear of the pauses between transmissions.
+ * In a pause the soft value is noise, and a frame model has to read it as letters (CQK, AB1EXPCU), glued
+ * to the call next to it; and a runner and a caller in one minute may send different stops (1.5 and 2
+ * bits). So each over is decoded on its own, with its own cadence, and the overs joined by a space.
+ * A minute with no clear pauses (one long over, or nothing but noise) stays one piece. */
+#define SEG_MIN  (8 * K)          /* an over: at least 8 bits */
+#define GAP_MIN  (3 * K)          /* a pause: at least 3 bits (a stop and a start are 2.5) */
+static int overs(const double *lvl, int T, int *lo, int *hi, int maxn)
+{
+    double *g = malloc(T * sizeof *g), *sm = malloc(T * sizeof *sm);
+    for (int t = 0; t < T; t++) g[t] = log(fmax(lvl[t], 1e-12));
+    ufilter(g, sm, T, K);                                  /* one bit: a space bit keeps the level up */
+    double p10 = percentile(sm, T, 0.10), p90 = percentile(sm, T, 0.90);
+    int n = 0;
+    if (p90 - p10 < log(4.0)) { free(g); free(sm); return 0; }   /* under 12 dB: no pauses to find */
+    double thr = p10 + 0.35 * (p90 - p10);
+    int t = 0;
+    while (t < T && n < maxn) {
+        while (t < T && sm[t] < thr) t++;
+        int a = t, quiet = 0, b = t;
+        while (t < T) {
+            if (sm[t] < thr) { if (++quiet >= GAP_MIN) break; } else { quiet = 0; b = t + 1; }
+            t++;
+        }
+        if (b - a >= SEG_MIN) { lo[n] = a > K ? a - K : 0; hi[n] = b + K < T ? b + K : T; n++; }
+    }
+    free(g); free(sm);
+    return n;
+}
+
+/* frtty_decode, and in *fsk_seconds (when not NULL) the seconds in which mark and space clearly alternated
+ * (correlation below -0.3 over one second), as librtty's rtty_fsk_seconds: RTTY keys one tone or the other,
+ * two CW signals 170 Hz apart key independently (rtty_excludes_cw). */
+int frtty_decode_fsk(const double *audio, int n, int rate_hz, double center, char *out, int out_len, int *fsk_seconds)
+{
+    double rate = rate_hz;
+    double spb = rate / BAUD, step = spb / K; int L = (int)lround(spb), T = (int)(n / step);
+    if (fsk_seconds) *fsk_seconds = 0;
+    if (T < 4 * K || out_len < 1) { if (out_len) out[0] = 0; return 0; }
+    double *d = malloc(T * sizeof *d), *lvl = malloc(T * sizeof *lvl);
+    double cs1 = 0, cm1 = 0, cs2 = 0, cm2 = 0, cms = 0; int cn = 0, per_s = (int)lround(rate / step);
+    {
+        double fm = center + SHIFT / 2, fs = center - SHIFT / 2;
+        double cm = cos(2 * M_PI * fm / rate), sm = sin(2 * M_PI * fm / rate), cs = cos(2 * M_PI * fs / rate), ss = sin(2 * M_PI * fs / rate);
+        double ar = 1, ai = 0, br = 1, bi = 0;                     /* oscillators exp(-i w t) */
+        double *mr = malloc(n * sizeof *mr), *mi = malloc(n * sizeof *mi), *sr = malloc(n * sizeof *sr), *si = malloc(n * sizeof *si);
+        for (int i = 0; i < n; i++) {
+            mr[i] = audio[i] * ar; mi[i] = audio[i] * ai; sr[i] = audio[i] * br; si[i] = audio[i] * bi;
+            double t1 = ar * cm + ai * sm; ai = ai * cm - ar * sm; ar = t1;
+            double t2 = br * cs + bi * ss; bi = bi * cs - br * ss; br = t2;
+            if ((i & 1023) == 1023) { double g = 1 / hypot(ar, ai), h = 1 / hypot(br, bi); ar *= g; ai *= g; br *= h; bi *= h; }
+        }
+        double cmr = 0, cmi = 0, csr = 0, csi = 0; int ti = 0;
+        for (int i = 0; i < n && ti < T; i++) {
+            cmr += mr[i]; cmi += mi[i]; csr += sr[i]; csi += si[i];
+            if (i >= L) { cmr -= mr[i - L]; cmi -= mi[i - L]; csr -= sr[i - L]; csi -= si[i - L]; }
+            while (ti < T && (long)(ti * step) == i) {
+                double m = i >= L - 1 ? hypot(cmr, cmi) / L : 0.0, s = i >= L - 1 ? hypot(csr, csi) / L : 0.0;
+                d[ti] = (m - s) / fmax(m + s, 1e-12); lvl[ti] = m + s; ti++;
+                cm1 += m; cs1 += s; cm2 += m * m; cs2 += s * s; cms += m * s;
+                if (++cn >= per_s) {
+                    double mm = cm1 / cn, sm_ = cs1 / cn, mv = cm2 / cn - mm * mm, sv = cs2 / cn - sm_ * sm_;
+                    double den = sqrt(fmax(mv, 0) * fmax(sv, 0));
+                    if (fsk_seconds && den > 1e-12 && (cms / cn - mm * sm_) / den < -0.3) (*fsk_seconds)++;
+                    cm1 = cs1 = cm2 = cs2 = cms = 0; cn = 0;
+                }
+            }
+        }
+        for (; ti < T; ti++) { d[ti] = 0.0; lvl[ti] = 0.0; }
+        free(mr); free(mi); free(sr); free(si);
+    }
+    int maxn = T / SEG_MIN + 1, *lo = malloc(maxn * sizeof *lo), *hi = malloc(maxn * sizeof *hi);
+    int ns = overs(lvl, T, lo, hi, maxn), o = 0;
+    if (ns == 0) o = decode_d(d, T, out, out_len);
+    else
+        for (int k = 0; k < ns && o < out_len - 2; k++) {
+            if (o) out[o++] = ' ';
+            o += decode_d(d + lo[k], hi[k] - lo[k], out + o, out_len - o);
+        }
+    out[o] = 0;
+    free(lo); free(hi); free(d); free(lvl);
+    return o;
+}
+
+int frtty_decode(const double *audio, int n, int rate_hz, double center, char *out, int out_len)
+{
+    return frtty_decode_fsk(audio, n, rate_hz, center, out, out_len, NULL);
 }

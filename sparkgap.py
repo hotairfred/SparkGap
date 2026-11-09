@@ -2382,6 +2382,10 @@ def _get_rtty_lib():
                 _rtty_lib.frtty_decode.restype  = _ct.c_int
                 _rtty_lib.frtty_decode.argtypes = [_ct.POINTER(_ct.c_double), _ct.c_int, _ct.c_int,
                                                       _ct.c_double, _ct.c_char_p, _ct.c_int]
+                _rtty_lib.frtty_decode_fsk.restype  = _ct.c_int
+                _rtty_lib.frtty_decode_fsk.argtypes = [_ct.POINTER(_ct.c_double), _ct.c_int, _ct.c_int,
+                                                          _ct.c_double, _ct.c_char_p, _ct.c_int,
+                                                          _ct.POINTER(_ct.c_int)]
             except AttributeError:
                 pass
             log.info("Loaded librtty.so")
@@ -2511,26 +2515,17 @@ def _rtty_printable(text):
 
 
 RTTY_DECODERS = ('librtty', 'frtty')
-_RTTY_CALLISH = re.compile(r'\b(?=[A-Z0-9]*\d)[A-Z0-9]{1,3}\d[A-Z]{1,4}\b')   # a call-shaped word (_rtty_pick)
 
 
 def _rtty_decoder(cfg):
-    """Config rtty_decoder: "librtty" (default) decodes each RTTY candidate with rtty_core.c only;
-    "frtty" also runs FRTTY, the frame-model decoder (frtty.c) and keeps whichever text names more
-    calls (_rtty_pick). On the JARTS and PA recordings: real calls 60 -> 67 and 91 -> 98 for 2 and 3
-    more unconfirmed, at about 6x the RTTY decode CPU."""
+    """Config rtty_decoder: "librtty" (default) decodes each RTTY candidate with rtty_core.c; "frtty"
+    with FRTTY, the frame-model decoder (frtty.c), in its place. On the JARTS and PA recordings: real
+    calls 60 -> 65 and 91 -> 97, unconfirmed 1 -> 3 and 5 -> 6, at about 3x librtty's decode CPU."""
     name = (cfg.get('rtty_decoder') or 'librtty').strip().lower()
     if name not in RTTY_DECODERS:
         log.warning("rtty_decoder %r is not one of %s: librtty is used", name, ', '.join(RTTY_DECODERS))
         return 'librtty'
     return name
-
-
-def _rtty_pick(lib_text, hmm_text):
-    """The better of two decodes of one candidate: the one with more call-shaped words; librtty on a tie.
-    The two decoders fail on different signals (a faded start bit costs librtty the next characters;
-    the frame model keeps them), so taking the better text per candidate gains what each copies alone."""
-    return hmm_text if len(_RTTY_CALLISH.findall(hmm_text)) > len(_RTTY_CALLISH.findall(lib_text)) else lib_text
 
 
 def _rtty_split_keywords(text):
@@ -2655,7 +2650,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         log.info("RTTY %s: %d candidates, decoding the strongest %d (rtty_max_candidates)",
                  bn, len(cands), cap)
     cands = cands[:cap]
-    pick = _rtty_decoder(skimmer.cfg) == 'frtty'
+    frtty = _rtty_decoder(skimmer.cfg) == 'frtty' and hasattr(rtty_lib, 'frtty_decode_fsk')
     if not cands:
         return 0
     rate, audio_center = 12000, 1000.0
@@ -2677,24 +2672,26 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         if peak <= 0:
             continue
         audio = np.ascontiguousarray(audio / peak * 0.7, dtype=np.float64)
-        h = rtty_lib.rtty_create(_ct.c_int(rate), _ct.c_double(audio_center))
-        if not h:
-            continue
-        conf = _ct.c_double(0.0)
         fsk_s = 0
-        try:
-            p = rtty_lib.rtty_feed(h, audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
-                                   _ct.c_int(len(audio)), _ct.byref(conf))
-            text = p.decode('latin-1', errors='replace').strip() if p else ''
-            if hasattr(rtty_lib, 'rtty_fsk_seconds'):
-                fsk_s = rtty_lib.rtty_fsk_seconds(h)
-        finally:
-            rtty_lib.rtty_free(h)
-        if pick and hasattr(rtty_lib, 'frtty_decode'):
-            buf = _ct.create_string_buffer(8192)
-            rtty_lib.frtty_decode(audio.ctypes.data_as(_ct.POINTER(_ct.c_double)), _ct.c_int(len(audio)),
-                                     _ct.c_int(rate), _ct.c_double(audio_center), buf, _ct.c_int(len(buf)))
-            text = _rtty_pick(text, buf.value.decode('latin-1', errors='replace').strip())
+        if frtty:
+            buf, fsk = _ct.create_string_buffer(8192), _ct.c_int(0)
+            rtty_lib.frtty_decode_fsk(audio.ctypes.data_as(_ct.POINTER(_ct.c_double)), _ct.c_int(len(audio)),
+                                      _ct.c_int(rate), _ct.c_double(audio_center), buf, _ct.c_int(len(buf)),
+                                      _ct.byref(fsk))
+            text, fsk_s = buf.value.decode('latin-1', errors='replace').strip(), fsk.value
+        else:
+            h = rtty_lib.rtty_create(_ct.c_int(rate), _ct.c_double(audio_center))
+            if not h:
+                continue
+            conf = _ct.c_double(0.0)
+            try:
+                p = rtty_lib.rtty_feed(h, audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                       _ct.c_int(len(audio)), _ct.byref(conf))
+                text = p.decode('latin-1', errors='replace').strip() if p else ''
+                if hasattr(rtty_lib, 'rtty_fsk_seconds'):
+                    fsk_s = rtty_lib.rtty_fsk_seconds(h)
+            finally:
+                rtty_lib.rtty_free(h)
         c_hz = band_center_khz * 1000.0 + off_hz                    # centre between the tones
         rf_khz = (c_hz + RTTY_MARK_HZ) / 1000.0                      # mark tone: what spots give
         # rtty_excludes_cw: a candidate whose tones clearly alternated for a few seconds is RTTY,
