@@ -49,6 +49,10 @@ Doubled calls (doubled; off by default): a call sent twice inside one CQ group
 (CQ K8TLJ K8TLJ, CQ CQ DE K8TLJ K8TLJ K) counts as two copies, so a common call spots on its
 first clean CQ. Needs cq_groups. Whether CW Skimmer counts this way, and whether RBN wants it,
 is open (hotairfred/SparkGap#43); on 7 recordings it added 101 calls, 89 confirmed.
+doubled_cq (off by default; the RTTY rule's rtty_spot_doubled_cq) is the narrow form for RTTY,
+where callers send their call two or three times right after the runner's CQ (N6IE N6IE N6IE,
+DE NN5T NN5T K): only CQ or TEST, at most one word, then a call sent exactly twice counts twice
+(CQ MAKRO K1MK K1MK).
 
 Runner signs (runner_signs; off by default; cdub89/SparkGap#37): split DX often never sends CQ
 (JH7ME 5NN TU UP KH8A UP). KH8A UP or TU UP KH8A makes KH8A the split runner of that frequency
@@ -371,7 +375,8 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
                  contest_words: bool = False, cq_repeats: bool = False,
                  stray: bool = False, words: frozenset[str] | None = None,
                  grid: bool = False, la1d: bool = False, gluek: bool = False,
-                 garbled: bool = False, stray_listed: Callable[[str], bool] | None = None) -> list[str]:
+                 garbled: bool = False, stray_listed: Callable[[str], bool] | None = None,
+                 doubled_cq: bool = False) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -383,7 +388,7 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
     instead of one per call."""
     return [call for call, _after in runner_groups(text, every, qualifiers, doubled, split_up,
                                                    contest_words, cq_repeats, stray, words, grid,
-                                                   la1d, gluek, garbled, stray_listed)]
+                                                   la1d, gluek, garbled, stray_listed, doubled_cq)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -465,11 +470,18 @@ def has_runner_sign(text: str, gluek: bool = False) -> bool:
         a == "TU" and b == "UP" for a, b in zip(toks, toks[1:], strict=False))
 
 
+# doubled_cq: the one word allowed between CQ and a doubled call (CQ MAKRO K1MK K1MK)
+DOUBLED_CQ_WORDS = frozenset({"TEST", "DX", "CONTEST", "RTTY", "RU", "ARRL", "WPX", "WW", "CQWW",
+                              "JA", "JARL", "JARTS", "NA", "NAQP", "SS", "SPRINT", "QP", "PA",
+                              "MAK", "MAKRO", "MKR", "MAKROTHEN"})
+
+
 def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
                   cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,
                   grid: bool = False, la1d: bool = False, gluek: bool = False, garbled: bool = False,
-                  stray_listed: Callable[[str], bool] | None = None) -> list[tuple[str, str | None]]:
+                  stray_listed: Callable[[str], bool] | None = None,
+                  doubled_cq: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller.
@@ -478,7 +490,11 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
     opens the next group instead of closing this one, so CQ CWT N1DC CQ CWT N1DC is two
     copies, not one. words: the contest words for contest_words (default CWT, SST, MST); grid:
     a call followed by a grid square is being sent the exchange (is_exchange). la1d, gluek, garbled:
-    see sender() and tokens(); stray_listed: which joined calls _stray_after takes for a 4-character call."""
+    see sender() and tokens(); stray_listed: which joined calls _stray_after takes for a 4-character call.
+    doubled_cq: as doubled, but only CQ or TEST, at most one contest word (DOUBLED_CQ_WORDS or
+    words), then a call sent exactly twice (CQ MAKRO K1MK K1MK), and not a CQ closing another
+    call's group (KA6BIM KA6BIM CQ K6TU K6TU is a caller after the runner's CQ), and no garbled
+    third copy right after (_third_copy): an RTTY caller sends their call three times or after DE."""
     toks = tokens(text, gluek)
     cwords = CONTEST_WORDS if words is None else words
     out: list[tuple[str, str | None]] = []
@@ -516,12 +532,26 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
             out.append((toks[j], _call_before(toks, i) if t == "TEST" else None))
             if doubled and every:
                 out.extend([out[-1]] * (k - j - 1))   # doubled: each copy counts
+            elif (doubled_cq and every and t in ("CQ", "TEST") and k - j == 2
+                  and (j == i + 1 or (j == i + 2 and toks[i + 1] in DOUBLED_CQ_WORDS | (words or frozenset())))
+                  and not (i and CALL_RE.match(toks[i - 1])) and not _third_copy(toks, k, toks[j])):
+                out.append(out[-1])               # CQ [word] X X: the runner's own CQ, two copies
         i = k
         while i < n and toks[i] in KEYWORDS:      # closing keywords end the group
             if cq_repeats and sender(toks, i, la1d, garbled) is not None and toks[sender(toks, i, la1d, garbled)] == toks[j]:
                 break                             # ... unless the same call follows: a new CQ
             i += 1
     return out
+
+
+def _third_copy(toks: list[str], k: int, call: str) -> bool:
+    """One of the 3 tokens from toks[k] is a garbled copy of call: its start (K4 of K4FTO) or a
+    token ending in its last 3 characters (NTEVAJ6V). doubled_cq: CQ AJ6V AJ6V NTEVAJ6V is a
+    caller sending the call three times after a lost runner call, not a runner's CQ."""
+    for t in toks[k:k + 3]:
+        if (len(t) >= 2 and call.startswith(t)) or (len(t) > 3 and t.endswith(call[-3:])):
+            return True
+    return False
 
 
 def _lev1(a: str, b: str) -> bool:
@@ -618,7 +648,8 @@ class RepeatSpotRule:
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
                  window_join: bool = False, validation_threshold: float | None = None,
-                 garbled_runner: bool = False, stray_known: bool = False) -> None:
+                 garbled_runner: bool = False, stray_known: bool = False,
+                 doubled_cq: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -639,6 +670,7 @@ class RepeatSpotRule:
         self.de_rejoin = split_runs  # with split runs, CQ POTADEW D9DWX reads CQ POTA DE WD9DWX
         self.cq_qualifiers = cq_qualifiers
         self.doubled = doubled and validation is None           # validation scores a doubled call itself
+        self.doubled_cq = doubled_cq and validation is None     # CQ [word] X X counts twice, see runner_groups()
         self.split_up = split_up          # TU <call> UP (a station working split) counts as a copy
         self.contest_words = contest_words      # CWT K5AX opens a group as CQ CWT K5AX does
         self.cq_repeats = cq_repeats            # CQ CWT N1DC CQ CWT N1DC is two copies
@@ -712,7 +744,7 @@ class RepeatSpotRule:
                                    contest_words=self.contest_words, cq_repeats=self.cq_repeats,
                                    stray=self.stray, words=self.words, grid=self.grid,
                                    la1d=self.la1d, gluek=self.gluek, garbled=self.garbled,
-                                   stray_listed=self.stray_listed))
+                                   stray_listed=self.stray_listed, doubled_cq=self.doubled_cq))
         if self.runner_signs:
             calls = calls + self._runner_copies(window, freq_khz, text, now, calls)
         for call, n in Counter(calls).items():
@@ -882,7 +914,7 @@ class RepeatSpotRule:
                                          cq_repeats=self.cq_repeats, stray=self.stray,
                                          words=self.words, grid=self.grid,
                                          la1d=self.la1d, gluek=self.gluek, garbled=self.garbled,
-                                         stray_listed=self.stray_listed):
+                                         stray_listed=self.stray_listed, doubled_cq=self.doubled_cq):
             owner = self.owner(freq_khz, now, self.takeover_idle_s)   # who may block or be challenged
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller
