@@ -31,8 +31,8 @@ def test_rbn_list(monkeypatch, tmp_path) -> None:
     lib = _Lib()
     seen = {}
 
-    def refresh(d, own, days):
-        seen.update(d=d, own=own, days=days)
+    def refresh(d, own, days, drop_busts=False, keep=None):
+        seen.update(d=d, own=own, days=days, drop_busts=drop_busts)
         return {"AI5I", "AI5IN", "K1VUT", "N3F"}
 
     monkeypatch.setattr(sparkgap, "_get_itila_lib", lambda: lib)
@@ -41,7 +41,7 @@ def test_rbn_list(monkeypatch, tmp_path) -> None:
            "callsign": "WF8Z", "rbn_known_days": 5}
     assert sparkgap._set_known_calls(cfg) == 2
     assert lib.calls == ["AI5IN", "K1VUT"] and lib.bonus == 3.0
-    assert seen == {"d": tmp_path, "own": "WF8Z", "days": 5}
+    assert seen == {"d": tmp_path, "own": "WF8Z", "days": 5, "drop_busts": False}
 
 
 def test_file_list_and_off(monkeypatch, tmp_path) -> None:

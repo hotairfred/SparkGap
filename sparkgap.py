@@ -1991,6 +1991,27 @@ def _prior_calls(calls):
     calls = sorted({c.strip().upper() for c in calls if len(c.strip()) >= 4})
     return [c for c, nxt in zip(calls, calls[1:] + ['']) if not nxt.startswith(c)]
 
+def _rbn_known(config, keep=None):
+    """The RBN known calls (rbn_known.py) for config: rbn_known_dir, rbn_known_days, and
+    rbn_known_drop_busts (off by default): a call that reaches 10 skimmers only as a bust many skimmers
+    share (K5MVSS beside K5MV in Sweepstakes) is not known, unless keep(call) (MASTER.SCP lists it)."""
+    import rbn_known
+    from pathlib import Path
+    return rbn_known.refresh(Path(config.get('rbn_known_dir', 'rbn_known')), config.get('callsign', ''),
+                             int(config.get('rbn_known_days', rbn_known.DAYS)),
+                             drop_busts=bool(config.get('rbn_known_drop_busts', False)), keep=keep)
+
+
+def _scp_lookup(config):
+    """keep() for _rbn_known from config master_scp (one call per line), or None when it cannot be read."""
+    try:
+        with open(config.get('master_scp', 'MASTER.SCP')) as f:
+            scp = {l.strip().upper() for l in f if l.strip() and not l.startswith('#')}
+    except OSError:
+        return None
+    return scp.__contains__
+
+
 def _set_known_calls(config):
     """Config itila_known_calls and itila_known_bonus (log units, 0 = off): itila2 favours calls heard
     on the air lately over callsign-shaped pieces of them. itila_known_calls is a file (one call per
@@ -2009,10 +2030,7 @@ def _set_known_calls(config):
     lib.itila_set_known_calls.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_double]
     try:
         if path == 'rbn':
-            import rbn_known
-            from pathlib import Path
-            calls = rbn_known.refresh(Path(config.get('rbn_known_dir', 'rbn_known')), config.get('callsign', ''),
-                                      int(config.get('rbn_known_days', rbn_known.DAYS)))
+            calls = _rbn_known(config, _scp_lookup(config) if config.get('rbn_known_drop_busts') else None)
         else:
             with open(path) as f:
                 calls = [l for l in f if not l.startswith('#')]
@@ -2207,8 +2225,7 @@ def _validation_list(config, tracker, calls):
         import rbn_known
         from pathlib import Path
         d = Path(config.get('rbn_known_dir', 'rbn_known'))
-        known = rbn_known.refresh(d, config.get('callsign', ''),
-                                  int(config.get('rbn_known_days', rbn_known.DAYS)))
+        known = _rbn_known(config, lambda c: c in tracker.valid_calls)
         if calls == 'rbn+skcc':
             import skcc_roster
             known = known | skcc_roster.refresh(d)
