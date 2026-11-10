@@ -2411,6 +2411,16 @@ def _get_rtty_lib():
                 _rtty_lib.rtty_fsk_seconds.argtypes = [_ct.c_void_p]
             except AttributeError:
                 pass
+            try:                                   # rtty_decoder "frtty": the frame-model decoder (frtty.c)
+                _rtty_lib.frtty_decode.restype  = _ct.c_int
+                _rtty_lib.frtty_decode.argtypes = [_ct.POINTER(_ct.c_double), _ct.c_int, _ct.c_int,
+                                                      _ct.c_double, _ct.c_char_p, _ct.c_int]
+                _rtty_lib.frtty_decode_fsk.restype  = _ct.c_int
+                _rtty_lib.frtty_decode_fsk.argtypes = [_ct.POINTER(_ct.c_double), _ct.c_int, _ct.c_int,
+                                                          _ct.c_double, _ct.c_char_p, _ct.c_int,
+                                                          _ct.POINTER(_ct.c_int)]
+            except AttributeError:
+                pass
             log.info("Loaded librtty.so")
         except OSError:
             log.warning("librtty.so not found — RTTY decoder unavailable")
@@ -2537,6 +2547,20 @@ def _rtty_printable(text):
     return ''.join(c if c.isprintable() else ' ' for c in text)
 
 
+RTTY_DECODERS = ('librtty', 'frtty')
+
+
+def _rtty_decoder(cfg):
+    """Config rtty_decoder: "librtty" (default) decodes each RTTY candidate with rtty_core.c; "frtty"
+    with FRTTY, the frame-model decoder (frtty.c), in its place. On the JARTS and PA recordings: real
+    calls 60 -> 65 and 91 -> 97, unconfirmed 1 -> 3 and 5 -> 6, at about 3x librtty's decode CPU."""
+    name = (cfg.get('rtty_decoder') or 'librtty').strip().lower()
+    if name not in RTTY_DECODERS:
+        log.warning("rtty_decoder %r is not one of %s: librtty is used", name, ', '.join(RTTY_DECODERS))
+        return 'librtty'
+    return name
+
+
 def _rtty_split_keywords(text):
     """RTTY prints line noise between transmissions with no spaces, so a keyword runs into
     junk: EFXTEST AI4WW, CQPDE KQ4TNF. Cut CQ, TEST and DE out of any token that is not itself
@@ -2659,6 +2683,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         log.info("RTTY %s: %d candidates, decoding the strongest %d (rtty_max_candidates)",
                  bn, len(cands), cap)
     cands = cands[:cap]
+    frtty = _rtty_decoder(skimmer.cfg) == 'frtty' and hasattr(rtty_lib, 'frtty_decode_fsk')
     if not cands:
         return 0
     rate, audio_center = 12000, 1000.0
@@ -2680,19 +2705,26 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         if peak <= 0:
             continue
         audio = np.ascontiguousarray(audio / peak * 0.7, dtype=np.float64)
-        h = rtty_lib.rtty_create(_ct.c_int(rate), _ct.c_double(audio_center))
-        if not h:
-            continue
-        conf = _ct.c_double(0.0)
         fsk_s = 0
-        try:
-            p = rtty_lib.rtty_feed(h, audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
-                                   _ct.c_int(len(audio)), _ct.byref(conf))
-            text = p.decode('latin-1', errors='replace').strip() if p else ''
-            if hasattr(rtty_lib, 'rtty_fsk_seconds'):
-                fsk_s = rtty_lib.rtty_fsk_seconds(h)
-        finally:
-            rtty_lib.rtty_free(h)
+        if frtty:
+            buf, fsk = _ct.create_string_buffer(8192), _ct.c_int(0)
+            rtty_lib.frtty_decode_fsk(audio.ctypes.data_as(_ct.POINTER(_ct.c_double)), _ct.c_int(len(audio)),
+                                      _ct.c_int(rate), _ct.c_double(audio_center), buf, _ct.c_int(len(buf)),
+                                      _ct.byref(fsk))
+            text, fsk_s = buf.value.decode('latin-1', errors='replace').strip(), fsk.value
+        else:
+            h = rtty_lib.rtty_create(_ct.c_int(rate), _ct.c_double(audio_center))
+            if not h:
+                continue
+            conf = _ct.c_double(0.0)
+            try:
+                p = rtty_lib.rtty_feed(h, audio.ctypes.data_as(_ct.POINTER(_ct.c_double)),
+                                       _ct.c_int(len(audio)), _ct.byref(conf))
+                text = p.decode('latin-1', errors='replace').strip() if p else ''
+                if hasattr(rtty_lib, 'rtty_fsk_seconds'):
+                    fsk_s = rtty_lib.rtty_fsk_seconds(h)
+            finally:
+                rtty_lib.rtty_free(h)
         c_hz = band_center_khz * 1000.0 + off_hz                    # centre between the tones
         rf_khz = (c_hz + RTTY_MARK_HZ) / 1000.0                      # mark tone: what spots give
         # rtty_excludes_cw: a candidate whose tones clearly alternated for a few seconds is RTTY,
