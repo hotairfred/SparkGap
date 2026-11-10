@@ -19,6 +19,7 @@ Status: the decoder, scanner and spot rule (`spot_rule: repeat`, the default wit
 | `spot_validation_calls` | off (default) | with `spot_validation`, a call list adds to the score: `scp` (MASTER.SCP), `rbn` (RBN known calls, `rbn_known.py`) or `rbn+skcc` (those and SKCC member calls, `skcc_roster.py`) |
 | `rbn_known_dir` | `rbn_known` (default) | with `spot_validation_calls: rbn`, cache of the RBN daily archives, refreshed at start |
 | `rbn_known_days` | 7 (default) | with `spot_validation_calls: rbn`, days of archives a call can be known from |
+| `rbn_known_drop_busts` | off (default) | a call that reaches 10 skimmers on a day only as a bust many skimmers share is not known from that day: another call that day had 5 times its skimmers, and it is that call with up to 3 letters glued on (K5MVSS beside K5MV in Sweepstakes) or one edit from it (AA3N beside AA3B); MASTER.SCP calls are kept. For the validation list and `itila_known_calls: rbn`. 310 of 10,246 calls dropped on 11-03..11-09 |
 | `itila_decode_threads` | 1 (default) | number of bins decoded in parallel, and scanner DSP worker threads |
 
 Decoder and scanner are selected together: an itila2 decoder on itila's scanner (or the reverse) is never run. The spot rule follows the decoder unless `spot_rule` is set (`repeat` with itila2, `off` with itila); setting it scores either chain under the other rule.
