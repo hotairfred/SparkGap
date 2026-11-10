@@ -1,5 +1,5 @@
 {
-  "_comment": "ka9q-radio radiod channels over RTP (an RX888, hotairfred/SparkGap#146): radiod does the wideband receiver and the channel filters (radiod_sparkgap.example.conf), SparkGap joins its data group and takes each band's channel by SSRC (its centre in kHz). Copy to <name>.local.json and set callsign, grid and rtp_group.",
+  "_comment": "ka9q-radio radiod channels over RTP (an RX888, hotairfred/SparkGap#146): radiod does the wideband receiver and the channel filters (radiod_sparkgap.example.conf), SparkGap joins its data group and takes each band's channel by SSRC (its centre in kHz). CW, FT8, RTTY and IQ recording (record_iq_dir) all run from the channels. Copy to <name>.local.json and set callsign, grid and rtp_group.",
   "callsign": "N0CALL",
   "skimmer_suffix": "-1",
   "grid": "AA00aa",
@@ -24,8 +24,8 @@
   "itila_max_bins": 400,
   "itila_decode_threads": 4,
   "signal_min_snr": 12,
-  "enable_ft8": false,
-  "enable_rtty": false,
+  "enable_ft8": true,
+  "enable_rtty": true,
   "gate_cq_runner": true,
   "gate_bypass_consensus": true,
   "gate_rare_dxcc_bypass": true,

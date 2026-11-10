@@ -194,11 +194,14 @@ The decoders get silence while the radio is keyed, until 0.1 s after
 its key-up (which comes after the transmitting client's CW delay), so
 your own transmissions and their key clicks are not decoded.
 
-**RX888 (or another radiod receiver):** run ka9q-radio's `radiod` with one 192 kHz IQ channel per
-band, each at the band centre SparkGap uses (radiod names a channel's SSRC after its frequency in
-kHz), then set `"sdr_type": "rtp"`, `rtp_group` (radiod's data multicast address or name),
-`rtp_encoding` (`f32le` or `s16be`, as radiod sends) and, if needed, `rtp_iface`. CW, FT8 and RTTY
-all run from the channels.
+**RX888 (or another radiod receiver):** build and install ka9q-radio
+([github.com/ka9q/ka9q-radio](https://github.com/ka9q/ka9q-radio), `docs/INSTALL.md`; `sudo make install`
+puts in radiod, the RX888 firmware and its udev rules). Start from `radiod_sparkgap.example.conf`, one
+192 kHz IQ channel per band at SparkGap's band centres (radiod names a channel's SSRC after its frequency
+in kHz); its comments cover loopback multicast, the socket buffer, FFTW wisdom and checking the gain.
+Then copy `skimmer_rtp.example.json`: `"sdr_type": "rtp"`, `rtp_group` (radiod's data group), `rtp_encoding`
+(`f32le` or `s16be`, as radiod sends) and, on one computer, `rtp_iface` 127.0.0.1. CW, FT8, RTTY and IQ
+recording all run from the channels.
 
 **macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
 omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for
