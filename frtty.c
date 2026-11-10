@@ -21,6 +21,7 @@
  * audio: rate_hz, mark at center + 85 Hz, space at center - 85 Hz.  Returns the text length.
  */
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -184,11 +185,18 @@ static int text_out(const Model *m, const int *path, int T, char *out, int out_l
     return o;
 }
 
+static Model loose, locked[2 * K + 1];                  /* read-only once built: every thread shares them */
+static pthread_once_t models_once = PTHREAD_ONCE_INIT;
+static void build_models(void)
+{
+    build(&loose, 0);
+    for (int L = K; L <= 2 * K; L++) build(&locked[L], L);
+}
+
 /* One over (or the whole minute): the loose model, then the three locked cadences; the best path's text. */
 static int decode_d(const double *d, int T, char *out, int out_len)
 {
-    static Model loose, locked[2 * K + 1]; static int built;
-    if (!built) { build(&loose, 0); for (int L = K; L <= 2 * K; L++) build(&locked[L], L); built = 1; }
+    pthread_once(&models_once, build_models);            /* once, even when two threads start together */
     if (T < 4 * K || out_len < 1) { if (out_len) out[0] = 0; return 0; }
     double *a = malloc(T * sizeof *a); for (int t = 0; t < T; t++) a[t] = fabs(d[t]);
     double mu0 = fmax(0.3, percentile(a, T, 0.80)), sigma = 0.3;
