@@ -77,11 +77,12 @@ def test_the_two_paths_of_one_window_never_join_each_other() -> None:
     assert not any(c.call == "K2MJP" for c in rule._copies)
 
 
-def test_the_config_key_reaches_the_rule() -> None:
+def test_window_join_is_built_in() -> None:
+    """cdub89/SparkGap#46: always on with the repeat rule; the key is no longer read."""
     import sparkgap
     tracker = sparkgap.SpotTracker(set(), set())
-    assert not sparkgap._make_spot_rule({}, tracker).window_join
-    assert sparkgap._make_spot_rule({"spot_rule_window_join": True}, tracker).window_join
+    assert sparkgap._make_spot_rule({}, tracker).window_join
+    assert sparkgap._make_spot_rule({"spot_rule_window_join": False}, tracker).window_join
 
 
 def test_a_joined_window_never_promotes_a_caller_against_the_owner() -> None:

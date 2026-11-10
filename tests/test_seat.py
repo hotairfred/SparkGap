@@ -115,8 +115,8 @@ def test_afc_is_written_to_the_config(seat: Seat) -> None:
 
 def test_decoder_options_are_written_and_off_removes_the_key(seat: Seat) -> None:
     i = seat.instance("dallas1")
-    seat.change("dallas1", {"spot_rule_owner_listed": True, "spot_rule_strongest_db": 6})
-    assert seat.config(i)["spot_rule_owner_listed"] is True
+    seat.change("dallas1", {"spot_rule_owner_cell": True, "spot_rule_strongest_db": 6})
+    assert seat.config(i)["spot_rule_owner_cell"] is True
     assert seat.settings(i)["spot_rule_strongest_db"] == 6
     seat.change("dallas1", {"spot_rule_strongest_db": None})
     assert "spot_rule_strongest_db" not in seat.config(i)
@@ -144,9 +144,11 @@ def test_a_stopped_copy_is_only_written(seat: Seat) -> None:
         ({"rbn_auth": "x"}, "cannot be changed"),
         ({"band": "6m"}, "band must be one of: 40m 20m 17m"),
         ({"validation": "loose"}, "validation must be one of"),
-        ({"spot_rule_split_runs": "yes"}, "true or false"),
+        ({"spot_rule_owner_cell": "yes"}, "true or false"),
+        ({"spot_rule_split_runs": True}, "cannot be changed"),          # built in (cdub89/SparkGap#46)
         ({"afc": "on"}, "afc must be true or false"),
-        ({"spot_rule_takeover_idle_s": 90}, "takeover_idle_s must be one of: off, 120"),
+        ({"spot_rule_strongest_db": 4}, "strongest_db must be one of: off, 3"),
+        ({"spot_rule_takeover_idle_s": 180}, "cannot be changed"),      # built in
         ({"spot_rule_strongest_db": True}, "strongest_db must be one of"),
         ({}, "nothing to change"),
     ],

@@ -22,6 +22,5 @@
         7090000
     ],
     "telnet_port": 7300,
-    "scp_bypass_threshold": 3,
     "max_bins": 300
 }

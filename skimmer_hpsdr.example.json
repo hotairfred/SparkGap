@@ -38,7 +38,6 @@
   "enable_rtty": false,
   "exclude_ft8_freqs": true,
   "exclude_ft4_freqs": false,
-  "scp_bypass_threshold": 2,
   "enable_caller_spotting": false,
   "gate_cq_runner": true,
   "gate_freq_consensus": false,

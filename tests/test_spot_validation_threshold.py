@@ -20,8 +20,9 @@ def test_set_replaces_the_level_and_needs_validation_on() -> None:
     assert RepeatSpotRule(_tier, validation=None, validation_threshold=2.5).threshold is None
 
 
-@pytest.mark.parametrize("value, want", [(None, VALIDATION["normal"]), (2.5, 2.5), ("2.5", 2.5)])
-def test_config_key(value, want) -> None:
+@pytest.mark.parametrize("value, want", [(None, VALIDATION["normal"]), (2.5, VALIDATION["normal"])])
+def test_config_key_is_no_longer_read(value, want) -> None:
+    """spot_validation_threshold is removed (cdub89/SparkGap#46): the level's threshold always."""
     cfg = {"spot_rule": "repeat", "spot_validation": "normal"}
     if value is not None:
         cfg["spot_validation_threshold"] = value

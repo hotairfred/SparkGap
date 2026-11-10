@@ -86,13 +86,15 @@ def _gui_settings(cfg, sample_rate):
         'spot_rule_cq_groups': repeat,         # _make_spot_rule: always on with the repeat rule
         'spot_rule_lockon': repeat,
         'spot_rule_cq_qualifiers': repeat,
-        'spot_rule_split_runs': repeat and bool(cfg.get('spot_rule_split_runs', False)),
+        'spot_rule_split_runs': repeat,        # built in with the repeat rule (cdub89/SparkGap#46)
         'spot_rule_contest_words': repeat and bool(cfg.get('spot_rule_contest_words', False)),
         'spot_rule_cq_repeats': repeat and bool(cfg.get('spot_rule_cq_repeats', False)),
         'spot_rule_doubled_calls': repeat and bool(cfg.get('spot_rule_doubled_calls', False)),
         'spot_rule_split_up': repeat and bool(cfg.get('spot_rule_split_up', False)),
-        'spot_rule_runner_signs': repeat and bool(cfg.get('spot_rule_runner_signs', False)),
-        'spot_rule_window_join': repeat and bool(cfg.get('spot_rule_window_join', False)),
+        'spot_rule_runner_signs': repeat,
+        'spot_rule_window_join': repeat,
+        'spot_rule_owner_listed': repeat and bool(validation and calls),   # with a known-call list
+        'spot_rule_takeover_idle_s': TAKEOVER_IDLE_S if repeat else None,
         'spot_rule_garbled_runner': repeat and bool(cfg.get('spot_rule_garbled_runner', False)),
         'spot_rule_stray_known': repeat and bool(cfg.get('spot_rule_stray_known', False)),
         'spot_rule_fragments': (cfg.get('spot_rule_fragments') or 'off') if repeat else 'off',
@@ -106,7 +108,7 @@ def _gui_settings(cfg, sample_rate):
         'rbn_known_days': int(cfg.get('rbn_known_days', rbn_known.DAYS))
                           if calls in ('rbn', 'rbn+skcc') else None,
     }
-    built_in = ['spot_rule_cq_groups', 'spot_rule_lockon', 'spot_rule_cq_qualifiers']
+    built_in = ['spot_rule_cq_groups', 'spot_rule_lockon', 'spot_rule_cq_qualifiers'] + list(BUILT_IN_KEYS)
     defaults = [k for k in eff if k not in cfg and k not in built_in and k != 'sample_rate']
     return eff, defaults, built_in
 
@@ -2270,10 +2272,28 @@ def _load_spot_memory(path, tracker, now):
     return kept
 
 
+TAKEOVER_IDLE_S = 180.0   # another call may take an owned frequency after its owner is quiet this long
+# Spot rule options built into the repeat rule after a week on WF8Z-1 and cdub89's nodes
+# (cdub89/SparkGap#46): the keys are no longer read, and a config that still has one is told so.
+BUILT_IN_KEYS = ('spot_rule_split_runs', 'spot_rule_runner_signs', 'spot_rule_window_join',
+                 'spot_rule_owner_listed', 'spot_rule_takeover_idle_s')
+REMOVED_KEYS = {'spot_validation_threshold': "the validation level's own threshold is used"}
+
+def _note_retired_keys(config):
+    """Log once per key a config still sets that is now built in or removed."""
+    for k in BUILT_IN_KEYS:
+        if k in config:
+            log.info("%s: built into the repeat rule now; the key is no longer read%s", k,
+                     "" if config[k] not in (False, None, 0) else " (it can't be turned off)")
+    for k, why in REMOVED_KEYS.items():
+        if k in config:
+            log.warning("%s: removed (%s); the key is no longer read", k, why)
+
 def _make_spot_rule(config, tracker, local=None):
     """The RepeatSpotRule SparkGap runs with spot_rule "repeat": tiers from patt3ch, lock-on,
-    CQ groups and CQ qualifiers always on (measured on every recording we have), split_runs
-    by config (spot_rule_split_runs, off by default), doubled calls by config
+    CQ groups and CQ qualifiers always on (measured on every recording we have), and since
+    cdub89/SparkGap#46 split runs, runner signs, window join, owner listed (with a known-call
+    list) and a 180 s takeover too (BUILT_IN_KEYS: those keys are no longer read); doubled calls by config
     (spot_rule_doubled_calls, off by default), split DX sign-offs by config
     (spot_rule_split_up, off by default: CW Skimmer does not spot TU <call> UP either,
     hotairfred/SparkGap#48).
@@ -2314,28 +2334,24 @@ def _make_spot_rule(config, tracker, local=None):
     return RepeatSpotRule(
         lambda c: max(2, {'active': 2, 'rare': 3}.get(tracker._matches_patt3ch(c), 4) - fewer),
         cq_groups=True, cq_qualifiers=True, lockon=True,
-        split_runs=bool(config.get('spot_rule_split_runs', False)),
+        split_runs=True,
         window_s=float(config.get('itila_window_sec', 60.0)),
         validation=validation, listed=listed, listed_by=calls or 'scp',
         doubled=bool(doubled), split_up=bool(split_up),
         contest_words=bool(contest_words), cq_repeats=bool(cq_repeats),
         fragments=config.get('spot_rule_fragments') or None,
-        # spot_rule_lock_idle_s, _owner_listed, _la1d, _gluek, _norival, _strongest_db, _takeover_idle_s: cdub89/SparkGap#11, unset = as before
+        # spot_rule_lock_idle_s, _la1d, _gluek, _norival, _strongest_db: cdub89/SparkGap#11, unset = as before
         lock_idle_s=float(config.get('spot_rule_lock_idle_s', LOCK_IDLE_S)),
-        owner_listed=bool(config.get('spot_rule_owner_listed', False)),
+        owner_listed=listed is not None,         # one copy owns an empty frequency only when listed
         la1d=bool(config.get('spot_rule_la1d', False)),
         gluek=bool(config.get('spot_rule_gluek', False)),
         norival=bool(config.get('spot_rule_norival', False)),
         strongest_db=(float(config['spot_rule_strongest_db'])
                       if config.get('spot_rule_strongest_db') is not None else None),
-        takeover_idle_s=(float(config['spot_rule_takeover_idle_s'])
-                         if config.get('spot_rule_takeover_idle_s') is not None else None),
+        takeover_idle_s=TAKEOVER_IDLE_S,
         owner_cell=bool(config.get('spot_rule_owner_cell', False)),
         owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)),
-        runner_signs=bool(config.get('spot_rule_runner_signs', False)),   # cdub89/SparkGap#37
-        window_join=bool(config.get('spot_rule_window_join', False)),   # cdub89/SparkGap#37
-        validation_threshold=(float(config['spot_validation_threshold'])
-                              if config.get('spot_validation_threshold') is not None else None),
+        runner_signs=True, window_join=True,      # cdub89/SparkGap#37
         garbled_runner=bool(config.get('spot_rule_garbled_runner', False)),
         stray_known=bool(config.get('spot_rule_stray_known', False)))
 
@@ -7851,8 +7867,9 @@ class SparkGap:
                                    scp_bypass_threshold=int(self.cfg.get('scp_bypass_threshold', 0)),
                                    gate_config=gate_config,
                                    recent_band_config=self.cfg.get('recent_band_floor'))
+        _note_retired_keys(self.cfg)
         _select_bin_liveness(self.cfg.get('itila2_bin_liveness', False), _liveness_list(self.cfg, self.tracker),
-                             self.cfg.get('spot_rule_runner_signs', False))
+                             _spot_rule_name(self.cfg) == 'repeat')
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
         _select_snr_decoder(self.cfg.get('itila2_snr_decoder', False))
         _select_afc(self.cfg.get('itila2_afc', False))
@@ -9470,8 +9487,9 @@ def run_file_mode(args, config):
     tracker = SpotTracker(calls, blacklist, respot_interval=0, add_calls=add_calls,
                           scp_bypass_threshold=int(config.get('scp_bypass_threshold', 0)),
                           gate_config=gate_config)
+    _note_retired_keys(config)
     _select_bin_liveness(config.get('itila2_bin_liveness', False), _liveness_list(config, tracker),
-                         config.get('spot_rule_runner_signs', False))
+                         _spot_rule_name(config) == 'repeat')
     _select_decode_threads(config.get('itila_decode_threads', 1))
     _select_snr_decoder(config.get('itila2_snr_decoder', False))
     _select_afc(config.get('itila2_afc', False))
