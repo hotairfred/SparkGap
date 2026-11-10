@@ -49,8 +49,10 @@ in `tools/eval/` and `tools/sim/`.
 ## What it does
 
 - **Receivers.** HPSDR protocol 1 radios (a Red Pitaya with Pavel Demin's `sdr_receiver_hpsdr`
-  firmware, up to 8 receivers at 48 to 192 kHz each), and FlexRadio DAX-IQ through `flex_iq.py`
-  (`skimmer_flex.example.json`). Lost UDP packets are counted from the sequence number and their
+  firmware, up to 8 receivers at 48 to 192 kHz each), FlexRadio DAX-IQ through `flex_iq.py`
+  (`skimmer_flex.example.json`), and any receiver ka9q-radio's `radiod` drives, such as an RX888,
+  as RTP channels (`"sdr_type": "rtp"`, `rtp_receiver.py`). Adding another radio takes one file
+  that delivers IQ ([docs/RADIOS.md](docs/RADIOS.md#adding-an-iq-back-end)). Lost UDP packets are counted from the sequence number and their
   time kept as silence, so FT8 slots stay on the clock (`FT8 trigger: ... lost=` in the log).
   A Red Pitaya streams to one client, and any client on the LAN can stop it: with no IQ for
   `hpsdr_restart_after_s` (default 30 s; 0 = never) the receiver sends the start sequence again and
@@ -191,6 +193,12 @@ and stop it after the last one. A copy started alone holds the station itself.
 The decoders get silence while the radio is keyed, until 0.1 s after
 its key-up (which comes after the transmitting client's CW delay), so
 your own transmissions and their key clicks are not decoded.
+
+**RX888 (or another radiod receiver):** run ka9q-radio's `radiod` with one 192 kHz IQ channel per
+band, each at the band centre SparkGap uses (radiod names a channel's SSRC after its frequency in
+kHz), then set `"sdr_type": "rtp"`, `rtp_group` (radiod's data multicast address or name),
+`rtp_encoding` (`f32le` or `s16be`, as radiod sends) and, if needed, `rtp_iface`. CW, FT8 and RTTY
+all run from the channels.
 
 **macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
 omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for
@@ -464,6 +472,8 @@ regardless.
 
 - **Pavel Demin** — Red Pitaya HPSDR firmware (`sdr_receiver_hpsdr`)
   and the `ft8d` standalone FT8 decoder.
+- **Phil Karn (KA9Q)** — *ka9q-radio*: `radiod` turns a wideband receiver such as the RX888 into
+  the IQ channels the `rtp` receiver reads.
 - **Rudy Bakalov (N2WQ)** — *GoCluster*, BSD-licensed cluster server.
   Cross-source validation techniques (recent-on-band support floor,
   harmonic suppression) in this project's spot pipeline are adapted

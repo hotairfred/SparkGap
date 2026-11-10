@@ -145,3 +145,46 @@ Each stage is live tested before the next.
 - Still on files: pid files, which the service writes when it starts a
   process and reads to stop one that has no link. Stage 7 (HPSDR) waits for
   the Web-888.
+
+## Adding an IQ back end
+
+A new radio needs one thing to skim: an object that delivers its IQ. The SparkGap Web side
+(Discover, capabilities in `radios.py`) is optional and can come later. `rtp_receiver.py`
+(ka9q-radio's radiod, for an RX888 and others) is a complete example in about 330 lines;
+`flex_iq.py` is a larger one.
+
+### The receiver
+
+A class with these methods, built in `SparkGap.start()` on a new `sdr_type` value, beside
+`rtp`, `flex` and the HPSDR default:
+
+- `set_frequency(rx_index, freq_hz)`: called for each band before `start()`, and again on a
+  live band change. `rx_index` is the band's place in the config's `bands` list (or its
+  `rx_index`).
+- `start()`: open the radio or the stream.
+- `receive(callback)`: block on SparkGap's receive thread until `stop()`, and call
+  `callback(rx_index, iq)` for each packet, `iq` an `(n, 2)` array of I and Q floats at 1.0
+  full scale.
+- `stop()`: end `receive()` and close.
+- Optional: `health()`, a dict the status shows; `restarts()`, called at each health line,
+  to log that the radio had to be restarted.
+
+What the IQ has to be:
+
+- **At `sample_rate`.** CW runs at 48, 96 or 192 kHz. FT8 and RTTY need 192 kHz.
+- **The right way round.** A signal above the centre must come out at a positive frequency. If
+  spots appear mirrored around the centre, negate Q.
+- **Whole in time.** Fill a lost packet with zeros rather than skipping it, so a band's time
+  line stays whole (FT8's slots, the repeat rule's windows), and count what was filled.
+- **Prompt.** Hand packets over as they arrive: aligned FT8 windows take their time from
+  arrival. A receiver that buffers seconds of IQ needs `"ft8_windows": "sliding"`.
+
+That is all CW, FT8 and RTTY need: each band's minute for FT8 and RTTY is kept from the same
+callback (`_py_minute_add`). Test with real audio from the radio, not synthetic tones: a few
+minutes against another skimmer on the same antenna, or against RBN.
+
+### SparkGap Web (optional)
+
+To have the server discover the radio and run its receivers, add a back end to `radios.py`:
+`discover(seconds, address)` returning `Found` radios, and its `Capabilities`; see Flex and
+Hpsdr there, and the stages above.
