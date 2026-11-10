@@ -689,6 +689,221 @@ def _ft8_decoder(cfg):
     if cfg.get('ft8_decoder'):
         return cfg['ft8_decoder']
     return FT8_DECODER_BUILT if os.path.exists(FT8_DECODER_BUILT) else FT8_DECODER_OLD
+
+
+# FT8 dials, kHz, and the Red Pitaya node's receiver centres (kHz) with the dial each decodes
+FT8_DIALS_KHZ = (1840, 3573, 7074, 10136, 14074, 18100, 21074, 24915, 28074)
+FT8_CENTRE_DIALS = {3590: 3573, 7090: 7074, 10118: 10136, 14090: 14074, 18083: 18100,
+                    21090: 21074, 24902: 24915, 28090: 28074}
+
+
+def ft8_dial_khz(center_khz, fs=192000):
+    """The FT8 dial a band's IQ decodes, or None: the Red Pitaya centres' own dial, else the FT8 dial
+    whose 3 kHz of audio lies inside the span with 2 kHz to spare (band names centre by the sample
+    rate, 7076.8 kHz at 192 kHz; an RTP or Flex receiver can sit anywhere)."""
+    dial = FT8_CENTRE_DIALS.get(int(center_khz))
+    if dial:
+        return dial
+    half = fs / 2000.0 - 2.0
+    return next((d for d in FT8_DIALS_KHZ if center_khz - half <= d and d + 3.0 <= center_khz + half), None)
+
+
+# The minute cycle: FT8 then RTTY per band from one FFT, on a thread, for either receive path.
+def _ft8_decode(jobs, skimmer):
+    # Whatever goes wrong in a cycle, the next minute must run.
+    try:
+        _ft8_cycle(jobs, skimmer)
+    except Exception:
+        log.exception("FT8/RTTY cycle failed")
+    finally:
+        skimmer._ft8_running = False
+
+
+def _ft8_cycle(jobs, skimmer):
+    # Re-read flags inside the thread so a runtime
+    # config edit could take effect at the next
+    # minute boundary (not currently used but cheap).
+    enable_ft8  = bool(skimmer.cfg.get('enable_ft8',  True))
+    enable_rtty = bool(skimmer.cfg.get('enable_rtty', True))
+    import subprocess, wave
+    from scipy.signal import resample_poly
+    from numpy.fft import fft, ifft
+    ft8_bin = _ft8_decoder(skimmer.cfg)
+    total = 0
+    seen_msgs = set()  # dedupe across sliding windows
+    aligned = skimmer.cfg.get('ft8_windows', 'aligned') == 'aligned'
+    cycle_dts = []                 # decodes' DT, for the clock watch
+    rtty_lib = _get_rtty_lib() if enable_rtty else None
+    rtty_repeat = skimmer.cfg.get('rtty_spot_rule') == 'repeat'
+    rtty_total, rtty_done = 0, set()
+
+    def _rtty_band(bn, ck, fi, fq, n, z=None):
+        nonlocal rtty_total
+        rtty_done.add(bn)
+        try:
+            if rtty_repeat:
+                rtty_total += _rtty_scan_band_repeat(
+                    skimmer, rtty_lib, bn, ck, fi, fq, n, z=z)
+            else:
+                rtty_total += _rtty_scan_band(skimmer, rtty_lib, bn, ck, fi, fq, n)
+        except Exception as e:
+            log.warning("RTTY scan %s: %s", bn, e)
+
+    for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 else []):
+        offset_hz = (ft8_khz - ck) * 1000
+        z = None
+        if skimmer.cfg.get('ft8_band_cut', 'fft') == 'fft':
+            # 12 kHz around the dial, cut from one FFT of the minute
+            z = minute_fft(fi[:n], fq[:n])
+            dec12 = band_slice_12k(fi[:n], fq[:n], offset_hz, z=z).astype(np.complex128)
+        else:
+            iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
+            t = np.arange(n) / 192000
+            mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
+            # 192k → 12k complex via polyphase
+            dec12 = resample_poly(mixed, 1, 16)
+        slot_n = 15 * 12000
+        # Windows from the snapshot's start time: two around each slot
+        # (ft8_windows "aligned"), or every second from 0 to 45 s
+        # ("sliding", the original, for a buffer whose time is unknown).
+        for start in ft8_window_starts(t0 if aligned else 0.0, len(dec12)):
+            chunk = dec12[start:start+slot_n]
+            if len(chunk) < slot_n:
+                continue
+            # USB demodulation: zero negative freqs, take real
+            spec = fft(chunk)
+            spec[len(spec)//2:] = 0
+            audio = ifft(spec).real * 2
+            peak = np.max(np.abs(audio))
+            if peak > 0:
+                audio = audio / peak * 0.9
+            i16 = (audio * 32767).astype(np.int16)
+            part = start // 12000  # used in WAV filename
+            wav_fn = f'/tmp/ft8_{bn}_p{part}.wav'
+            with wave.open(wav_fn, 'wb') as wf:
+                wf.setnchannels(1); wf.setsampwidth(2)
+                wf.setframerate(12000)
+                wf.writeframes(i16.tobytes())
+            try:
+                r = subprocess.run([ft8_bin, wav_fn],
+                    capture_output=True, text=True, timeout=20)
+            except Exception as e:
+                log.debug("decode_ft8 err %s p%d: %s", bn, part, e)
+                continue
+            for line in (r.stdout or '').strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                # Format: "000000 +05.0 +1.12 1803 ~  CQ N4DWD EM86"
+                parts_o = line.split(maxsplit=5)
+                if len(parts_o) < 6:
+                    continue
+                try:
+                    snr = int(float(parts_o[1]))
+                    time_sec = float(parts_o[2])
+                    audio_hz = int(parts_o[3])
+                    msg = parts_o[5]
+                except (ValueError, IndexError):
+                    continue
+                # RF freq = dial + audio offset
+                rf_khz = ft8_khz + audio_hz / 1000.0
+                # Extract caller from message
+                # CQ X Y → X is calling
+                # X Y Z → Y is responding to X (spot Y)
+                # X Y RR73/grid → spot Y
+                msg_parts = msg.split()
+                ft8_call = None
+                if msg_parts and msg_parts[0] == 'CQ':
+                    # CQ [DX] CALL GRID — call is at index 1 or 2
+                    if len(msg_parts) >= 2 and re.match(
+                            r'^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}$',
+                            msg_parts[1]):
+                        ft8_call = msg_parts[1]
+                    elif len(msg_parts) >= 3:
+                        ft8_call = msg_parts[2]
+                elif len(msg_parts) >= 2:
+                    # Standard QSO: X Y ... — Y is the spotted station
+                    ft8_call = msg_parts[1]
+                if not ft8_call or not re.match(
+                        r'^[A-Z0-9/]{3,11}$', ft8_call):
+                    continue
+                # Dedupe: same band + msg = duplicate from
+                # sliding window catching same TX twice
+                dedup_key = (bn, msg)
+                if dedup_key in seen_msgs:
+                    continue
+                seen_msgs.add(dedup_key)
+                if aligned and t0 > 0:
+                    cycle_dts.append(ft8_slot_dt(t0 + start / 12000.0, time_sec))
+                log.info("FT8 %s p%d: %s", bn, part, line)
+                total += 1
+                skimmer.spot_count += 1
+                rf_khz_corr = skimmer._corrected_freq_khz(rf_khz)
+                skimmer.broadcast(
+                    freq_khz=rf_khz_corr, dx_call=ft8_call,
+                    snr=snr, mode='FT8',
+                    comment=msg)
+                # Best-effort publish to skimmer/ft8/raw for pskr_feeder.
+                # Grid is the last 4/6-char token if it matches Maidenhead.
+                ft8_grid = ''
+                if msg_parts and _GRID_RE.match(msg_parts[-1]):
+                    ft8_grid = msg_parts[-1]
+                _pub = _get_mqtt_publisher()
+                if _pub is not None:
+                    try:
+                        _pub.publish('skimmer/ft8/raw', json.dumps({
+                            'call':    ft8_call,
+                            'grid':    ft8_grid,
+                            'freq_hz': int(rf_khz_corr * 1000),
+                            'snr':     int(snr),
+                            'mode':    'FT8',
+                            'msg':     msg,
+                            'ts':      int(time.time()),
+                        }), qos=0)
+                    except Exception:
+                        pass
+                log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
+                         rf_khz, ft8_call, snr, msg)
+        # this band's RTTY now, from the same FFT, so the minute is
+        # transformed once and its FFT freed before the next band
+        if rtty_lib is not None and z is not None:
+            _rtty_band(bn, ck, fi, fq, n, z)
+        del z
+    if enable_ft8:
+        watch = getattr(skimmer, '_ft8_clock', None)
+        if watch is None:
+            watch = skimmer._ft8_clock = Ft8ClockWatch()
+        med, warn = watch.add(cycle_dts, time.time())
+        log.info("FT8 cycle done: %d spots across %d bands%s",
+                 total, len(jobs),
+                 '' if med is None else ', median DT %+.2f s' % med)
+        if warn:
+            log.warning(warn)
+    # RTTY scan piggybacks on the same minute snapshot.
+    # Each band was scanned right after its FT8 (sharing its FFT);
+    # this covers bands that were not (FT8 off, or the resample cut).
+    # Independent of enable_ft8 — controlled by
+    # enable_rtty (default true for backward compat).
+    if enable_rtty:
+        if rtty_lib is not None:
+            for bn, ri, ck, ft8_khz, fi, fq, n, _t0 in jobs:
+                if bn not in rtty_done:      # FT8 off, or the resample cut
+                    _rtty_band(bn, ck, fi, fq, n)
+            excl = ''
+            if skimmer.cfg.get('rtty_excludes_cw'):
+                rel = blk = 0
+                for mgr in skimmer.managers:
+                    sc = getattr(getattr(mgr, '_itila_scanner', None), '_sc', None)
+                    c = sc.excl_counts() if sc and hasattr(sc, 'excl_counts') else None
+                    if c:
+                        rel += c[0]; blk += c[1]
+                excl = ("; CW kept off %d RTTY signals (total), %d CW bins released, "
+                        "%d spawns blocked" % (skimmer._rtty_excluded, rel, blk))
+            log.info("RTTY cycle done: %d spots across %d bands%s",
+                     rtty_total, len(jobs), excl)
+    skimmer._ft8_running = False
+
+
 BMORSE_RATE = 4000    # bmorse input sample rate
 PEAK_SCAN_SAMPLES = 8192    # live peak scan FFT; the Python receive path keeps only this much IQ
 RECORD_WAV_MAX_BYTES = 4_000_000_000    # under the WAV format's 2**32 - 1 byte limit
@@ -7855,8 +8070,8 @@ class SparkGap:
         spot_log_path = self.cfg.get('spot_log')
         self._spot_log = open(spot_log_path, 'a', buffering=1) if spot_log_path else None
 
-        # All-band IQ recorder for the C receiver path (see iq_recorder.py):
-        # record_wav below only works on the Python receiver path.
+        # All-band IQ recorder (see iq_recorder.py): the C receiver's minute swaps, or the Python receive
+        # path's minute buffers (_py_minute_tick) at 192 kHz. record_wav below is the older single-band one.
         self._iq_rec = None
         if self.cfg.get('record_iq_dir'):
             from iq_recorder import BandRecorder
@@ -7979,6 +8194,7 @@ class SparkGap:
                 'raw': [],   # iq_samples per packet from the receiver thread, unconverted
                 'i': [],
                 'q': [],
+                'min_i': [], 'min_q': [], 'min_n': 0, 'min_t0': 0.0,   # the minute for FT8/RTTY (_py_minute_add)
             }
 
         self._set_telnet_bands()
@@ -8238,6 +8454,7 @@ class SparkGap:
         with self._iq_lock:
             buf = self._band_bufs[rx_idx]
             buf['raw'], buf['iq'], buf['i'], buf['q'] = [], np.empty((0, 2)), [], []
+            buf['min_i'], buf['min_q'], buf['min_n'], buf['min_next'] = [], [], 0, 0.0
         mgr = self.managers[0]
         mgr.kill_all()   # the scanner goes; the next one is made for the new centre
         mgr._wpm_cache.clear()
@@ -8460,6 +8677,63 @@ class SparkGap:
         if before // RECORD_WAV_DROP_BYTES != self._wav_bytes // RECORD_WAV_DROP_BYTES:
             _wav_drop_cache(self._wav_path)
 
+    def _py_minute_add(self, buf, i_cat, q_cat, rate):
+        """The Python receive path's minute of IQ per band, for FT8 and RTTY: what the C receiver keeps in
+        its swap buffer. At most 65 s; min_t0 is the wall time of the first sample kept: where the last
+        minute ended (the samples are contiguous, so their count is the clock), unless the arrival time
+        says otherwise by a second or more (a stream that stopped)."""
+        if not buf['min_n']:
+            est, nxt = time.time() - len(i_cat) / rate, buf.get('min_next', 0.0)
+            buf['min_t0'] = nxt if nxt and abs(est - nxt) < 1.0 else est
+        buf['min_i'].append(i_cat.astype(np.float32))
+        buf['min_q'].append(q_cat.astype(np.float32))
+        buf['min_n'] += len(i_cat)
+        while len(buf['min_i']) > 1 and buf['min_n'] - len(buf['min_i'][0]) >= 65 * rate:
+            d = len(buf['min_i'].pop(0))
+            buf['min_q'].pop(0)
+            buf['min_n'] -= d
+            buf['min_t0'] += d / rate
+
+    def _py_minute_tick(self):
+        """At each minute boundary, every band's minute to the IQ recorder (record_iq_dir, all of it: the
+        recording stays contiguous) and its last 60 s to the FT8/RTTY cycle, as the C receiver's swap
+        does: for an RTP (radiod) or Flex receiver. The minute is taken even while the last cycle still
+        runs (only that cycle is skipped), so the recording has no gap."""
+        sec = time.time() % 60
+        prev, self._ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60), sec
+        if not (sec < 5 and prev >= 55):
+            return
+        busy = getattr(self, '_ft8_running', False)
+        digital = bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True))
+        fs, jobs = 192000, []
+        n60 = fs * 60
+        for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
+            buf = self._band_bufs.get(ri)
+            if buf is None:
+                continue
+            chunks_i, chunks_q, n, t_first = buf['min_i'], buf['min_q'], buf['min_n'], buf['min_t0']
+            buf['min_i'], buf['min_q'], buf['min_n'] = [], [], 0
+            if not n:
+                continue
+            buf['min_next'] = t_first + n / fs
+            ck = ch / 1000
+            fi, fq = np.concatenate(chunks_i), np.concatenate(chunks_q)
+            if self._iq_rec is not None:
+                self._iq_rec.submit(int(ck), t_first, fi, fq, n)
+            ft8_khz = ft8_dial_khz(ck)
+            if busy or not digital or not ft8_khz:
+                continue
+            if n < n60 - fs:
+                log.info("FT8 %s rx%d: short snapshot (%.1f s), skip", bn, ri, n / fs)
+                continue
+            fi, fq = fi[-n60:], fq[-n60:]
+            jobs.append((bn, ri, ck, ft8_khz, fi, fq, len(fi), t_first + (n - len(fi)) / fs))
+        if busy and digital:
+            log.info("FT8/RTTY: the last minute's cycle is still running, this minute skipped")
+        if jobs:
+            self._ft8_running = True
+            threading.Thread(target=_ft8_decode, args=(jobs, self), daemon=True).start()
+
     async def run(self):
         use_c = getattr(self, '_use_c_receiver', False)
         if use_c:
@@ -8472,6 +8746,12 @@ class SparkGap:
             )
             rx_thread.start()
         log.info("IQ stream started")
+        # The Python receive path (RTP, Flex) keeps each band's minute itself for FT8 and RTTY
+        self._py_minute = (not use_c and self.cfg.get('sample_rate', 48000) == 192000
+                           and bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)
+                                    or self._iq_rec is not None))
+        if not use_c and not self._py_minute and (self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)):
+            log.info("FT8/RTTY need 192 kHz IQ; this receiver runs at %s: CW only", self.cfg.get('sample_rate', 48000))
 
         scan_interval = self.cfg.get('scan_interval', 5)
         status_interval = self.cfg.get('status_interval', 30)
@@ -8535,6 +8815,8 @@ class SparkGap:
                         i_cat = iq_new[:, 0] * 8388608.0
                         q_cat = iq_new[:, 1] * 8388608.0
                         mgr.feed_all_iq(i_cat, q_cat)
+                        if self._py_minute:
+                            self._py_minute_add(buf, i_cat, q_cat, live_rate)
             if use_c and not getattr(self, '_worker_started', False):
                 scanners_ready = sum(1 for mgr in self.managers
                                      if mgr._itila_scanner and mgr._itila_scanner._sc)
@@ -8585,13 +8867,9 @@ class SparkGap:
                                         "it isn't NTP-synchronised: FT8 needs it within about a second "
                                         "(enable NTP, or set ft8_windows: sliding)")
                     if enable_ft8 or enable_rtty or self._iq_rec is not None:
-                        FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
-                                     14090: 14074, 18083: 18100,
-                                     21090: 21074, 24902: 24915,
-                                     28090: 28074}
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
-                            ft8_khz = FT8_FREQS.get(int(ck))
+                            ft8_khz = ft8_dial_khz(ck)
                             if not ft8_khz and self._iq_rec is not None:
                                 ft8_khz = ck      # recorder only: capture every band
                             if ft8_khz:
@@ -9107,10 +9385,6 @@ class SparkGap:
                         not getattr(self, '_ft8_running', False):
                     self._ft8_running = True
                     import ctypes as _ct, struct
-                    FT8_FREQS = {3590: 3573, 7090: 7074, 10118: 10136,
-                                 14090: 14074, 18083: 18100,
-                                 21090: 21074, 24902: 24915,
-                                 28090: 28074}
                     ft8_jobs = []
                     n60 = 192000 * 60
                     buf_cap = 192000 * 65
@@ -9129,7 +9403,7 @@ class SparkGap:
                     # active buffer between the prior swap and this one.
                     for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                         ck = ch / 1000
-                        ft8_khz = FT8_FREQS.get(int(ck))
+                        ft8_khz = ft8_dial_khz(ck)
                         if not ft8_khz and self._iq_rec is None:
                             continue
                         fi = np.empty(buf_cap, dtype=np.float32)
@@ -9165,204 +9439,14 @@ class SparkGap:
                         ft8_jobs.append((bn, ri, ck, ft8_khz,
                                          fi_60, fq_60, take, t0))
                     if ft8_jobs:
-                        def _ft8_decode(jobs, skimmer):
-                            # Whatever goes wrong in a cycle, the next minute must run.
-                            try:
-                                _ft8_cycle(jobs, skimmer)
-                            except Exception:
-                                log.exception("FT8/RTTY cycle failed")
-                            finally:
-                                skimmer._ft8_running = False
-
-                        def _ft8_cycle(jobs, skimmer):
-                            # Re-read flags inside the thread so a runtime
-                            # config edit could take effect at the next
-                            # minute boundary (not currently used but cheap).
-                            enable_ft8  = bool(skimmer.cfg.get('enable_ft8',  True))
-                            enable_rtty = bool(skimmer.cfg.get('enable_rtty', True))
-                            import subprocess, wave
-                            from scipy.signal import resample_poly
-                            from numpy.fft import fft, ifft
-                            ft8_bin = _ft8_decoder(skimmer.cfg)
-                            total = 0
-                            seen_msgs = set()  # dedupe across sliding windows
-                            aligned = skimmer.cfg.get('ft8_windows', 'aligned') == 'aligned'
-                            cycle_dts = []                 # decodes' DT, for the clock watch
-                            rtty_lib = _get_rtty_lib() if enable_rtty else None
-                            rtty_repeat = skimmer.cfg.get('rtty_spot_rule') == 'repeat'
-                            rtty_total, rtty_done = 0, set()
-
-                            def _rtty_band(bn, ck, fi, fq, n, z=None):
-                                nonlocal rtty_total
-                                rtty_done.add(bn)
-                                try:
-                                    if rtty_repeat:
-                                        rtty_total += _rtty_scan_band_repeat(
-                                            skimmer, rtty_lib, bn, ck, fi, fq, n, z=z)
-                                    else:
-                                        rtty_total += _rtty_scan_band(skimmer, rtty_lib, bn, ck, fi, fq, n)
-                                except Exception as e:
-                                    log.warning("RTTY scan %s: %s", bn, e)
-
-                            for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 else []):
-                                offset_hz = (ft8_khz - ck) * 1000
-                                z = None
-                                if skimmer.cfg.get('ft8_band_cut', 'fft') == 'fft':
-                                    # 12 kHz around the dial, cut from one FFT of the minute
-                                    z = minute_fft(fi[:n], fq[:n])
-                                    dec12 = band_slice_12k(fi[:n], fq[:n], offset_hz, z=z).astype(np.complex128)
-                                else:
-                                    iq = fi.astype(np.float64) + 1j * fq.astype(np.float64)
-                                    t = np.arange(n) / 192000
-                                    mixed = iq * np.exp(-1j * 2 * np.pi * offset_hz * t)
-                                    # 192k → 12k complex via polyphase
-                                    dec12 = resample_poly(mixed, 1, 16)
-                                slot_n = 15 * 12000
-                                # Windows from the snapshot's start time: two around each slot
-                                # (ft8_windows "aligned"), or every second from 0 to 45 s
-                                # ("sliding", the original, for a buffer whose time is unknown).
-                                for start in ft8_window_starts(t0 if aligned else 0.0, len(dec12)):
-                                    chunk = dec12[start:start+slot_n]
-                                    if len(chunk) < slot_n:
-                                        continue
-                                    # USB demodulation: zero negative freqs, take real
-                                    spec = fft(chunk)
-                                    spec[len(spec)//2:] = 0
-                                    audio = ifft(spec).real * 2
-                                    peak = np.max(np.abs(audio))
-                                    if peak > 0:
-                                        audio = audio / peak * 0.9
-                                    i16 = (audio * 32767).astype(np.int16)
-                                    part = start // 12000  # used in WAV filename
-                                    wav_fn = f'/tmp/ft8_{bn}_p{part}.wav'
-                                    with wave.open(wav_fn, 'wb') as wf:
-                                        wf.setnchannels(1); wf.setsampwidth(2)
-                                        wf.setframerate(12000)
-                                        wf.writeframes(i16.tobytes())
-                                    try:
-                                        r = subprocess.run([ft8_bin, wav_fn],
-                                            capture_output=True, text=True, timeout=20)
-                                    except Exception as e:
-                                        log.debug("decode_ft8 err %s p%d: %s", bn, part, e)
-                                        continue
-                                    for line in (r.stdout or '').strip().split('\n'):
-                                        line = line.strip()
-                                        if not line:
-                                            continue
-                                        # Format: "000000 +05.0 +1.12 1803 ~  CQ N4DWD EM86"
-                                        parts_o = line.split(maxsplit=5)
-                                        if len(parts_o) < 6:
-                                            continue
-                                        try:
-                                            snr = int(float(parts_o[1]))
-                                            time_sec = float(parts_o[2])
-                                            audio_hz = int(parts_o[3])
-                                            msg = parts_o[5]
-                                        except (ValueError, IndexError):
-                                            continue
-                                        # RF freq = dial + audio offset
-                                        rf_khz = ft8_khz + audio_hz / 1000.0
-                                        # Extract caller from message
-                                        # CQ X Y → X is calling
-                                        # X Y Z → Y is responding to X (spot Y)
-                                        # X Y RR73/grid → spot Y
-                                        msg_parts = msg.split()
-                                        ft8_call = None
-                                        if msg_parts and msg_parts[0] == 'CQ':
-                                            # CQ [DX] CALL GRID — call is at index 1 or 2
-                                            if len(msg_parts) >= 2 and re.match(
-                                                    r'^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}$',
-                                                    msg_parts[1]):
-                                                ft8_call = msg_parts[1]
-                                            elif len(msg_parts) >= 3:
-                                                ft8_call = msg_parts[2]
-                                        elif len(msg_parts) >= 2:
-                                            # Standard QSO: X Y ... — Y is the spotted station
-                                            ft8_call = msg_parts[1]
-                                        if not ft8_call or not re.match(
-                                                r'^[A-Z0-9/]{3,11}$', ft8_call):
-                                            continue
-                                        # Dedupe: same band + msg = duplicate from
-                                        # sliding window catching same TX twice
-                                        dedup_key = (bn, msg)
-                                        if dedup_key in seen_msgs:
-                                            continue
-                                        seen_msgs.add(dedup_key)
-                                        if aligned and t0 > 0:
-                                            cycle_dts.append(ft8_slot_dt(t0 + start / 12000.0, time_sec))
-                                        log.info("FT8 %s p%d: %s", bn, part, line)
-                                        total += 1
-                                        skimmer.spot_count += 1
-                                        rf_khz_corr = skimmer._corrected_freq_khz(rf_khz)
-                                        skimmer.broadcast(
-                                            freq_khz=rf_khz_corr, dx_call=ft8_call,
-                                            snr=snr, mode='FT8',
-                                            comment=msg)
-                                        # Best-effort publish to skimmer/ft8/raw for pskr_feeder.
-                                        # Grid is the last 4/6-char token if it matches Maidenhead.
-                                        ft8_grid = ''
-                                        if msg_parts and _GRID_RE.match(msg_parts[-1]):
-                                            ft8_grid = msg_parts[-1]
-                                        _pub = _get_mqtt_publisher()
-                                        if _pub is not None:
-                                            try:
-                                                _pub.publish('skimmer/ft8/raw', json.dumps({
-                                                    'call':    ft8_call,
-                                                    'grid':    ft8_grid,
-                                                    'freq_hz': int(rf_khz_corr * 1000),
-                                                    'snr':     int(snr),
-                                                    'mode':    'FT8',
-                                                    'msg':     msg,
-                                                    'ts':      int(time.time()),
-                                                }), qos=0)
-                                            except Exception:
-                                                pass
-                                        log.info("*** SPOT: %10.1f  %-12s  %+d dB  FT8  [%s] ***",
-                                                 rf_khz, ft8_call, snr, msg)
-                                # this band's RTTY now, from the same FFT, so the minute is
-                                # transformed once and its FFT freed before the next band
-                                if rtty_lib is not None and z is not None:
-                                    _rtty_band(bn, ck, fi, fq, n, z)
-                                del z
-                            if enable_ft8:
-                                watch = getattr(skimmer, '_ft8_clock', None)
-                                if watch is None:
-                                    watch = skimmer._ft8_clock = Ft8ClockWatch()
-                                med, warn = watch.add(cycle_dts, time.time())
-                                log.info("FT8 cycle done: %d spots across %d bands%s",
-                                         total, len(jobs),
-                                         '' if med is None else ', median DT %+.2f s' % med)
-                                if warn:
-                                    log.warning(warn)
-                            # RTTY scan piggybacks on the same minute snapshot.
-                            # Each band was scanned right after its FT8 (sharing its FFT);
-                            # this covers bands that were not (FT8 off, or the resample cut).
-                            # Independent of enable_ft8 — controlled by
-                            # enable_rtty (default true for backward compat).
-                            if enable_rtty:
-                                if rtty_lib is not None:
-                                    for bn, ri, ck, ft8_khz, fi, fq, n, _t0 in jobs:
-                                        if bn not in rtty_done:      # FT8 off, or the resample cut
-                                            _rtty_band(bn, ck, fi, fq, n)
-                                    excl = ''
-                                    if skimmer.cfg.get('rtty_excludes_cw'):
-                                        rel = blk = 0
-                                        for mgr in skimmer.managers:
-                                            sc = getattr(getattr(mgr, '_itila_scanner', None), '_sc', None)
-                                            c = sc.excl_counts() if sc and hasattr(sc, 'excl_counts') else None
-                                            if c:
-                                                rel += c[0]; blk += c[1]
-                                        excl = ("; CW kept off %d RTTY signals (total), %d CW bins released, "
-                                                "%d spawns blocked" % (skimmer._rtty_excluded, rel, blk))
-                                    log.info("RTTY cycle done: %d spots across %d bands%s",
-                                             rtty_total, len(jobs), excl)
-                            skimmer._ft8_running = False
                         threading.Thread(target=_ft8_decode,
                                          args=(ft8_jobs, self),
                                          daemon=True).start()
                     else:
                         self._ft8_running = False
                 self._ft8_prev_sec = ft8_sec
+            elif getattr(self, '_py_minute', False):
+                self._py_minute_tick()
 
             await asyncio.sleep(0.1 if use_c else 0.025)
 
