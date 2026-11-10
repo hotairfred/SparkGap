@@ -483,8 +483,8 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
     see sender() and tokens(); stray_listed: which joined calls _stray_after takes for a 4-character call.
     cq_tail: a call sent twice right before a closing CQ, TEST or QRZ, after one word that is no call and
     no opening keyword, is a copy too (JARL W2FM W2FM CQ, MAKRO KA6BIM KA6BIM CQ): an RTTY runner whose
-    opening CQ was lost. Not when a CQ, TEST, QRZ or DE comes right before that word: then the group
-    already counted the call (CQ JARL W2FM W2FM CQ is one copy)."""
+    opening CQ was lost. Not when a CQ, TEST, QRZ or DE is within LOOKAHEAD tokens before the call: then
+    that group already counted it (CQ JARL W2FM W2FM CQ and CQ RU RU W2FM W2FM CQ are one copy each; WX7V)."""
     toks = tokens(text, gluek)
     cwords = CONTEST_WORDS if words is None else words
     out: list[tuple[str, str | None]] = []
@@ -532,7 +532,8 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
             x = toks[i]
             if (toks[i + 1] == x and toks[i + 2] in _TAIL_CLOSE and CALL_RE.match(x) and toks[i - 1] != x
                     and not CALL_RE.match(toks[i - 1]) and toks[i - 1] not in _TAIL_NOT_WORD
-                    and not (i >= 2 and toks[i - 2] in _TAIL_OPEN) and (every or all(x != c for c, _ in out))):
+                    and not any(t in _TAIL_OPEN for t in toks[max(0, i - LOOKAHEAD):i - 1])
+                    and (every or all(x != c for c, _ in out))):
                 out.append((x, None))
     return out
 

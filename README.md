@@ -49,8 +49,10 @@ in `tools/eval/` and `tools/sim/`.
 ## What it does
 
 - **Receivers.** HPSDR protocol 1 radios (a Red Pitaya with Pavel Demin's `sdr_receiver_hpsdr`
-  firmware, up to 8 receivers at 48 to 192 kHz each), and FlexRadio DAX-IQ through `flex_iq.py`
-  (`skimmer_flex.example.json`). Lost UDP packets are counted from the sequence number and their
+  firmware, up to 8 receivers at 48 to 192 kHz each), FlexRadio DAX-IQ through `flex_iq.py`
+  (`skimmer_flex.example.json`), and any receiver ka9q-radio's `radiod` drives, such as an RX888,
+  as RTP channels (`"sdr_type": "rtp"`, `rtp_receiver.py`). Adding another radio takes one file
+  that delivers IQ ([docs/RADIOS.md](docs/RADIOS.md#adding-an-iq-back-end)). Lost UDP packets are counted from the sequence number and their
   time kept as silence, so FT8 slots stay on the clock (`FT8 trigger: ... lost=` in the log).
   A Red Pitaya streams to one client, and any client on the LAN can stop it: with no IQ for
   `hpsdr_restart_after_s` (default 30 s; 0 = never) the receiver sends the start sequence again and
@@ -71,6 +73,9 @@ in `tools/eval/` and `tools/sim/`.
   `rtty_spot_cq_tail` (off by default) also counts a call sent twice right before a closing CQ,
   TEST or QRZ after one other word (`JARL W2FM W2FM CQ`): a runner whose opening CQ was lost, in any
   contest, with no `rtty_contest` needed.
+  `"rtty_decoder": "frtty"` (off by default) decodes with FRTTY (`frtty.c`) in place of `rtty_core.c`:
+  a decoder that models the whole character frame and the sender's cadence, over by over, so weak and
+  fading signals copy better (JARTS 60 -> 65 real calls, PA 91 -> 97), at about 3x the RTTY decode CPU.
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
@@ -194,6 +199,15 @@ and stop it after the last one. A copy started alone holds the station itself.
 The decoders get silence while the radio is keyed, until 0.1 s after
 its key-up (which comes after the transmitting client's CW delay), so
 your own transmissions and their key clicks are not decoded.
+
+**RX888 (or another radiod receiver):** build and install ka9q-radio
+([github.com/ka9q/ka9q-radio](https://github.com/ka9q/ka9q-radio), `docs/INSTALL.md`; `sudo make install`
+puts in radiod, the RX888 firmware and its udev rules). Start from `radiod_sparkgap.example.conf`, one
+192 kHz IQ channel per band at SparkGap's band centres (radiod names a channel's SSRC after its frequency
+in kHz); its comments cover loopback multicast, the socket buffer, FFTW wisdom and checking the gain.
+Then copy `skimmer_rtp.example.json`: `"sdr_type": "rtp"`, `rtp_group` (radiod's data group), `rtp_encoding`
+(`f32le` or `s16be`, as radiod sends) and, on one computer, `rtp_iface` 127.0.0.1. CW, FT8, RTTY and IQ
+recording all run from the channels.
 
 **macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
 omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for
@@ -467,6 +481,8 @@ regardless.
 
 - **Pavel Demin** — Red Pitaya HPSDR firmware (`sdr_receiver_hpsdr`)
   and the `ft8d` standalone FT8 decoder.
+- **Phil Karn (KA9Q)** — *ka9q-radio*: `radiod` turns a wideband receiver such as the RX888 into
+  the IQ channels the `rtp` receiver reads.
 - **Rudy Bakalov (N2WQ)** — *GoCluster*, BSD-licensed cluster server.
   Cross-source validation techniques (recent-on-band support floor,
   harmonic suppression) in this project's spot pipeline are adapted

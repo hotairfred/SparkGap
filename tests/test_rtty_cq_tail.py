@@ -18,6 +18,8 @@ def test_a_runner_whose_opening_cq_was_lost_counts() -> None:
 def test_a_cq_group_that_already_named_the_call_counts_once() -> None:
     assert _calls("CQ JARL W2FM W2FM CQ") == ["W2FM"]
     assert _calls("TEST K1NY K1NY CQ") == ["K1NY"]
+    assert _calls("CQ RU RU W2FM W2FM CQ") == ["W2FM"]                 # two words: still the group's copy (WX7V)
+    assert _calls("TEST WW CQ K1NY K1NY TEST") == ["K1NY"]
 
 
 def test_callers_and_exchanges_do_not_count() -> None:

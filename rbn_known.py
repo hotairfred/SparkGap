@@ -28,6 +28,7 @@ from pathlib import Path
 ARCHIVE_URL = "https://data.reversebeacon.net/rbn_history/{day}.zip"
 DAYS = 7                      # default days of archives a call can be known from (rbn_known_days)
 MIN_SKIMMERS = 10             # distinct other skimmers on one day
+BUST_RATIO = 5                # drop_busts: a look-alike with this many times the skimmers that day
 KEEP_DAYS = 30                # cached days older than this (and than the window) are deleted
 FETCH_TIMEOUT_S = 30.0
 FETCH_PAUSE_S = 10.0          # between downloads: polite to RBN
@@ -69,9 +70,44 @@ def read_archive(data: bytes) -> Iterable[dict[str, str]]:
             yield from csv.DictReader(io.TextIOWrapper(f, encoding="utf-8", errors="replace"))
 
 
-def known_calls(days: Iterable[Counter[str]], min_skimmers: int = MIN_SKIMMERS) -> set[str]:
-    """Calls with min_skimmers or more distinct skimmers on at least one of the days."""
-    return {c for counts in days for c, n in counts.items() if n >= min_skimmers}
+def _one_edit(a: str, b: str) -> bool:
+    """a and b differ by one substitution, insertion or deletion."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b, strict=True)) == 1
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def busts(counts: Counter[str], min_skimmers: int = MIN_SKIMMERS) -> set[str]:
+    """The calls of one day that reach min_skimmers only as a bust many skimmers share: a look-alike with
+    BUST_RATIO times their skimmers was spotted that day, and they are that call with a word glued on
+    (K5MVSS beside K5MV in Sweepstakes: K5MV SS) or one edit from it (AA3N, AA3T beside AA3B)."""
+    by_start: dict[str, list[str]] = {}
+    for c in counts:
+        by_start.setdefault(c[:3], []).append(c)
+    out = set()
+    for x, n in counts.items():
+        if n < min_skimmers:
+            continue
+        for y in by_start[x[:3]]:
+            if y != x and counts[y] >= BUST_RATIO * n and (
+                    (x.startswith(y) and 1 <= len(x) - len(y) <= 3 and x[len(y):].isalpha()) or _one_edit(x, y)):
+                out.add(x)
+                break
+    return out
+
+
+def known_calls(days: Iterable[Counter[str]], min_skimmers: int = MIN_SKIMMERS, drop_busts: bool = False,
+                keep: Callable[[str], bool] | None = None) -> set[str]:
+    """Calls with min_skimmers or more distinct skimmers on at least one of the days. drop_busts: a day
+    where the call is one of busts() does not count, unless keep(call) (a call list vouches for it)."""
+    known = set()
+    for counts in days:
+        drop = busts(counts, min_skimmers) if drop_busts else set()
+        known |= {c for c, n in counts.items() if n >= min_skimmers and (c not in drop or (keep and keep(c)))}
+    return known
 
 
 def _fetch(day: date) -> bytes:
@@ -108,8 +144,10 @@ def _write(path: Path, text: str) -> None:
 
 def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None = None,
             fetch: Callable[[date], bytes] = _fetch,
-            sleep: Callable[[float], None] = time.sleep) -> set[str]:
-    """Fetch any missing day of the last DAYS (yesterday back); write and return the known calls."""
+            sleep: Callable[[float], None] = time.sleep, drop_busts: bool = False,
+            keep: Callable[[str], bool] | None = None) -> set[str]:
+    """Fetch any missing day of the last DAYS (yesterday back); write and return the known calls.
+    drop_busts, keep: see known_calls()."""
     today = today or datetime.now(timezone.utc).date()
     cache_dir.mkdir(parents=True, exist_ok=True)
     tag = spotter(own_call) if own_call else "ALL"
@@ -149,18 +187,20 @@ def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None
     for old in cache_dir.glob("*.calls"):
         stamp = old.name[:8]
         try:
-            keep = timedelta(days=max(KEEP_DAYS, days))
-            if datetime.strptime(stamp, "%Y%m%d").date() < today - keep:
+            kept_for = timedelta(days=max(KEEP_DAYS, days))
+            if datetime.strptime(stamp, "%Y%m%d").date() < today - kept_for:
                 old.unlink()
         except ValueError:
             continue
-    known = known_calls(counted)
+    known = known_calls(counted, drop_busts=drop_busts, keep=keep)
     span = f"{min(have):%Y-%m-%d} to {max(have):%Y-%m-%d}" if have else "none"
-    _write(cache_dir / "rbn_known.txt",
+    dropped = len(known_calls(counted)) - len(known) if drop_busts else 0
+    _write(cache_dir / ("rbn_known_nobusts.txt" if drop_busts else "rbn_known.txt"),
         f"# RBN known calls: {MIN_SKIMMERS}+ skimmers on one day, {span}, "
-        f"own spotter {tag} left out\n"
+        f"own spotter {tag} left out" + (f", {dropped} shared busts dropped" if drop_busts else "") + "\n"
         + "".join(f"{c}\n" for c in sorted(known)))
-    log.info("rbn_known: %d known calls from %d days (%s)", len(known), len(have), span)
+    log.info("rbn_known: %d known calls from %d days (%s)%s", len(known), len(have), span,
+             f", {dropped} shared busts dropped (rbn_known_drop_busts)" if drop_busts else "")
     return known
 
 

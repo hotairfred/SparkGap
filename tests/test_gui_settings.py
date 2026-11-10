@@ -10,13 +10,17 @@ def test_empty_config_reports_defaults() -> None:
     assert eff["spot_rule"] == "repeat" and eff["spot_rule_cq_groups"] is True
     assert eff["flex_daxiq_channel"] is None  # not a Flex config
     assert "telnet_port" in defaults and "sample_rate" not in defaults
-    assert set(built_in) == {"spot_rule_cq_groups", "spot_rule_lockon", "spot_rule_cq_qualifiers"}
+    assert set(built_in) == {"spot_rule_cq_groups", "spot_rule_lockon", "spot_rule_cq_qualifiers",
+                             "spot_rule_split_runs", "spot_rule_runner_signs", "spot_rule_window_join",
+                             "spot_rule_owner_listed", "spot_rule_takeover_idle_s"}
+    assert eff["spot_rule_owner_listed"] is False      # no known-call list
+    assert eff["spot_rule_takeover_idle_s"] == 180.0
 
 
 def test_itila2_runs_the_repeat_rule_by_default() -> None:
     eff, defaults, _ = _gui_settings({"cw_decoder": "itila2"}, 96_000)
     assert eff["spot_rule"] == "repeat" and "spot_rule" in defaults
-    assert eff["spot_rule_lockon"] is True and eff["spot_rule_split_runs"] is False
+    assert eff["spot_rule_lockon"] is True and eff["spot_rule_split_runs"] is True    # built in
 
 
 def test_repeat_rule_with_rbn_validation() -> None:
@@ -24,6 +28,7 @@ def test_repeat_rule_with_rbn_validation() -> None:
            "sdr_type": "flex", "spot_rule_split_runs": True}
     eff, defaults, _ = _gui_settings(cfg, 96_000)
     assert eff["spot_rule_lockon"] is True and eff["spot_rule_split_runs"] is True
+    assert eff["spot_rule_owner_listed"] is True       # with the RBN list
     assert eff["rbn_known_days"] == 7 and "rbn_known_days" in defaults
     assert eff["flex_daxiq_channel"] == 1 and "flex_daxiq_channel" in defaults
 

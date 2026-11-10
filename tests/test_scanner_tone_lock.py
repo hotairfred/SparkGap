@@ -20,14 +20,16 @@ def _scene(parts, seconds: float) -> tuple[np.ndarray, np.ndarray]:
     n = int(seconds * FS)
     t = np.arange(n) / FS
     z = 30.0 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
-    for t0, t1, df in parts:
+    for part in parts:
+        t0, t1, df = part[:3]
+        amp = part[3] if len(part) > 3 else 3000.0
         a, b = int(t0 * FS), int(t1 * FS)
         key = CODE[((t[a:b] - t0) / DIT).astype(int) % len(CODE)]
-        z[a:b] += 3000.0 * key * np.exp(2j * np.pi * (F1 - CENTER + df) * t[a:b])
+        z[a:b] += amp * key * np.exp(2j * np.pi * (F1 - CENTER + df) * t[a:b])
     return np.ascontiguousarray(z.real), np.ascontiguousarray(z.imag)
 
 
-def _env(gate_hz, i, q, afc=False, drain_at=()):
+def _env(gate_hz, i, q, afc=False, drain_at=(), path=200):
     """The 200 Hz path's envelope of the bin nearest the runner, and (words, blanked).  drain_at: also
     take the envelope at these seconds, as a decoder window does, besides once at the end."""
     lib, h = _scanner(False)
@@ -53,7 +55,7 @@ def _env(gate_hz, i, q, afc=False, drain_at=()):
                 return
             f = min(bins, key=lambda x: abs(x - F1))
         n = lib.itila_sc_drain_env(h, f, e1.ctypes.data_as(P), e2.ctypes.data_as(P), 15000)
-        out.append(e2[:n].copy())
+        out.append((e2 if path == 200 else e1)[:n].copy())
 
     for p in range(0, len(i), 960):
         lib.itila_sc_feed_iq(h, i[p:p + 960].ctypes.data_as(P), q[p:p + 960].ctypes.data_as(P), len(i[p:p + 960]))
@@ -185,3 +187,18 @@ def test_short_word_in_a_held_over_is_blanked() -> None:
     for k in range(1, 5):
         keyed = _peak(off, 14 * k + 10.95, 14 * k + 11.2, 70.0)
         assert keyed > 1000 and _peak(on, 14 * k + 10.95, 14 * k + 11.2, 70.0) < 0.01 * keyed
+
+
+def test_runner_under_a_far_neighbour_keeps_the_narrow_path() -> None:
+    """KA1EFO (cdub89/SparkGap#46): a stronger neighbour 70 Hz off sends words while the runner keys (it need not wait,
+    as a caller does). Its words are blanked from the 200 Hz path only; the 100 Hz path, where the
+    neighbour barely reaches, keeps the runner's keying under them."""
+    run = [(14 * k, 14 * k + 9, 0.0) for k in range(5)]
+    neighbour = [(14 * k + 3, 14 * k + 5, -70.0, 12000.0) for k in range(5)]    # 12 dB stronger, as on 10-14
+    i, q = _scene(run + neighbour, 70.0)
+    off, _, _ = _env(0.0, i, q, path=100)
+    on, _, bl = _env(8.0, i, q, path=100)
+    assert bl >= 1
+    for k in range(1, 5):
+        keyed = _peak(off, 14 * k + 3, 14 * k + 5, 70.0)
+        assert _peak(on, 14 * k + 3, 14 * k + 5, 70.0) > 0.9 * keyed

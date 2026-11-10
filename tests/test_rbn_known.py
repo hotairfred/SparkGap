@@ -8,7 +8,7 @@ from datetime import date
 from email.message import Message
 from pathlib import Path
 
-from rbn_known import _write, base_call, day_counts, known_calls, refresh, spotter
+from rbn_known import _write, base_call, busts, day_counts, known_calls, refresh, spotter
 
 HEADER = "callsign,de_pfx,de_cont,freq,band,dx,dx_pfx,dx_cont,mode,db,date,speed,tx_mode\n"
 
@@ -140,3 +140,29 @@ def test_two_writers_sharing_the_cache_never_collide(tmp_path: Path) -> None:
     assert errors == []
     assert path.read_text() in texts
     assert [p.name for p in tmp_path.iterdir()] == ["rbn_known.txt"]
+
+
+def test_busts_many_skimmers_share() -> None:
+    """Counts as on 11-08 (SS weekend): K5MVSS is K5MV with SS glued on, AA3N one edit from AA3B."""
+    from collections import Counter
+    day = Counter({"K5MV": 141, "K5MVSS": 27, "AA3B": 184, "AA3N": 24, "AA3T": 27, "W1AW": 12, "W1AX": 40,
+                   "K1ABC": 50, "K1ABD": 30})
+    assert busts(day) == {"K5MVSS", "AA3N", "AA3T"}       # W1AW: W1AX not 5x; K1ABD: K1ABC not 5x
+
+
+def test_drop_busts_keeps_a_listed_call_and_a_day_it_stood_alone() -> None:
+    from collections import Counter
+    sat = Counter({"AA3B": 184, "AA3N": 24, "AA3T": 27, "K5MV": 141, "K5MVSS": 27})
+    sun = Counter({"AA3T": 15})                            # AA3T without AA3B: on the air itself
+    assert known_calls([sat, sun]) == {"AA3B", "AA3N", "AA3T", "K5MV", "K5MVSS"}
+    assert known_calls([sat, sun], drop_busts=True) == {"AA3B", "AA3T", "K5MV"}
+    assert known_calls([sat], drop_busts=True, keep={"AA3N"}.__contains__) == {"AA3B", "AA3N", "K5MV"}
+
+
+def test_refresh_drop_busts_writes_its_own_list(tmp_path: Path) -> None:
+    rows = [_row(f"S{i}", "K5MV") for i in range(60)] + [_row(f"S{i}", "K5MVSS") for i in range(11)]
+    calls = refresh(tmp_path, "WF8Z", days=1, today=date(2026, 11, 9), fetch=lambda d: _zip(rows), sleep=_nap,
+                    drop_busts=True)
+    assert calls == {"K5MV"}
+    assert (tmp_path / "rbn_known_nobusts.txt").read_text().startswith("# RBN known calls")
+    assert refresh(tmp_path, "WF8Z", days=1, today=date(2026, 11, 9), sleep=_nap) == {"K5MV", "K5MVSS"}
