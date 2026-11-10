@@ -1,6 +1,7 @@
-"""FT8 and RTTY on the Python receive path (RTP from radiod, Flex): each band keeps its minute of IQ
-(_py_minute_add) and the minute boundary hands the last 60 s to the FT8/RTTY cycle (_py_minute_tick),
-as the C receiver's swap buffer does for the Red Pitaya; ft8_dial_khz finds the FT8 dial for any centre."""
+"""FT8, RTTY and IQ recording on the Python receive path (RTP from radiod, Flex): each band keeps its minute
+of IQ (_py_minute_add) and the minute boundary hands it to the recorder and its last 60 s to the FT8/RTTY
+cycle (_py_minute_tick), as the C receiver's swap buffer does for the Red Pitaya; ft8_dial_khz finds the
+FT8 dial for any centre."""
 import types
 
 import numpy as np
@@ -39,7 +40,8 @@ def test_the_minute_buffer_keeps_at_most_65_seconds(monkeypatch) -> None:
 
 
 def _skimmer(bands):
-    sk = types.SimpleNamespace(_band_meta=[], managers=[], _band_bufs={}, _ft8_running=False, _ft8_prev_sec=59.0)
+    sk = types.SimpleNamespace(_band_meta=[], managers=[], _band_bufs={}, _ft8_running=False, _ft8_prev_sec=59.0,
+                               _iq_rec=None, cfg={})
     for ri, (name, centre_hz, seconds) in enumerate(bands):
         sk._band_meta.append((name, centre_hz, ri))
         sk.managers.append(None)
@@ -78,4 +80,36 @@ def test_no_cycle_away_from_the_boundary_or_while_one_runs(monkeypatch) -> None:
     monkeypatch.setattr(sparkgap.time, 'time', lambda: 1020.5)
     sk._ft8_prev_sec, sk._ft8_running = 59.0, True
     SparkGap._py_minute_tick(sk)
-    assert jobs == [] and sk._band_bufs[0]['min_n'] == 62 * FS
+    assert jobs == [] and sk._band_bufs[0]['min_n'] == 0     # the minute is taken (recorder), no cycle
+
+
+class _Rec:
+    def __init__(self):
+        self.got = []
+
+    def submit(self, band_khz, t_first, fi, fq, n):
+        self.got.append((band_khz, t_first, n))
+
+
+def test_every_band_is_recorded_whole_even_while_a_cycle_runs(monkeypatch) -> None:
+    jobs = []
+    monkeypatch.setattr(sparkgap, '_ft8_decode', lambda j, skimmer: jobs.extend(j))
+    monkeypatch.setattr(sparkgap.time, 'time', lambda: 1020.5)
+    sk = _skimmer([('40m', 7076800, 62), ('6m', 50313000, 61)])     # 6m: no FT8 dial in this table
+    sk._iq_rec, sk._ft8_running = _Rec(), True
+    SparkGap._py_minute_tick(sk)
+    assert sk._iq_rec.got == [(7076, 940.0, 62 * FS), (50313, 940.0, 61 * FS)]   # all of it, every band
+    assert jobs == []                                                # the cycle still running: skipped
+
+
+def test_the_next_minute_starts_where_the_last_one_ended(monkeypatch) -> None:
+    buf = _buf()
+    buf['min_next'] = 1000.0
+    monkeypatch.setattr(sparkgap.time, 'time', lambda: 1000.03)     # arrival jitter: the count is the clock
+    SparkGap._py_minute_add(None, buf, np.ones(4800), np.ones(4800), FS)
+    assert buf['min_t0'] == 1000.0
+    buf = _buf()
+    buf['min_next'] = 1000.0
+    monkeypatch.setattr(sparkgap.time, 'time', lambda: 1010.0)      # the stream stopped: arrival time
+    SparkGap._py_minute_add(None, buf, np.ones(4800), np.ones(4800), FS)
+    assert buf['min_t0'] == 1010.0 - 4800 / FS

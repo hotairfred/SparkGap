@@ -8005,8 +8005,8 @@ class SparkGap:
         spot_log_path = self.cfg.get('spot_log')
         self._spot_log = open(spot_log_path, 'a', buffering=1) if spot_log_path else None
 
-        # All-band IQ recorder for the C receiver path (see iq_recorder.py):
-        # record_wav below only works on the Python receiver path.
+        # All-band IQ recorder (see iq_recorder.py): the C receiver's minute swaps, or the Python receive
+        # path's minute buffers (_py_minute_tick) at 192 kHz. record_wav below is the older single-band one.
         self._iq_rec = None
         if self.cfg.get('record_iq_dir'):
             from iq_recorder import BandRecorder
@@ -8388,7 +8388,7 @@ class SparkGap:
         with self._iq_lock:
             buf = self._band_bufs[rx_idx]
             buf['raw'], buf['iq'], buf['i'], buf['q'] = [], np.empty((0, 2)), [], []
-            buf['min_i'], buf['min_q'], buf['min_n'] = [], [], 0
+            buf['min_i'], buf['min_q'], buf['min_n'], buf['min_next'] = [], [], 0, 0.0
         mgr = self.managers[0]
         mgr.kill_all()   # the scanner goes; the next one is made for the new centre
         mgr._wpm_cache.clear()
@@ -8613,9 +8613,12 @@ class SparkGap:
 
     def _py_minute_add(self, buf, i_cat, q_cat, rate):
         """The Python receive path's minute of IQ per band, for FT8 and RTTY: what the C receiver keeps in
-        its swap buffer. At most 65 s; min_t0 is the wall time of the first sample kept."""
+        its swap buffer. At most 65 s; min_t0 is the wall time of the first sample kept: where the last
+        minute ended (the samples are contiguous, so their count is the clock), unless the arrival time
+        says otherwise by a second or more (a stream that stopped)."""
         if not buf['min_n']:
-            buf['min_t0'] = time.time() - len(i_cat) / rate
+            est, nxt = time.time() - len(i_cat) / rate, buf.get('min_next', 0.0)
+            buf['min_t0'] = nxt if nxt and abs(est - nxt) < 1.0 else est
         buf['min_i'].append(i_cat.astype(np.float32))
         buf['min_q'].append(q_cat.astype(np.float32))
         buf['min_n'] += len(i_cat)
@@ -8626,12 +8629,16 @@ class SparkGap:
             buf['min_t0'] += d / rate
 
     def _py_minute_tick(self):
-        """At each minute boundary, every band's last 60 s to the FT8/RTTY cycle, as the C receiver's swap
-        does: for an RTP (radiod) or Flex receiver."""
+        """At each minute boundary, every band's minute to the IQ recorder (record_iq_dir, all of it: the
+        recording stays contiguous) and its last 60 s to the FT8/RTTY cycle, as the C receiver's swap
+        does: for an RTP (radiod) or Flex receiver. The minute is taken even while the last cycle still
+        runs (only that cycle is skipped), so the recording has no gap."""
         sec = time.time() % 60
         prev, self._ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60), sec
-        if not (sec < 5 and prev >= 55) or getattr(self, '_ft8_running', False):
+        if not (sec < 5 and prev >= 55):
             return
+        busy = getattr(self, '_ft8_running', False)
+        digital = bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True))
         fs, jobs = 192000, []
         n60 = fs * 60
         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
@@ -8640,15 +8647,23 @@ class SparkGap:
                 continue
             chunks_i, chunks_q, n, t_first = buf['min_i'], buf['min_q'], buf['min_n'], buf['min_t0']
             buf['min_i'], buf['min_q'], buf['min_n'] = [], [], 0
+            if not n:
+                continue
+            buf['min_next'] = t_first + n / fs
             ck = ch / 1000
+            fi, fq = np.concatenate(chunks_i), np.concatenate(chunks_q)
+            if self._iq_rec is not None:
+                self._iq_rec.submit(int(ck), t_first, fi, fq, n)
             ft8_khz = ft8_dial_khz(ck)
-            if not ft8_khz:
+            if busy or not digital or not ft8_khz:
                 continue
             if n < n60 - fs:
                 log.info("FT8 %s rx%d: short snapshot (%.1f s), skip", bn, ri, n / fs)
                 continue
-            fi, fq = np.concatenate(chunks_i)[-n60:], np.concatenate(chunks_q)[-n60:]
+            fi, fq = fi[-n60:], fq[-n60:]
             jobs.append((bn, ri, ck, ft8_khz, fi, fq, len(fi), t_first + (n - len(fi)) / fs))
+        if busy and digital:
+            log.info("FT8/RTTY: the last minute's cycle is still running, this minute skipped")
         if jobs:
             self._ft8_running = True
             threading.Thread(target=_ft8_decode, args=(jobs, self), daemon=True).start()
@@ -8667,7 +8682,8 @@ class SparkGap:
         log.info("IQ stream started")
         # The Python receive path (RTP, Flex) keeps each band's minute itself for FT8 and RTTY
         self._py_minute = (not use_c and self.cfg.get('sample_rate', 48000) == 192000
-                           and bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)))
+                           and bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)
+                                    or self._iq_rec is not None))
         if not use_c and not self._py_minute and (self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)):
             log.info("FT8/RTTY need 192 kHz IQ; this receiver runs at %s: CW only", self.cfg.get('sample_rate', 48000))
 
