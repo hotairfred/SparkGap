@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 import itertools
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import numpy as np
@@ -2688,7 +2688,8 @@ RTTY_RANGES = {
 # 40m ran 7046 to 7074 kHz, above the 7035-7055 of RTTY_RANGES.
 # rtty_excludes_cw: CW bins are kept off an RTTY signal (both tones and sidebands, centre +-
 # RTTY_EXCL_HALF_HZ) for RTTY_EXCL_HOLD_S after a minute scan finds it alternating for at
-# least RTTY_EXCL_MIN_FSK_S seconds. Scans run once a minute, so the hold covers two misses.
+# least RTTY_EXCL_MIN_FSK_S seconds and its text reads as RTTY (_rtty_text_evidence). Scans run once a
+# minute, so the hold covers two misses.
 RTTY_EXCL_HALF_HZ = 150.0
 RTTY_EXCL_HOLD_S = 150.0
 RTTY_EXCL_MIN_FSK_S = 3
@@ -2755,6 +2756,21 @@ def _rtty_contest(cfg):
         return None
     log.info("RTTY spot rule: %s contest words and exchange", name)
     return RTTY_CONTESTS[name]
+
+
+_RTTY_EVIDENCE_WORDS = frozenset({'CQ', 'TEST', 'DE', 'QRZ', 'RYRY', 'RYRYRY'})
+
+
+def _rtty_text_evidence(text):
+    """The text of a minute's candidate reads as RTTY: a call-shaped word sent twice, or one of CQ,
+    TEST, DE, QRZ, RYRY. On the PA and JARTS recordings 92-96% of candidate-minutes naming a recurring
+    call pass; on WF8Z-1's RX888 on 11-10, none of 1,052 readings of CW stations taken for RTTY did."""
+    from spot_rule import CALL_RE
+    toks = re.findall(r'[A-Z0-9/]+', text or '')
+    if any(t in _RTTY_EVIDENCE_WORDS for t in toks):
+        return True
+    calls = Counter(t for t in toks if len(t) >= 4 and CALL_RE.match(t))
+    return any(n >= 2 for n in calls.values())
 
 
 def _rtty_printable(text):
@@ -2944,7 +2960,11 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         rf_khz = (c_hz + RTTY_MARK_HZ) / 1000.0                      # mark tone: what spots give
         # rtty_excludes_cw: a candidate whose tones clearly alternated for a few seconds is RTTY,
         # not two CW stations 170 Hz apart; keep CW bins off its tones and sidebands (around the centre).
-        if skimmer.cfg.get('rtty_excludes_cw') and fsk_s >= RTTY_EXCL_MIN_FSK_S:
+        # And its text reads as RTTY: on a sensitive receiver (an RX888 on WF8Z-1, 11-10) CW stations
+        # about 170 Hz apart passed the tone test 189 times in 2 h, all with random letters for text,
+        # and the exclusions kept CW bins off real CW in the 40m CW segment.
+        if (skimmer.cfg.get('rtty_excludes_cw') and fsk_s >= RTTY_EXCL_MIN_FSK_S
+                and _rtty_text_evidence(text)):
             if skimmer._exclude_cw(bn, c_hz - RTTY_EXCL_HALF_HZ, c_hz + RTTY_EXCL_HALF_HZ,
                                    RTTY_EXCL_HOLD_S):
                 skimmer._rtty_excluded += 1
