@@ -2712,9 +2712,13 @@ RTTY_MAX_CANDIDATES = 100      # per band per minute (config rtty_max_candidates
 # name as runners put it in their CQ (CQ MAKRO AC2FA AC2FA, or MAKRO AE1P AE1P when the CQ is lost)
 # opens a CQ group; exchange "grid": a call followed by a grid square is being sent the exchange, so a
 # caller (CQ MAKRO NK2Y NK2Y CQ AA4DD AA4DD FN31). Measured on the 10-10 Makrothen recording against
-# RTTY Skimmer Server on the same replay: 92 -> 93 real stations, none unconfirmed.
+# RTTY Skimmer Server on the same replay: 92 -> 93 real stations, none unconfirmed. WAE DX RTTY (DARC
+# rules: RST and a serial, plus QTC traffic): its words open a group (WAE DL1ABC DL1ABC with the CQ
+# lost); the serial exchange (599 012) needs no setting, the general rule already reads it as a caller's,
+# and QTC lines (1310 DL1ABC 034) open no group. Not yet measured on a WAE recording.
 RTTY_CONTESTS = {
     'makrothen': {'words': ('MAK', 'MAKRO', 'MAKROTHEN', 'MKR'), 'exchange': 'grid'},
+    'wae': {'words': ('WAE', 'WAEDC'), 'exchange': None},
 }
 # FT8 and JS8 dials (kHz): each dial and 3 kHz above it is no RTTY, so no candidate there.
 # FT4 dials are not excluded: RTTY contest stations sit in them (7047.5, 14080), and on the PA
