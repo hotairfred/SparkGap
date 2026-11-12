@@ -106,6 +106,7 @@ _SIGNOFF = frozenset({"K", "AR", "KN", "SK", "BK", "TU"})    # la1d: ends the se
 # threshold, in place of the tier count. Weights are a logistic fit on the three legs of the
 # 10-12..10-14 dry run (cdub89/SparkGap#10), every spot checked against RBN; thresholds from
 # the curve with each leg scored by weights fitted on the other two.
+# Refit with tools/eval/fit_validation.py; a refit on three WebRX logs (11-08..11-12) gained nothing, so these stay (cdub89/SparkGap#50).
 VALIDATION = {"permissive": 1.25, "normal": 3.0, "aggressive": 5.0}
 # validation: the call signed its own CQ (CQ ... DE WB8NER WB8NER K) in two windows or more, see
 # signed_calls(); one window alone is not enough.
