@@ -4,6 +4,7 @@ import sparkgap
 from spot_rule import RepeatSpotRule, runner_calls
 
 MAK = frozenset(sparkgap.RTTY_CONTESTS['makrothen']['words'])
+WAE = frozenset(sparkgap.RTTY_CONTESTS['wae']['words'])
 
 
 def test_a_doubled_call_run_together_is_split() -> None:
@@ -43,3 +44,25 @@ def test_a_makrothen_runner_spots_from_contest_word_groups() -> None:
         w = rule.window_id(708, k, 60.0 * k)
         spots += rule.feed(w, 7080.0, sparkgap._rtty_split_keywords("XQ MAKRO AE1P AE1P QQ"), 60.0 * k)
     assert spots == [("AE1P", 7080.0)]
+
+
+def test_wae_words_open_a_group_and_qtc_traffic_spots_nobody() -> None:
+    assert runner_calls("XQ WAE DL1ABC DL1ABC") == []
+    assert runner_calls("XQ WAE DL1ABC DL1ABC", contest_words=True, words=WAE) == ["DL1ABC"]
+    assert runner_calls("WAEDC TEST DL1ABC DL1ABC K", contest_words=True, words=WAE) == ["DL1ABC"]
+    # the serial exchange is a caller's without any contest setting
+    assert runner_calls("TEST DL1ABC DL1ABC K5TR K5TR 599 012", every=True) == ["DL1ABC"]
+    # QTC traffic: a header, then time, call and serial per QSO relayed
+    for text in ("QTC 3/10 1310 DL1ABC 034 1312 F5XYZ 021 1315 K1AB 044", "QTC? QTC 1/5 QRV? DL1ABC"):
+        assert runner_calls(text, every=True, contest_words=True, words=WAE) == []
+    assert sparkgap._rtty_contest({'rtty_contest': 'WAE'})['words'] == ('WAE', 'WAEDC')
+
+
+def test_a_caller_after_the_runners_tu_wae_is_held_by_lock_on() -> None:
+    rule = RepeatSpotRule(lambda c: 2, cq_groups=True, lockon=True, window_s=30.0,
+                          contest_words=True, words=WAE)
+    spots = []
+    texts = ["CQ WAE DL1ABC DL1ABC CQ"] * 2 + ["TU K1XYZ DL1ABC WAE K1XYZ K1XYZ"] * 3
+    for k, text in enumerate(texts):
+        spots += rule.feed(rule.window_id(708, k, 60.0 * k), 7080.0, text, 60.0 * k)
+    assert spots == [("DL1ABC", 7080.0)]
