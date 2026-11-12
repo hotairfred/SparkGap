@@ -122,3 +122,20 @@ def test_scanner_keeps_bins_off_an_excluded_span() -> None:
         assert _near(lib, h, 7035000.0)
     finally:
         lib.itila_sc_free(h)
+
+
+def test_text_evidence_tells_rtty_from_cw_stations_taken_for_it() -> None:
+    """rtty_excludes_cw also needs the text to read as RTTY (WF8Z-1's RX888, 11-10: CW stations 170 Hz
+    apart passed the tone test with random letters for text)."""
+    import sparkgap
+    ev = sparkgap._rtty_text_evidence
+    assert ev("CQ TEST KN0L KN0L CQ")
+    assert ev("XQ MAKRO EA4GOY EA4GOY P YU")                       # the call twice, no CQ
+    assert ev("RYRYRY DE W1AW")
+    assert ev("TU DE N6AR QRZ?")
+    # readings of CW stations from skimmer1 on 11-10 (7057.8 and 7040.2 kHz)
+    assert not ev("J OFH91\";ENY SUPOXXQYKMJGARKDHOVMPVWVV.2 '')207##8&#95#4:.6:7$:8.51;")
+    assert not ev("N AZMLLTXKUEALIOITUUZYG AVEKVXUKKTKZSLBJVUW PU HFQX(1 PP I II I PWIWUI")
+    assert not ev("K5VR ZQXV")                                        # a call-shaped word once is not enough
+    assert not ev("")
+    assert not ev(None)
