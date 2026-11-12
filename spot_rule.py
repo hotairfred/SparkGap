@@ -371,7 +371,8 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
                  contest_words: bool = False, cq_repeats: bool = False,
                  stray: bool = False, words: frozenset[str] | None = None,
                  grid: bool = False, la1d: bool = False, gluek: bool = False,
-                 garbled: bool = False, stray_listed: Callable[[str], bool] | None = None) -> list[str]:
+                 garbled: bool = False, stray_listed: Callable[[str], bool] | None = None,
+                 cq_tail: bool = False) -> list[str]:
     """Senders of CQ groups (rules 1 and 4). A group opens at CQ or TEST, or at DE after a CQ.
     Its sender is the call inside it or right after the keywords (within LOOKAHEAD). Keywords
     right after the sender close the group; the next transmission (usually a caller) starts
@@ -383,7 +384,7 @@ def runner_calls(text: str, every: bool = False, qualifiers: bool = False,
     instead of one per call."""
     return [call for call, _after in runner_groups(text, every, qualifiers, doubled, split_up,
                                                    contest_words, cq_repeats, stray, words, grid,
-                                                   la1d, gluek, garbled, stray_listed)]
+                                                   la1d, gluek, garbled, stray_listed, cq_tail)]
 
 
 def _call_before(toks: list[str], i: int) -> str | None:
@@ -469,7 +470,8 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
                   doubled: bool = False, split_up: bool = False, contest_words: bool = False,
                   cq_repeats: bool = False, stray: bool = False, words: frozenset[str] | None = None,
                   grid: bool = False, la1d: bool = False, gluek: bool = False, garbled: bool = False,
-                  stray_listed: Callable[[str], bool] | None = None) -> list[tuple[str, str | None]]:
+                  stray_listed: Callable[[str], bool] | None = None,
+                  cq_tail: bool = False) -> list[tuple[str, str | None]]:
     """runner_calls() with, for each call, the callsign right before a bare TEST that opened
     its group (TU W6YH TEST EI4KF -> ("EI4KF", "W6YH")), else None. Lock-on uses it: when W6YH
     owns the frequency, that TEST is W6YH signing and EI4KF is a caller.
@@ -478,7 +480,11 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
     opens the next group instead of closing this one, so CQ CWT N1DC CQ CWT N1DC is two
     copies, not one. words: the contest words for contest_words (default CWT, SST, MST); grid:
     a call followed by a grid square is being sent the exchange (is_exchange). la1d, gluek, garbled:
-    see sender() and tokens(); stray_listed: which joined calls _stray_after takes for a 4-character call."""
+    see sender() and tokens(); stray_listed: which joined calls _stray_after takes for a 4-character call.
+    cq_tail: a call sent twice right before a closing CQ, TEST or QRZ, after one word that is no call and
+    no opening keyword, is a copy too (JARL W2FM W2FM CQ, MAKRO KA6BIM KA6BIM CQ): an RTTY runner whose
+    opening CQ was lost. Not when a CQ, TEST, QRZ or DE is within LOOKAHEAD tokens before the call: then
+    that group already counted it (CQ JARL W2FM W2FM CQ and CQ RU RU W2FM W2FM CQ are one copy each; WX7V)."""
     toks = tokens(text, gluek)
     cwords = CONTEST_WORDS if words is None else words
     out: list[tuple[str, str | None]] = []
@@ -521,7 +527,20 @@ def runner_groups(text: str, every: bool = False, qualifiers: bool = False,
             if cq_repeats and sender(toks, i, la1d, garbled) is not None and toks[sender(toks, i, la1d, garbled)] == toks[j]:
                 break                             # ... unless the same call follows: a new CQ
             i += 1
+    if cq_tail:
+        for i in range(1, n - 2):
+            x = toks[i]
+            if (toks[i + 1] == x and toks[i + 2] in _TAIL_CLOSE and CALL_RE.match(x) and toks[i - 1] != x
+                    and not CALL_RE.match(toks[i - 1]) and toks[i - 1] not in _TAIL_NOT_WORD
+                    and not any(t in _TAIL_OPEN for t in toks[max(0, i - LOOKAHEAD):i - 1])
+                    and (every or all(x != c for c, _ in out))):
+                out.append((x, None))
     return out
+
+
+_TAIL_CLOSE = frozenset({"CQ", "TEST", "QRZ"})            # cq_tail: the keyword after the doubled call
+_TAIL_OPEN = _TAIL_CLOSE | {"DE"}                         # cq_tail: these before the word opened the group
+_TAIL_NOT_WORD = _TAIL_OPEN | {"TU", "R", "RR", "QSL", "599", "5NN"}   # a caller's or an exchange's words
 
 
 def _lev1(a: str, b: str) -> bool:
@@ -618,7 +637,8 @@ class RepeatSpotRule:
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
                  window_join: bool = False, validation_threshold: float | None = None,
-                 garbled_runner: bool = False, stray_known: bool = False) -> None:
+                 garbled_runner: bool = False, stray_known: bool = False,
+                 cq_tail: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -664,6 +684,7 @@ class RepeatSpotRule:
         self.window_join = window_join          # CQ CQ DE | K2MJP: the window edge cut a group, see _joined()
         self.garbled = garbled_runner           # CQ POTAQ0SN K5LG: a broken call ends the sender search, see sender()
         self.stray_known = stray_known          # DE K1PU G after a copy of K1PUG: see _stray_after()
+        self.cq_tail = cq_tail                  # JARL W2FM W2FM CQ counts: see runner_groups()
         self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
         self._signed: dict[int, set[str]] = {}    # validation: window -> calls that signed a CQ in it
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
@@ -712,7 +733,7 @@ class RepeatSpotRule:
                                    contest_words=self.contest_words, cq_repeats=self.cq_repeats,
                                    stray=self.stray, words=self.words, grid=self.grid,
                                    la1d=self.la1d, gluek=self.gluek, garbled=self.garbled,
-                                   stray_listed=self.stray_listed))
+                                   stray_listed=self.stray_listed, cq_tail=self.cq_tail))
         if self.runner_signs:
             calls = calls + self._runner_copies(window, freq_khz, text, now, calls)
         for call, n in Counter(calls).items():
@@ -882,7 +903,7 @@ class RepeatSpotRule:
                                          cq_repeats=self.cq_repeats, stray=self.stray,
                                          words=self.words, grid=self.grid,
                                          la1d=self.la1d, gluek=self.gluek, garbled=self.garbled,
-                                         stray_listed=self.stray_listed):
+                                         stray_listed=self.stray_listed, cq_tail=self.cq_tail):
             owner = self.owner(freq_khz, now, self.takeover_idle_s)   # who may block or be challenged
             if after is not None and after != call and owner == after:
                 continue                          # the owner signing (W6YH TEST): call is a caller

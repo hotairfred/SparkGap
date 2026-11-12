@@ -70,6 +70,9 @@ in `tools/eval/` and `tools/sim/`.
   rules: `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group
   even when the CQ itself was lost, and reads a call followed by a grid square as a caller being
   sent the exchange. Makrothen is the only contest defined so far (`RTTY_CONTESTS` in `sparkgap.py`).
+  `rtty_spot_cq_tail` (off by default) also counts a call sent twice right before a closing CQ,
+  TEST or QRZ after one other word (`JARL W2FM W2FM CQ`): a runner whose opening CQ was lost, in any
+  contest, with no `rtty_contest` needed.
   `"rtty_decoder": "frtty"` (off by default) decodes with FRTTY (`frtty.c`) in place of `rtty_core.c`:
   a decoder that models the whole character frame and the sender's cadence, over by over, so weak and
   fading signals copy better (JARTS 60 -> 65 real calls, PA 91 -> 97), at about 3x the RTTY decode CPU.

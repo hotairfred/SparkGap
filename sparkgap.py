@@ -2906,7 +2906,8 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
             fragments=skimmer.cfg.get('rtty_spot_rule_fragments') or None,
             contest_words=contest is not None,
             words=frozenset(contest['words']) if contest else None,
-            grid=bool(contest) and contest.get('exchange') == 'grid')
+            grid=bool(contest) and contest.get('exchange') == 'grid',
+            cq_tail=bool(skimmer.cfg.get('rtty_spot_cq_tail', False)))
     cands = [c for c in _rtty_candidates(fi, fq, *rng)
              if not _in_digital_window(band_center_khz + c[0] / 1000.0)]
     cap = int(skimmer.cfg.get('rtty_max_candidates', RTTY_MAX_CANDIDATES))
