@@ -28,7 +28,8 @@ call within 1 kHz and 10 minutes.
 - **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings in October (Red Pitaya
   receiver), SparkGap spotted 1.6 to 1.9 times as many calls and caught about 70% of that node's
   (#43). Against the CW nodes within about 300 miles, WF8Z-1 on its first RX888 day spotted 75 to
-  80% of the calls two or more of them heard calling CQ on 20 m and above, fewer on 40 m and below.
+  80% of the calls two or more of them heard calling CQ on 20 m and above; on 40 m and below that
+  node is limited by its receive setup (local noise), not the decoder.
 - **RTTY.** One hour of the PA QSO Party and Makrothen weekend (10-10 22Z), the same IQ replayed to
   SparkGap and RTTY Skimmer Server, both on a Makrothen profile: RTTY Skimmer Server tagged 116
   stations CQ, 110 confirmed; SparkGap spotted 93, all confirmed, with the default RTTY decoder, and
