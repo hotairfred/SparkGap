@@ -1,35 +1,37 @@
 # SparkGap
 
-*(Formerly OpenSkimmer. Not affiliated with SparkSDR by M0NNB.)*
+*(Formerly OpenSkimmer; not related to Karl Heinz Kremer's OpenSkimmer of 2026, nor to SparkSDR by
+M0NNB.)*
 
 Open-source, Linux-native, multi-band skimmer for amateur radio: **CW, RTTY and FT8** on
-several bands at once, with DX-cluster spots on telnet and an uploader for the Reverse Beacon
-Network (RBN). **SSB voice** spotting is in `voice/` too (experimental; it needs a CUDA GPU).
+several bands at once, with DX-cluster spots on telnet, an uploader for the Reverse Beacon
+Network (RBN) and FT8 reports to PSKReporter. **SSB voice** spotting is in `voice/` too
+(experimental; it needs a CUDA GPU).
 
-> **Status: beta.** In daily use on a Red Pitaya STEMlab 125-14 at WF8Z skimming 8 bands
-> (80, 40, 30, 20, 17, 15, 12 and 10 m), feeding a local cluster and PSKReporter (FT8).
-> **Not connected to RBN.** The RBN team has given test criteria SparkGap must pass before a
-> node may connect, including identifying itself as SparkGap by name and version; that work
-> is tracked in #49. Until then, keep `rbn_feeder.py` off.
+> **Status: beta, live on RBN.** Two beta nodes upload to RBN with `rbn2_feeder.py`: WF8Z-1 (live
+> since 2026-11-05; since 11-10 on an RX888 through ka9q-radio, 9 bands from 160 to 10 m) and WX7V-1
+> (a Web-888).
+> Anyone else: run with `rbn_upload` off until your node holds up against other skimmers
+> (*Feeding a cluster or RBN* below).
 
 ## Where it stands
 
-Measured on our own recordings, replayed through the production receiver path and scored
-against what other RBN skimmers reported at the same time:
+Scored per spot against the RBN archive: a spot is confirmed when another skimmer spotted the same
+call within 1 kHz and 10 minutes.
 
-- **Precision.** About 95% of the calls SparkGap spots are also spotted by another RBN skimmer
-  within 1 kHz, across 7 recordings (CWTs, an MST, the PA QSO Party, quiet overnights; the
-  tables are in #61 and #67). CW
-  Skimmer nodes nearby run about 95 to 98% on the same measure. The rest are a mix of real stations
-  nobody else heard and busts, mostly calls cut short (K1V for K1VUT), which current decoder
-  work targets.
-- **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings, SparkGap spots
-  1.6 to 1.9 times as many calls and catches about 70% of that node's calls (#43).
-- **RTTY.** One hour of the Makrothen RTTY weekend, five bands, replayed to SparkGap and RTTY
-  Skimmer Server at the same time and judged by at least two RBN skimmers: SparkGap spotted 94
-  stations, all real; RTTY Skimmer Server's CQ-tagged spots were 92 real of 110 on its DX profile
-  and 110 of 116 on its Makrothen profile. Frequencies agreed to a median of 0.00 kHz. Details,
-  both sides' mistakes and what we are doing about the stations only it found are in #91.
+- **Precision, live.** WF8Z-1's first full day on the RX888 (2026-11-11): 95.5% of its CW spots
+  confirmed. The same day replayed through the spot rule with the two options turned on since
+  (`spot_rule_owned_two_windows`, `rbn_known_drop_busts`): 97.3%. WX7V-1 in the 11-11 19Z CWT:
+  98.7% of 611 spots. CW Skimmer nodes run about 95 to 98% on the same measure. Most of what isn't
+  confirmed is either a real station nobody else heard or a caller read in a runner's text; the
+  options above and `itila2_tone_lock_hz` target the second.
+- **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings in October (Red Pitaya
+  receiver), SparkGap spotted 1.6 to 1.9 times as many calls and caught about 70% of that node's
+  (#43).
+- **RTTY.** One hour of the PA QSO Party and Makrothen weekend (10-10 22Z), the same IQ replayed to
+  SparkGap and RTTY Skimmer Server, both on a Makrothen profile: RTTY Skimmer Server tagged 116
+  stations CQ, 110 confirmed; SparkGap spotted 93, all confirmed, with the default RTTY decoder, and
+  106, 105 confirmed, with `"rtty_decoder": "frtty"`. Details in #91.
 - **SSB (voice).** CQ WW SSB 2026, eight band-hours recorded from a FlexRadio and scored against the
   DX cluster spots people posted: 347 calls spotted, 248 of them also spotted by a person (almost nobody
   spots US and Canadian stations in CQ WW, and most of the rest are those); reading the transcripts,
@@ -38,44 +40,49 @@ against what other RBN skimmers reported at the same time:
   contest band. Details in `voice/README.md`.
 - **Copy on known text.** Character error on three W1AW code-practice clips: 3.1, 3.7 and
   1.9% (`docs/ITILA2.md`; CW Skimmer copies the same audio nearly perfectly).
-- **Cost.** 8 bands at 192 kHz with CW, FT8 and RTTY use about 1.7 cores of CPU time on a 35 W i5-9500T
-  with `itila_decode_threads: 4` on a weekday afternoon (2.2 before the October CPU work; profile
-  in #59).
+- **Cost.** 8 bands at 192 kHz with CW, FT8 and RTTY use about 1.7 cores of CPU time on a 35 W
+  i5-9500T with `itila_decode_threads: 4` on a weekday afternoon (2.2 before the October CPU work;
+  profile in #59). On an RX888, `radiod` takes about half a core more for 9 bands.
 
-The CW, RTTY and FT8 numbers are calibration on our station, not a contest result; the SSB ones are
-from one contest weekend. The harness to reproduce them is
-in `tools/eval/` and `tools/sim/`.
+The CW, RTTY and FT8 numbers are calibration on our stations, not contest results; the SSB ones are
+from one contest weekend. The harness to reproduce them is in `tools/eval/` and `tools/sim/`.
 
 ## What it does
 
-- **Receivers.** HPSDR protocol 1 radios (a Red Pitaya with Pavel Demin's `sdr_receiver_hpsdr`
-  firmware, up to 8 receivers at 48 to 192 kHz each), FlexRadio DAX-IQ through `flex_iq.py`
-  (`skimmer_flex.example.json`), and any receiver ka9q-radio's `radiod` drives, such as an RX888,
-  as RTP channels (`"sdr_type": "rtp"`, `rtp_receiver.py`). Adding another radio takes one file
-  that delivers IQ ([docs/RADIOS.md](docs/RADIOS.md#adding-an-iq-back-end)). Lost UDP packets are counted from the sequence number and their
-  time kept as silence, so FT8 slots stay on the clock (`FT8 trigger: ... lost=` in the log).
-  A Red Pitaya streams to one client, and any client on the LAN can stop it: with no IQ for
-  `hpsdr_restart_after_s` (default 30 s; 0 = never) the receiver sends the start sequence again and
-  logs `Receiver: no IQ ... sent the start sequence again`, on the multi-band C receiver and the
-  single-band Python one alike.
+- **Receivers.**
+  - **RX888 or any receiver ka9q-radio's `radiod` drives** (`"sdr_type": "rtp"`, `rtp_receiver.py`):
+    `radiod` digitises the whole of HF at once and hands SparkGap one IQ channel per band, so a band
+    is a line in `radiod`'s config, not more hardware. The cheapest way in, and what WF8Z-1 runs.
+  - **HPSDR protocol 1 radios**: a Red Pitaya with Pavel Demin's `sdr_receiver_hpsdr` firmware, up
+    to 8 receivers at 48 to 192 kHz each, or a Web-888 with its HPSDR image
+    ([docs/WEB888_GETTING_STARTED.md](docs/WEB888_GETTING_STARTED.md)).
+  - **FlexRadio** DAX-IQ through `flex_iq.py` (`skimmer_flex.example.json`).
+  - Adding another radio takes one file that delivers IQ
+    ([docs/RADIOS.md](docs/RADIOS.md#adding-an-iq-back-end)).
+
+  Lost UDP packets are counted from the sequence number and their time kept as silence, so FT8
+  slots stay on the clock (`FT8 trigger: ... lost=` in the log). A Red Pitaya streams to one
+  client, and any client on the LAN can stop it: with no IQ for `hpsdr_restart_after_s` (default
+  30 s; 0 = never) the receiver sends the start sequence again and logs `Receiver: no IQ ... sent
+  the start sequence again`.
 - **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
   is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
   keying (`docs/ITILA2.md`).
 - **Spotting the runner, not the caller.** The repeat spot rule (`spot_rule.py`) follows what
   RBN asks of a skimmer node: only the station calling CQ or TEST is spotted, after 2, 3 or 4
   copies by RBN's call pattern file (`patt3ch.lst`), with lock-on (who owns the frequency) and
-  CQ qualifiers (`CQ PA`, `CQ FD`). Callers are never spotted.
+  CQ qualifiers (`CQ PA`, `CQ FD`). Callers are never spotted on purpose.
 - **RTTY.** RTTY signals are found in each band's RTTY segment and decoded once a minute, with
-  the same repeat rule. For a contest weekend, `rtty_contest` (off by default) adds that contest's
-  rules: `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group
-  even when the CQ itself was lost, and reads a call followed by a grid square as a caller being
-  sent the exchange. Makrothen is the only contest defined so far (`RTTY_CONTESTS` in `sparkgap.py`).
-  `rtty_spot_cq_tail` (off by default) also counts a call sent twice right before a closing CQ,
-  TEST or QRZ after one other word (`JARL W2FM W2FM CQ`): a runner whose opening CQ was lost, in any
-  contest, with no `rtty_contest` needed.
-  `"rtty_decoder": "frtty"` (off by default) decodes with FRTTY (`frtty.c`) in place of `rtty_core.c`:
-  a decoder that models the whole character frame and the sender's cadence, over by over, so weak and
-  fading signals copy better (JARTS 60 -> 65 real calls, PA 91 -> 97), at about 3x the RTTY decode CPU.
+  the same repeat rule. `"rtty_decoder": "frtty"` decodes with FRTTY (`frtty.c`) in place of
+  `rtty_core.c`: it models the whole character frame and the sender's cadence, over by over, so
+  weak and fading signals copy better (JARTS 60 -> 65 real calls, PA 91 -> 97), at about 3x the
+  RTTY decode CPU. For a contest weekend, `rtty_contest` adds that contest's rules:
+  `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group even
+  when the CQ itself was lost, and reads a call followed by a grid square as a caller being sent
+  the exchange (contests defined: `RTTY_CONTESTS` in `sparkgap.py`). `rtty_spot_cq_tail` also
+  counts a call sent twice right before a closing CQ, TEST or QRZ after one other word (`JARL W2FM
+  W2FM CQ`): a runner whose opening CQ was lost. `rtty_excludes_cw` keeps the CW decoder off a
+  signal the RTTY decoder has read as RTTY.
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
@@ -83,32 +90,45 @@ in `tools/eval/` and `tools/sim/`.
 - **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
   transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
   is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of
-  two readings, lock-on. It runs on its own beside the CW skimmer: `voice/live_voice.py` on IQ from
-  `voice/flex_record.py` (FlexRadio DAX-IQ). How it works, how to run it and how it measured:
-  `voice/README.md`.
+  two readings, lock-on. It runs on its own beside the CW skimmer: `voice/live_voice.py` on a growing
+  IQ file, for example from `voice/flex_record.py` (FlexRadio DAX-IQ). How it works, how to run it and
+  how it measured: `voice/README.md`.
 - **Outputs.** DX-cluster spots on telnet port 7300 in CW Skimmer Server's format (RTTY lines as
   RTTY Skimmer Server writes them), so loggers, clusters and Aggregator can read them; an
   optional second port for your own use with its own, looser spot rule (see the quick start);
-  `rbn_feeder.py` uploads CQ-tagged spots to RBN directly (keep it off until the RBN criteria
-  above are passed).
-- **Options for the spot rule**, all off by default: a validation score using calls RBN
-  skimmers have heard and the SKCC roster (`spot_validation`, `docs/ITILA2.md`), split DX
-  signing `TU <call> UP` (`spot_rule_split_up`), back-to-back CQs counted each
-  (`spot_rule_cq_repeats`), `CWT <call>` without CQ (`spot_rule_contest_words`), and pieces of
-  longer calls held back (`spot_rule_fragments`).
+  `rbn2_feeder.py` uploads the CQ spots to RBN directly.
 - **SparkGap Web**, in a browser: waterfall, call ladder and live decode
   text, and through each machine's SparkGap server (`sparkgap_server.py`) start, stop and
   settings for its copies (`docs/WEBUI.md`).
-- **Tools.** An all-band IQ recorder (`iq_recorder.py`), a proxy that replays recordings as an
-  HPSDR radio to any number of skimmers at once (`hpsdr_proxy.py`, with `--align` to keep FT8
-  slots on the clock and `--drop` to lose packets on purpose), file-mode replay, a band simulator
-  with exact ground truth (`tools/sim/`), scoring against the RBN archive
-  (`tools/eval/rbn_confirm.py`), and a clip cutter to listen to a decode: frequency and time in,
+- **Tools.** An all-band IQ recorder (`iq_recorder.py`, `record_iq_dir`), a proxy that replays
+  recordings as an HPSDR radio to any number of skimmers at once (`hpsdr_proxy.py`, with `--align`
+  to keep FT8 slots on the clock and `--drop` to lose packets on purpose), file-mode replay, a band
+  simulator with exact ground truth (`tools/sim/`), scoring against the RBN archive
+  (`tools/eval/rbn_confirm.py`), refitting the spot validation weights from your own run logs
+  (`tools/eval/fit_validation.py`), and a clip cutter to listen to a decode: frequency and time in,
   CW audio and the decoder's text out (`tools/listen/cw_clip.py`).
+
+### Settings worth knowing
+
+Off unless set, except where a default is given:
+
+| Key | What it does |
+|---|---|
+| `spot_validation`, `spot_validation_calls` | Score each call before spotting it, using calls RBN skimmers heard (`rbn`) and the SKCC roster (`rbn+skcc`); `normal` is the tested level (`docs/ITILA2.md`) |
+| `spot_rule_owned_two_windows` | A call heard on a frequency another call owns needs copies in two decode windows: a caller read in the runner's text waits |
+| `rbn_known_drop_busts` | A call that reaches 10 RBN skimmers in a day only as a bust many of them share (a far busier look-alike that day) doesn't count as known; calls in MASTER.SCP always do |
+| `itila2_tone_lock_hz` | Each bin locks on the tone that keys most of its time (the runner) and blanks a short over sent more than this many hertz from it (a caller off zero beat); 8 is the tested value |
+| `spot_rule_window_join` | A CQ group cut by the edge of a decode window counts in the next window of the same bin |
+| `spot_rule_split_up` | Split DX signing `TU <call> UP` is spotted |
+| `spot_rule_cq_repeats`, `spot_rule_contest_words` | Back-to-back CQs count each; `CWT <call>` (and SST, MST) without a CQ opens a group |
+| `spot_rule_fragments` | Pieces of a longer call heard near it are held back (K1V of K1VUT) |
+| `signal_min_snr` | Scanner threshold to open a bin, dB over the local noise (12) |
+| `itila_max_bins` | Most bins at once per band |
+| `ft8_windows`, `ft8_band_cut` | `aligned` FT8 windows around each slot (keep the PC clock synced) or `sliding`; `fft` or `resample` band cut |
 
 Work in progress is in the [open pull requests](https://github.com/hotairfred/SparkGap/pulls).
 
-## Quick start (Linux, Red Pitaya 125-14)
+## Quick start (Linux)
 
 Dependencies (Debian/Ubuntu):
 
@@ -131,10 +151,31 @@ FT8 needs `decode_ft8` from [ft8_lib](https://github.com/kgoba/ft8_lib): `make f
 `"ft8_decoder": "/path/to/decode_ft8"`; or set `"enable_ft8": false`. SparkGap logs a warning
 at start if FT8 is on and the decoder is missing.
 
-Pitaya: install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/)
-firmware and make sure it's reachable on your LAN.
+Then set up your receiver, below, and run:
 
-Configure: copy `sk_5band.json` and edit at least:
+```
+python3 sparkgap.py --config your_config.json
+telnet localhost 7300
+```
+
+Every config needs at least your `callsign` and `grid`; the examples below show the rest.
+`cw_decoder: itila2` (the default) is the current decoder with the repeat spot rule;
+`cw_decoder: itila` selects the original chain ([docs/HISTORY.md](docs/HISTORY.md)).
+
+**RX888 (or another radiod receiver).** Build and install ka9q-radio
+([github.com/ka9q/ka9q-radio](https://github.com/ka9q/ka9q-radio), `docs/INSTALL.md`; `sudo make install`
+puts in radiod, the RX888 firmware and its udev rules). Start from `radiod_sparkgap.example.conf`, one
+192 kHz IQ channel per band at SparkGap's band centres (radiod names a channel's SSRC after its frequency
+in kHz); its comments cover loopback multicast, the socket buffer, FFTW wisdom and checking the gain.
+Then copy `skimmer_rtp.example.json`: `"sdr_type": "rtp"`, `rtp_group` (radiod's data group), `rtp_encoding`
+(`f32le` or `s16be`, as radiod sends) and, on one computer, `rtp_iface` 127.0.0.1. CW, FT8, RTTY and IQ
+recording all run from the channels. The RX888 has no input filtering, and everything on HF shares
+its one ADC and gain: feed it from a protected receive path (a transceiver's receive loop, or a
+limiter), a broadcast-band filter helps near strong AM stations, and keep it and its USB and coax
+away from noisy computer power supplies, whose hash it hears on the low bands.
+
+**Red Pitaya 125-14.** Install [Pavel Demin's `sdr_receiver_hpsdr`](https://pavel-demin.github.io/red-pitaya-notes/sdr-receiver-hpsdr/)
+firmware and make sure it's reachable on your LAN. Copy `sk_5band.json` and edit at least:
 
 ```json
 {
@@ -154,36 +195,8 @@ Configure: copy `sk_5band.json` and edit at least:
 `recent_band_floor.peers` ships empty. Any spot source you add there (another cluster on your
 LAN, RBN's telnet) is connected at start even with `gate_recent_band_floor` off.
 
-`cw_decoder: itila2` (the default) is the current decoder with the repeat spot rule;
-`cw_decoder: itila` selects the original chain (see *History*).
-
-Run:
-
-```
-python3 sparkgap.py --config sk_5band.json
-```
-
-Connect to the spot stream:
-
-```
-telnet localhost 7300
-```
-
-Port 7300 (`telnet_port`) carries the RBN-grade spots, the same stream `rbn_feeder.py`
-uploads. If you want your own spots filtered differently, for example a looser rule for your
-cluster or logger, add a second port with its own rule:
-
-```json
-"telnet_local_port": 7301,
-"local_spot_rule": {"doubled_calls": true, "split_up": true, "fewer_repeats": 0}
-```
-
-`split_up` also spots DX working split from its sign-offs (`TU CY0S UP`), which CW Skimmer
-does not do. Both port numbers are yours to pick (`--port` and `--local-port` override them).
-Tweaks to `local_spot_rule` change only the local port; what goes to RBN stays the same.
-Without `local_spot_rule`, 7301 carries the same spots as 7300. FT8 and RTTY go to both ports.
-The local rule can also set its own `validation`, `validation_calls`, `cq_repeats` and
-`contest_words`; without them it follows the top-level keys.
+**Web-888.** [docs/WEB888_GETTING_STARTED.md](docs/WEB888_GETTING_STARTED.md): the HPSDR image,
+six bands at 192 kHz, set up in SparkGap Web or from a config file.
 
 **FlexRadio:** copy `skimmer_flex.example.json`; it uses a DAX-IQ channel, so CW Skimmer can
 keep another channel on the same radio. If another receiver hangs on one of the radio's receive
@@ -200,14 +213,21 @@ The decoders get silence while the radio is keyed, until 0.1 s after
 its key-up (which comes after the transmitting client's CW delay), so
 your own transmissions and their key clicks are not decoded.
 
-**RX888 (or another radiod receiver):** build and install ka9q-radio
-([github.com/ka9q/ka9q-radio](https://github.com/ka9q/ka9q-radio), `docs/INSTALL.md`; `sudo make install`
-puts in radiod, the RX888 firmware and its udev rules). Start from `radiod_sparkgap.example.conf`, one
-192 kHz IQ channel per band at SparkGap's band centres (radiod names a channel's SSRC after its frequency
-in kHz); its comments cover loopback multicast, the socket buffer, FFTW wisdom and checking the gain.
-Then copy `skimmer_rtp.example.json`: `"sdr_type": "rtp"`, `rtp_group` (radiod's data group), `rtp_encoding`
-(`f32le` or `s16be`, as radiod sends) and, on one computer, `rtp_iface` 127.0.0.1. CW, FT8, RTTY and IQ
-recording all run from the channels.
+**Your own spots.** Port 7300 (`telnet_port`) carries the RBN-grade spots, the same stream
+`rbn2_feeder.py` uploads. If you want your own spots filtered differently, for example a looser
+rule for your cluster or logger, add a second port with its own rule:
+
+```json
+"telnet_local_port": 7301,
+"local_spot_rule": {"doubled_calls": true, "split_up": true, "fewer_repeats": 0}
+```
+
+`split_up` also spots DX working split from its sign-offs (`TU CY0S UP`), which CW Skimmer
+does not do. Both port numbers are yours to pick (`--port` and `--local-port` override them).
+Tweaks to `local_spot_rule` change only the local port; what goes to RBN stays the same.
+Without `local_spot_rule`, 7301 carries the same spots as 7300. FT8 and RTTY go to both ports.
+The local rule can also set its own `validation`, `validation_calls`, `cq_repeats` and
+`contest_words`; without them it follows the top-level keys.
 
 **macOS** should work with light Makefile changes (`.dylib` instead of `.so`; on Apple Silicon
 omit `-march=native`). **Windows:** WSL2 with Ubuntu, then the Linux steps. Native builds for
@@ -233,17 +253,24 @@ CW and RTTY spots don't use MQTT.
 
 ### RBN
 
-RBN: beta testers are running live uploads with `rbn2_feeder.py`; everyone else keeps `rbn_upload`
-off until their node holds up against other skimmers. The checks a node must make itself before a
-spot reaches RBN (CQ only, repeats, mode codes, beacons, frequency) and what we measured are in
+`rbn2_feeder.py` uploads to RBN, set by the config's `rbn_upload` (`dry` to log what it would
+send, `live` to send; anything else, or nothing, is off). Run `dry` first and check your node
+against other skimmers before going `live`: the checks a node must make itself before a spot
+reaches RBN (CQ only, repeats, mode codes, beacons, frequency) and what we measured are in
 hotairfred/SparkGap#49. How to send spots: [docs/sending-spots.md](docs/sending-spots.md). The
 feeders: [docs/rbn-feeding.md](docs/rbn-feeding.md). The RBN auth library the feeder needs:
 [docs/rbn-auth-library.md](docs/rbn-auth-library.md).
 
-## Sharing one Red Pitaya between computers
+## Sharing a receiver between computers
 
-A Red Pitaya streams to one client. `hpsdr_proxy.py` takes that stream once and passes it to any number of
-SparkGaps, so a second computer can take some of the bands:
+**RX888 / radiod.** `radiod`'s channels are multicast, so any number of programs can listen to the
+same channels at once: a second SparkGap, a recorder, another skimmer. On one computer with
+`ttl = 0` that needs nothing more; across the LAN, set `radiod`'s `ttl` with care, since every
+channel then goes to every port of the switch that doesn't filter multicast (about 12 Mbit/s per
+192 kHz float32 channel).
+
+**Red Pitaya.** A Red Pitaya streams to one client. `hpsdr_proxy.py` takes that stream once and
+passes it to any number of SparkGaps, so a second computer can take some of the bands:
 
 ```
 python3 hpsdr_proxy.py --pitaya 192.168.1.54 --port 1025 --owner 192.168.1.76
@@ -308,160 +335,10 @@ GPLv3. See `LICENSE`.
 
 ## History
 
-SparkGap grew out of luarvique's csdr-skimmer. From March to September 2026 it ran the
-original ITILA decoder with a configurable set of spot gates; itila2 and the repeat spot rule
-became the default chain in October 2026 (`cw_decoder: itila2`, #62); `cw_decoder: itila`
-still selects the original one. The material below describes
-that earlier chain and the comparisons made with it. It is kept for reference; the numbers
-are not current.
-
-### March 2026 comparison (B1_seg2, original decoder)
-
-> **Reference comparisons** (single 15-min recording: B1_seg2, 40m,
-> 2026-03-19 03:15–03:30 UTC, scored two ways for the local-vs-global
-> distinction operators care about):
->
-> - **`recall_local` — vs the same-antenna decoder ceiling**: against
->   the SkimSrv-curated 56-call CQ key (what CW Skimmer's offline
->   mode caught on the same audio, hand-filtered to runner CQs):
->   **92.9%** (52 of 56, slash-tolerant). This is the fair
->   decoder-quality metric — it controls for "what our antenna could
->   even theoretically hear at this site that night."
->
-> - **`recall_global` — vs RBN worldwide consensus**: against the
->   RBN historical CSV (≥2 distinct skimmers confirming, 153 unique
->   calls after slash-normalization): **49.7%** (76 of 153). Lower
->   bounded by propagation/antenna — RBN's distributed nodes hear
->   stations our single 40m loop physically could not.
->
-> - **Vs CW Skimmer's own RBN recall**: CW Skimmer offline mode on
->   the same audio caught **22.9%** of the RBN-153 set (35 calls).
->   On `recall_global`, SparkGap is roughly **2× CW Skimmer** on
->   this recording. **47 RBN-validated calls** SparkGap caught that
->   CW Skimmer missed; **6** CW Skimmer caught that SparkGap missed.
->
-> - **Precision side**: 274 unique SparkGap spots, 96 (35%)
->   independently validated by RBN or CW Skimmer; 178 are
->   unverified — mix of real local stations (RBN missed) and false
->   positives.  Live mode disambiguates these via SDC tee; the file
->   replay does not.
->
-> - **The "local but not global" bucket exists**: of those 96
->   validated spots, **20 are calls where SparkGap and CW Skimmer
->   independently agreed but RBN missed entirely** — two different
->   decoders, different algorithms, both saw the signal that no
->   worldwide skimmer ≥2-consensus-confirmed. That's empirical
->   evidence for the "RBN-only scoring underweights local coverage"
->   argument: an antenna-co-located decoder catches stations RBN's
->   distributed network doesn't.
->
-> - **Live deployment** alongside UT4LW's SDC-Connectors (actively-
->   maintained closed-source alternative) on a shared antenna split:
->   matches 67% of SDC-Connectors' spots in the first 17 minutes of
->   operation.  Each catches some calls the other doesn't — they hear
->   different pieces of the same band.
->
-> SDC-Connectors has years of contest tuning we don't yet match. We
-> have features it doesn't (open source, multi-mode in one process,
-> packet-loss telemetry). One recording is one recording — these
-> numbers are calibration, not a contest result. Methodology in
-> `tools/eval/b1_benchmark.py` and `eval_rbn_validated.py`.
->
-
-### The original ITILA decoder
-
-The CW decoder ("ITILA" in the source — named after MacKay's *Information
-Theory, Inference, and Learning Algorithms* textbook that motivated the
-approach, not a single named algorithm) is a **Bayesian, soft-decision
-keystate decoder**.  It maintains continuous `P(key=down | t)` posteriors
-all the way through to character matching rather than thresholding the
-envelope into bits at any intermediate stage.
-
-The pipeline, per channel:
-
-1. **Channelization.** Per-bin IIR LPF on the FFT-decimated baseband,
-   producing a real-valued envelope at 200 Hz.
-2. **EM parameter estimation.** A two-state Gaussian-mixture EM iterates
-   the noise mean (`nm`), signal amplitude (`A`), observation variance
-   (`σ²`), and dit unit length (WPM) for this channel.  Warm-starts from
-   the previous window's converged parameters when available.
-3. **HMM forward-backward.** Given the EM-fit observation model and a
-   two-state Markov transition matrix derived from the estimated WPM,
-   `fb_core` (C extension) computes the per-sample posteriors
-   `γ[t,0] = P(space | observation)` and `γ[t,1] = P(mark | observation)`.
-   These are continuous, never thresholded inside the decoder.
-4. **Speed marginalization.**  Sixteen WPM bins span 8-60 WPM; the
-   forward-backward log-evidence is computed at each bin and used to
-   marginalize γ across speed hypotheses (`gamma_marg`).  Multi-station
-   density triggers GMM WPM detection (M8): two candidate WPMs decoded
-   in parallel so a slow runner doesn't lose to a faster caller's clock.
-5. **Late quantization.** `γ_marg[:,1] > 0.5` produces the binary
-   mark/space stream — the *only* threshold in the whole decoder, and it
-   happens once the posterior has integrated evidence across the full
-   window.
-6. **Beam-search run-length decode.** A 64-wide beam search over the
-   mark/space run-lengths consumes Morse-element timing log-likelihoods
-   (canonical dit / dah / inter-element / inter-character / inter-word
-   gaps) plus an ambiguity-aware emission model.  Returns the top-K
-   decoded text hypotheses.
-7. **Callsign extraction.** Three-pass regex+SCP scan of the decoded
-   text: literal SCP match, length-bounded substring scan, and a
-   Morse-distance-aware edit-1 correction (e.g. `T1LZ → K1LZ`).
-8. **Adaptive consensus gates.**  Outside the decoder, in `SpotTracker`,
-   per-frequency leader / CQ-runner / harmonic / blacklist / patt3ch
-   gates filter what becomes a spot.  Every gate is a config flag so the
-   operator can tune precision/recall.
-
-What this means relative to other open-source CW decoders:
-
-- **Not threshold-based.** Threshold decoders (cwdaemon, fldigi's
-  default CW) make a hard mark/space decision per sample and lose
-  posterior evidence.  Skimmer's reputation rests on *not* doing that;
-  SparkGap doesn't either.
-- **Speed is marginalized, not assumed.** Many decoders need the
-  operator to set WPM (or auto-detect on training data once).  SparkGap
-  re-fits per window, every window, with a 60 s context.
-- **Soft keystate, but post-decode SCP fusion is shallow.**  Right now
-  SCP / patt3ch corrections are applied *after* the beam decode picks a
-  winner.  Combining word-level priors *during* beam selection (BALUN
-  vs BALAN style) is a known open area — tested on a 15-min CWT
-  recording (`research/fusion_per_window.py`); +0.1 pp recall in that
-  dataset, but the test conditions weren't dense enough to exercise it.
-  Open question.
-
-Source: `itila_core.c` (full implementation, ~1400 lines C),
-`fb_core.c` (forward-backward kernel), `itila_scanner.c` (band-wide
-channelizer + lazy bin-spawn), and `_ItilaScanner` + `SpotTracker` in
-`sparkgap.py` for the Python orchestration.
-
-### Gate flags (`cw_decoder: itila`, `spot_rule: off`)
-
-The decoder behavior is fully configurable.  Defaults are "ship-it"
-mode (permissive emit, trust cluster filtering).  Each gate can be
-re-enabled individually for stricter local behavior:
-
-| Flag | Default | What it does |
-|---|---|---|
-| `enable_caller_spotting` | `true`  | Extract callers AND runner from QSO context (high-recall mode) |
-| `gate_cq_runner` | `false` | Forces runner-only when CQ is in buffer (lower recall, higher precision) |
-| `gate_freq_consensus` | `false` | Per-freq adaptive consensus + 5-min commit lock |
-| `gate_patt3ch_filter` | `false` | Reject bypass calls not matching SkimSrv's `patt3ch.lst` patterns |
-| `gate_bypass_consensus` | `false` | Bypass calls go through freq consensus vs simple count threshold |
-| `gate_scp_bucket_substitute` | `true`  | Emit nearest-SCP bucket form instead of raw decoded call |
-| `gate_recent_band_floor` | `false` | S-floor: anchor solo decode if peer skimmers spotted the same call on the same band recently |
-| `gate_harmonic_filter` | `false` | Drop apparent 2x-5x harmonic spurs of recent same-call spots (RX intermod artifacts) |
-| `gate_telemetry` | `true`  | Log "would-gate" decisions even when gate is off (diagnostic) |
-| `gate_timing_cost` | `false` (in code; `sk_5band.json` overrides to `true`) | Drop ITILA decode windows whose segmentation timing cost exceeds `timing_cost_max`. B1_seg2 validation suggested 30; production shipped at 100 (median emit-cost in production was higher than the recording's, so 100 catches the obvious M5M-class flood without clipping marginal real calls). Targets the M5M / G7D class where decoder noise threshold-crosses and "decodes" to a short callsign by chance. Cost is logged on every decode regardless of the flag. |
-| `gate_short_scp_bucket` | `true` | When a SCP bucket-substitute target is ≤3 chars, require peer-skimmer corroboration before allowing the substitution. Short SCP entries are noise magnets (G5E, M3E, M5A class); without this guard, decoder garbage routinely lands edit-1 from one of them. Skipped for ≥4-char targets. |
-
-Plus the standard knobs:
-
-- `signal_min_snr` — bin spawn threshold (default 12 dB; lower = more weak DX, more CPU)
-- `itila_max_bins` — concurrent bin ceiling per band (`sk_5band.json` ships at 400; 200 is conservative)
-- `scp_bypass_threshold` — sightings required for non-SCP-validated calls
-- `enable_ft8` — runs FT8 + RTTY pipelines (RTTY currently piggy-backs)
-- `ft8_band_cut` — `fft` (default): each band's 12 kHz FT8 audio is cut from one FFT of the minute, single precision; `resample`: the original mix of the whole minute plus `resample_poly`
-- `ft8_windows` — `aligned` (default): two 15 s windows around each FT8 slot, placed from the snapshot's start time; `sliding`: the original, every second from 0 to 45 s, 46 decodes a band-minute. Aligned windows take the slots from this PC's clock and cover a transmission from about 1 s early to 2.3 s late, so keep the clock synced (NTP or chrony); a clock a second or more off loses FT8 decodes. Use `sliding` for replays unless `hpsdr_proxy.py --align` lines the recording up with the clock
+SparkGap grew out of luarvique's csdr-skimmer. From March to September 2026 it ran the original ITILA
+decoder with a configurable set of spot gates; itila2 and the repeat spot rule became the default chain
+in October 2026 (`cw_decoder: itila2`, #62), and `cw_decoder: itila` still selects the original one.
+That chain, its gate flags and the comparisons made with it are in [docs/HISTORY.md](docs/HISTORY.md).
 
 ## Acknowledgments
 
@@ -483,6 +360,9 @@ regardless.
   and the `ft8d` standalone FT8 decoder.
 - **Phil Karn (KA9Q)** — *ka9q-radio*: `radiod` turns a wideband receiver such as the RX888 into
   the IQ channels the `rtp` receiver reads.
+- **Karlis Goba** — *ft8_lib* (MIT): `decode_ft8` decodes SparkGap's FT8.
+- **OpenAI** — *Whisper*, and **SYSTRAN** — *faster-whisper* (both MIT): the transcriber behind
+  the SSB voice skimmer.
 - **Rudy Bakalov (N2WQ)** — *GoCluster*, BSD-licensed cluster server.
   Cross-source validation techniques (recent-on-band support floor,
   harmonic suppression) in this project's spot pipeline are adapted
