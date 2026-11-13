@@ -113,6 +113,10 @@ VALIDATION = {"permissive": 1.25, "normal": 3.0, "aggressive": 5.0}
 # Not fitted with the other weights: set by hand on WF8Z-1's 11-05 evening log, checked on the 11-06
 # 01:18-05:41Z hours, the PA 10-10 recording and four more (hotairfred/SparkGap PR text).
 SIGNED = 2.0
+# validation, spot_rule_clean_cq: the call signed one CQ cleanly (CQ CQ DE WA6BBQ, CQ DE F6FAI AR K) in any
+# of its windows, see clean_signed(). Set by hand on WF8Z-1's 11-11 live windows, checked on 11-12 (PR text).
+CLEAN = 1.0
+_CLEAN_END = frozenset({"K", "AR", "KN", "BK", "SK"})     # clean_signed: what may follow the call
 _WEIGHTS = {"bias": 0.74, "single": -1.49, "three": 0.43, "four_plus": 0.42, "windows": 1.68,
             "tier3": -0.52, "tier4": -1.82, "heard_before": 1.87, "paths_agree": 0.65,
             "paths_disagree": -0.63, "doubled": 2.48, "rival": -1.64, "signed": SIGNED}
@@ -621,6 +625,24 @@ def signed_calls(toks: list[str]) -> set[str]:
     return out
 
 
+def clean_signed(toks: list[str], listed: Callable[[str], bool] | None = None) -> set[str]:
+    """Calls that sign a CQ cleanly in a window: CQ, TEST or QRZ, then within DE_LOOKBACK tokens and with no
+    other call between, DE and the call, then nothing more, a sign-off (K AR KN BK SK) or the same call
+    again (CQ CQ CQ DE WA6BBQ; CQ DE F6FAI AR K; TEST DE KD3CNH KD3CNH). A caller sends the runner's call
+    before DE and his exchange after his own; a CQ ending at the call is the runner's. A second copy one
+    letter off (DE W3FE W3F) is clean only when listed knows the call and not the other reading: either
+    may be the bust (DE K4NGR K4NGA)."""
+    out = set()
+    for i in range(len(toks) - 1):
+        if toks[i] != "DE" or not CALL_RE.match(toks[i + 1]) or not _cq_before(toks, i):
+            continue
+        call, nxt = toks[i + 1], toks[i + 2] if i + 2 < len(toks) else None
+        if (nxt is None or nxt in _CLEAN_END or nxt == call
+                or (listed is not None and _lev1(nxt, call) and listed(call) and not listed(nxt))):
+            out.add(call)
+    return out
+
+
 class RepeatSpotRule:
     """Feed every decode window; returns the spots the window completes."""
 
@@ -638,7 +660,7 @@ class RepeatSpotRule:
                  norival: bool = False, strongest_db: float | None = None,
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
                  window_join: bool = False, validation_threshold: float | None = None,
-                 garbled_runner: bool = False, stray_known: bool = False,
+                 garbled_runner: bool = False, stray_known: bool = False, clean_cq: bool = False,
                  cq_tail: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
@@ -686,8 +708,10 @@ class RepeatSpotRule:
         self.garbled = garbled_runner           # CQ POTAQ0SN K5LG: a broken call ends the sender search, see sender()
         self.stray_known = stray_known          # DE K1PU G after a copy of K1PUG: see _stray_after()
         self.cq_tail = cq_tail                  # JARL W2FM W2FM CQ counts: see runner_groups()
+        self.clean_cq = clean_cq                # validation: a clean CQ CQ DE WA6BBQ adds CLEAN, see clean_signed()
         self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
         self._signed: dict[int, set[str]] = {}    # validation: window -> calls that signed a CQ in it
+        self._clean: dict[int, set[str]] = {}     # validation, clean_cq: window -> calls that signed one cleanly
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
         self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
         self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
@@ -725,6 +749,8 @@ class RepeatSpotRule:
             toks = tokens(text, self.gluek)
             self._paths.setdefault(window, []).append(Counter(toks))
             self._signed.setdefault(window, set()).update(signed_calls(toks))
+            if self.clean_cq:
+                self._clean.setdefault(window, set()).update(clean_signed(toks, self.listed))
         spots = []
         self.stray_listed = ((lambda c: any(x.call == c and abs(x.freq_khz - freq_khz) <= 1.0 for x in self._copies))
                              if self.stray_known else None)
@@ -836,6 +862,8 @@ class RepeatSpotRule:
              + w["signed"] * (sum(call in self._signed.get(win, ()) for win in windows) >= 2))
         if self.listed:
             s += w["listed"] * self.listed(call)
+        if self.clean_cq and any(call in self._clean.get(win, ()) for win in windows):
+            s += CLEAN
         return s
 
     def _same_audio(self, window: int, call: str, freq_khz: float, now: float,
@@ -1002,5 +1030,6 @@ class RepeatSpotRule:
             self._tails = {b: ts for b, ts in self._tails.items() if now - ts[-1][0] <= 1.5 * self.window_s}
             self._paths = {w: p for w, p in self._paths.items() if w in live}
             self._signed = {w: c for w, c in self._signed.items() if w in live}
+            self._clean = {w: c for w, c in self._clean.items() if w in live}
             self._same = {w: g for w, g in self._same.items() if w in live}
             self._heard = {c: h for c, h in self._heard.items() if now - h[1] <= HEARD_KEEP_S}
