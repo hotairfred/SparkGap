@@ -184,7 +184,7 @@ Every 2 seconds.
  "telnet": {"port": 7300, "clients": 1}, "iq_trimmed_s": 0.0,
  "recording": {"file": "/srv/sparkgap/rec/40m.wav", "bytes": 2473963564},
  "windows": 72823, "calls": 97, "spots_hour": 41, "bins_peak": 52,
- "decode_khz": [[7000.0, 7070.0]],
+ "decode_khz": [[7000.0, 7125.0]],
  "clients": [{"peer": "192.168.1.31:61718", "name": "shack", "via": null,
               "since": 1792018739, "dropped": 12}],
  "problems": {"errors": 8, "warnings": 3,
