@@ -47,3 +47,16 @@ def test_config_key() -> None:
     cfg = {"spot_rule": "repeat", "spot_validation": "normal"}
     assert _make_spot_rule(cfg, None).clean_cq is False
     assert _make_spot_rule({**cfg, "spot_rule_clean_cq": True}, None).clean_cq is True
+
+
+def test_an_unlisted_1x1_gains_nothing() -> None:
+    # N4V read cleanly for N5V (5 lost its last dit): a 1x1 is one element from another, so CLEAN needs it listed
+    from collections import Counter
+    for call, gains in (("N4V", False), ("KD3CNH", True)):
+        got = {}
+        for on in (False, True):
+            r = _rule(on)
+            r.feed(r.window_id(1, 0, 0.0), 21041.9, f"CQ CQ DE {call} {call} K", 0.0)
+            near = [c for c in r._copies if c.call == call]
+            got[on] = r.score(call, near, Counter(c.call for c in near), False)
+        assert (abs(got[True] - got[False] - CLEAN) < 1e-9) is gains

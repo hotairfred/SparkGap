@@ -862,7 +862,9 @@ class RepeatSpotRule:
              + w["signed"] * (sum(call in self._signed.get(win, ()) for win in windows) >= 2))
         if self.listed:
             s += w["listed"] * self.listed(call)
-        if self.clean_cq and any(call in self._clean.get(win, ()) for win in windows):
+        # a 1x1 (N4V) is one dah from another 1x1 (N5V) and comes and goes: clean only when listed knows it
+        if (self.clean_cq and (len(call) > 3 or (self.listed is not None and self.listed(call)))
+                and any(call in self._clean.get(win, ()) for win in windows)):
             s += CLEAN
         return s
 
