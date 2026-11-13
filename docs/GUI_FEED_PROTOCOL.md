@@ -91,7 +91,7 @@ Who this SparkGap is and the settings it runs with.
             "spot_rule_window_join": true, "spot_rule_owner_listed": true,
             "spot_rule_takeover_idle_s": 180.0,
             "spot_rule_garbled_runner": false,
-            "spot_rule_stray_known": false,
+            "spot_rule_stray_known": false, "spot_rule_clean_cq": false,
             "spot_rule_fragments": "off",
             "spot_rule_owner_cell": false, "spot_rule_owned_two_windows": false,
             "itila_window_sec": 30.0, "itila_max_bins": 400,

@@ -100,6 +100,7 @@ def _gui_settings(cfg, sample_rate):
         'spot_rule_fragments': (cfg.get('spot_rule_fragments') or 'off') if repeat else 'off',
         'spot_rule_owner_cell': repeat and bool(cfg.get('spot_rule_owner_cell', False)),
         'spot_rule_owned_two_windows': repeat and bool(cfg.get('spot_rule_owned_two_windows', False)),
+        'spot_rule_clean_cq': repeat and bool(validation) and bool(cfg.get('spot_rule_clean_cq', False)),
         'itila_window_sec': float(cfg.get('itila_window_sec', 60.0)),
         'itila_max_bins': int(cfg.get('itila_max_bins', 200)),
         'itila_decode_threads': int(cfg.get('itila_decode_threads', 1)),
@@ -2568,7 +2569,8 @@ def _make_spot_rule(config, tracker, local=None):
         owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)),
         runner_signs=True, window_join=True,      # cdub89/SparkGap#37
         garbled_runner=bool(config.get('spot_rule_garbled_runner', False)),
-        stray_known=bool(config.get('spot_rule_stray_known', False)))
+        stray_known=bool(config.get('spot_rule_stray_known', False)),
+        clean_cq=bool(config.get('spot_rule_clean_cq', False)))
 
 def _get_itila_lib():
     global _itila_lib
