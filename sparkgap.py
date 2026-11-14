@@ -477,6 +477,24 @@ CW_BAND_PLAN_R2 = [
     (28000,  28070,     28070,        28074),   # 10m   — FT4=28180 above FT8 (unreachable)
 ]
 
+# Whole CW segment (cw_whole_segment, on by default; cdub89/SparkGap#48): the CW window runs from the
+# band's lower edge to the top of the US CW/data segment, as far as the IQ span reaches, and the
+# digital dials inside are skipped zones instead of ending the window. Before, each band stopped
+# below FT8 (40m 7000-7070), so CQs at 7.114 or 14.080 were never decoded.
+CW_SEGMENT_TOP_KHZ = {1810: 2000, 3500: 3600, 7000: 7125, 10100: 10150, 14000: 14150,
+                      18068: 18110, 21000: 21200, 24890: 24930, 28000: 28300}
+# Dials skipped inside the segment, each from CW_SKIP_BELOW_KHZ under it to CW_SKIP_ABOVE_KHZ over
+# it (the 3 kHz of audio above the dial): FT8 and JS8, and FT4 where CW does not reach it (30m,
+# 17m, 15m, 12m, 10m: 21140 was half the extra 15m decoding on the SS replay and gave no spot), with
+# exclude_ft8_freqs (the default). FT4 on 80m, 40m and 20m only with exclude_ft4_freqs: CW drifts
+# into 7047.5 and 14080 in contests (K2YY CQ on 14080.2, confirmed), as before.
+CW_SKIP_FT8_KHZ = (1840, 3573, 3578, 7074, 7078, 10136, 10140, 14074, 14078, 18100, 18104,
+                   21074, 21078, 21140, 24915, 24919, 28074, 28078, 28180)
+CW_SKIP_FT4_KHZ = (3575, 7047.5, 14080)
+CW_SKIP_BELOW_KHZ, CW_SKIP_ABOVE_KHZ = 0.5, 3.5
+CW_SKIP_HOLD_SEC = 1e8       # an exclusion zone that never lapses
+
+
 # Band names for the config's bands[]: each is centred so the band's lower CW edge above sits
 # BAND_EDGE_MARGIN of the sample rate inside the IQ span, past the receiver's roll-off: a
 # FLEX-6400 is flat from 8.3% in at 48 and 96 kHz, a Red Pitaya from ~3% at 192 kHz (#63)
@@ -527,7 +545,7 @@ def _decode_span(bmin, bmax, center_khz, sample_rate):
     return (max(bmin, center_khz - half), min(bmax, center_khz + half))
 
 
-def _derive_cw_window(center_khz, exclude_ft8=True, exclude_ft4=False):
+def _derive_cw_window(center_khz, exclude_ft8=True, exclude_ft4=False, whole_segment=False):
     """Look up the CW window for the IARU R2 band containing center_khz.
 
     Returns (cw_min_khz, cw_max_khz) or None if center_khz doesn't fall
@@ -538,9 +556,12 @@ def _derive_cw_window(center_khz, exclude_ft8=True, exclude_ft4=False):
     Defaults match WF8Z preference (2026-05-25): FT8 zones excluded
     (phantom bin source on noisy 10m, also general waste), FT4 zones
     included (CW drift in contests is real).  Override via config flags.
+    whole_segment: up to CW_SEGMENT_TOP_KHZ instead; _cw_skip_zones() gives the dials to skip.
     """
     for lo, hi_no_ft4, hi_with_ft4, ft8 in CW_BAND_PLAN_R2:
         if lo - 200 <= center_khz <= hi_with_ft4 + 200:
+            if whole_segment:
+                return float(lo), float(CW_SEGMENT_TOP_KHZ[lo])
             hi = hi_no_ft4 if exclude_ft4 else hi_with_ft4
             if not exclude_ft8 and ft8 > 0:
                 # Caller doesn't want FT8 excluded — extend upper edge past
@@ -548,6 +569,20 @@ def _derive_cw_window(center_khz, exclude_ft8=True, exclude_ft4=False):
                 hi = max(hi, ft8 + 5)
             return float(lo), float(hi)
     return None
+
+
+def _cw_skip_zones(bmin, bmax, exclude_ft8=True, exclude_ft4=False):
+    """(lo, hi) kHz zones inside [bmin, bmax] the CW scanner skips with cw_whole_segment, merged."""
+    dials = (CW_SKIP_FT8_KHZ if exclude_ft8 else ()) + (CW_SKIP_FT4_KHZ if exclude_ft4 else ())
+    zones = []
+    for lo, hi in sorted((d - CW_SKIP_BELOW_KHZ, d + CW_SKIP_ABOVE_KHZ) for d in dials):
+        if hi < bmin or lo > bmax:
+            continue
+        if zones and lo <= zones[-1][1]:
+            zones[-1] = (zones[-1][0], max(zones[-1][1], hi))
+        else:
+            zones.append((lo, hi))
+    return zones
 
 
 def load_callsign_db(scp_path='MASTER.SCP', add_path='add_calls.txt',
@@ -5766,7 +5801,7 @@ class InstanceManager:
                  cw_min_khz=0.0, cw_max_khz=99999.0,
                  enable_caller_spotting=True,
                  gate_timing_cost=False, timing_cost_max=30.0,
-                 exclude_ft8_freqs=True, exclude_ft4_freqs=False):
+                 exclude_ft8_freqs=True, exclude_ft4_freqs=False, cw_whole_segment=False):
         self.valid_calls = valid_calls or set()
         self.sample_rate = sample_rate
         self.decoder_bin = decoder_bin
@@ -5797,6 +5832,7 @@ class InstanceManager:
         #              scanning.  Override either in sk_5band.json.
         self.exclude_ft8_freqs = bool(exclude_ft8_freqs)
         self.exclude_ft4_freqs = bool(exclude_ft4_freqs)
+        self.cw_whole_segment = bool(cw_whole_segment)   # see CW_SEGMENT_TOP_KHZ
         self._itila_scanner = None  # created lazily in update_signals once center_khz is known
         self.max_instances = max_instances  # total decoder process cap (legacy)
         # max_channels: max simultaneous signals — decoupled from decoder count
@@ -5864,17 +5900,30 @@ class InstanceManager:
                 # back to the old "20-100 kHz below center" heuristic if
                 # the band isn't in the table.
                 bmin, bmax = self.cw_min_khz, self.cw_max_khz
+                skips = []
                 if bmin == 0 or center_khz < bmin - 100 or center_khz > bmax + 100:
                     auto = _derive_cw_window(
                         center_khz,
                         exclude_ft8=self.exclude_ft8_freqs,
-                        exclude_ft4=self.exclude_ft4_freqs)
+                        exclude_ft4=self.exclude_ft4_freqs,
+                        whole_segment=self.cw_whole_segment)
                     if auto:
                         bmin, bmax = auto
+                        if self.cw_whole_segment:
+                            # no higher than the flat part of the span (BAND_EDGE_MARGIN), never below the old top
+                            old_hi = _derive_cw_window(center_khz, self.exclude_ft8_freqs, self.exclude_ft4_freqs)[1]
+                            flat = center_khz + self.sample_rate * (0.5 - BAND_EDGE_MARGIN) / 1000.0
+                            bmax = max(old_hi, min(bmax, flat))
+                            half = self.sample_rate / 2000.0
+                            skips = [z for z in _cw_skip_zones(bmin, bmax, self.exclude_ft8_freqs,
+                                                               self.exclude_ft4_freqs)
+                                     if z[1] >= center_khz - half and z[0] <= center_khz + half]
                         log.info("CW window for %.0f kHz: [%.0f, %.0f] kHz "
-                                 "(ft8_excl=%s ft4_excl=%s)",
+                                 "(ft8_excl=%s ft4_excl=%s whole_segment=%s skip=%s)",
                                  center_khz, bmin, bmax,
-                                 self.exclude_ft8_freqs, self.exclude_ft4_freqs)
+                                 self.exclude_ft8_freqs, self.exclude_ft4_freqs,
+                                 self.cw_whole_segment,
+                                 ' '.join('%.1f-%.1f' % z for z in skips) or '-')
                     else:
                         bmin = center_khz - 100
                         bmax = center_khz - 20
@@ -5895,6 +5944,10 @@ class InstanceManager:
                     enable_caller_spotting=self.enable_caller_spotting,
                     gate_timing_cost=getattr(self, 'gate_timing_cost', False),
                     timing_cost_max=getattr(self, 'timing_cost_max', 30.0))
+                sc = getattr(self._itila_scanner, '_sc', None)
+                for lo, hi in skips:
+                    if sc is None or not sc.exclude(lo * 1000.0, hi * 1000.0, CW_SKIP_HOLD_SEC):
+                        log.warning("CW window: cannot skip %.1f-%.1f kHz (no exclusion zones in this scanner)", lo, hi)
             else:
                 self._itila_scanner.center_khz = center_khz
 
@@ -8384,6 +8437,7 @@ class SparkGap:
                 timing_cost_max=float(self.cfg.get('timing_cost_max', 30.0)),
                 exclude_ft8_freqs=bool(self.cfg.get('exclude_ft8_freqs', True)),
                 exclude_ft4_freqs=bool(self.cfg.get('exclude_ft4_freqs', False)),
+                cw_whole_segment=bool(self.cfg.get('cw_whole_segment', True)),
             )
             self.managers.append(mgr)
         # Legacy single-manager ref
@@ -9697,6 +9751,7 @@ def run_file_mode(args, config):
         enable_caller_spotting=bool(config.get('enable_caller_spotting', True)),
         exclude_ft8_freqs=bool(config.get('exclude_ft8_freqs', True)),
         exclude_ft4_freqs=bool(config.get('exclude_ft4_freqs', False)),
+        cw_whole_segment=bool(config.get('cw_whole_segment', True)),
         gate_timing_cost=bool(config.get('gate_timing_cost', False)),
         timing_cost_max=float(config.get('timing_cost_max', 30.0)),
     )
