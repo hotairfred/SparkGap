@@ -69,7 +69,8 @@ in `tools/eval/` and `tools/sim/`.
   the same repeat rule. For a contest weekend, `rtty_contest` (off by default) adds that contest's
   rules: `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group
   even when the CQ itself was lost, and reads a call followed by a grid square as a caller being
-  sent the exchange. Makrothen is the only contest defined so far (`RTTY_CONTESTS` in `sparkgap.py`).
+  sent the exchange. `"rtty_contest": "wae"` (WAE DX RTTY) makes WAE and WAEDC open a CQ group; its
+  serial exchange needs no setting. Those two are defined so far (`RTTY_CONTESTS` in `sparkgap.py`).
   `rtty_spot_cq_tail` (off by default) also counts a call sent twice right before a closing CQ,
   TEST or QRZ after one other word (`JARL W2FM W2FM CQ`): a runner whose opening CQ was lost, in any
   contest, with no `rtty_contest` needed.
