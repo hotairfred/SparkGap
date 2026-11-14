@@ -225,3 +225,13 @@ def test_an_established_runner_outvotes_a_caller_with_as_many_copies() -> None:
     new = _g('DR1A', 7165.0, [80.0, 90.0])                            # one copy before: not established yet
     other = _g('NB4A', 7165.1, [85.0, 95.0, 100.0])
     assert not v.caller_on_owned(other, [new, other])
+
+
+@pytest.mark.parametrize("text,calls", [
+    ("CQ20, CQ20, CQ20, November 2, Alpha, India, Charlie calling CQ", ["N2AIC"]),   # 11-12 live: was 0N2AIC
+    ("CQ40 CQ40 Kilo 8 Alpha Bravo", ["K8AB"]),
+    ("CQDX, November 2, Alpha, India, Charlie", ["N2AIC"]),
+    ("CQ 20, CQ 20, November 2, Alpha, India, Charlie calling CQ", ["N2AIC"]),       # spaced: unchanged
+])
+def test_cq_glued_to_the_band_lends_no_digit(text: str, calls: list[str]) -> None:
+    assert [c for c, _a, _b in v.calls_in(v.tokens(text))] == calls
