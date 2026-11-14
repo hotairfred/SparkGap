@@ -281,7 +281,10 @@ python3 sparkgap.py --config sk_5band.json --file recording.wav --center-khz 709
                     --start-min 0 --end-min 15
 ```
 
-It reads 16- and 24-bit stereo IQ WAV files at 96 or 192 kHz. Multi-band runs go through the
+It reads 16- and 24-bit stereo IQ WAV files at 96 or 192 kHz. File mode decodes CW only, unless
+`--digital` (192 kHz): then the FT8 and RTTY minute cycle runs on each minute of the audio as it does
+live (`enable_ft8`, `enable_rtty`), so `rtty_excludes_cw` keeps CW bins off RTTY in a replay too
+(FT8 needs `make ft8`). Multi-band runs go through the
 production C receiver path when the recording is replayed with `hpsdr_proxy.py` from another
 host (`--negate-q` for skimmer1 captures). Public test recordings are in the repository's
 releases (CY0S working split on 40m, a hand-sent 30m PA QSO Party segment, W1AW clips with
