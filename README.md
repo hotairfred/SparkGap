@@ -3,9 +3,9 @@
 *(Formerly OpenSkimmer; not related to Karl Heinz Kremer's OpenSkimmer of 2026, nor to SparkSDR by
 M0NNB.)*
 
-Open-source, Linux-native, multi-band skimmer for amateur radio: **CW, RTTY and FT8** on
+Open-source, Linux-native, multi-band skimmer for amateur radio: **CW, RTTY, FT8 and FT4** on
 several bands at once, with DX-cluster spots on telnet, an uploader for the Reverse Beacon
-Network (RBN) and FT8 reports to PSKReporter. **SSB voice** spotting is in `voice/` too
+Network (RBN) and FT8 and FT4 reports to PSKReporter. **SSB voice** spotting is in `voice/` too
 (experimental; it needs a CUDA GPU).
 
 > **Status: beta, live on RBN.** Two beta nodes upload to RBN with `rbn2_feeder.py`: WF8Z-1 (live
@@ -68,7 +68,10 @@ from one contest weekend. The harness to reproduce them is in `tools/eval/` and 
   the start sequence again`.
 - **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
   is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
-  keying (`docs/ITILA2.md`).
+  keying (`docs/ITILA2.md`). Each band is decoded across its whole CW segment, to the top of the US
+  CW/data segment (3600, 7125, 10150, 14150, 18110, 21200, 24930, 28300) as far as the receiver's span
+  reaches, with the FT8 and JS8 frequencies inside it skipped (and FT4 where CW doesn't go);
+  `"cw_whole_segment": false` stops each band below FT8 as before.
 - **Spotting the runner, not the caller.** The repeat spot rule (`spot_rule.py`) follows what
   RBN asks of a skimmer node: only the station calling CQ or TEST is spotted, after 2, 3 or 4
   copies by RBN's call pattern file (`patt3ch.lst`), with lock-on (who owns the frequency) and
@@ -122,6 +125,10 @@ Off unless set, except where a default is given:
 | `spot_rule_owned_two_windows` | A call heard on a frequency another call owns needs copies in two decode windows: a caller read in the runner's text waits |
 | `rbn_known_drop_busts` | A call that reaches 10 RBN skimmers in a day only as a bust many of them share (a far busier look-alike that day) doesn't count as known; calls in MASTER.SCP always do |
 | `itila2_tone_lock_hz` | Each bin locks on the tone that keys most of its time (the runner) and blanks a short over sent more than this many hertz from it (a caller off zero beat); 8 is the tested value |
+| `spot_rule_clean_cq` | With validation: a call that signs one CQ cleanly (`CQ CQ DE WA6BBQ K`) scores higher, so one clean window can spot it |
+| `spot_rule_clip_busts` | With `rbn` or `rbn+skcc` validation: a call that is a longer call cut off at its end or start (K1AY of K1AYZ), decoded nearby and far better known to RBN, doesn't spot |
+| `cw_whole_segment` | On by default: decode the whole CW segment of each band, skipping the digital frequencies inside it (above) |
+| `enable_ft4` | Decode each band's FT4 frequency too (above) |
 | `spot_rule_window_join` | A CQ group cut by the edge of a decode window counts in the next window of the same bin |
 | `spot_rule_split_up` | Split DX signing `TU <call> UP` is spotted |
 | `spot_rule_cq_repeats`, `spot_rule_contest_words` | Back-to-back CQs count each; `CWT <call>` (and SST, MST) without a CQ opens a group |
@@ -242,9 +249,9 @@ both are welcome contributions.
 Port 7300 speaks the same telnet format as CW Skimmer Server, so a DX cluster (we use
 GoCluster), a logger or Aggregator can connect to it.
 
-### PSKReporter (FT8) and MQTT
+### PSKReporter (FT8, FT4) and MQTT
 
-FT8 decodes travel from `sparkgap.py` to `pskr_feeder.py` through an MQTT broker (Mosquitto
+FT8 and FT4 decodes travel from `sparkgap.py` to `pskr_feeder.py` through an MQTT broker (Mosquitto
 or any other): SparkGap publishes one JSON message per decode on topic `skimmer/ft8/raw`, and
 the feeder batches them to PSKReporter under your call and grid (`pskr_feeder.py --call
 YOUR_CALL --grid YOUR_GRID`). The payload is described at the top of `pskr_feeder.py`
