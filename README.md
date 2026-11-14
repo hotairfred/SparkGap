@@ -138,6 +138,7 @@ Off unless set, except where a default is given:
 | `spot_rule_fragments` | Pieces of a longer call heard near it are held back (K1V of K1VUT) |
 | `signal_min_snr` | Scanner threshold to open a bin, dB over the local noise (12) |
 | `itila_max_bins` | Most bins at once per band |
+| `ftx_decoder`, `jt9_depth` | `jt9` decodes FT8 and FT4 with WSJT-X's own decoder instead of `decode_ft8` (above); depth 1 (default) to 3 |
 | `ft8_windows`, `ft8_band_cut` | `aligned` FT8 windows around each slot (keep the PC clock synced) or `sliding`; `fft` or `resample` band cut |
 
 Work in progress is in the [open pull requests](https://github.com/hotairfred/SparkGap/pulls).
