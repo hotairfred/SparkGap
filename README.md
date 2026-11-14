@@ -94,6 +94,9 @@ from one contest weekend. The harness to reproduce them is in `tools/eval/` and 
   it says the PC clock is off. With `"enable_ft4": true` each band's FT4 frequency (3575, 7047.5,
   10140, 14080, 18104, 21140, 24919, 28180) is decoded too, with the same `decode_ft8 -ft4` on FT4's
   7.5 s slots, and its spots go out as FT4 (about 4% of a core for 9 bands).
+  `"ftx_decoder": "jt9"` decodes both with WSJT-X's own `jt9` instead (install WSJT-X, or set
+  `jt9_path`; `jt9_depth` 1-3, default 1): on the same audio about 45% more FT8 and FT4 decodes at depth 1,
+  for about a third of a core over 9 bands (depth 2: about 75% more for about 1.4 cores).
 - **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
   transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
   is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of

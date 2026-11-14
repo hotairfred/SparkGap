@@ -26,11 +26,13 @@ import logging
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import itertools
@@ -83,6 +85,8 @@ def _gui_settings(cfg, sample_rate):
         'telnet_port': cfg.get('telnet_port', 7300),
         'enable_ft8': bool(cfg.get('enable_ft8', True)),
         'enable_ft4': bool(cfg.get('enable_ft4', False)),
+        'ftx_decoder': str(cfg.get('ftx_decoder', 'ft8_lib')).lower(),
+        'jt9_depth': min(3, max(1, int(cfg.get('jt9_depth', 1)))) if str(cfg.get('ftx_decoder', '')).lower() == 'jt9' else None,
         'spot_rule': rule,
         'spot_rule_cq_groups': repeat,         # _make_spot_rule: always on with the repeat rule
         'spot_rule_lockon': repeat,
@@ -629,6 +633,13 @@ FT8_SLOT_S = 15.0
 FT8_SLOT_OFFSETS_S = (-0.5, 0.5)    # windows per slot, from its start (:00/:15/:30/:45)
 FT4_SLOT_S = 7.5                    # enable_ft4: FT4's slots, decoded as FT8's (decode_ft8 -ft4)
 FT4_SLOT_OFFSETS_S = (-0.5, 0.5)
+# ftx_decoder "jt9": WSJT-X's own decoder (jt9 -8 / -5, GPL, a separate program) in place of decode_ft8.
+# Same slices; one window per slot from its start, as WSJT-X records (jt9 finds the signal's time itself:
+# two windows gave it 849 decodes against 852 for one on the SS recording). jt9_depth 1-3 is WSJT-X's
+# decoding depth. On that recording (20m, 11-08 13:59Z, 10 min) per band and minute: decode_ft8 60 FT8 / 20
+# FT4 decodes for 0.2 s CPU; jt9 depth 1 85 / 27 for 2.6 s; depth 2 103 / 32 for 9.2 s.
+JT9_SLOT_OFFSETS_S = (0.0,)
+_JT9_AP = re.compile(r"\s+a\d+\s*$")       # jt9 marks an a-priori decode with a1..a7 after the message
 
 
 def ft8_window_starts(t0, n, rate=12000, offsets=FT8_SLOT_OFFSETS_S, slot_s=FT8_SLOT_S):
@@ -756,6 +767,23 @@ def ft4_dial_khz(center_khz, fs=192000):
     return next((d for d in FT4_DIALS_KHZ if center_khz - half <= d and d + 3.0 <= center_khz + half), None)
 
 
+def _jt9_decoder(cfg):
+    """ftx_decoder "jt9": (program, depth, work dir) for _ft8_cycle, else None (decode_ft8). jt9_path, default
+    "jt9" on the PATH; jt9_depth 1-3, default 1; a work dir of this process for jt9's data and temp files."""
+    if str(cfg.get('ftx_decoder', 'ft8_lib')).lower() != 'jt9':
+        return None
+    depth = min(3, max(1, int(cfg.get('jt9_depth', 1))))
+    work = os.path.join(tempfile.gettempdir(), 'sparkgap_jt9_%d' % os.getpid())
+    os.makedirs(work, exist_ok=True)
+    return (cfg.get('jt9_path') or 'jt9', depth, work)
+
+
+def _jt9_args(jt9, mode):
+    """jt9's arguments before the WAV, for FT8 or FT4: its mode, period, depth and work dir."""
+    prog, depth, work = jt9
+    return (['-8', '-p', '15'] if mode == 'FT8' else ['-5', '-p', '7']) + ['-d', str(depth), '-a', work, '-t', work]
+
+
 # The minute cycle: FT8 then RTTY per band from one FFT, on a thread, for either receive path.
 def _ft8_decode(jobs, skimmer):
     # Whatever goes wrong in a cycle, the next minute must run.
@@ -774,6 +802,7 @@ def _ft8_cycle(jobs, skimmer):
     enable_ft8  = bool(skimmer.cfg.get('enable_ft8',  True))
     enable_rtty = bool(skimmer.cfg.get('enable_rtty', True))
     enable_ft4  = bool(skimmer.cfg.get('enable_ft4',  False))
+    jt9 = _jt9_decoder(skimmer.cfg)       # ftx_decoder "jt9": (program, depth, work dir), else None
     import subprocess, wave
     from scipy.signal import resample_poly
     from numpy.fft import fft, ifft
@@ -804,6 +833,8 @@ def _ft8_cycle(jobs, skimmer):
         ft4_khz = ft4_dial_khz(ck) if enable_ft4 else None
         if ft4_khz:
             modes.append(('FT4', ft4_khz, FT4_SLOT_S, FT4_SLOT_OFFSETS_S, ['-ft4']))
+        if jt9:
+            modes = [(m, d, slot, JT9_SLOT_OFFSETS_S, _jt9_args(jt9, m)) for m, d, slot, _o, _a in modes]
         z = None
         for mode, dial_khz, slot_s, offsets, mode_args in modes:
             offset_hz = (dial_khz - ck) * 1000
@@ -841,7 +872,7 @@ def _ft8_cycle(jobs, skimmer):
                     wf.setframerate(12000)
                     wf.writeframes(i16.tobytes())
                 try:
-                    r = subprocess.run([ft8_bin] + mode_args + [wav_fn],
+                    r = subprocess.run(([jt9[0]] if jt9 else [ft8_bin]) + mode_args + [wav_fn],
                         capture_output=True, text=True, timeout=20)
                 except Exception as e:
                     log.debug("decode_ft8 err %s p%d: %s", bn, part, e)
@@ -858,7 +889,7 @@ def _ft8_cycle(jobs, skimmer):
                         snr = int(float(parts_o[1]))
                         time_sec = float(parts_o[2])
                         audio_hz = int(parts_o[3])
-                        msg = parts_o[5]
+                        msg = _JT9_AP.sub('', parts_o[5]).strip()
                     except (ValueError, IndexError):
                         continue
                     # RF freq = dial + audio offset
@@ -890,7 +921,8 @@ def _ft8_cycle(jobs, skimmer):
                         continue
                     seen_msgs.add(dedup_key)
                     if aligned and t0 > 0 and mode == 'FT8':
-                        cycle_dts.append(ft8_slot_dt(t0 + start / 12000.0, time_sec))
+                        # jt9 reports the DT WSJT-X shows; decode_ft8 the time from the window's start
+                        cycle_dts.append(time_sec if jt9 else ft8_slot_dt(t0 + start / 12000.0, time_sec))
                     log.info("%s %s p%d: %s", mode, bn, part, line)
                     if mode == 'FT8':
                         total += 1
@@ -8985,7 +9017,13 @@ class SparkGap:
                     # for free), so allocate it if EITHER is enabled.
                     enable_ft8  = bool(self.cfg.get('enable_ft8',  True))
                     enable_rtty = bool(self.cfg.get('enable_rtty', True))
-                    if enable_ft8 and not os.path.exists(_ft8_decoder(self.cfg)):
+                    jt9 = _jt9_decoder(self.cfg)
+                    if jt9 and not shutil.which(jt9[0]):
+                        log.warning("ftx_decoder is jt9 but %s is not found (install WSJT-X, or set jt9_path); "
+                                    "FT8/FT4 decode will fail", jt9[0])
+                    elif jt9:
+                        log.info("FT8/FT4 decoder: %s depth %d (ftx_decoder jt9)", jt9[0], jt9[1])
+                    elif enable_ft8 and not os.path.exists(_ft8_decoder(self.cfg)):
                         log.warning("enable_ft8 is on but %s is missing (make ft8, or set ft8_decoder); "
                                     "FT8 decode will fail", _ft8_decoder(self.cfg))
                     if enable_ft8 and self.cfg.get('ft8_windows', 'aligned') == 'aligned':
