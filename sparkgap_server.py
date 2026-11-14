@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import help_page
+import radios
 from feed_server import (
     CLOSE_LOCKED_OUT,
     CLOSE_WRONG_CODE,
@@ -84,6 +85,7 @@ SERVER_PATH = "/server"
 FEED_PREFIX = "/feed/"
 HELP_PATH = "/help"
 STATE_EVERY_S = 2.0
+RADIO_LOG_EVERY_S = 2.0  # a radio's log is read at most this often, however many panes ask
 PING_EVERY_S = 20.0
 MAX_CLIENTS = 16
 MAX_PROXIED = 32  # browser feeds passed through to copies, all copies together
@@ -236,6 +238,7 @@ class Server:
         self.conns: set[asyncio.StreamWriter] = set()  # every open connection, closed at shutdown
         self.listener: asyncio.Server | None = None
         self.local_listener: asyncio.Server | None = None  # loopback, for a network bind
+        self.radio_logs: dict[str, tuple[float, list[str]]] = {}  # radio -> (read at, its newest lines)
         self.busy: dict[str, str] = {}  # instance -> operation in progress or queued
         self.procs: dict[tuple[str, str], Proc] = {}  # (role, name) -> its link to the hub
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -620,6 +623,12 @@ class Server:
             log.warning("Server: %s %s refused: %s", cmd, name, text)
             result(False, text)
 
+        if cmd == "radiolog":  # read only: a radio's link log for its pane, not queued or logged
+            radio = settings.get("radio") if isinstance(settings, dict) else None
+            if not isinstance(radio, str) or not radios.NAME_RE.match(radio):
+                return result(False, "unknown radio")
+            self._radio_log(c, rid, radio)
+            return None
         if cmd in RADIO_COMMANDS:
             name = cmd   # busy and queued like an instance, under its own name
         elif cmd not in COMMANDS or not isinstance(name, str) or not NAME_RE.match(name):
@@ -651,6 +660,22 @@ class Server:
 
         fut.add_done_callback(done)
         return None
+
+    def _radio_log(self, c: Client, rid: Any, radio: str) -> None:
+        """A radio's newest log lines, read off the event loop and shared by every pane asking."""
+        def send(lines: list[str]) -> None:
+            self._send_json(c, {"type": "server_result", "id": rid, "ok": True, "lines": lines})
+
+        at, lines = self.radio_logs.get(radio, (0.0, []))
+        if time.monotonic() - at < RADIO_LOG_EVERY_S:
+            return send(lines)
+
+        def done(f: asyncio.Future[list[str]]) -> None:
+            got = [] if f.exception() else f.result()
+            self.radio_logs[radio] = (time.monotonic(), got)
+            send(got)
+
+        asyncio.get_running_loop().run_in_executor(None, self.seat.radio_log, radio).add_done_callback(done)
 
     def _run_op(self, cmd: str, name: str, settings: dict[str, Any], who: str = "") -> str:
         if cmd in ("start", "stop", "restart", "set"):

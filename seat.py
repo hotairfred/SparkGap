@@ -35,6 +35,10 @@ REC_MIN_GB = 5  # recording on refuses below this much free space in rec/
 LIVE_MARK = "SparkGap LIVE:"
 STATION_MARK = "holds the GUI client"
 STATION_HELD = "already has station"
+RADIO_LOG_LINES = 200  # the Radio pane's log
+RADIO_LOG_HEAD = 65_536  # an HPSDR run log's start (where its radio link is set up) and its newest part
+RADIO_LOG_TAIL = 262_144
+HPSDR_LINK_RE = re.compile(r"SDR IP|hpsdr|HPSDR|C receiver|Web-888|board|reconnect|packets? lost|radio", re.I)
 FEED_PORT_RE = re.compile(r"GUI feed on wss?://\S+?:(\d+)/")
 ERROR_RE = re.compile(r"^[0-9:]+ ERROR |^[A-Za-z_.]*(Error|Exception): ")
 SPOT_RE = re.compile(r"SPOT:")
@@ -430,6 +434,29 @@ class Seat:
         except (OSError, ValueError):
             return None
         return pid if any(Path(a.decode(errors="replace")).name == program for a in argv) else None
+
+    def radio_log(self, radio: str, lines: int = RADIO_LOG_LINES) -> list[str]:
+        """The newest lines of a radio's link: its station's log (a Flex: every command and reply),
+        or an HPSDR radio's link lines from its receivers' log. [] when it has none yet."""
+        rf = next((r for r in radios.radio_files(self.root / "config") if r["name"] == radio), None)
+        if rf is None:
+            return []
+        hpsdr = rf.get("type") == "hpsdr"
+        path = self.newest_log(radio if hpsdr else f"station_{radio}")
+        if path is None:
+            return []
+        with path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            head = b""
+            if hpsdr and size > RADIO_LOG_HEAD + RADIO_LOG_TAIL:
+                f.seek(0)
+                head = f.read(RADIO_LOG_HEAD).rsplit(b"\n", 1)[0] + b"\n"
+            f.seek(max(0, size - RADIO_LOG_TAIL))
+            tail = f.read()
+        if size > RADIO_LOG_TAIL:
+            tail = tail.split(b"\n", 1)[-1]  # a cut first line
+        text = (head + tail).decode(errors="replace").splitlines()
+        return [ln for ln in text if not hpsdr or HPSDR_LINK_RE.search(ln)][-lines:]
 
     def newest_log(self, prefix: str) -> Path | None:
         logs = sorted(self.logs.glob(f"{prefix}_*.log"), key=lambda p: p.stat().st_mtime)
