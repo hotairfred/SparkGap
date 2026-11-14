@@ -119,22 +119,27 @@ VALIDATION = {"permissive": 1.25, "normal": 3.0, "aggressive": 5.0}
 # 01:18-05:41Z hours, the PA 10-10 recording and four more (hotairfred/SparkGap PR text).
 SIGNED = 2.0
 # validation, spot_rule_clean_cq: the call signed one CQ cleanly (CQ CQ DE WA6BBQ, CQ DE F6FAI AR K) in any
-# of its windows, see clean_signed(). Set by hand on WF8Z-1's 11-11 live windows, checked on 11-12 (PR text).
+# of its windows, see clean_signed(). The "clean" weight of each table below, so tools/eval/fit_validation.py
+# fits it with the others; set by hand on WF8Z-1's 11-11 live windows, checked on 11-12 (PR text).
 CLEAN = 1.0
 _CLEAN_END = frozenset({"K", "AR", "KN", "BK", "SK"})     # clean_signed: what may follow the call
 _WEIGHTS = {"bias": 0.74, "single": -1.49, "three": 0.43, "four_plus": 0.42, "windows": 1.68,
             "tier3": -0.52, "tier4": -1.82, "heard_before": 1.87, "paths_agree": 0.65,
-            "paths_disagree": -0.63, "doubled": 2.48, "rival": -1.64, "signed": SIGNED}
+            "paths_disagree": -0.63, "doubled": 2.48, "rival": -1.64, "signed": SIGNED,
+            "clean": CLEAN}
 _WEIGHTS_LISTED = {           # per call list (spot_validation_calls): scp, rbn, rbn+skcc
     "scp": {"bias": 0.29, "single": -1.52, "three": 0.42, "four_plus": 0.28, "windows": 1.58,
             "tier3": -0.27, "tier4": -1.46, "heard_before": 1.68, "paths_agree": 0.48,
-            "paths_disagree": -0.70, "doubled": 2.25, "rival": -1.62, "listed": 2.48, "signed": SIGNED},
+            "paths_disagree": -0.70, "doubled": 2.25, "rival": -1.62, "listed": 2.48, "signed": SIGNED,
+            "clean": CLEAN},
     "rbn": {"bias": -0.22, "single": -1.57, "three": 0.24, "four_plus": 0.50, "windows": 1.30,
             "tier3": 0.0, "tier4": -1.90, "heard_before": 1.45, "paths_agree": 0.56,
-            "paths_disagree": -0.79, "doubled": 1.90, "rival": -0.88, "listed": 4.18, "signed": SIGNED},
+            "paths_disagree": -0.79, "doubled": 1.90, "rival": -0.88, "listed": 4.18, "signed": SIGNED,
+            "clean": CLEAN},
     "rbn+skcc": {"bias": -0.60, "single": -1.58, "three": 0.38, "four_plus": 0.72, "windows": 1.35,
                  "tier3": -0.05, "tier4": -1.55, "heard_before": 1.44, "paths_agree": 0.28,
-                 "paths_disagree": -0.72, "doubled": 1.77, "rival": -0.89, "listed": 3.92, "signed": SIGNED},
+                 "paths_disagree": -0.72, "doubled": 1.77, "rival": -0.89, "listed": 3.92, "signed": SIGNED,
+                 "clean": CLEAN},
 }
 HEARD_KEEP_S = 12 * 3600.0    # validation: a call unheard this long is forgotten
 _MORSE = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/",
@@ -901,7 +906,7 @@ class RepeatSpotRule:
         # a 1x1 (N4V) is one dah from another 1x1 (N5V) and comes and goes: clean only when listed knows it
         if (self.clean_cq and (len(call) > 3 or (self.listed is not None and self.listed(call)))
                 and any(call in self._clean.get(win, ()) for win in windows)):
-            s += CLEAN
+            s += w["clean"]
         return s
 
     def _same_audio(self, window: int, call: str, freq_khz: float, now: float,

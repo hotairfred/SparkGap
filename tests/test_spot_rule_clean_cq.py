@@ -31,7 +31,7 @@ def _rule(clean: bool) -> RepeatSpotRule:
 
 
 def test_one_clean_window_spots_only_with_the_option() -> None:
-    assert CLEAN > 0
+    assert CLEAN > 0 and _rule(True).weights["clean"] == CLEAN
     text = "CQ CQ CQ DE WA6BBQ"
     for on, want in ((False, []), (True, [("WA6BBQ", 7048.0)])):
         r = _rule(on)
@@ -59,4 +59,10 @@ def test_an_unlisted_1x1_gains_nothing() -> None:
             r.feed(r.window_id(1, 0, 0.0), 21041.9, f"CQ CQ DE {call} {call} K", 0.0)
             near = [c for c in r._copies if c.call == call]
             got[on] = r.score(call, near, Counter(c.call for c in near), False)
-        assert (abs(got[True] - got[False] - CLEAN) < 1e-9) is gains
+        assert (abs(got[True] - got[False] - r.weights["clean"]) < 1e-9) is gains
+
+
+def test_clean_is_a_weight_of_every_table() -> None:
+    """fit_validation.py fits every key of the weight table; clean is one, and off it adds nothing."""
+    from spot_rule import _WEIGHTS, _WEIGHTS_LISTED
+    assert _WEIGHTS["clean"] == CLEAN and all(w["clean"] == CLEAN for w in _WEIGHTS_LISTED.values())
