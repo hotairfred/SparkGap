@@ -82,7 +82,7 @@ Who this SparkGap is and the settings it runs with.
  "config": {"callsign": "W1AW", "cw_decoder": "itila2", "itila2_afc": false,
             "itila2_tone_lock_hz": null,
             "sample_rate": 96000, "flex_daxiq_channel": 2,
-            "telnet_port": 7300, "enable_ft8": false,
+            "telnet_port": 7300, "enable_ft8": false, "enable_ft4": false,
             "spot_rule": "repeat", "spot_rule_cq_groups": true,
             "spot_rule_lockon": true, "spot_rule_cq_qualifiers": true,
             "spot_rule_split_runs": true, "spot_rule_contest_words": false,
