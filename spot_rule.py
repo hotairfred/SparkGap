@@ -83,6 +83,11 @@ MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re
 OWNER_CELL_KHZ = 0.25         # owner_cell: a new owner replaces only the owner within this
 STRONGEST_S = 60.0            # strongest: a stronger copy of the call elsewhere in the band this recently
 LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
+CLIP_KHZ = 0.3                # clip_busts: the longer call decoded this near...
+CLIP_S = REPEAT_S             # ...and this recently
+CLIP_MIN = 10                 # clip_busts: the longer call had this many skimmers on a day (rbn_known.MIN_SKIMMERS)
+CLIP_RATIO_END = 2.0          # ...and this many times the clip's: an end or a start cut off (K1AY of K1AYZ, H8A of KH8A)
+CLIP_RATIO_FIRST = 5.0        # ...this many for a first character that lost its leading elements (MX4U of 3X4U)
 
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:[A-Z]{1,2}|[0-9][A-Z])[0-9]{1,4}[A-Z]{1,6}"
@@ -588,6 +593,28 @@ def _fragment(short: str, long_: str) -> bool:
     return 2 <= d <= 4 and len(short) >= 2 and short in long_ and CALL_RE.match(long_) is not None
 
 
+def clip_of(short: str, long_: str, strength: Callable[[str], int],
+            keep: Callable[[str], bool] | None = None) -> bool:
+    """short is long_ with an end or a start cut off at a window edge or a fade (K1AY of K1AYZ, W3P of
+    W3PYF, H8A of KH8A), or with the leading elements of its first character lost (MX4U and WX4U of
+    3X4U: ...-- read as -- or .--), by the RBN skimmer counts of the last days: long_ had CLIP_MIN or
+    more skimmers on a day and CLIP_RATIO_END (CLIP_RATIO_FIRST) times short's. The first-character
+    case needs short weak itself (under CLIP_MIN) and not vouched for by keep (MASTER.SCP): K6AR and
+    N6AR, -.- and -., are two stations. Portable forms are not clips (W1AW of W1AW/3)."""
+    if short == long_ or "/" in long_ or "/" in short or len(short) < 3:
+        return False
+    n_long, n_short = strength(long_), strength(short)
+    if n_long < CLIP_MIN:
+        return False
+    d = len(long_) - len(short)
+    if (long_.startswith(short) and 1 <= d <= 3) or (long_.endswith(short) and 1 <= d <= 2):
+        return n_long >= CLIP_RATIO_END * n_short
+    if d == 0 and short[1:] == long_[1:] and n_short < CLIP_MIN and not (keep and keep(short)):
+        a, b = _MORSE.get(short[0], ""), _MORSE.get(long_[0], "")
+        return bool(a) and len(a) < len(b) and b.endswith(a) and n_long >= CLIP_RATIO_FIRST * n_short
+    return False
+
+
 def _regap(a: str, b: str) -> bool:
     """a and b are one keying read with the letter gaps in different places (C0TT, NN0TT), or
     one's Morse elements start the other's (N7HR, N7HRK/M)."""
@@ -639,12 +666,16 @@ class RepeatSpotRule:
                  takeover_idle_s: float | None = None, runner_signs: bool = False,
                  window_join: bool = False, validation_threshold: float | None = None,
                  garbled_runner: bool = False, stray_known: bool = False,
-                 cq_tail: bool = False) -> None:
+                 cq_tail: bool = False, clip_strength: Callable[[str], int] | None = None,
+                 clip_keep: Callable[[str], bool] | None = None) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
             raise ValueError(f"listed_by must be one of {list(_WEIGHTS_LISTED)}, got {listed_by!r}")
         self.tier = tier
+        self.clip_strength = clip_strength      # clip_busts: RBN skimmers of a call on its best recent day, see clip_of()
+        self.clip_keep = clip_keep
+        self._clip_toks: dict[int, deque[tuple[float, float, frozenset[str]]]] = {}   # 0.1 kHz bin: (time, kHz, tokens)
         # validation_threshold (spot_validation_threshold): the score a call needs, in place of the level's
         self.threshold = (None if not validation else
                           float(validation_threshold) if validation_threshold is not None
@@ -721,6 +752,9 @@ class RepeatSpotRule:
             text = split_runs(text, self.de_rejoin)
         if self.window_join:
             text = self._joined(window, freq_khz, text, now)
+        if self.clip_strength is not None:
+            self._clip_toks.setdefault(round(freq_khz * 10), deque()).append(
+                (now, freq_khz, frozenset(tokens(text, self.gluek))))
         if self.threshold is not None:
             toks = tokens(text, self.gluek)
             self._paths.setdefault(window, []).append(Counter(toks))
@@ -762,6 +796,8 @@ class RepeatSpotRule:
                                       and k >= (counts[call] if self.fragments == 'even' else 1)
                                       for other, k in counts.items()):
                 continue          # a piece of a longer call heard here (K1V of K1VUT): wait
+            if self.clip_strength is not None and self._clipped(call, freq_khz, now):
+                continue          # the call RBN knows, with this one's end or start, was decoded here: a clip
             if owned is not None and owned != call and len({c.window for c in near if c.call == call}) < 2:
                 continue          # another call owns this frequency: a caller read as the runner waits
             best = max((c for c in near if c.call == call), key=lambda c: c.snr)
@@ -984,6 +1020,14 @@ class RepeatSpotRule:
                 out.append(c)
         return out
 
+    def _clipped(self, call: str, freq_khz: float, now: float) -> bool:
+        """clip_busts: a longer call that call is a clip of (clip_of) was decoded within CLIP_KHZ in the last CLIP_S."""
+        assert self.clip_strength is not None
+        b, r = round(freq_khz * 10), int(CLIP_KHZ * 10) + 1
+        return any(clip_of(call, k, self.clip_strength, self.clip_keep)
+                   for i in range(b - r, b + r + 1) for t, f, toks in self._clip_toks.get(i, ())
+                   if now - t <= CLIP_S and abs(f - freq_khz) <= CLIP_KHZ for k in toks)
+
     def _expire(self, now: float) -> None:
         cutoff = now - REPEAT_S
         while self._copies and self._copies[0].time < cutoff:
@@ -1002,5 +1046,9 @@ class RepeatSpotRule:
             self._tails = {b: ts for b, ts in self._tails.items() if now - ts[-1][0] <= 1.5 * self.window_s}
             self._paths = {w: p for w, p in self._paths.items() if w in live}
             self._signed = {w: c for w, c in self._signed.items() if w in live}
+            for q in self._clip_toks.values():
+                while q and q[0][0] < now - CLIP_S:
+                    q.popleft()
+            self._clip_toks = {b: q for b, q in self._clip_toks.items() if q}
             self._same = {w: g for w, g in self._same.items() if w in live}
             self._heard = {c: h for c, h in self._heard.items() if now - h[1] <= HEARD_KEEP_S}
