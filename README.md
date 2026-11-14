@@ -79,7 +79,9 @@ in `tools/eval/` and `tools/sim/`.
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
-  it says the PC clock is off.
+  it says the PC clock is off. With `"enable_ft4": true` each band's FT4 frequency (3575, 7047.5,
+  10140, 14080, 18104, 21140, 24919, 28180) is decoded too, with the same `decode_ft8 -ft4` on FT4's
+  7.5 s slots, and its spots go out as FT4 (about 4% of a core for 9 bands).
 - **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
   transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
   is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of
