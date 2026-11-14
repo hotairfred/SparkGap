@@ -94,6 +94,7 @@ Who this SparkGap is and the settings it runs with.
             "spot_rule_stray_known": false,
             "spot_rule_fragments": "off",
             "spot_rule_owner_cell": false, "spot_rule_owned_two_windows": false,
+            "spot_rule_clip_busts": false,
             "itila_window_sec": 30.0, "itila_max_bins": 400,
             "itila_decode_threads": 1, "spot_validation": "normal",
             "spot_validation_calls": "rbn+skcc", "rbn_known_days": 7},
