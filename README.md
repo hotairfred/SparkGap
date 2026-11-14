@@ -80,14 +80,17 @@ from one contest weekend. The harness to reproduce them is in `tools/eval/` and 
   RTTY decode CPU. For a contest weekend, `rtty_contest` adds that contest's rules:
   `"rtty_contest": "makrothen"` makes its words (MAK, MAKRO, MAKROTHEN, MKR) open a CQ group even
   when the CQ itself was lost, and reads a call followed by a grid square as a caller being sent
-  the exchange (contests defined: `RTTY_CONTESTS` in `sparkgap.py`). `rtty_spot_cq_tail` also
-  counts a call sent twice right before a closing CQ, TEST or QRZ after one other word (`JARL W2FM
-  W2FM CQ`): a runner whose opening CQ was lost. `rtty_excludes_cw` keeps the CW decoder off a
-  signal the RTTY decoder has read as RTTY.
+  the exchange; `"rtty_contest": "wae"` (WAE DX RTTY) makes WAE and WAEDC open a CQ group, its
+  serial exchange needing no setting (contests defined: `RTTY_CONTESTS` in `sparkgap.py`).
+  `rtty_spot_cq_tail` also counts a call sent twice right before a closing CQ, TEST or QRZ after
+  one other word (`JARL W2FM W2FM CQ`): a runner whose opening CQ was lost, in any contest.
+  `rtty_excludes_cw` keeps the CW decoder off a signal the RTTY decoder has read as RTTY.
 - **FT8.** Decoded on each band's FT8 frequency with `decode_ft8` from Karlis Goba's
   [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and uploaded to PSKReporter
   (`pskr_feeder.py`). Each cycle logs the median time offset (DT) of its decodes and warns when
-  it says the PC clock is off.
+  it says the PC clock is off. With `"enable_ft4": true` each band's FT4 frequency (3575, 7047.5,
+  10140, 14080, 18104, 21140, 24919, 28180) is decoded too, with the same `decode_ft8 -ft4` on FT4's
+  7.5 s slots, and its spots go out as FT4 (about 4% of a core for 9 bands).
 - **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
   transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
   is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of
@@ -309,7 +312,10 @@ python3 sparkgap.py --config sk_5band.json --file recording.wav --center-khz 709
                     --start-min 0 --end-min 15
 ```
 
-It reads 16- and 24-bit stereo IQ WAV files at 96 or 192 kHz. Multi-band runs go through the
+It reads 16- and 24-bit stereo IQ WAV files at 96 or 192 kHz. File mode decodes CW only, unless
+`--digital` (192 kHz): then the FT8 and RTTY minute cycle runs on each minute of the audio as it does
+live (`enable_ft8`, `enable_rtty`), so `rtty_excludes_cw` keeps CW bins off RTTY in a replay too
+(FT8 needs `make ft8`). Multi-band runs go through the
 production C receiver path when the recording is replayed with `hpsdr_proxy.py` from another
 host (`--negate-q` for skimmer1 captures). Public test recordings are in the repository's
 releases (CY0S working split on 40m, a hand-sent 30m PA QSO Party segment, W1AW clips with
