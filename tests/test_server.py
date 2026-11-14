@@ -582,3 +582,15 @@ def test_a_station_and_its_warnings_reach_the_server(server: Server) -> None:
 ])
 def test_a_request_shows_its_own_word_while_it_runs(cmd: str, settings: dict, want: str) -> None:
     assert sparkgap_server.busy_word(cmd, settings) == want
+
+
+def test_radiolog_reads_a_radio_named_as_radio_files_allow(server: Server, seat: Seat) -> None:  # noqa: F811
+    (seat.root / "config" / "6400.lake.radio.json").write_text(json.dumps({"type": "flex"}))
+    (seat.logs / "station_6400.lake_20261114_120000Z.log").write_text("12:00:00 INFO [Flex] >>> C1|info\n")
+    ws = _ws(server)
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 7, "cmd": "radiolog", "name": "radiolog",
+                                 "settings": {"radio": "6400.lake"}}).encode())
+    assert _result(ws, 7)["lines"] == ["12:00:00 INFO [Flex] >>> C1|info"]
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 8, "cmd": "radiolog", "name": "radiolog",
+                                 "settings": {"radio": "../x"}}).encode())
+    assert not _result(ws, 8)["ok"]

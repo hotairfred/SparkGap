@@ -95,6 +95,7 @@ main { flex: 1; display: flex; gap: 12px; min-height: 0; }
 .stat .mono { font-size: 15px; font-weight: 500; }
 .dlabel { padding: 10px 16px 0; }
 .dcopy { display: flex; align-items: center; justify-content: space-between; }
+.dcopy #dShow { margin-left: auto; margin-right: 6px; }
 .note { padding: 6px 16px; color: var(--muted); font-size: 12px; }
 .wins { flex: 1; overflow-y: auto; scrollbar-width: thin; padding: 6px 16px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 11px; }
 .win { display: flex; gap: 10px; }
@@ -267,7 +268,7 @@ details.adv[open] summary > span:first-child::before { content: "\25BE  "; }
 .navhead { color: var(--muted); font-size: 11px; letter-spacing: 1px; margin: 14px 4px 4px; }
 .navrx { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 8px 10px; background: none; border: 0; border-radius: 8px; color: var(--fg); cursor: pointer; text-align: left; font: inherit; }
 .rxtop { display: flex; align-items: center; gap: 8px; width: 100%; }
-.rxsub { color: var(--muted); font-size: 13px; padding-left: 16px; }
+.rxsub { color: var(--muted); font-size: 13px; padding-left: 16px; max-width: 100%; box-sizing: border-box; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pdot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-left: auto; }
 .navadd { color: var(--muted); padding: 8px 10px; font-size: 14px; }
 .navsep { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
@@ -297,10 +298,7 @@ details.adv[open] summary > span:first-child::before { content: "\25BE  "; }
 .fbar { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); font-size: 14px; background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .fbar .grow { flex: 1; }
 /* left pane: information reads as text; everything clickable is a row with an arrow */
-.infoblock { display: flex; flex-direction: column; gap: 3px; padding: 4px 4px 10px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
-.info { display: grid; grid-template-columns: 58px 1fr; gap: 8px; font-size: 13px; color: var(--muted); }
-.info .ilabel { color: var(--faint); }
-.info .good { color: var(--good); } .info .bad { color: var(--bad); }
+.rxsub .good { color: var(--good); } .rxsub .bad { color: var(--bad); } .rxsub .warn { color: var(--accent); }
 .navitem .chev, .navrx .chev { color: var(--muted); margin-left: 8px; }
 .navrx .rxtop .chev { margin-left: auto; }
 .navrx .rxtop .pdot + .chev { margin-left: 8px; }

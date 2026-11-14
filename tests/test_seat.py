@@ -681,3 +681,17 @@ def test_a_removed_receivers_settings_are_offered_back(radio_seat: Seat) -> None
     radio_seat.remove("Dallas-1")
     back = radio_seat.snapshot()["removed"]
     assert list(back) == ["Dallas-1"] and back["Dallas-1"]["afc"] is True
+
+
+def test_radio_log_flex_station_and_hpsdr_link_lines(seat: Seat) -> None:
+    cfg = seat.root / "config"
+    (cfg / "Lake.radio.json").write_text(json.dumps({"type": "flex"}))
+    (cfg / "Web888.radio.json").write_text(json.dumps({"type": "hpsdr"}))
+    assert seat.radio_log("Lake") == [] and seat.radio_log("Nope") == []
+    (seat.logs / "station_Lake_20261114_120000Z.log").write_text(
+        "12:00:00 INFO [Flex] >>> C1|info\n12:00:00 INFO [Flex] <<< R1|0|model=\"FLEX-6400\"\n")
+    assert seat.radio_log("Lake") == ["12:00:00 INFO [Flex] >>> C1|info", '12:00:00 INFO [Flex] <<< R1|0|model="FLEX-6400"']
+    (seat.logs / "Web888_40m_20261114_120000Z.log").write_text(
+        "12:00:00 INFO Using direct SDR IP: 192.0.2.7\n12:00:01 INFO ITILA raw 7030.0 kHz: 'CQ'\n")
+    assert seat.radio_log("Web888") == ["12:00:00 INFO Using direct SDR IP: 192.0.2.7"]
+    assert len(seat.radio_log("Lake", lines=1)) == 1

@@ -88,7 +88,8 @@ const WINDOWS = [[60, "60 s"], [30, "30 s"], [15, "15 s"], [7.5, "7.5 s"]];
   // the dialog's header; its ? button shows help
 const NEWS_SHOWN = 4;  // What's new entries shown in the dialog; the guide has them all
 const NOTHING = '<span class="nothing">(nothing decoded)</span>';  // a path whose window decoded no text
-const DECODED = ["both", "wide", "narrow", "lowest"];  // which readings of each window the panel shows
+const DECODED = ["both", "wide", "narrow", "lowest"];
+const DECODED_LABELS = ["Both", "Wide", "Narrow", "Lowest cost"];  // which readings of each window the panel shows
 const ZOOM_STEPS = [["Full", 1], ["Half", 2], ["Quarter", 4]];  // the zoom button: name and fraction of the band
 const ZOOM_MATCH = 0.05;  // a view within 5% of a step's span is at that step
 const DETAIL_MATCH_KHZ = 0.06;
@@ -246,6 +247,12 @@ class Instance {
       this.moved = !!this.hello.type && JSON.stringify(this.hello.bands) !== JSON.stringify(m.bands);
       if (this.moved) { this.selKhz = null; this.selCall = null; this.lastPick = null; }
       this.hello = m;
+      if (!this.helloSeen) {  // its first hello since the page loaded: the band last shown on it
+        const n = this.bands.findIndex(b => b.center_khz === (load("bands", {}) || {})[this.name]);
+        if (n >= 0) this.band = n;
+        this.restoreKhz = savedPick(this);
+        this.helloSeen = true;
+      }
       if (!this.bands[this.band]) this.band = 0;
       this.subscribe();  // now the band on screen is known: only its spectrum is computed and sent
       this.windows = []; this.spots.clear(); this.signals.clear(); this.recent.clear(); this.runners.clear();
@@ -597,10 +604,14 @@ class Waterfall {
 
   fit() {
     const inst = this.inst;
-    if (inst && inst.nBins && inst.goKhz) {
+    if (inst && inst.nBins && inst.restoreKhz && !inst.goKhz) {  // the signal last picked on this band: centred and picked again
+      const span = this.hi > this.lo ? this.hi - this.lo : Number(load(zoomKey(inst), 30)) || 30, k = inst.restoreKhz;
+      inst.restoreKhz = null;
+      if (inst.lowKhz <= k && k <= inst.highKhz) { this.setView(k - span / 2, k + span / 2); setTimeout(() => { if (wf.inst === inst) pick(k); }); }
+    } else if (inst && inst.nBins && inst.goKhz) {
       const span = this.hi > this.lo ? this.hi - this.lo : 30;
       this.setView(inst.goKhz - span / 2, inst.goKhz + span / 2);
-      inst.goKhz = null;
+      inst.goKhz = inst.restoreKhz = null;  // a search match wins over the band's last pick
     } else if (inst && inst.nBins && !(inst.lowKhz <= this.lo && this.lo < this.hi && this.hi <= inst.highKhz)) {
       const mid = (inst.lowKhz + inst.highKhz) / 2, span = Number(load(zoomKey(inst), 30)) || 30;  // the copy's last zoom
       this.setView(mid - span / 2, mid + span / 2);
@@ -785,6 +796,7 @@ const app = {
   pending: {},  // "<server address>|<copy name>" -> settings picked but not yet applied
   mode: load("mode", "info"),  // the dialog shows Settings or Info
   want: load("current", ""),  // the copy shown, by name, wherever its port is today
+  restoring: !!load("current", ""),  // after a load: the saved copy is shown once it is up, unless one is picked first
   instances: [],
   current: 0,
   selectedKhz: -1,
@@ -900,7 +912,8 @@ class ServerLink {
     else if (m.type === "seat") {
       this.seat = m;
       const names = new Set((m.instances || []).map(i => i.name));
-      dropPending(this.server.address, name => !names.has(name) && !name.startsWith("+add:"));
+      const radioNames = new Set((m.instances || []).map(i => i.radio));  // a radio's Node options stay while it has receivers
+      dropPending(this.server.address, name => !names.has(name) && !name.startsWith("+add:") && !(name.startsWith("+node:") && radioNames.has(name.slice(6))));
       serverCopies(this.server); renderSettings(); renderState();
     }
     else if (m.type === "server_result" && this.waiting.has(m.id)) { this.waiting.get(m.id)(m); this.waiting.delete(m.id); }
@@ -960,7 +973,7 @@ function rxMoved(i) {
 
 function changed(i, what) {
   // a copy that comes back on another port is followed by name, but never away from a live one
-  if (what === "hello" && i.name === app.want && i !== inst() && !(inst() && inst().state === "live")) {
+  if (what === "hello" && i.name === app.want && i !== inst() && (app.restoring || !(inst() && inst().state === "live"))) {
     setCurrent(app.instances.indexOf(i)); return;
   }
   if (what === "hello" && i === inst() && !app.want) { app.want = i.name; save("current", i.name); }
@@ -984,7 +997,8 @@ function setCurrent(n) {
   const i = inst();
   const covers = k => k > 0 && i && (!i.nBins || (i.lowKhz <= k && k <= i.highKhz));
   if (i && i.lastPick && (!i.nBins || !covers(khz)) && covers(i.lastPick.khz)) ({ khz, lo, hi } = i.lastPick);  // not drawn yet: its own pick
-  if (i && i.hello.run) { app.want = i.name; save("current", i.name); }
+  if (i && i.name === app.want) app.restoring = false;
+  if (i && i.hello.run && !app.restoring) { app.want = i.name; save("current", i.name); }
   app.selectedKhz = -1;
   wf.sel = -1;
   const keep = covers(khz);
@@ -1065,10 +1079,15 @@ function removeInstance(i) {
   if (app.current >= app.instances.length || app.current > n) app.current = Math.max(0, app.current - 1);
 }
 
+// the signal last picked on a copy's band, kept across band changes and reloads
+function pickKey(i) { const b = i.bands[i.band]; return b ? `${i.name}|${b.center_khz}` : ""; }
+function savedPick(i) { const key = pickKey(i); return (key && (load("picks", {}) || {})[key]) || null; }
+
 function pick(khz, call) {
   app.selectedKhz = khz;
   wf.sel = khz;
   const i = inst();
+  if (i && khz > 0 && pickKey(i)) save("picks", { ...(load("picks", {}) || {}), [pickKey(i)]: khz });
   if (i) i.select(khz, call);
   renderLadder();
 }
@@ -1284,6 +1303,7 @@ function renderBands() {
   sel.value = String(all.findIndex(c => c.n === app.current && c.band === i.band));
   sel.onchange = () => {
     const c = all[Number(sel.value)];
+    app.restoring = false;
     if (c.n !== app.current) setCurrent(c.n);
     if (c.band !== inst().band) setBand(c.band); else renderAll();
   };
@@ -1293,6 +1313,9 @@ function setBand(n) {
   const i = inst();
   if (!i) return;
   i.setBand(n);
+  i.restoreKhz = savedPick(i);  // back on a band: the signal last picked there
+  const b = i.bands[i.band];  // remembered for a reload, by the copy's name
+  if (b) save("bands", { ...(load("bands", {}) || {}), [i.name]: b.center_khz });
   app.selectedKhz = -1;
   wf.sel = -1;
   renderAll();
@@ -1402,6 +1425,7 @@ function renderDetail() {
   $("dNote").hidden = !(d && d.note);
   $("dNote").textContent = d ? d.note : "";
   // both decodes of each window: wide filter on top, narrow dimmed
+  $("dShow").textContent = DECODED_LABELS[DECODED.indexOf(app.decoded)] || "Both";
   $("dCopy").hidden = !(d && d.windows.length);
   $("dWins").innerHTML = (d ? d.windows : []).map(r => {
     const rs = readings(r, app.decoded);
@@ -1590,6 +1614,7 @@ function addPaneHtml(k, sv, rn) {
   const name = `${rn}-${d.channel}`, at = `data-server="${k}" data-radio="${esc(rn)}"`;
   const back = (seat.removed || {})[name], pend = app.pending[pendKey(sv, addKey(rn))] || {}, st = { ...addBase(seat, rn), ...pend };
   const opt = `data-server="${k}" data-name="${esc(addKey(rn))}"`, { decRows, choose } = decoderOptions(opt, st, pend);
+  const mates = (seat.instances || []).some(i => i.radio === rn);  // a Flex radio's next copy runs its Node's options
   const opts = (list, cur) => list.map(v => `<option value="${esc(String(v))}"${v === cur ? " selected" : ""}>${esc(String(v))}</option>`).join("");
   const row = (label, control, note = "") => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}${note}</span></div>`;
   return head + `<div class="fbar"><span>${esc(name)} not added yet</span><span class="grow"></span>`
@@ -1600,8 +1625,9 @@ function addPaneHtml(k, sv, rn) {
       + (proc ? "" : `<div class="fold"><div class="form">${decRows.join("")}</div></div>`) : "")
     + (hpsdr ? "" : row("DAX-IQ", `<select class="fsel" data-add="channel">${opts(free, d.channel)}</select>`, `<span class="fnote">its name: ${esc(name)}</span>`)
     + row("RECORDING", choose("record", [[false, "off"], [true, "on"]], !!st.record))
-    + `</div><div class="fhint">It starts with the radio's antenna and RF gain, and ${back ? `the settings ${esc(name)} had before it was removed` : "the shipped default decoder options"}; change them here.</div>`
-    + `<div class="fold"><div class="form">${decRows.join("")}</div></div>`);
+    + (mates ? `</div><div class="fhint">It starts with the radio's antenna and RF gain, and runs ${esc(rn)}'s decoder options (its Node).</div>`
+      : `</div><div class="fhint">It starts with the radio's antenna and RF gain, and ${back ? `the settings ${esc(name)} had before it was removed` : "the shipped default decoder options"}; change them here.</div>`
+      + `<div class="fold"><div class="form">${decRows.join("")}</div></div>`));
 }
 
 // Reset to defaults: every decoder option that differs from the shipped defaults goes pending, for Apply
@@ -1627,7 +1653,9 @@ async function addReceiver(sv, rn) {
   const name = `${rn}-${d.channel}`;
   app.adding = true; renderSettings();
   const k = pendKey(sv, addKey(rn));
-  const ok = await seatRequest(sv.link, "add", name, { ...(app.pending[k] || {}), band: d.band });
+  const seat = sv.link.seat || {}, flexMates = !addRoom(seat, rn).hpsdr && (seat.instances || []).some(i => i.radio === rn);
+  const node = flexMates ? Object.fromEntries(OPTION_KEYS.filter(key => key in nodeBase(seat, rn)).map(key => [key, nodeBase(seat, rn)[key]])) : {};
+  const ok = await seatRequest(sv.link, "add", name, { ...node, ...(app.pending[k] || {}), band: d.band });
   app.adding = false;
   const hp = addRoom(sv.link.seat || {}, rn).hpsdr;  // an HPSDR receiver: its radio's process, its number
   if (ok) { app.addDraft = null; delete app.pending[k]; app.pick = hp ? { k: app.servers.indexOf(sv), kind: "rx", name: rn, rx: d.channel } : { k: app.servers.indexOf(sv), kind: "rx", name }; }
@@ -1694,6 +1722,8 @@ function leftPaneHtml(pick) {
         + `<span class="rxtop">${dot(i.busy ? "busy" : i.state)}<b>${esc(i.name)}</b><span class="rxband">${esc(band)}</span>${pend ? '<span class="pdot" title="change not applied"></span>' : ""}<span class="chev">›</span></span>`
         + `<span class="rxsub">${esc(i.busy ? `${i.busy}...` : i.state)}${!i.busy && i.state === "running" && (i.settings || {}).record ? ' · <span class="warn">recording</span>' : ""}</span></button>`;
     };
+    const card = (kind, name, top, sub) => `<div class="navrx${is(kind, name) ? " on" : ""}" role="button" tabindex="0" data-act="pick" data-server="${k}" data-kind="${kind}" data-pick="${esc(name)}">`
+      + `<span class="rxtop">${top}<span class="chev">›</span></span>${sub ? `<span class="rxsub">${sub}</span>` : ""}</div>`;
     const blocks = [], shown = new Set(), files = seat.radio_files || [];
     // a radio with no receivers yet still shows, so its first one can be added
     for (const r of [...(seat.radios || []), ...files.filter(f => !(seat.radios || []).some(x => x.name === f.name))]) {
@@ -1701,13 +1731,15 @@ function leftPaneHtml(pick) {
       if (!mine.length && !files.some(f => f.name === r.name)) continue;
       mine.forEach(i => shown.add(i.name));
       if (!only(k, r.name)) continue;
-      const st = (seat.stations || []).find(x => x.radio === r.name), f = r.feeder;
+      const f = r.feeder, up = (r.rbn_upload || "off") !== "off", runs = mine.some(i => i.state === "running");
+      const linked = radioLink(seat, r.name), hp = r.type === "hpsdr";
+      const radioState = linked === "up" || (hp && runs) ? "running" : linked === "down" || !linked ? "stopped" : "busy";
+      const ok = !up || (f && !Number(f.errors) && f.registered);  // the feeder, where it uploads
+      const nodeState = !runs ? "stopped" : ok && !mine.some(i => i.state === "running" && Number(i.errors)) ? "running" : "busy";  // a stopped receiver's error is its own
       blocks.push(`<div class="navradio">`
-        + `<div class="infoblock">`
-        + `<div class="info"><span class="ilabel">Node</span><span>${esc([r.callsign || "no spotter ID", r.grid, r.op_name].filter(Boolean).join(" · "))} · rbn upload ${esc(upMode(r.rbn_upload))}</span></div>`
-        + (r.type === "hpsdr" && mine.length === 1 ? `<div class="info"><span class="ilabel">Skimmer</span><span>${skimmerText(mine[0], seat.utc)}</span></div>` : "")
-        + `<div class="info"><span class="ilabel">Feeder</span><span>${feederState(f, r.rbn_upload)}${f && (r.rbn_upload || "off") !== "off" ? esc(` · ${Number(f.sent) || 0} spots sent`) : ""}</span></div>`
-        + `</div>`
+        + card("radio", r.name, `${dot(radioState)}<b>Radio</b><span class="rxband">${esc(r.model || TYPE_NAMES[r.type] || r.type || "")}</span>`, esc(r.address || ""))
+        + card("node", r.name, `${dot(nodeState)}<b>Node</b><span class="rxband">${esc(r.callsign || "no spotter ID")}</span>`,
+          esc(`RBN Upload: ${r.rbn_upload || "off"}${f && up ? ` · ${Number(f.sent) || 0} sent` : ""}`))
         + `<div class="navhead">RECEIVERS</div>${mine.map(rxItem).join("")}`
         + addItem(k, seat, r.name, is("add", r.name))
         + `</div>`);
@@ -1715,17 +1747,16 @@ function leftPaneHtml(pick) {
     const rest = list.filter(i => !shown.has(i.name));
     if (rest.length && only(k, "")) blocks.push(`<div class="navradio"><div class="navhead">RECEIVERS WITH NO RADIO FILE</div>${rest.map(rxItem).join("")}</div>`);
     const host = (sv.link.hello && sv.link.hello.host) || sv.address;
-    const radio = (seat.radios || []).find(r => list.some(i => i.radio === r.name));
-    const card = (kind, name, top, sub) => `<div class="navrx${is(kind, name) ? " on" : ""}" role="button" tabindex="0" data-act="pick" data-server="${k}" data-kind="${kind}" data-pick="${esc(name)}">`
-      + `<span class="rxtop">${top}<span class="chev">›</span></span>${sub ? `<span class="rxsub">${sub}</span>` : ""}</div>`;
     blocks.push(`<div class="navhead">SERVER</div>`
       + card("server", "", `<b>${esc(host)}</b>`, sv.link.state === "live" ? "" : '<span class="bad">not connected</span>'));
     return blocks.join("");
   }).join('<hr class="navsep">') + `<button class="navadd addsrv" data-act="addserver">+ Add a server</button>`;
 }
 
-// the picked receiver: header, facts, its settings (each showing what it was while a change waits), Apply
-function receiverPaneHtml(k, sv, i, rxNum) {
+// the picked receiver: header, facts, its settings (each showing what it was while a change waits), Apply.
+// part "node": an HPSDR radio's one skimmer in its Node pane (run, recording, decoder options, details);
+// "rx": a receiver (an HPSDR one: its band; a Flex copy, its own process: run, band, receive path, recording, details)
+function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
   const run = i.state === "running", busy = i.busy, saved = i.settings || {};
   const list = i.receiver_list, rr = list ? list.find(r => r.receiver === rxNum) || list[0] : null;  // an HPSDR receiver
   const radioName = i.radio || i.name, all = list ? `all ${list.length} receivers of ${radioName}` : "";
@@ -1742,12 +1773,14 @@ function receiverPaneHtml(k, sv, i, rxNum) {
   const bandOpts = known.includes(saved.band) || saved.band === undefined ? known : [saved.band, ...known];
   const gains = rx && rx.range ? Array.from({ length: Math.floor((rx.range[1] - rx.range[0]) / rx.range[2]) + 1 }, (_, g) => rx.range[0] + g * rx.range[2]) : [];
   const row = (label, control, note = "") => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}${note}</span></div>`;
-  const rows = [row("RUN", segOf("run", [[false, "off"], [true, "on"]], "run" in pend ? pend.run : run), rr ? `<span class="fnote">${esc(all)}</span>` : ""),
-    rr ? row("BAND", `<select class="fsel${(pend.rx_bands || {})[rr.receiver] ? " pend" : ""}" ${at} data-key="rx_bands" data-rx="${rr.receiver}"${busy ? " disabled" : ""}>${
+  const node = part === "node", own = !list && !i.radio;  // own: a copy with no radio file keeps its decoder options
+  const rows = [];
+  if (!list || node) rows.push(row("RUN", segOf("run", [[false, "off"], [true, "on"]], "run" in pend ? pend.run : run), list ? `<span class="fnote">${esc(all)}</span>` : ""));
+  if (!node) rows.push(rr ? row("BAND", `<select class="fsel${(pend.rx_bands || {})[rr.receiver] ? " pend" : ""}" ${at} data-key="rx_bands" data-rx="${rr.receiver}"${busy ? " disabled" : ""}>${
         (known.includes(rr.band) ? known : [rr.band, ...known]).map(b => `<option value="${esc(b)}"${b === ((pend.rx_bands || {})[rr.receiver] || rr.band) ? " selected" : ""}>${esc(b)}</option>`).join("")}</select>`,
       (pend.rx_bands || {})[rr.receiver] ? `<span class="fnote">was ${esc(rr.band)}</span>` : `<span class="fnote">${run ? `restarts ${esc(all)}` : "used at its next start"}</span>`)
     : row("BAND", saved.multi_band ? esc(String(saved.band)) : sel("band", bandOpts.map(b => [b, String(b)]), st.band),
-      "band" in pend ? was("band", saved.band) : `<span class="fnote">${run ? "changes live" : "used at its next start"}</span>`)];
+      "band" in pend ? was("band", saved.band) : `<span class="fnote">${run ? "changes live" : "used at its next start"}</span>`));
   if (rx && rxHas(rx, "antenna")) rows.push(row("ANTENNA", sel("antenna", rx.ant_list.map(a => [a, a]), rs.antenna), was("antenna", rx.antenna)));
   if (rx && rxHas(rx, "rf_gain")) rows.push(row("RF GAIN", sel("rf_gain", gains.map(g => [g, `${g} dB`]), rs.rf_gain), was("rf_gain", rx.rf_gain, g => `${g} dB`)));
   if (rx && (rxHas(rx, "antenna") || rxHas(rx, "rf_gain"))) {
@@ -1757,18 +1790,18 @@ function receiverPaneHtml(k, sv, i, rxNum) {
       : r.num_scu > 1 ? `Antenna and RF gain are shared by the receivers on the same SCU (${r.num_scu} SCUs; the radio does not say which): check the others after a change.` : SHARED_NOTE;
     rows.push(`<div class="frow"><span></span><span class="fhint">${esc(note)}</span></div>`);
   } else if (i.radio && !run && radioOf(sv, i).rx_settings && radioOf(sv, i).rx_settings.length) rows.push(`<div class="frow"><span></span><span class="fhint">Antenna and RF gain show while ${esc(i.name)} runs.</span></div>`);
-  rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">restarts ${esc(i.name)}</span>` : "")
+  if (!list || node) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">restarts ${esc(i.name)}</span>` : "")
     .replace('<div class="frow"', `<div class="frow" title="${esc(HINTS.record)}"`));
-  rows.push(row("DECODED TEXT", `<div class="seg" title="Click for the next: Both, Wide, Narrow, Lowest cost"><span class="on" data-act="cycledecoded">${esc(["Both", "Wide", "Narrow", "Lowest cost"][DECODED.indexOf(app.decoded)] || "Both")}</span></div>`,
-    '<span class="fnote">this browser: all receivers</span>'));
+  if (!node && !own) rows.push(`<div class="frow"><span></span><span class="fhint">${list ? `Run, recording, decoder options and details: ${esc(radioName)}'s Node, for all its receivers.`
+    : `Decoder options: ${esc(radioName)}'s Node, for all its receivers.`}</span></div>`);
   const { decRows, win, valid, ons } = decoderOptions(at, st, pend);
   const fold = app.fold || {}, decOpen = !!fold.decoder, detOpen = !!fold.details;
   const feed = app.instances.find(x => x.server === sv && copyName(x) === i.name) || null;
-  const entries = `<button class="fentry" data-act="fold" data-fold="decoder" aria-expanded="${decOpen}"><span>Decoder options</span><span class="fnote">${esc(`${win} s windows · validation ${valid} · ${ons} of ${DECODER_OPTIONS.length + 1} on`)}</span><span class="chev">${decOpen ? "\u25BE" : "\u25B8"}</span></button>`
+  const entries = (!node && !own ? "" : `<button class="fentry" data-act="fold" data-fold="decoder" aria-expanded="${decOpen}"><span>Decoder options</span><span class="fnote">${esc(`${win} s windows · validation ${valid} · ${ons} of ${DECODER_OPTIONS.length + 1} on`)}</span><span class="chev">${decOpen ? "\u25BE" : "\u25B8"}</span></button>`
     + (decOpen ? `<div class="fold"><div class="form">${decRows.join("")}</div><div class="fhint">${rr ? `Shared by ${esc(all)}: changes restart them all.` : `Changes restart ${esc(i.name)}.`} Hover over an option for more.</div>`
-      + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div></div>` : "")
-    + `<button class="fentry" data-act="fold" data-fold="details" aria-expanded="${detOpen}"><span>Details</span><span class="fnote">packets, reconnects, warnings, log</span><span class="chev">${detOpen ? "\u25BE" : "\u25B8"}</span></button>`
-    + (detOpen ? `<div class="fold details">${feed && feed.status ? statusHtml(feed, i, false) : stoppedInfoHtml(i)}</div>` : "");
+      + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div></div>` : ""))
+    + (list && !node ? "" : `<button class="fentry" data-act="fold" data-fold="details" aria-expanded="${detOpen}"><span>Details</span><span class="fnote">packets, reconnects, warnings, log</span><span class="chev">${detOpen ? "\u25BE" : "\u25B8"}</span></button>`
+    + (detOpen ? `<div class="fold details">${feed && feed.status ? statusHtml(feed, i, false) : stoppedInfoHtml(i)}</div>` : ""));
   const others = Object.keys(pend).filter(x => !RX_KEYS.includes(x));
   const live = run && (!others.length || (others.length === 1 && others[0] === "band"));
   const label = { run: "run", band: "band", antenna: "antenna", rf_gain: "RF gain", record: "recording", afc: "AFC", itila_window_sec: "window",
@@ -1782,66 +1815,151 @@ function receiverPaneHtml(k, sv, i, rxNum) {
   const shown = (run && feed && feed.status) || {};  // an HPSDR receiver: its own band's spots; the feeder has the total
   const binsOf = r => ((i.receivers || []).find(x => x.rx === r.receiver - 1) || {}).bins;
   const total = key => list.some(r => (key === "bins" ? binsOf(r) : r[key]) != null) ? list.reduce((n, r) => n + (Number(key === "bins" ? binsOf(r) : r[key]) || 0), 0) : null;
-  const facts = rr ? statusTilesHtml({ ...shown, spots: rr.spots, calls: rr.calls, windows: rr.windows, bins: binsOf(rr), spots_hour: undefined, bins_peak: undefined },
-    { label: all, spots: total("spots"), calls: total("calls"), windows: total("windows"), bins: total("bins") }) : statusTilesHtml(shown);
+  const sum = list ? { spots: total("spots"), calls: total("calls"), windows: total("windows"), bins: total("bins") } : {};
+  const facts = node ? statusTilesHtml({ ...shown, ...sum, spots_hour: undefined, bins_peak: undefined }) : rr ? statusTilesHtml({ ...shown, spots: rr.spots, calls: rr.calls, windows: rr.windows, bins: binsOf(rr), spots_hour: undefined, bins_peak: undefined },
+    { label: all, ...sum }) : statusTilesHtml(shown);
   const state = busy ? `${busy}...` : run ? `running${where ? ` · ${where}` : ""}` : "stopped";
   const err = !run && i.last_error ? `<div class="small err">${esc(i.last_error)}</div>` : "";
-  const head = rr ? `${state.split(" · ")[0]} · ${rr.band}${rr.centre_khz ? ` ${Number(rr.centre_khz).toFixed(1)} kHz` : ""}${run && rr.spots !== null ? ` · ${rr.spots} spots` : ""}` : state;
-  return `<div class="phead"><span class="ptitle">${esc(rr ? rr.name : i.name)}</span>${dot(busy ? "busy" : i.state)}<span class="muted">${esc(head)}</span></div>`
+  const head = node ? state : rr ? `${state.split(" · ")[0]} · ${rr.band}${rr.centre_khz ? ` ${Number(rr.centre_khz).toFixed(1)} kHz` : ""}${run && rr.spots !== null ? ` · ${rr.spots} spots` : ""}` : state;
+  return `<div class="phead"><span class="ptitle">${esc(node ? "Skimmer" : rr ? rr.name : i.name)}</span>${dot(busy ? "busy" : i.state)}<span class="muted">${esc(head)}</span></div>`
     + bar + facts + err + `<div class="form">${rows.join("")}</div><div class="fentries">${entries}</div>`
-    + (!i.radio || (radioOf(sv, i).type !== "flex" && !rr) ? "" : `<div class="fremove"><button class="btn small${pend.remove ? " pend" : ""}" ${at} data-value="${esc(JSON.stringify(rr ? rr.name : true))}" data-key="remove"${busy ? " disabled" : ""}>`
+    + (node || !i.radio || (radioOf(sv, i).type !== "flex" && !rr) ? "" : `<div class="fremove"><button class="btn small${pend.remove ? " pend" : ""}" ${at} data-value="${esc(JSON.stringify(rr ? rr.name : true))}" data-key="remove"${busy ? " disabled" : ""}>`
     + `${pend.remove ? "Removed on Apply" : `Remove ${esc(rr ? rr.name : i.name)}`}</button></div>`);
 }
 
 const RADIO_TYPES = [["flex", "FlexRadio"], ["hpsdr", "HPSDR (Web-888)"]];  // radios.BACKENDS
 
-// Setup: the radio picked in the header switch (its type, node, RBN upload, name, removal), then Add a radio.
+// A radio's two panes, Radio (what it is) and Node (what it sends to RBN), and the server's Add a radio.
 // The same steps as sparkgap.sh setup, run by the server (discover, node, rename, remove_radio).
 const TYPE_NAMES = { flex: "FlexRadio", hpsdr: "HPSDR" };
-function setupHtml(k, sv) {
+const LINK_WORDS = { up: "connected", down: "not connected", wait: "reconnecting", first: "connecting" };
+const OPTION_KEYS = ["validation", "call_source", "itila_window_sec", "afc", ...DECODER_OPTIONS.map(([k]) => k)];
+
+function radioFileOf(sv, name) { return ((sv.link.seat || {}).radio_files || []).find(x => x.name === name); }
+
+function setupRow(label, control, note = "") {
+  return `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}${note ? `<span class="fnote">${note}</span>` : ""}</span></div>`;
+}
+
+// the Apply bar of a radio's settings: the Radio and Node panes both write its file
+function srvBarHtml(k, sv, r) {
+  const [what, restart, feeder] = srvPlan(sv, r.name), pend = srvPend(sv, r.name);
+  const how = "name" in pend ? `Apply (renames ${r.name})` : restart.length ? `Apply (restarts ${restart.join(", ")})` : feeder ? "Apply (restarts the feeder)" : "Apply";
+  const err = (app.srvError || {})[`${sv.address}|${r.name}`];
+  return (!what ? "" : `<div class="fbar"><span>not applied: ${esc(what)}</span><span class="grow"></span>`
+    + `<button class="btn small primary" data-act="srvapply" data-server="${k}" data-radio="${esc(r.name)}">${esc(how)}</button>`
+    + `<button class="btn small" data-act="srvcancel" data-server="${k}" data-radio="${esc(r.name)}">Cancel</button></div>`)
+    + (err ? `<div class="small err">${esc(r.name)}: ${esc(err)}</div>` : "");
+}
+
+function radioPaneHtml(k, sv, name) {
+  const seat = sv.link.seat || {}, r = radioFileOf(sv, name);
+  if (!r) return "";
+  const pend = srvPend(sv, r.name), users = (seat.instances || []).filter(i => i.radio === r.name), runs = users.some(i => i.state === "running");
+  const view = (seat.radios || []).find(x => x.name === r.name) || {}, st = (seat.stations || []).find(x => x.radio === r.name) || {};
+  const inUse = users.filter(i => i.state === "running").reduce((n, x) => n + ((x.receivers || []).length || 1), 0);
+  const facts = [TYPE_NAMES[r.type] || r.type || "radio", r.model, r.address, r.board_id ? `board ${r.board_id}` : "", r.firmware ? `firmware ${r.firmware}` : "",
+    view.num_scu ? `${view.num_scu} SCU` : ""].filter(Boolean).join(" · ");
+  const held = r.max_panadapters ? `${inUse} of ${r.max_panadapters} pans` : r.receivers ? `${inUse} of ${r.receivers} receivers` : `${inUse} running`;
+  const link = LINK_WORDS[radioLink(seat, r.name)] || (r.type === "hpsdr" ? (runs ? "receiving" : "stopped") : "no station");
+  const health = [st.station, st.rtt_ms != null ? `${Math.round(st.rtt_ms)} ms round trip` : "",
+    st.losses_hour != null ? `${st.losses_hour} link loss${st.losses_hour === 1 ? "" : "es"} this hour` : "",
+    st.last_loss ? `last at ${utcTime(st.last_loss[0])}` : ""].filter(Boolean).join(" · ");
+  const lg = radioLogOf(sv, r.name);
+  const lines = lg.lines.map(l => `<div class="cl${/ WARNING /.test(l) ? " warn" : / (ERROR|CRITICAL) /.test(l) ? " bad" : ""}">${esc(l)}</div>`).join("");
+  return `<div class="phead"><span class="ptitle">${esc(r.name)}</span><span class="muted">Radio · ${esc(link)}</span></div>`
+    + srvBarHtml(k, sv, r) + `<div class="form">`
+    + setupRow("Type", esc(facts))
+    + setupRow("Link", esc(link), health ? esc(health) : "")
+    + setupRow("In use", esc(held))
+    + (r.type !== "hpsdr" ? "" : setupRow("Name", `<input class="finput short${"name" in pend ? " pend" : ""}" data-node="name" data-server="${k}" data-radio="${esc(r.name)}" value="${esc("name" in pend ? pend.name : r.name)}" spellcheck="false"${runs ? " disabled" : ""}>`,
+      runs ? `stop ${esc(r.name)} to rename it` : "its receivers and process follow"))
+    + setupRow("Remove", `<button class="btn small" data-act="setupremove" data-server="${k}" data-radio="${esc(r.name)}"${users.length ? " disabled" : ""}>Remove ${esc(r.name)}</button>`,
+      users.length ? `remove its receivers first (${esc(users.map(i => i.name).join(", "))})` : "its file is kept, renamed")
+    + `</div><section class="psection"><div class="psec"><span class="psectitle">Log</span><span class="muted">${esc(r.type === "hpsdr" ? "its link, from the receivers' log" : "every command to the radio and its reply")}</span></div>`
+    + `<div class="console mono" data-console="radio${k}">${lines || `<div class="cl faint">${lg.t ? "nothing logged yet" : "loading..."}</div>`}</div></section>`;
+}
+
+// a radio's link log for its pane: asked again every RADIO_LOG_S while the pane is open
+const RADIO_LOG_S = 5;
+function radioLogOf(sv, radio) {
+  const all = app.radioLogs || (app.radioLogs = {}), id = `${sv.address}|${radio}`, lg = all[id] || (all[id] = { t: 0, lines: [], asking: false });
+  if (!lg.asking && Date.now() - lg.t > RADIO_LOG_S * 1000) {
+    lg.asking = true;
+    sv.link.request("radiolog", "radiolog", { radio }).then(res => {
+      lg.asking = false; lg.t = Date.now();
+      if (res.ok && Array.isArray(res.lines)) lg.lines = res.lines;
+      const p = app.pick;
+      if (p && p.kind === "radio" && p.name === radio && !$("modal").hidden) renderSettings();
+    });
+  }
+  return lg;
+}
+
+// the Node: who spots (spotter ID, grid, operator), what reaches RBN (upload, feeder) and the skimmer that makes the spots
+function nodePaneHtml(k, sv, name) {
+  const seat = sv.link.seat || {}, r = radioFileOf(sv, name);
+  if (!r) return "";
+  const pend = srvPend(sv, r.name), users = (seat.instances || []).filter(i => i.radio === r.name);
+  const field = (label, key, value, ph) => setupRow(label, `<input class="finput short${key in pend ? " pend" : ""}" data-node="${key}" data-server="${k}" data-radio="${esc(r.name)}" value="${esc(key in pend ? pend[key] : value || "")}" placeholder="${esc(ph)}" spellcheck="false">`);
+  const mode = pend.rbn_upload || r.rbn_upload || "off", f = ((seat.radios || []).find(x => x.name === r.name) || {}).feeder;
+  const upload = `<div class="seg${"rbn_upload" in pend ? " pend" : ""}">${["off", "dry", "live"].map(m =>
+    `<span data-act="srvpick" data-server="${k}" data-radio="${esc(r.name)}" data-key="rbn_upload" data-v="${m}"${m === mode ? ' class="on"' : ""}>${m}</span>`).join("")}</div>`;
+  const proc = r.type === "hpsdr" && users.length === 1 ? users[0] : null;
+  const skimmer = proc ? `<section class="psection">${receiverPaneHtml(k, sv, proc, null, "node")}</section>`
+    : users.length ? `<section class="psection">${nodeOptionsHtml(k, sv, r.name, users)}</section>` : "";
+  return `<div class="phead"><span class="ptitle">${esc(r.callsign || "Node")}</span><span class="muted">Node · ${esc(r.name)}</span></div>`
+    + srvBarHtml(k, sv, r) + `<div class="form">`
+    + field("Spotter ID", "callsign", r.callsign, "the callsign RBN shows (N0CALL-2)")
+    + field("Grid", "grid", r.grid, "EM12 or EM12ub")
+    + field("Operator", "op_name", r.op_name, "the operator's name")
+    + setupRow("RBN upload", upload, users.length ? "dry logs what it would post; only the feeder restarts" : "used once it has receivers")
+    + setupRow("Feeder", `${feederState(f, r.rbn_upload)}${f && (r.rbn_upload || "off") !== "off" ? esc(` · ${Number(f.sent) || 0} spots sent`) : ""}`)
+    + `</div>` + skimmer;
+}
+
+// the decoder options of a radio whose receivers are separate copies (Flex): one set, sent to every copy
+function nodeKey(radio) { return `+node:${radio}`; }
+function nodeBase(seat, radio) {
+  const c = (seat.instances || []).find(i => i.radio === radio);
+  return (c && c.settings) || seat.default_settings || {};
+}
+function nodeDiffers(seat, radio) {
+  const base = nodeBase(seat, radio), copies = (seat.instances || []).filter(i => i.radio === radio);
+  return OPTION_KEYS.filter(key => copies.some(c => JSON.stringify((c.settings || {})[key]) !== JSON.stringify(base[key])));
+}
+function nodeOptionsHtml(k, sv, radio, copies) {
+  const seat = sv.link.seat || {}, name = nodeKey(radio), at = `data-server="${k}" data-name="${esc(name)}"`;
+  const pend = app.pending[pendKey(sv, name)] || {}, st = { ...nodeBase(seat, radio), ...pend }, n = Object.keys(pend).length;
+  const { decRows, win, valid, ons } = decoderOptions(at, st, pend), differ = nodeDiffers(seat, radio);
+  const running = copies.filter(c => c.state === "running").map(c => c.name), names = copies.map(c => c.name).join(", ");
+  const bar = n || differ.length ? `<div class="fbar"><span>${n ? `${n} change${n > 1 ? "s" : ""} not applied` : `${esc(names)} differ`}</span><span class="grow"></span>`
+    + `<button class="btn small primary" ${at} data-cmd="apply">${running.length ? `Apply (restarts ${esc(running.join(", "))})` : "Save"}</button>`
+    + (n ? `<button class="btn small" ${at} data-cmd="discard">Discard</button>` : "") + `</div>` : "";
+  return `<div class="psec"><span class="psectitle">Decoder options</span><span class="muted">${esc(`${win} s windows · validation ${valid} · ${ons} of ${DECODER_OPTIONS.length + 1} on`)}</span></div>` + bar
+    + (differ.length ? `<div class="fhint">${esc(names)} run different ${esc(differ.join(", "))}: Apply sets every receiver to what shows here.</div>` : "")
+    + `<div class="form">${decRows.join("")}</div><div class="fhint">Every receiver of ${esc(radio)} runs these: changes restart the running ones. Hover over an option for more.</div>`
+    + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div>`;
+}
+
+// the server's Add a radio; a radio Find writes opens on its Node, ready for its spotter ID
+function addRadioHtml(k, sv) {
   const seat = sv.link.seat || {}, files = seat.radio_files || [];
   const d = app.setupDraft || (app.setupDraft = {});
-  // a radio Find just wrote becomes the picked radio: the section above shows it, ready for its node
-  const found = d.found && files.find(x => x.type === d.found.type && (!d.found.name || x.name === d.found.name) && (!d.found.address || x.address === d.found.address));
-  if (found) { app.radioSel = { address: sv.address, name: found.name }; save("radioSel", app.radioSel); delete d.found; }
-  const sel = radioList().length ? radioSel(app.pick) : null;
-  const r = files.find(x => sel && sel.k === k && x.name === sel.name) || files[0];
-  const row = (label, control, note = "") => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}${note ? `<span class="fnote">${note}</span>` : ""}</span></div>`;
-  let mine = "";
-  if (r) {
-    const pend = srvPend(sv, r.name), users = (seat.instances || []).filter(i => i.radio === r.name), runs = users.some(i => i.state === "running");
-    const field = (label, key, value, ph) => row(label, `<input class="finput short${key in pend ? " pend" : ""}" data-node="${key}" data-server="${k}" data-radio="${esc(r.name)}" value="${esc(key in pend ? pend[key] : value || "")}" placeholder="${esc(ph)}" spellcheck="false">`);
-    const facts = [TYPE_NAMES[r.type] || r.type || "radio", r.model, r.address, r.board_id ? `board ${r.board_id}` : "", r.receivers ? `${r.receivers} receivers` : ""].filter(Boolean).join(" · ");
-    const mode = pend.rbn_upload || r.rbn_upload || "off";
-    const upload = `<div class="seg${"rbn_upload" in pend ? " pend" : ""}">${["off", "dry", "live"].map(m =>
-      `<span data-act="srvpick" data-server="${k}" data-radio="${esc(r.name)}" data-key="rbn_upload" data-v="${m}"${m === mode ? ' class="on"' : ""}>${m}</span>`).join("")}</div>`;
-    const [what, restart, feeder] = srvPlan(sv, r.name);
-    const how = "name" in pend ? `Apply (renames ${r.name})` : restart.length ? `Apply (restarts ${restart.join(", ")})` : feeder ? "Apply (restarts the feeder)" : "Apply";
-    const err = (app.srvError || {})[`${sv.address}|${r.name}`];
-    const bar = (!what ? "" : `<div class="fbar"><span>not applied: ${esc(what)}</span><span class="grow"></span>`
-      + `<button class="btn small primary" data-act="srvapply" data-server="${k}" data-radio="${esc(r.name)}">${esc(how)}</button>`
-      + `<button class="btn small" data-act="srvcancel" data-server="${k}" data-radio="${esc(r.name)}">Cancel</button></div>`)
-      + (err ? `<div class="small err">${esc(r.name)}: ${esc(err)}</div>` : "");
-    mine = `<div class="psec"><span class="psectitle">Setup</span><span class="muted">${esc(r.name)}</span></div>${bar}<div class="form">`
-      + row("Type", esc(facts))
-      + field("Spotter ID", "callsign", r.callsign, "the callsign RBN shows (N0CALL-2)")
-      + field("Grid", "grid", r.grid, "EM12 or EM12ub")
-      + field("Operator", "op_name", r.op_name, "the operator's name")
-      + row("RBN upload", upload, users.length ? "dry logs what it would post; only the feeder restarts" : "used once it has receivers")
-      + (r.type !== "hpsdr" ? "" : row("Name", `<input class="finput short${"name" in pend ? " pend" : ""}" data-node="name" data-server="${k}" data-radio="${esc(r.name)}" value="${esc("name" in pend ? pend.name : r.name)}" spellcheck="false"${runs ? " disabled" : ""}>`,
-        runs ? `stop ${esc(r.name)} to rename it` : "its receivers and process follow"))
-      + row("Remove", `<button class="btn small" data-act="setupremove" data-server="${k}" data-radio="${esc(r.name)}"${users.length ? " disabled" : ""}>Remove ${esc(r.name)}</button>`,
-        users.length ? `remove its receivers first (${esc(users.map(i => i.name).join(", "))})` : "its file is kept, renamed")
-      + `</div>`;
+  const found = d.found && files.find(x => x.type === d.found.type && (!d.found.name || x.name === d.found.name)
+    && (!d.found.before.includes(x.name) || (d.found.address && x.address === d.found.address)));
+  if (found) {
+    app.radioSel = { address: sv.address, name: found.name }; save("radioSel", app.radioSel); delete d.found;
+    app.pick = { k, kind: "node", name: found.name }; setTimeout(renderSettings);
   }
   const kind = d.type || "";
-  const add = `<div class="psec"><span class="psectitle">Add a radio</span></div><div class="form">`
-    + row("Type", `<select class="fsel" data-setup="type">` + [["", "choose a type"], ...RADIO_TYPES].map(([v, l]) => `<option value="${v}"${v === kind ? " selected" : ""}${v ? "" : " disabled"}>${esc(l)}</option>`).join("") + `</select>`)
-    + (kind === "hpsdr" ? row("Name", `<input class="finput short" data-setup="name" value="${esc(d.name || "")}" placeholder="Pitaya" spellcheck="false">`, "empty: Web888 or HPSDR") : "")
-    + row("Address", `<input class="finput short" data-setup="address" value="${esc(d.address || "")}" placeholder="its IP address" spellcheck="false">`, "empty: search the network")
-    + row("", `<button class="btn small primary" data-act="setupfind" data-server="${k}"${kind ? "" : " disabled"}>Find</button>`)
+  return `<div class="psec"><span class="psectitle">Add a radio</span></div><div class="form">`
+    + setupRow("Type", `<select class="fsel" data-setup="type">` + [["", "choose a type"], ...RADIO_TYPES].map(([v, l]) => `<option value="${v}"${v === kind ? " selected" : ""}${v ? "" : " disabled"}>${esc(l)}</option>`).join("") + `</select>`)
+    + (kind === "hpsdr" ? setupRow("Name", `<input class="finput short" data-setup="name" value="${esc(d.name || "")}" placeholder="Pitaya" spellcheck="false">`, "empty: Web888 or HPSDR") : "")
+    + setupRow("Address", `<input class="finput short" data-setup="address" value="${esc(d.address || "")}" placeholder="its IP address" spellcheck="false">`, "empty: search the network")
+    + setupRow("", `<button class="btn small primary" data-act="setupfind" data-server="${k}"${kind ? "" : " disabled"}>Find</button>`,
+      d.found && !d.note ? "searching..." : d.note ? esc(d.note) : "")
     + `</div>`;
-  return mine + add;
 }
 
 // the server pane's settings, waiting for Apply as a receiver's do: {address|radio: {key: value}}
@@ -1900,7 +2018,7 @@ function serverPaneHtml(k, sv) {
   return `<div class="phead"><span class="ptitle">Server</span><span class="muted">${esc(host)}</span><span class="grow"></span>`
     + `<button class="btn small" data-act="editserver" data-server="${k}">Edit</button><button class="btn small" data-act="removeserver" data-server="${k}">Remove</button></div>`
     + sec(`<div class="psec"><span class="psectitle">Join code</span></div>${joinCodeRow(sv)}`)
-    + sec(setupHtml(k, sv))
+    + sec(addRadioHtml(k, sv))
     + sec(`<div class="psec"><span class="psectitle">Log</span></div><div class="console mono" data-console="r${k}">${lines || '<div class="cl faint">nothing logged yet</div>'}</div>`);
 }
 
@@ -1959,6 +2077,8 @@ function radiosHtml() {
       const i = ((sv.link.seat && sv.link.seat.instances) || []).find(x => x.name === pick.name);
       right = i ? receiverPaneHtml(pick.k, sv, i, pick.rx) : "";
     } else if (pick.kind === "add") right = addPaneHtml(pick.k, sv, pick.name);
+    else if (pick.kind === "radio") right = radioPaneHtml(pick.k, sv, pick.name);
+    else if (pick.kind === "node") right = nodePaneHtml(pick.k, sv, pick.name);
     else right = serverPaneHtml(pick.k, sv);
   }
   return `<div class="panes"><nav class="lpane">${leftPaneHtml(pick)}</nav><div class="rpane">${right}</div></div>`;
@@ -2073,7 +2193,8 @@ function pendKey(sv, name) { return `${sv.address}|${name}`; }
 // a setting picked: pending until Apply; picked back to what the copy runs, it is no longer pending
 function pickSetting(link, name, key, value) {
   const k = pendKey(link.server, name), i = ((link.seat && link.seat.instances) || []).find(x => x.name === name);
-  const tpl = name.startsWith("+add:") ? addBase(link.seat || {}, name.slice(5)) : null;  // a receiver not added yet
+  const tpl = name.startsWith("+add:") ? addBase(link.seat || {}, name.slice(5))  // a receiver not added yet
+    : name.startsWith("+node:") ? nodeBase(link.seat || {}, name.slice(6)) : null;  // a Flex radio's options, for every copy
   const saved = (i && i.settings) || tpl || {}, pend = app.pending[k] || (app.pending[k] = {});
   const base = key === "run" ? !!i && i.state === "running"  // run on or off, applied as a start or stop
     : RX_KEYS.includes(key) ? (rxOf(link.server, name) || {})[key] : saved[key];  // the receive path: the radio's
@@ -2103,6 +2224,7 @@ function renderFootLine() {
 
 // Apply: every pending change in one request, so a running copy restarts once (its label says so)
 async function applySettings(link, name) {
+  if (name.startsWith("+node:")) return applyNode(link, name.slice(6));
   const k = pendKey(link.server, name), settings = app.pending[k] ? { ...app.pending[k] } : null;  // what is sent
   if (!settings) return;
   if ("run" in settings) {  // off: stop, then the rest (written while stopped); on: the rest, then start
@@ -2130,13 +2252,35 @@ async function applySettings(link, name) {
   renderSettings();
 }
 
+// a Flex radio's decoder options: the same settings to each of its copies (a running one restarts)
+async function applyNode(link, radio) {
+  const seat = link.seat || {}, k = pendKey(link.server, nodeKey(radio)), base = nodeBase(seat, radio);
+  const settings = { ...Object.fromEntries(nodeDiffers(seat, radio).map(key => [key, base[key]])), ...(app.pending[k] || {}) };
+  let ok = true;
+  for (const c of (seat.instances || []).filter(i => i.radio === radio)) ok = (await seatRequest(link, "set", c.name, settings)) && ok;
+  if (ok) delete app.pending[k];
+  renderSettings();
+}
+
 function seatTarget(t) {
   const holder = t.closest("[data-server]");
   const sv = holder && app.servers[Number(holder.dataset.server)];
   return sv && sv.link ? [sv.link, holder.dataset.name, holder] : [null, "", null];
 }
 
-function openSettings() { $("modal").hidden = false; renderSettings(); }
+function openSettings() { showPick(); $("modal").hidden = false; renderSettings(); }
+
+// Settings opens on what the main screen shows: its radio, and the receiver of the band on screen
+function showPick() {
+  const i = inst(), sv = i && i.server, seat = sv && sv.link && sv.link.seat;
+  if (!seat) return;
+  const proc = (seat.instances || []).find(x => x.name === copyName(i));
+  if (!proc) return;
+  const b = i.bands[i.band], list = proc.receiver_list || [];
+  const rr = b && list.find(r => Math.abs(Number(r.centre_khz) - b.center_khz) < 1);  // an HPSDR receiver, by its centre
+  app.pick = { k: app.servers.indexOf(sv), kind: "rx", name: proc.name, rx: rr ? rr.receiver : undefined };
+  if (proc.radio) app.radioSel = { address: sv.address, name: proc.radio };
+}
 
 // the guide this page ships with: a SparkGap server's own, else GitHub's
 function guideUrl() { return /^https?:$/.test(location.protocol) && !app.here ? "/help" : HELP_URL; }
@@ -2176,7 +2320,7 @@ async function seatClick(e) {
   if (t.tagName === "SPAN" && t.classList.contains("on")) return;  // the run switch, already there
   if (cmd === "show") {
     const n = app.instances.findIndex(x => x.server === link.server && copyName(x) === name);
-    if (n >= 0) { setCurrent(n); closeSettings(); }
+    if (n >= 0) { app.restoring = false; setCurrent(n); closeSettings(); }
   } else if (cmd === "apply") applySettings(link, name);
   else if (cmd === "discard") { delete app.pending[pendKey(link.server, name)]; renderSettings(); }
   else if (cmd === "discover") seatRequest(link, "discover", "radios");
@@ -2228,8 +2372,13 @@ function bindInput() {
       const named = d.type === "hpsdr" && (d.name || "").trim() ? { name: d.name.trim() } : {};
       const input = $("radiosBody").querySelector('[data-setup="address"]'), address = ((input && input.value) || "").trim();
       const at = address ? { address } : {};  // an address asks that radio; none searches the network
-      app.setupDraft = { type: d.type, found: { type: d.type, ...at, ...named } };
-      seatRequest(link, "discover", "radios", { type: d.type, ...at, ...named });
+      const before = ((link.seat && link.seat.radio_files) || []).map(x => x.name);  // a radio already here is not what Find found
+      const draft = app.setupDraft = { type: d.type, address, found: { type: d.type, ...at, ...named, before } };
+      link.request("discover", "radios", { type: d.type, ...at, ...named }).then(res => {
+        draft.note = res.ok ? res.message || "" : res.error || "refused";  // what the server heard, under Find
+        renderSettings();
+      });
+      renderSettings();
       return;
     }
     const f = e.target.closest('[data-act="fold"]');
@@ -2252,9 +2401,6 @@ function bindInput() {
       else if (act === "editserver") editConn(n);
       else if (confirm(`Remove ${app.servers[n].address}? Adding it again needs its join code.`)) { removeConn(n); app.pick = null; renderSettings(); }
       return;
-    }
-    if (e.target.closest('[data-act="cycledecoded"]')) {
-      app.decoded = DECODED[(DECODED.indexOf(app.decoded) + 1) % DECODED.length]; save("decoded", app.decoded); renderSettings(); renderDetail(); return;
     }
     seatClick(e);
   };
@@ -2307,6 +2453,7 @@ function bindInput() {
     const copy = e.target.closest('[data-act="copycode"]');
     if (copy) copyText(copy.dataset.code).then(ok => { copy.textContent = ok ? "Copied" : "Copy failed"; });
   });
+  $("dShow").onclick = () => { app.decoded = DECODED[(DECODED.indexOf(app.decoded) + 1) % DECODED.length]; save("decoded", app.decoded); renderDetail(); };
   $("dCopy").onclick = () => copyText($("dWins").innerText).then(ok => {
     $("dCopy").textContent = ok ? "Copied" : "Copy failed";
     setTimeout(() => { $("dCopy").textContent = "Copy"; }, 1500);
