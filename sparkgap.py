@@ -2924,7 +2924,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
     n = len(z)
     n_out = n * rate // 192000
     bin_hz = 192000.0 / n
-    now = time.time()
+    now = getattr(skimmer, 'clock', time.time)()     # file mode (--digital): audio time
     n_spots = 0
     for off_hz, snr_db in cands:
         k0 = int(round(off_hz / bin_hz))
@@ -9601,6 +9601,59 @@ def _wav_start_utc(path):
     return t
 
 
+class _FileDigital:
+    """File mode --digital: the FT8 and RTTY minute cycle (_ft8_cycle) on the recording, as the live
+    receiver runs it on each minute's snapshot, so rtty_excludes_cw keeps the CW bins off RTTY in a
+    replay as it does live. Stands in for the SparkGap object the cycle expects; FT8 and RTTY spots
+    are logged by the cycle, not broadcast. The cycle runs in line at each minute of audio time."""
+
+    FS = 192000
+
+    def __init__(self, config, tracker, manager, center_khz, t0):
+        self.cfg, self.tracker, self.managers = config, tracker, [manager]
+        self.spot_count, self._rtty_excluded, self._ft8_running = 0, 0, False
+        self.center_khz, self.t0 = center_khz, t0 or 0.0
+        self.bn = 'file%d' % os.getpid()        # decode_ft8's temp WAVs are named by band
+        self.audio_t = 0.0
+        self._i, self._q, self._n, self._minute, self._first = [], [], 0, None, 0.0
+
+    def clock(self):
+        return self.t0 + self.audio_t
+
+    def broadcast(self, **spot):
+        pass
+
+    def _corrected_freq_khz(self, f):
+        return f
+
+    def _exclude_cw(self, band_name, lo_hz, hi_hz, hold_sec):
+        sc = getattr(self.managers[0]._itila_scanner, '_sc', None)
+        return bool(sc) and sc.exclude(lo_hz, hi_hz, hold_sec)
+
+    def add(self, i_block, q_block, audio_t):
+        """One block of IQ starting at audio_t s; at each minute boundary, the last minute's cycle."""
+        self.audio_t = audio_t
+        minute = int((self.t0 + audio_t) // 60)
+        if self._minute is not None and minute != self._minute:
+            self._cycle()
+        if not self._n:
+            self._minute, self._first = minute, self.t0 + audio_t
+        self._i.append(np.asarray(i_block, dtype=np.float32))
+        self._q.append(np.asarray(q_block, dtype=np.float32))
+        self._n += len(i_block)
+
+    def _cycle(self):
+        fs, n = self.FS, self._n
+        fi, fq = np.concatenate(self._i), np.concatenate(self._q)
+        self._i, self._q, self._n = [], [], 0
+        ft8_khz = ft8_dial_khz(self.center_khz)
+        if n < fs * 59 or not ft8_khz:
+            return
+        fi, fq = fi[-fs * 60:], fq[-fs * 60:]
+        _ft8_cycle([(self.bn, 0, self.center_khz, ft8_khz, fi, fq, len(fi),
+                     self._first + (n - len(fi)) / fs)], self)
+
+
 def run_file_mode(args, config):
     """Offline file mode — process a WAV recording and output spots."""
     # Log times follow the audio, as live logs follow the clock: the recording's start from its name, else 00:00:00
@@ -9796,6 +9849,15 @@ def run_file_mode(args, config):
 
     manager.update_signals(clustered, center_khz)
     del scan_i, scan_q
+    digital = None
+    if getattr(args, 'digital', False):
+        if file_rate != _FileDigital.FS:
+            log.warning("--digital: needs a %d Hz recording, this one is %d; off", _FileDigital.FS, file_rate)
+        elif config.get('enable_ft8', True) or config.get('enable_rtty', True):
+            digital = _FileDigital(config, tracker, manager, center_khz, t0)
+            log.info("File mode: FT8 %s, RTTY %s each minute of audio, as live (--digital)",
+                     'on' if config.get('enable_ft8', True) else 'off',
+                     'on' if config.get('enable_rtty', True) else 'off')
     if t0 is not None:
         _log_rbn_node(_rbn_spotter(config), config.get('grid', ''))
         _log_rbn_span(t0 + start_sec, [center_khz], file_rate)
@@ -9897,6 +9959,8 @@ def run_file_mode(args, config):
                                                    'state': 'replaying',
                                                    'position_s': round(audio_t)}})
             _file_audio_t = t_start + pos / file_rate
+            if digital is not None:
+                digital.add(i_block, q_block, _file_audio_t)
             manager.feed_all_iq(i_block, q_block)
             if _spot_rule_on:
                 audio_now[0] = t_start + pos / file_rate
@@ -10035,6 +10099,9 @@ def main():
     parser.add_argument('--start-min', type=float, default=0, help='Start minute in file')
     parser.add_argument('--end-min', type=float, default=0, help='End minute in file (0=end)')
     parser.add_argument('--center-khz', type=float, default=7090, help='Center freq kHz for file mode')
+    parser.add_argument('--digital', action='store_true',
+                        help='File mode: run the FT8 and RTTY minute cycle on the recording, as live '
+                             '(enable_ft8, enable_rtty, rtty_excludes_cw)')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
