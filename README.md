@@ -22,7 +22,8 @@ call within 1 kHz and 10 minutes.
 - **Precision, live.** WF8Z-1's first full day on the RX888 (2026-11-11): 95.5% of its CW spots
   confirmed. The same day replayed through the spot rule with the two options turned on since
   (`spot_rule_owned_two_windows`, `rbn_known_drop_busts`): 97.3%. WX7V-1 in the 11-11 19Z CWT:
-  98.7% of 611 spots. CW Skimmer nodes run about 95 to 98% on the same measure. Most of what isn't
+  98.7% of 611 spots. WX7V-1 over 2026-11-11 18:31Z to 11-13 11:04Z (about 40 h, five bands, the
+  repeat spot rule): 98.4% of 2,384 spots, scored with rbn-validate-node. CW Skimmer nodes run about 95 to 98% on the same measure. Most of what isn't
   confirmed is either a real station nobody else heard or a caller read in a runner's text; the
   options above and `itila2_tone_lock_hz` target the second.
 - **Recall.** Against a CW Skimmer node 20 miles away, on the same evenings in October (Red Pitaya
@@ -330,8 +331,8 @@ GPLv3. See `LICENSE`.
 ## Authors
 
 - Fred Krause, **WF8Z** (EM79SM), project owner. Contact info is on QRZ.
-- Chris White, **WX7V**: the itila2 decoder and scanner, the repeat spot rule, the FlexRadio
-  path and SparkGap Web.
+- Chris White, **WX7V**: the itila2 decoder and scanner, the repeat spot rule, the FlexRadio and
+  Web-888 (HPSDR) paths, and SparkGap Web.
 
 ## History
 
