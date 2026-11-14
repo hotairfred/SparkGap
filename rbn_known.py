@@ -110,6 +110,20 @@ def known_calls(days: Iterable[Counter[str]], min_skimmers: int = MIN_SKIMMERS, 
     return known
 
 
+def skimmer_counts(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None = None) -> Counter[str]:
+    """Each call's distinct skimmers on its best day of the last days cached (yesterday back), as refresh()
+    left them; nothing is fetched. For spot_rule_clip_busts."""
+    today = today or datetime.now(timezone.utc).date()
+    tag = spotter(own_call) if own_call else "ALL"
+    best: Counter[str] = Counter()
+    for back in range(1, days + 1):
+        path = cache_dir / f"{today - timedelta(days=back):%Y%m%d}_{tag}_v{CACHE_VERSION}.calls"
+        counts = _load(path) if path.exists() else None
+        for c, n in (counts or {}).items():
+            best[c] = max(best[c], n)
+    return best
+
+
 def _fetch(day: date) -> bytes:
     url = ARCHIVE_URL.format(day=f"{day:%Y%m%d}")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})

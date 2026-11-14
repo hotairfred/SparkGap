@@ -100,6 +100,7 @@ def _gui_settings(cfg, sample_rate):
         'spot_rule_fragments': (cfg.get('spot_rule_fragments') or 'off') if repeat else 'off',
         'spot_rule_owner_cell': repeat and bool(cfg.get('spot_rule_owner_cell', False)),
         'spot_rule_owned_two_windows': repeat and bool(cfg.get('spot_rule_owned_two_windows', False)),
+        'spot_rule_clip_busts': repeat and calls in ('rbn', 'rbn+skcc') and bool(cfg.get('spot_rule_clip_busts', False)),
         'itila_window_sec': float(cfg.get('itila_window_sec', 60.0)),
         'itila_max_bins': int(cfg.get('itila_max_bins', 200)),
         'itila_decode_threads': int(cfg.get('itila_decode_threads', 1)),
@@ -2568,7 +2569,30 @@ def _make_spot_rule(config, tracker, local=None):
         owned_two_windows=bool(config.get('spot_rule_owned_two_windows', False)),
         runner_signs=True, window_join=True,      # cdub89/SparkGap#37
         garbled_runner=bool(config.get('spot_rule_garbled_runner', False)),
-        stray_known=bool(config.get('spot_rule_stray_known', False)))
+        stray_known=bool(config.get('spot_rule_stray_known', False)),
+        clip_strength=_clip_strength(config, calls, tracker),
+        clip_keep=lambda c: c in tracker.valid_calls)
+
+
+def _clip_strength(config, calls, tracker):
+    """spot_rule_clip_busts (off by default): each call's RBN skimmers on its best recent day (rbn_known
+    cache), for spot_rule.clip_of; None when off, or without the rbn / rbn+skcc call list it reads."""
+    if not config.get('spot_rule_clip_busts'):
+        return None
+    if calls not in ('rbn', 'rbn+skcc'):
+        log.warning("spot_rule_clip_busts: needs spot_validation_calls rbn or rbn+skcc (the RBN skimmer counts); off")
+        return None
+    cache = tracker.__dict__.setdefault('_validation_lists', {})
+    if 'clip_strength' not in cache:
+        from pathlib import Path
+
+        import rbn_known
+        counts = rbn_known.skimmer_counts(Path(config.get('rbn_known_dir', 'rbn_known')), config.get('callsign', ''),
+                                          int(config.get('rbn_known_days', rbn_known.DAYS)))
+        log.info("spot_rule_clip_busts: a call cut off at an end or start of a call RBN knows better, decoded "
+                 "within 0.3 kHz in 10 min, does not spot (%d calls counted)", len(counts))
+        cache['clip_strength'] = counts.__getitem__
+    return cache['clip_strength']
 
 def _get_itila_lib():
     global _itila_lib
