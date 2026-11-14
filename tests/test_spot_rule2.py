@@ -1,0 +1,288 @@
+"""Gate spot rule (spot_rule2.py): one pass and one fail case per requirement."""
+
+from spot_rule import tokens
+from spot_rule2 import GateSpotRule, keyword_calls
+
+RARE = {"KX9QQ"}          # unflagged patt3ch pattern: 3 reads
+NONE = {"TT5T"}           # no pattern: 5 reads
+
+
+def _shape(c: str) -> str | None:
+    return None if c in NONE else ("rare" if c in RARE else "active")
+
+
+def _rule(**kw) -> GateSpotRule:
+    return GateSpotRule(_shape, **kw)
+
+
+def _feed(rule: GateSpotRule, text: str, t: float = 0.0, f: float = 14025.0, w: int | None = None,
+          snr: float | None = None) -> list[str]:
+    win = rule.window_id(int(round(f * 10)), int(t) if w is None else w, t)
+    rule.feed(win, f, text, t, snr)
+    return [c for c, _ in rule.end_pass()]
+
+
+def _why(rule: GateSpotRule, call: str) -> int:
+    return [r for _, _, c, r, _ in rule.trace if c == call][-1]
+
+
+def test_spot_on_cq() -> None:
+    r = _rule()
+    assert _feed(r, "CQ CQ DE K1ABC K1ABC K") == ["K1ABC"]
+
+
+def test_2_banned() -> None:
+    r = _rule(banned=["K1ABC"])
+    assert _feed(r, "CQ K1ABC K1ABC") == [] and _why(r, "K1ABC") == 2
+
+
+def test_3_reads_by_pattern() -> None:
+    r = _rule()
+    assert _feed(r, "CQ CWT N5RG", w=1) == [] and _why(r, "N5RG") == 3          # + pattern: 1 of 2
+    assert _feed(r, "CQ CWT N5RG", t=30, w=2) == ["N5RG"]                     # same signal: 2 reads
+    assert _feed(r, "CQ KX9QQ KX9QQ", f=7030.0) == [] and _why(r, "KX9QQ") == 3   # rare: 2 of 3
+    assert _feed(r, "CQ TT5T TT5T TT5T TT5T", f=3530.0) == []          # none: 4 of 5
+    assert _why(r, "TT5T") == 3
+
+
+def test_3_buffer_is_256_characters() -> None:
+    r = _rule()
+    _feed(r, "CQ N5RG", w=1)
+    _feed(r, "E " * 140, t=10, w=2)                                             # pushes N5RG out
+    assert _feed(r, "CQ N5RG", t=20, w=3) == [] and _why(r, "N5RG") == 3
+
+
+def test_4_best_reading() -> None:
+    r = _rule()
+    assert _feed(r, "CQ N5RZ N5RZ N5RZ CQ N5RG N5RG") == ["N5RZ"]
+    assert _why(r, "N5RG") == 4
+
+
+def test_5_keyword() -> None:
+    r = _rule()
+    assert _feed(r, "K1ABC K1ABC 5NN") == [] and _why(r, "K1ABC") == 5
+
+
+def test_6_call_with_keyword() -> None:
+    r = _rule()
+    assert _feed(r, "TEST 5NN TU K1ABC K1ABC") == [] and _why(r, "K1ABC") == 7
+    assert keyword_calls(tokens("TU K1ABC TEST")) == [(1, "TEST", False)]
+
+
+def test_6_event_word_between_keyword_and_call() -> None:
+    assert keyword_calls(tokens("CQ CQ POTA DE WA3N")) == [(4, "CQ", False)]
+    assert keyword_calls(tokens("CQ CWT W4LOO")) == [(2, "CQ", False)]
+
+
+def test_5_run_together_text() -> None:
+    r = _rule()
+    assert _feed(r, "CQCQDE K1ABC K1ABC") == ["K1ABC"]
+
+
+def test_7_own_keyword() -> None:
+    r = _rule()
+    assert _feed(r, "K1ABC TEST DL1XYZ DL1XYZ DL1XYZ") == [] and _why(r, "DL1XYZ") == 8
+
+
+def test_7_two_runners_on_one_frequency() -> None:
+    r = _rule()
+    assert _feed(r, "CQ K1ABC K1ABC", w=1) == ["K1ABC"]
+    assert _feed(r, "CQ DL1XYZ DL1XYZ", t=20, w=2) == [] and _why(r, "DL1XYZ") == 4   # a tie
+    assert _feed(r, "CQ DL1XYZ", t=40, w=3) == ["DL1XYZ"]
+
+
+def test_9_stronger_copy_elsewhere() -> None:
+    r = _rule()
+    _feed(r, "CQ K1ABC K1ABC", t=0, f=14025.0, snr=25.0)
+    assert _feed(r, "CQ K1ABC K1ABC", t=10, f=14073.0, snr=5.0) == [] and _why(r, "K1ABC") == 9
+
+
+def test_10_respot() -> None:
+    r = _rule()
+    assert _feed(r, "CQ K1ABC K1ABC", t=0, w=1) == ["K1ABC"]
+    assert _feed(r, "CQ K1ABC K1ABC", t=300, w=2) == [] and _why(r, "K1ABC") == 10
+    assert _feed(r, "CQ K1ABC K1ABC", t=700, w=3) == ["K1ABC"]
+
+
+def test_11_rbn_window() -> None:
+    r = _rule(segments=[(14000.0, 14070.0)])
+    assert _feed(r, "CQ K1ABC K1ABC", f=14095.0) == [] and _why(r, "K1ABC") == 11
+
+
+def test_11_beacon() -> None:
+    r = _rule()
+    assert _feed(r, "4U1UN 4U1UN", f=14100.0) == ["4U1UN"]                 # no keyword needed
+
+
+def test_5_keywords_only() -> None:
+    r = _rule()
+    assert _feed(r, "SS N6RO N6RO") == [] and _why(r, "N6RO") == 5
+    assert keyword_calls(tokens("NA K1ABC")) == []
+
+
+def test_6_qualifier_is_the_events_cq() -> None:
+    r = _rule(qualifiers=["SS"])
+    assert _feed(r, "SS N6RO N6RO") == ["N6RO"]
+    assert _feed(_rule(qualifiers=["SS"]), "CQ SS N6RO N6RO", f=7030.0) == ["N6RO"]
+
+
+def test_7_called_station_before_de() -> None:
+    assert keyword_calls(tokens("CQ S52Y DE N8EM")) == [(3, "CQ", False)]
+
+
+def test_7_caller_after_de_needs_a_keyword() -> None:
+    assert keyword_calls(tokens("K1ABC DE W2XYZ")) == []
+
+
+def test_7_tu_only_before_test() -> None:
+    assert keyword_calls(tokens("TU K1ABC UP")) == []
+
+
+def test_s_buffer_is_continuous() -> None:
+    r = _rule()
+    assert _feed(r, "TEST DE", w=1) == []
+    assert _feed(r, "K1ABC K1ABC", t=30, w=2) == ["K1ABC"]
+
+
+def test_4_most_read_wins_over_a_glued_tail() -> None:
+    r = _rule()
+    assert _feed(r, "CQ K1TR CQ K1TR CQ K1TRE") == ["K1TR"]
+    assert _why(r, "K1TRE") == 3
+
+
+def test_4_tie_spots_neither() -> None:
+    r = _rule()
+    assert _feed(r, "CQ N5AL N5AL CQ W5AL W5AL") == []
+    assert _why(r, "N5AL") == 4 and _why(r, "W5AL") == 4
+
+
+def test_7_read_with_exchange_is_never_tied() -> None:
+    assert keyword_calls(tokens("CQ POTA KV0I KV0I TONY 445")) == []
+    assert keyword_calls(tokens("CWT N4YDU N4YDU KEITH 2182"), frozenset({"CWT", "CQ"})) == []
+
+
+def test_7_lookahead_skips_words_that_are_not_calls() -> None:
+    assert keyword_calls(tokens("CQ SES WW1USA")) == [(2, "CQ", False)]
+    assert keyword_calls(tokens("CQ CQ E E HFT ON6FT")) == [(5, "CQ", False)]
+    assert keyword_calls(tokens("CQ BK W1AW")) == []                     # a sign-off ends the CQ
+    assert keyword_calls(tokens("CQ K W1AW")) == [(2, "CQ", False)]      # K is no sign-off
+    assert keyword_calls(tokens("CQ BT W1AW")) == [(2, "CQ", False)]     # BT continues
+
+
+def test_9_strongest_same_signal_within_1_khz() -> None:
+    r = _rule()
+    _feed(r, "CQ K1ABC K1ABC", t=0, f=14025.0, snr=25.0)
+    assert _feed(r, "CQ K1ABC K1ABC", t=10, f=14025.8, snr=5.0, w=9) == []
+    assert _why(r, "K1ABC") == 10                                # same signal: a re-spot
+
+
+def test_1_shape_accepts_digit_two_letter_prefix() -> None:
+    assert keyword_calls(tokens("CQ 3DA0XYZ")) == [(1, "CQ", False)]
+
+
+def test_s_buffer_ends_with_its_bin() -> None:
+    r = _rule()
+    _feed(r, "CQ K1ABC", w=1)
+    r.close_bin(int(round(14025.0 * 10)))
+    assert _feed(r, "CQ K1ABC", t=30, w=2) == [] and _why(r, "K1ABC") == 3
+
+
+def test_5_up_is_no_keyword() -> None:
+    assert keyword_calls(tokens("TU UP LA9GX 5NN A LA9GX LA9GX 5NN")) == []
+
+
+def test_9_stronger_copy_on_another_band() -> None:
+    r = _rule()
+    _feed(r, "CQ WX7V WX7V", t=0, f=7052.0, snr=88.0)
+    assert _feed(r, "CQ WX7V WX7V", t=20, f=28024.3, snr=11.0) == [] and _why(r, "WX7V") == 9
+
+
+def test_9_images_fed_before_the_real_copy_in_one_pass() -> None:
+    r = _rule()
+    for f, snr in ((28024.3, 33.0), (21038.1, 17.0), (14056.0, 10.0), (7052.0, 88.0)):
+        r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
+    assert [(c, f) for c, f in r.end_pass()] == [("WX7V", 7052.0)]
+
+
+def test_9_images_within_6_db_of_each_other_spot_none() -> None:
+    r = _rule()                               # WebRX 11-14 00:21:45Z, LakeDog on 7061
+    copies = ((21004.1, 12.3), (21004.3, 12.4), (14016.2, 12.0), (21000.1, 15.1), (7036.0, 17.2))
+    for f, snr in copies:
+        r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
+    assert r.end_pass() == []
+
+
+def test_9_ranks_by_the_reported_snr() -> None:
+    r = _rule()                   # WebRX 11-14 05:26:20Z, LakeDog on 7060
+    for f, snr, rep in ((28060.0, 26.2, 35.9), (21050.1, 26.4, 24.7), (28025.2, 26.5, 22.7),
+                        (14000.1, 20.0, 14.2), (7060.0, 19.8, 91.3)):
+        win = r.window_id(round(f * 10), 1, 0.0)
+        r.feed(win, f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr, rep)
+    assert r.end_pass() == [("WX7V", 7060.0)]
+
+
+def test_2_bad_calls_file(tmp_path) -> None:
+    from spot_rule2 import read_bad_calls
+    (tmp_path / "BadCalls.txt").write_text("wx7v\n\nWX7U\n")
+    r = _rule(banned=read_bad_calls(tmp_path / "BadCalls.txt"))
+    assert _feed(r, "CQ WX7U WX7U") == [] and _why(r, "WX7U") == 2
+
+
+def test_11_notched_freqs_file(tmp_path) -> None:
+    from spot_rule2 import read_notched
+    (tmp_path / "NotchedFreqs.txt").write_text("7074\n14079.5-14081\n14090 14092\nnote\n")
+    notched = read_notched(tmp_path / "NotchedFreqs.txt")
+    assert notched == [(7074.0, 7074.0), (14079.5, 14081.0), (14090.0, 14092.0)]
+    r = _rule(notched=notched)
+    assert _feed(r, "CQ K1ABC K1ABC", f=14080.0) == [] and _why(r, "K1ABC") == 11
+    assert _feed(r, "CQ K1ABC K1ABC", f=14025.0) == ["K1ABC"]
+
+
+def test_4_a_split_call_reads_as_the_longer_call() -> None:
+    r = _rule()                   # CWT 10-08 7023.9: K1VUT read whole and split by a gap
+    assert _feed(r, "CQ CWT K1VUT TEST K1V UT TU K1V UT CQ CWT K1VUT", f=7023.9) == ["K1VUT"]
+
+
+def test_4_a_cut_off_copy_loses_to_the_whole_call() -> None:
+    r = _rule()                   # CWT 10-08 7042.0
+    assert _feed(r, "CQ CWT N5TJ CQ CWT N5T T CQ CWT N5TJ CWT N5T M N5TJ", f=7042.0) == ["N5TJ"]
+    assert _why(r, "N5T") == 4
+
+
+def test_4_noise_letters_glued_on_are_no_longer_call() -> None:
+    assert _feed(_rule(), "CQ K1TR CQ K1TR CQ K1TRE") == ["K1TR"]
+
+
+def test_4_a_sign_off_after_the_call_is_no_split() -> None:
+    r = _rule()                   # net 11-01 14038.1
+    assert _feed(r, "CQ POTA DE KE8UEX KE8UEX K CQ POTA DE KE8UEX KE8UEXK", f=14038.1) == ["KE8UEX"]
+
+
+def test_4_a_portable_form_is_the_same_station() -> None:
+    r = _rule()                   # WebRX 11-14 14034.1: W1AW, then W1AW/7 read once
+    assert _feed(r, "CQ CQ DE W1AW W1AW W1AW/7 K", f=14034.1) == ["W1AW"]
+
+
+def test_4_a_call_with_its_start_cut_off_loses() -> None:
+    r = _rule()                   # WX7V-2 11-14 14028.0: C6X of NC6X
+    assert _feed(r, "CQ NC6X NC6X K CQ C6X C6X C6X", f=14028.0) == ["NC6X"]
+    assert _why(r, "C6X") == 4
+
+
+def test_4_a_glued_noise_letter_in_front_makes_no_longer_call() -> None:
+    r = _rule()                   # WebRX 11-14 14055.0: SW0YB read 5x beside W0YB
+    assert _feed(r, "CQ DE W0YB W0YB SW0YB K CQ DE W0YB SW0YB K", f=14055.0) == ["W0YB"]
+
+
+def test_4_a_portable_form_is_no_rival() -> None:
+    r = _rule()                   # Codex audit: W1AW read as often as W1AW/7
+    assert "W1AW" in _feed(r, "CQ DE W1AW W1AW W1AW/7 W1AW/7 K", f=14034.1)
+
+
+def test_trace_and_last_spots_are_bounded() -> None:
+    import spot_rule2
+    r = _rule()
+    assert r.trace.maxlen == spot_rule2.TRACE_KEPT
+    assert _feed(r, "CQ K1ABC K1ABC", t=0, w=1) == ["K1ABC"]
+    _feed(r, "CQ DL1XYZ DL1XYZ", t=700, f=7030.0, w=2)
+    assert all(c != "K1ABC" for c, _ in r._last_spot)

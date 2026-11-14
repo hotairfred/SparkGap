@@ -2732,6 +2732,17 @@ def _copies_known_runner(raw, valid_calls):
 _SPOT_RULES = ('off', 'repeat')
 _spot_rule_on = False
 _window_seq = itertools.count(1)   # window keys for spot_rule; never reused, unlike id(bin state)
+_bin_seq = itertools.count(1)      # bin ids for spot_rule_gates: never reused, unlike id(bin state)
+_PASS_END = object()               # spot_rule_gates: ends one collect pass of every band (tracker.flush_pass)
+
+
+_gates_on = False   # spot_rule_gates: set when the gate rule is built
+
+
+def _new_bin_seq(f_hz):
+    n = next(_bin_seq)
+    log.info("ITILA bin %d open %.1f kHz", n, f_hz / 1000.0)
+    return n
 
 def _select_spot_rule(name):
     """Config key spot_rule: "repeat" sends whole ITILA decode windows to
@@ -2840,6 +2851,38 @@ def _make_spot_rule(config, tracker, local=None):
     for this port only). doubled_calls has no effect while validation is on: the score
     already weighs a call sent twice."""
     from spot_rule import LOCK_IDLE_S, RepeatSpotRule
+    if config.get('spot_rule_gates'):
+        global _gates_on
+        _gates_on = True    # C-worker bins close when idle (see _ItilaScanner.collect)
+        # spot_rule_gates (off by default): spot_rule2.GateSpotRule, the call requirements in order
+        from spot_rule2 import GateSpotRule, read_bad_calls, read_notched
+        # spot_rule_bad_calls, spot_rule_notched_freqs (off by default): BadCalls.txt and
+        # NotchedFreqs.txt beside the config file, as the Aggregator's (Node Profile)
+        here = os.path.dirname(_config_path or '.')
+        bad = list(config.get('spot_rule_banned_calls', ()))
+        notched = []
+        for key, name in (('spot_rule_bad_calls', 'BadCalls.txt'), ('spot_rule_notched_freqs', 'NotchedFreqs.txt')):
+            path = os.path.join(here, name)
+            if not config.get(key):
+                continue
+            if not os.path.exists(path):
+                log.warning("%s is on but %s is missing", key, path)
+            elif key == 'spot_rule_bad_calls':
+                bad += read_bad_calls(path)
+            else:
+                notched = read_notched(path)
+        log.info("spot rule gates: %d bad calls, %d notched ranges", len(bad), len(notched))
+        calls = (local or {}).get('validation_calls', config.get('spot_validation_calls')) or 'scp'
+        return GateSpotRule(
+            tracker._matches_patt3ch,
+            listed=_validation_list(config, tracker, calls),
+            banned=bad,
+            segments=config.get('spot_rule_segments'),
+            notched=notched,
+            beacons=config.get('spot_rule_beacons'),
+            qualifiers=config.get('spot_rule_qualifiers', ()),
+            stronger_db=(float(config['spot_rule_strongest_db'])
+                         if config.get('spot_rule_strongest_db') is not None else None))
     # spot_validation (off by default): permissive / normal / aggressive confidence score in
     # place of the tier count; spot_validation_calls adds a call list to the score: "scp"
     # (MASTER.SCP), "rbn" (RBN known calls, rbn_known.py, refreshed from the archives here) or
@@ -4143,6 +4186,9 @@ class _ItilaChannel:
 # _ItilaScanner — band-wide ITILA channelizer (FFT energy scan)
 # ---------------------------------------------------------------------------
 
+BIN_IDLE_WINDOWS = 2.5   # a C worker's bin with no window for this many window lengths has ended
+
+
 class _ItilaScanner:
     """Band-wide ITILA channelizer — thin Python wrapper over libitila_scanner.so.
 
@@ -4191,6 +4237,7 @@ class _ItilaScanner:
 
         # f_hz -> {h100, h200, pending} — itila decoder handles per bin
         self._bins = {}
+        self._closed = []   # spot_rule_gates: bins closed since the last collect()
 
         loader = _get_pfb_scanner if self._use_pfb else _get_itila_scanner
         # Per-bin scanner keeps its 50 Hz grid.  PFB scanner uses 50 Hz too;
@@ -4251,6 +4298,7 @@ class _ItilaScanner:
             'spotted': set(),     # calls already spotted on this bin
             'last_cq_time': 0.0,  # wall time of last CQ trigger on this bin
             'window_id_next': 0,  # monotonic counter for SpotIntent.window_id
+            'bin_seq': _new_bin_seq(f_hz),
         }
         log.info("ITILA scanner: spawned %.1f kHz", f_hz / 1000.0)
 
@@ -4503,7 +4551,7 @@ class _ItilaScanner:
                 self._bins[f_hz] = {
                     'h100': None, 'h200': None, 'pending': [], 'wpm': 0, 'snr': 0.0,
                     'text_buf': '', 'spotted': set(), 'last_cq_time': 0.0,
-                    'window_id_next': 0,
+                    'window_id_next': 0, 'bin_seq': _new_bin_seq(f_hz),
                 }
             st = self._bins[f_hz]
             st['snr'] = snr
@@ -4568,18 +4616,29 @@ class _ItilaScanner:
         these to tracker.process_intent() rather than tracker.process().
         """
         results = []
+        # spot_rule_gates: a C worker's bin says nothing when it ends; one that has sent no window for
+        # 2.5 windows has ended in C, so its buffer goes (the Python scanner frees its own)
+        idle = time.time() - BIN_IDLE_WINDOWS * self._window_sec
+        for f_hz in [f for f, st in self._bins.items() if _gates_on and st.get('c_seen', idle) < idle]:
+            self._free_bin_handles(f_hz)
         for f_hz, st in self._bins.items():
             if not st['pending']:
                 continue
             pending = st['pending']
             st['pending'] = []
             results.extend(pending)
+        results.extend(self._closed)
+        self._closed = []
         return results
 
     def _free_bin_handles(self, f_hz):
         st = self._bins.pop(f_hz, None)
         if not st:
             return
+        if st.get('bin_seq'):
+            log.info("ITILA bin %d close %.1f kHz", st['bin_seq'], f_hz / 1000.0)
+            self._closed.append(SpotIntent(call='', freq_khz=f_hz / 1000.0, snr_db=0.0, wpm=0,
+                                           is_runner=False, bin_seq=st['bin_seq'], closed=True))
         lib = _get_itila_lib()
         if lib:
             for h in (st['h100'], st['h200']):
@@ -6783,6 +6842,8 @@ class SpotIntent:
     bin_id:    int = 0     # id(bin_state) — stable for bin lifetime
     window_text: str = ''  # spot_rule "repeat": whole decoded text, call empty
     snr500: float = None   # itila2_snr_decoder: SNR in 500 Hz the spot reports; snr_db still ranks copies
+    bin_seq: int = 0       # spot_rule_gates: the bin's never-reused id
+    closed: bool = False   # spot_rule_gates: the bin closed; its buffer goes
 
 
 def _emit_intent(st, f_khz, call, wpm, is_runner, raw_text=''):
@@ -6806,9 +6867,14 @@ def _emit_intent(st, f_khz, call, wpm, is_runner, raw_text=''):
 def _emit_window(st, f_khz, raw, wpm, window_key):
     """spot_rule "repeat": queue one decoded text of a window for RepeatSpotRule.
     Both LPF paths of a window share window_key, so they count as one sighting."""
+    if st.get('logged_window') != window_key:     # one line per window: replays rebuild bins exactly
+        st['logged_window'] = window_key
+        log.info("ITILA window %s bin %d %.1f kHz snr %.1f snr500 %s", window_key, st.get('bin_seq', 0), f_khz,
+                 st['snr'], st.get('snr500'))
     st['pending'].append(SpotIntent(
         call='', freq_khz=f_khz, snr_db=st['snr'], wpm=wpm, is_runner=True,
-        window_id=window_key, bin_id=id(st), window_text=raw, snr500=st.get('snr500')))
+        window_id=window_key, bin_id=id(st), window_text=raw, snr500=st.get('snr500'),
+        bin_seq=st.get('bin_seq', 0)))
 
 
 class SpotTracker:
@@ -6853,6 +6919,7 @@ class SpotTracker:
         self.respot_interval = respot_interval
         self.spot_rule = None      # spot_rule.RepeatSpotRule when config spot_rule is "repeat"
         self.local_rule = None     # the local telnet port's rule (telnet_local_port), else None
+        self._pass_intents = {}    # spot_rule_gates: id(rule) -> {kHz: SpotIntent} of the current pass
         self.clock = time.time     # spot_rule's clock; file mode sets it to audio time
         self.fuzzy_min_cycles = fuzzy_min_cycles
         self.add_calls = add_calls or set()
@@ -7750,6 +7817,22 @@ class SpotTracker:
     # bands.  See _short_scp_exact_attempts below.
     SHORT_SCP_EXACT_TTL = 600
 
+    def flush_pass(self):
+        """spot_rule_gates: the spots held during one pass of every band's windows (gate 9 compares
+        all of them at once). Call once per collect pass; [] for the other rules."""
+        spots = []
+        for rule, stream in ((self.spot_rule, 'rbn'), (self.local_rule, 'local')):
+            if rule is None or not hasattr(rule, 'end_pass'):
+                continue
+            seen = self._pass_intents.pop(id(rule), {})
+            for call, f in rule.end_pass():
+                intent = seen.get(f)
+                if call in self.blacklist or intent is None:
+                    continue
+                spots.append({'call': call, 'freq_khz': f, 'snr': rule.spot_snr.get(call, intent.snr_db),
+                              'wpm': intent.wpm, 'method': 'repeat', 'stream': stream})
+        return spots
+
     def process_intent(self, intent):
         """Consume a structured SpotIntent from _ItilaScanner.
 
@@ -7765,6 +7848,11 @@ class SpotTracker:
         (extracted_call, is_runner, has_cq_context) to skip the
         re-parsing step.  Deferred until this wrapper proves stable.
         """
+        if intent.closed:
+            for rule in (self.spot_rule, self.local_rule):
+                if rule is not None and hasattr(rule, 'close_bin'):
+                    rule.close_bin(intent.bin_seq)
+            return []
         if intent.window_text:
             # Blacklisted calls never spot. No MAX_WPM check here: the rule never renames
             # a call, and CWT runners read 42-48 WPM (WG3J, NJ3K, N3AD, NT6Q, W8FJ).
@@ -7775,7 +7863,10 @@ class SpotTracker:
             for rule, stream in ((self.spot_rule, 'rbn'), (self.local_rule, 'local')):
                 if rule is None:
                     continue
-                w = rule.window_id(intent.bin_id, intent.window_id, now)
+                w = rule.window_id(intent.bin_seq if hasattr(rule, 'close_bin') else intent.bin_id,
+                                   intent.window_id, now)
+                if hasattr(rule, 'end_pass'):         # spot_rule_gates: spots come from flush_pass()
+                    self._pass_intents.setdefault(id(rule), {})[intent.freq_khz] = intent
                 spots += [{'call': call, 'freq_khz': f, 'snr': rule.spot_snr.get(call, intent.snr_db),
                            'wpm': intent.wpm, 'method': 'repeat', 'stream': stream}
                           for call, f in rule.feed(w, intent.freq_khz, intent.window_text, now,
@@ -9349,9 +9440,10 @@ class SparkGap:
                             'h100': None, 'h200': None, 'pending': [],
                             'wpm': 0, 'snr': 0.0, 'text_buf': '',
                             'spotted': set(), 'last_cq_time': 0.0,
-                            'window_id_next': 0,
+                            'window_id_next': 0, 'bin_seq': _new_bin_seq(f_hz),
                         }
                     st = scanner._bins[f_hz]
+                    st['c_seen'] = time.time()   # its C bin is alive: see collect()
                     st['snr'] = snr
                     if _snr_decoder:
                         st['snr500'] = snr500
@@ -9472,14 +9564,17 @@ class SparkGap:
             # Collect decoder output from every band — spots to shared telnet
             # ----------------------------------------------------------------
             max_spot_wpm = self.cfg.get('max_spot_wpm', 0)  # 0 = unlimited
-            for (_band_name, _center_hz, _rx_idx), mgr in zip(self._band_meta, self.managers):
-                results = mgr.collect_all()
+            for (_band_name, _center_hz, _rx_idx), mgr in [*zip(self._band_meta, self.managers),
+                                                           ((None, None, None), None)]:
+                results = mgr.collect_all() if mgr is not None else [_PASS_END]
                 for result in results:
                     # Dispatch on result type: ITILA scanner emits SpotIntent
                     # records (no text re-parsing needed); uhsdr/bmorse/hamfist
                     # emit legacy 7-tuples (streamed character text).  Both
                     # branches end up with a `spots` list handled uniformly.
-                    if isinstance(result, SpotIntent):
+                    if result is _PASS_END:
+                        spots = self.tracker.flush_pass()
+                    elif isinstance(result, SpotIntent):
                         if max_spot_wpm and result.wpm > max_spot_wpm:
                             log.debug("WPM cap: %.1f kHz %d WPM > %d, skipped",
                                       result.freq_khz, result.wpm, max_spot_wpm)
@@ -10347,9 +10442,11 @@ def run_file_mode(args, config):
                 audio_now[0] = t_start + pos / file_rate
 
             # Collect output periodically
-            results = manager.collect_all()
+            results = manager.collect_all() + [_PASS_END]
             for result in results:
-                if isinstance(result, SpotIntent):
+                if result is _PASS_END:
+                    spots = tracker.flush_pass()
+                elif isinstance(result, SpotIntent):
                     total_results += 1
                     spots = tracker.process_intent(result)
                 else:
@@ -10374,9 +10471,11 @@ def run_file_mode(args, config):
         # Final collect after all data fed — give decoders a moment to flush
         import time as _time
         _time.sleep(0.5)
-        results = manager.collect_all()
+        results = manager.collect_all() + [_PASS_END]
         for result in results:
-            if isinstance(result, SpotIntent):
+            if result is _PASS_END:
+                spots = tracker.flush_pass()
+            elif isinstance(result, SpotIntent):
                 total_results += 1
                 spots = tracker.process_intent(result)
             else:
