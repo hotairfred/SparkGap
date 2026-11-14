@@ -75,6 +75,9 @@ def tokens(text):
     t = text.lower().replace('x-ray', 'xray').replace('x ray', 'xray').replace('seek you', 'cq')
     t = re.sub(r'\bc\s*q\b', 'cq', t)
     t = re.sub(r'\bq\s*r\s*z\b', 'qrz', t)
+    # "CQ20, CQ20, November 2 ..." (11-12, RX888 20 m): Whisper writes CQ and the band as one word, and the
+    # call borrowed its 0 (0N2AIC for N2AIC). Split it so the band is a qualifier, as "CQ 20" already is.
+    t = re.sub(r'\bcq(dx|\d{1,3})\b', r'cq \1', t)
     t = re.sub(r"[^a-z0-9/' ]+", ' ', t)
     return t.split()
 
