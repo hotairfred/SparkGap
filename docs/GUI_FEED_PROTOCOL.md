@@ -83,7 +83,7 @@ Who this SparkGap is and the settings it runs with.
             "itila2_tone_lock_hz": null,
             "sample_rate": 96000, "flex_daxiq_channel": 2,
             "telnet_port": 7300, "enable_ft8": false, "enable_ft4": false,
-            "ftx_decoder": "ft8_lib", "jt9_depth": null,
+            "ftx_decoder": "ft8_lib", "jt9_depth": null, "enable_wspr": false,
             "spot_rule": "repeat", "spot_rule_cq_groups": true,
             "spot_rule_lockon": true, "spot_rule_cq_qualifiers": true,
             "spot_rule_split_runs": true, "spot_rule_contest_words": false,

@@ -1,0 +1,28 @@
+[Unit]
+Description=WSPRnet feeder for SparkGap WSPR spots
+After=network-online.target sparkgap.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sparkgap
+Group=sparkgap
+WorkingDirectory=/home/sparkgap/csdr-skimmer
+
+# Same broker as sparkgap.service (consumes skimmer/wspr/raw, posts each
+# spot to wsprnet.org/post/ as WSJT-X does).
+Environment="MQTT_HOST=YOUR_BROKER_IP"
+Environment="MQTT_PORT=1883"
+Environment="MQTT_USER=YOUR_MQTT_USER"
+Environment="MQTT_PASS=YOUR_MQTT_PASSWORD"
+
+ExecStart=/usr/bin/python3 /home/sparkgap/csdr-skimmer/wspr_feeder.py --call YOUR_CALL --grid YOUR_GRID
+
+StandardOutput=append:/tmp/wspr_feeder.log
+StandardError=append:/tmp/wspr_feeder.log
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
