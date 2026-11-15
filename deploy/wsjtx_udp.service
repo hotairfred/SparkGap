@@ -1,0 +1,28 @@
+[Unit]
+Description=SparkGap FT8, FT4 and WSPR decodes as WSJT-X UDP messages
+After=network-online.target sparkgap.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sparkgap
+Group=sparkgap
+WorkingDirectory=/home/sparkgap/csdr-skimmer
+
+# Same broker as sparkgap.service (reads skimmer/ft8/raw and skimmer/wspr/raw and
+# sends WSJT-X UDP messages; --to as often as needed, a multicast group works).
+Environment="MQTT_HOST=YOUR_BROKER_IP"
+Environment="MQTT_PORT=1883"
+Environment="MQTT_USER=YOUR_MQTT_USER"
+Environment="MQTT_PASS=YOUR_MQTT_PASSWORD"
+
+ExecStart=/usr/bin/python3 /home/sparkgap/csdr-skimmer/wsjtx_udp.py --call YOUR_CALL --grid YOUR_GRID --to 127.0.0.1:2237
+
+StandardOutput=append:/tmp/wsjtx_udp.log
+StandardError=append:/tmp/wsjtx_udp.log
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

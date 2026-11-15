@@ -18,7 +18,11 @@ Spot payload format (JSON over MQTT):
     "snr":     -5,            # signed integer dB
     "mode":    "FT8",         # mode string
     "msg":     "CQ N4DWD EM86",  # raw FT8 message (advisory)
-    "ts":      1714888777     # Unix epoch seconds
+    "ts":      1714888777,    # Unix epoch seconds
+    "dial_hz": 7074000,       # dial and audio offset (freq_hz = dial_hz + df_hz), for wsjtx_udp.py
+    "df_hz":   650,
+    "slot_ts": 1714888770.0,  # the slot's start and the decode's DT, when the IQ's time is known
+    "dt":      0.3
   }
 
 Run:
