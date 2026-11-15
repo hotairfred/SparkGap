@@ -274,8 +274,10 @@ can read SparkGap: GridTracker, JTAlert, N1MM Logger+, or the RBN Aggregator's F
 `skimmer/ft8/raw` (and `skimmer/wspr/raw` when WSPR is on) from the same broker and sends to
 127.0.0.1:2237 unless told otherwise (`--to HOST:PORT`, as many as you need; a multicast group
 such as 224.0.0.73:2237 works). Each band and mode is its own WSJT-X instance, named
-"SparkGap 20m FT8" and so on (`--id` sets the first word), because a WSJT-X instance has one dial:
-a Heartbeat and a Status every 15 s, one Decode per decode, and a Close when it stops or a band
+"SG 20m FT8" and so on, because a WSJT-X instance has one dial. `--name` sets the name from `{band}`,
+`{mode}`, `{dial}` (kHz) and `{call}` (default `"SG {band} {mode}"`; `"{band} {mode}"` is shorter
+still in GridTracker's tabs), and must hold the band or dial and the mode. Each instance sends a
+Heartbeat and a Status every 15 s, one Decode per decode, and a Close when it stops or a band
 has been quiet for 10 minutes. The program only sends; replies from those programs (call this
 station, halt Tx) are ignored, since there is no transmitter. `--dry-run` logs what it would
 send. `deploy/wsjtx_udp.service` is a systemd unit for it.

@@ -9,7 +9,7 @@ It reads the decodes SparkGap publishes on MQTT (skimmer/ft8/raw for FT8 and FT4
 the topics pskr_feeder.py and wspr_feeder.py read) and sends, per band and mode, what one WSJT-X instance
 would: a Heartbeat and a Status every 15 s (the dial frequency and mode), a Decode (or WSPRDecode) per
 decode, and a Close when it stops. Each band and mode is its own instance, named by --id with the band and
-mode after it ("SparkGap 20m FT8"), because a WSJT-X instance has one dial.
+mode in its name (--name, default "SG {band} {mode}": "SG 20m FT8"), because a WSJT-X instance has one dial.
 
 The wire format is WSJT-X's Network/NetworkMessage.hpp: a QDataStream (Qt 5.4, schema 2), big-endian.
 
@@ -143,9 +143,27 @@ def wspr_fields(msg):
     return call, grid, dbm
 
 
+DEFAULT_NAME = 'SG {band} {mode}'
+
+
+def instance_name(fmt, dial_hz, mode, call=''):
+    """The name of the instance for a dial and mode, from --name: 'SG {band} {mode}' -> 'SG 20m FT8'."""
+    return fmt.format(band=band_of(dial_hz / 1000), mode=mode, dial=f'{dial_hz / 1000:g}', call=call)
+
+
+def check_name(fmt):
+    """--name must tell the bands and modes apart (one instance per dial), and name only known fields."""
+    if '{mode}' not in fmt or ('{band}' not in fmt and '{dial}' not in fmt):
+        raise ValueError('--name must contain {mode} and {band} or {dial}, one instance per band and mode')
+    try:
+        instance_name(fmt, 14074000, 'FT8')
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(f'--name {fmt!r}: fields are {{band}} {{mode}} {{dial}} {{call}} ({e})') from None
+
+
 class Sender:
-    def __init__(self, dests, ident, call, grid, version, dry_run=False, ttl=1):
-        self.dests, self.ident, self.call, self.grid = dests, ident, call, grid
+    def __init__(self, dests, name_fmt, call, grid, version, dry_run=False, ttl=1):
+        self.dests, self.name_fmt, self.call, self.grid = dests, name_fmt, call, grid
         self.version, self.dry_run = version, dry_run
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
@@ -166,7 +184,7 @@ class Sender:
 
     def instance(self, dial_hz, mode):
         """The instance for this dial and mode, announced (Heartbeat + Status) when it is new."""
-        name = f'{self.ident} {band_of(dial_hz / 1000)} {mode}'
+        name = instance_name(self.name_fmt, dial_hz, mode, self.call)
         with self.lock:
             it = self.inst.get(name)
             fresh = it is None or it['dial'] != dial_hz
@@ -225,7 +243,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--to', action='append', default=[], metavar='HOST:PORT',
                    help='where to send (repeat for more; a multicast address works); default 127.0.0.1:2237')
-    p.add_argument('--id', default='SparkGap', help='instance name, the band and mode follow it')
+    p.add_argument('--name', default=DEFAULT_NAME,
+                   help='instance name: {band} {mode} {dial} (kHz) {call}; must hold the band or dial, and the mode '
+                        '(default "%(default)s")')
     p.add_argument('--call', default='', help='your call, shown as DE call in the Status')
     p.add_argument('--grid', default='', help='your grid, shown as DE grid in the Status')
     p.add_argument('--version', default='SparkGap', help='version string in the Heartbeat')
@@ -243,7 +263,11 @@ def main():
     import paho.mqtt.client as mqtt
 
     dests = [parse_dest(s) for s in a.to] or [('127.0.0.1', 2237)]
-    snd = Sender(dests, a.id, a.call.upper(), a.grid, a.version, a.dry_run, a.ttl)
+    try:
+        check_name(a.name)
+    except ValueError as e:
+        p.error(str(e))
+    snd = Sender(dests, a.name, a.call.upper(), a.grid, a.version, a.dry_run, a.ttl)
     topics = {'skimmer/ft8/raw': snd.on_ftx}
     if not a.no_wspr:
         topics['skimmer/wspr/raw'] = snd.on_wspr

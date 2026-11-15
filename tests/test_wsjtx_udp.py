@@ -40,8 +40,8 @@ class Reader:
 
 
 def test_decode_message() -> None:
-    r = Reader(w.decode('SparkGap 20m FT8', 1792605645.0, -5, 0.3, 1803, 'FT8', 'CQ N4DWD EM86'))
-    assert r.head() == (w.DECODE, 'SparkGap 20m FT8')
+    r = Reader(w.decode('SG 20m FT8', 1792605645.0, -5, 0.3, 1803, 'FT8', 'CQ N4DWD EM86'))
+    assert r.head() == (w.DECODE, 'SG 20m FT8')
     assert r.take('?') is True
     assert r.take('I') == (1792605645 % 86400) * 1000           # ms since UTC midnight
     assert (r.take('i'), r.take('d'), r.take('I')) == (-5, 0.3, 1803)
@@ -72,7 +72,7 @@ def test_wspr_message() -> None:
 
 
 def _sender():
-    s = w.Sender([], 'SparkGap', 'WF8Z', 'EM79', 'test')
+    s = w.Sender([], w.DEFAULT_NAME, 'WF8Z', 'EM79', 'test')
     s.pkts = []
     s.send = lambda pkt, what='': s.pkts.append(Reader(pkt).head())
     return s
@@ -85,13 +85,13 @@ def test_one_instance_per_band_and_mode_announced_once() -> None:
     s.on_ftx(p)
     s.on_ftx(dict(p, msg='CQ K4DB EM84'))
     s.on_ftx(dict(p, mode='FT4', dial_hz=14080000, freq_hz=14081500, df_hz=1500))
-    assert s.pkts == [(w.HEARTBEAT, 'SparkGap 20m FT8'), (w.STATUS, 'SparkGap 20m FT8'),
-                      (w.DECODE, 'SparkGap 20m FT8'), (w.DECODE, 'SparkGap 20m FT8'),
-                      (w.HEARTBEAT, 'SparkGap 20m FT4'), (w.STATUS, 'SparkGap 20m FT4'),
-                      (w.DECODE, 'SparkGap 20m FT4')]
+    assert s.pkts == [(w.HEARTBEAT, 'SG 20m FT8'), (w.STATUS, 'SG 20m FT8'),
+                      (w.DECODE, 'SG 20m FT8'), (w.DECODE, 'SG 20m FT8'),
+                      (w.HEARTBEAT, 'SG 20m FT4'), (w.STATUS, 'SG 20m FT4'),
+                      (w.DECODE, 'SG 20m FT4')]
     s.pkts.clear()
     s.close_all()
-    assert sorted(s.pkts) == [(w.CLOSE, 'SparkGap 20m FT4'), (w.CLOSE, 'SparkGap 20m FT8')]
+    assert sorted(s.pkts) == [(w.CLOSE, 'SG 20m FT4'), (w.CLOSE, 'SG 20m FT8')]
 
 
 def test_payload_without_dial_uses_the_standard_dial() -> None:
@@ -126,3 +126,13 @@ def test_cycle_publishes_dial_offset_slot_and_dt(monkeypatch) -> None:
     assert (d['dial_hz'], d['df_hz']) == (14074000, 1803)
     assert d['slot_ts'] % 15 == 0 and -1.5 < d['dt'] < 2.5
     assert w.ftx_spot(d)[:2] == (14074000, 1803)
+
+
+def test_instance_names() -> None:
+    assert w.instance_name(w.DEFAULT_NAME, 14074000, 'FT8') == 'SG 20m FT8'
+    assert w.instance_name('{band}{mode}', 7047500, 'FT4') == '40mFT4'
+    assert w.instance_name('{call} {dial}', 7047500, 'FT4', 'WF8Z') == 'WF8Z 7047.5'
+    w.check_name('SparkGap {band} {mode}')
+    for bad in ('SG', 'SG {band}', 'SG {mode}', 'SG {band} {mode} {nope}', 'SG {band} {mode} {'):
+        with pytest.raises(ValueError):
+            w.check_name(bad)
