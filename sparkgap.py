@@ -2737,11 +2737,13 @@ _PASS_END = object()               # spot_rule_gates: ends one collect pass of e
 
 
 _gates_on = False   # spot_rule_gates: set when the gate rule is built
+_DUMP_WINDOWS = bool(os.environ.get('ITILA2_DUMP_WINDOWS'))   # bin and window lines, for log replays
 
 
 def _new_bin_seq(f_hz):
     n = next(_bin_seq)
-    log.info("ITILA bin %d open %.1f kHz", n, f_hz / 1000.0)
+    if _DUMP_WINDOWS:
+        log.info("ITILA bin %d open %.1f kHz", n, f_hz / 1000.0)
     return n
 
 def _select_spot_rule(name):
@@ -4636,7 +4638,8 @@ class _ItilaScanner:
         if not st:
             return
         if st.get('bin_seq'):
-            log.info("ITILA bin %d close %.1f kHz", st['bin_seq'], f_hz / 1000.0)
+            if _DUMP_WINDOWS:
+                log.info("ITILA bin %d close %.1f kHz", st['bin_seq'], f_hz / 1000.0)
             self._closed.append(SpotIntent(call='', freq_khz=f_hz / 1000.0, snr_db=0.0, wpm=0,
                                            is_runner=False, bin_seq=st['bin_seq'], closed=True))
         lib = _get_itila_lib()
@@ -6867,7 +6870,7 @@ def _emit_intent(st, f_khz, call, wpm, is_runner, raw_text=''):
 def _emit_window(st, f_khz, raw, wpm, window_key):
     """spot_rule "repeat": queue one decoded text of a window for RepeatSpotRule.
     Both LPF paths of a window share window_key, so they count as one sighting."""
-    if st.get('logged_window') != window_key:     # one line per window: replays rebuild bins exactly
+    if _DUMP_WINDOWS and st.get('logged_window') != window_key:     # one line per window: replays rebuild bins exactly
         st['logged_window'] = window_key
         log.info("ITILA window %s bin %d %.1f kHz snr %.1f snr500 %s", window_key, st.get('bin_seq', 0), f_khz,
                  st['snr'], st.get('snr500'))

@@ -191,22 +191,29 @@ def test_5_up_is_no_keyword() -> None:
     assert keyword_calls(tokens("TU UP LA9GX 5NN A LA9GX LA9GX 5NN")) == []
 
 
-def test_9_stronger_copy_on_another_band() -> None:
-    r = _rule()
-    _feed(r, "CQ WX7V WX7V", t=0, f=7052.0, snr=88.0)
-    assert _feed(r, "CQ WX7V WX7V", t=20, f=28024.3, snr=11.0) == [] and _why(r, "WX7V") == 9
+def test_9_a_copy_on_another_band_does_not_block() -> None:
+    r = _rule()                   # CQWW: multi-ops CQ on two bands at once (hotairfred#173)
+    _feed(r, "CQ K3LR K3LR", t=0, f=14025.0, snr=20.0)
+    assert _feed(r, "CQ K3LR K3LR", t=20, f=21025.0, snr=18.0) == ["K3LR"]
+
+
+def test_9_both_bands_of_one_pass_spot() -> None:
+    r = _rule()                   # WebRX 11-14 13:46Z, OK/OM DX: OM3GI on 15 and 10 m, confirmed
+    for f, snr in ((21012.3, 20.0), (28013.8, 18.0)):
+        r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ TEST OM3GI OM3GI", 0.0, snr)
+    assert sorted(r.end_pass()) == [("OM3GI", 21012.3), ("OM3GI", 28013.8)]
 
 
 def test_9_images_fed_before_the_real_copy_in_one_pass() -> None:
     r = _rule()
-    for f, snr in ((28024.3, 33.0), (21038.1, 17.0), (14056.0, 10.0), (7052.0, 88.0)):
+    for f, snr in ((7036.0, 17.0), (7061.5, 10.0), (7052.0, 88.0)):
         r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
     assert [(c, f) for c, f in r.end_pass()] == [("WX7V", 7052.0)]
 
 
 def test_9_images_within_6_db_of_each_other_spot_none() -> None:
     r = _rule()                               # WebRX 11-14 00:21:45Z, LakeDog on 7061
-    copies = ((21004.1, 12.3), (21004.3, 12.4), (14016.2, 12.0), (21000.1, 15.1), (7036.0, 17.2))
+    copies = ((21004.1, 12.3), (21004.3, 12.4), (21000.1, 15.1))   # the 15 m copies
     for f, snr in copies:
         r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
     assert r.end_pass() == []
@@ -214,11 +221,10 @@ def test_9_images_within_6_db_of_each_other_spot_none() -> None:
 
 def test_9_ranks_by_the_reported_snr() -> None:
     r = _rule()                   # WebRX 11-14 05:26:20Z, LakeDog on 7060
-    for f, snr, rep in ((28060.0, 26.2, 35.9), (21050.1, 26.4, 24.7), (28025.2, 26.5, 22.7),
-                        (14000.1, 20.0, 14.2), (7060.0, 19.8, 91.3)):
+    for f, snr, rep in ((28060.0, 26.2, 35.9), (28025.2, 26.5, 22.7)):   # the 10 m copies
         win = r.window_id(round(f * 10), 1, 0.0)
         r.feed(win, f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr, rep)
-    assert r.end_pass() == [("WX7V", 7060.0)]
+    assert r.end_pass() == [("WX7V", 28060.0)]
 
 
 def test_2_bad_calls_file(tmp_path) -> None:
@@ -286,3 +292,15 @@ def test_trace_and_last_spots_are_bounded() -> None:
     assert _feed(r, "CQ K1ABC K1ABC", t=0, w=1) == ["K1ABC"]
     _feed(r, "CQ DL1XYZ DL1XYZ", t=700, f=7030.0, w=2)
     assert all(c != "K1ABC" for c, _ in r._last_spot)
+
+
+def test_window_lines_only_with_itila2_dump_windows(monkeypatch, caplog) -> None:
+    import sparkgap
+    st = {'snr': 12.0, 'pending': [], 'bin_seq': 7}
+    with caplog.at_level("INFO", logger=sparkgap.log.name):
+        sparkgap._emit_window(st, 14030.0, "CQ K1ABC", 25, 1)
+        monkeypatch.setattr(sparkgap, "_DUMP_WINDOWS", True)
+        sparkgap._emit_window(st, 14030.0, "CQ K1ABC", 25, 2)
+    assert [r.getMessage() for r in caplog.records if "ITILA window" in r.getMessage()] == \
+        ["ITILA window 2 bin 7 14030.0 kHz snr 12.0 snr500 None"]
+    assert len(st['pending']) == 2

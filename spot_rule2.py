@@ -20,9 +20,9 @@ checked in this order; a call not spotted is dropped by the first gate that is f
                        call right before DE is being called (CQ S52Y DE N8EM); a read followed
                        by its exchange is a QSO, never tied
   8 Own keyword        the keyword does not come right after another call (K1ABC TEST DL1XYZ)
-  9 Strongest          the copy beats every other copy of the call more than 1 kHz away, on any
-                       band, in the last 60 s by 6 dB; a tie spots none (a local transmitter's
-                       images)
+  9 Strongest          the copy beats every other copy of the call more than 1 kHz away on the
+                       same band, in the last 60 s by 6 dB; a tie spots none (a multi-op on two
+                       bands spots on both; a node's own call goes in BadCalls.txt)
  10 Re-spot            not spotted on this band in the last 10 minutes, unless moved 1 kHz
  11 Window             the frequency is inside the configured CW segments and outside every
                        range in the Notched Freqs file
@@ -66,6 +66,7 @@ PRUNE_S = 60.0                # window ids are pruned this often (as spot_rule.p
 STRUCT_RE = re.compile(r"^(?:[A-Z]{1,2}|[0-9][A-Z]{1,2})[0-9]{1,4}[A-Z]{1,6}$")   # gate 1
 MOVE_KHZ = 1.0                # gates 9 and 10: a move this large is another frequency
 STRONGER_S = 60.0             # gate 9: a stronger copy this recent
+SAME_BAND_KHZ = 600.0         # gate 9: copies this close share a band (CW segments < 300 kHz)
 STRONGER_DB = 6.0
 BEACON_KHZ = 5.0              # gate 12: a listed beacon within this of its frequency
 NCDXF = frozenset({"4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O", "VR2B",
@@ -228,7 +229,7 @@ class GateSpotRule:
         # bin -> {window: text}, oldest first
         self._bins: dict[int, dict[int, str]] = {}
         self._win_bin: dict[int, int] = {}
-        self._reads: list[tuple[float, str, float, float]] = []    # (t, call, kHz, SNR) for gate 10
+        self._reads: deque[tuple[float, str, float, float]] = deque()  # (t, call, kHz, SNR): gate 9
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}
         # gate 9: calls that passed every gate this pass, spotted by end_pass()
         self._held: list[tuple[float, str, float, float | None, float | None]] = []
@@ -252,7 +253,8 @@ class GateSpotRule:
         return req == 0
 
     def _expire(self, now: float) -> None:
-        self._reads = [r for r in self._reads if now - r[0] <= STRONGER_S]
+        while self._reads and now - self._reads[0][0] > STRONGER_S:
+            self._reads.popleft()
         if now - self._pruned >= PRUNE_S:
             self._pruned = now
             self._last_spot = {k: v for k, v in self._last_spot.items() if now - v[0] < RESPOT_S}
@@ -299,7 +301,7 @@ class GateSpotRule:
              snr: float | None = None, report: float | None = None) -> list[tuple[str, float]]:
         """One decoded text of a window. A call that passes every gate is held, not returned:
         end_pass() spots it once every window decoded in the same pass is in (gate 9 then sees a
-        stronger copy on another band whatever order the bands were fed in). A window decoded
+        stronger copy in another bin whatever order the bins were fed in). A window decoded
         more than once (the two filter paths) keeps its latest text."""
         self._expire(now)
         text = " ".join(tokens(split_runs(text, de_rejoin=True)))     # CQCQDE -> CQ CQ DE
@@ -320,11 +322,12 @@ class GateSpotRule:
         return []
 
     def _stronger(self, call: str, f: float, snr: float | None) -> bool:
-        """Gate 9: another copy of the call more than 1 kHz away, on any band, that this copy does
-        not beat by 6 dB: a stronger copy, or a tie (one station is not on two frequencies)."""
+        """Gate 9: another copy of the call more than 1 kHz away on the same band, that this copy
+        does not beat by 6 dB: a stronger copy, or a tie (one station is not on two frequencies of
+        a band)."""
         return (self.stronger_db is not None and snr is not None
-                and any(c == call and abs(rf - f) > MOVE_KHZ and rs > snr - self.stronger_db
-                        for _, c, rf, rs in self._reads))
+                and any(c == call and MOVE_KHZ < abs(rf - f) < SAME_BAND_KHZ
+                        and rs > snr - self.stronger_db for _, c, rf, rs in self._reads))
 
     def end_pass(self) -> list[tuple[str, float]]:
         """Spot the calls held this pass: gates 9 and 10 again, now that every window of the
