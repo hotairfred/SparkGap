@@ -25,9 +25,15 @@ Spot payload format (JSON over MQTT):
     "dt":      0.3
   }
 
+CW and RTTY (--telnet HOST:PORT, off unless given): the spots SparkGap's cluster telnet port sends,
+the same CQ-tagged CW and RTTY spots the RBN feeders upload (rbn_feeder.uploadable: never a caller),
+reported as mode CW or RTTY with no grid. Each call at most once per mode and band in DEDUP_TIMEOUT.
+
 Run:
   python3 pskr_feeder.py --call WF8Z --grid EM79SM --dry-run    # test
   python3 pskr_feeder.py --call WF8Z --grid EM79SM              # live
+  python3 pskr_feeder.py --call WF8Z --grid EM79SM --telnet 127.0.0.1:7300   # and CW + RTTY
+  python3 pskr_feeder.py --call WF8Z --grid EM79SM --telnet 127.0.0.1:7300 --no-mqtt   # CW + RTTY only
 """
 import argparse
 import json
@@ -36,10 +42,11 @@ import os
 import random
 import socket
 import struct
+import threading
 import time
 from collections import deque
 
-import paho.mqtt.client as mqtt
+import rbn_feeder
 
 
 # === PSKReporter protocol constants (from WSJT-X PSKReporter.cpp) ===
@@ -196,7 +203,59 @@ class PSKReporterFeeder:
         self.endpoint = (args.host, args.port)
         self.log = logging.getLogger('pskr_feeder')
         self.totals = {'queued': 0, 'sent_spots': 0, 'deduped': 0,
-                       'packets_sent': 0, 'send_errors': 0}
+                       'packets_sent': 0, 'send_errors': 0, 'telnet_queued': 0}
+        self.lock = threading.Lock()               # the MQTT and telnet threads both queue
+
+    def on_telnet_line(self, text, now=None):
+        """One line of SparkGap's cluster telnet: a CQ-tagged CW or RTTY spot is queued, each call once
+        per mode and band in DEDUP_TIMEOUT (FT8 and FT4 come over MQTT instead). Returns the spot or None."""
+        spot = rbn_feeder.parse_spot(text)
+        if not rbn_feeder.uploadable(spot):
+            return None
+        now = time.time() if now is None else now
+        freq_hz = round(spot['freq'] * 1000)
+        key = (spot['call'], spot['mode'], freq_hz // 1_000_000)
+        with self.lock:
+            if key in self.dedup_cache and now - self.dedup_cache[key] < DEDUP_TIMEOUT:
+                self.totals['deduped'] += 1
+                return None
+            self.dedup_cache[key] = now
+            out = {'call': spot['call'], 'grid': '', 'freq_hz': freq_hz, 'snr': spot['snr'],
+                   'mode': spot['mode'], 'ts': int(now)}
+            self.spot_queue.append(out)
+            self.totals['queued'] += 1
+            self.totals['telnet_queued'] += 1
+        return out
+
+    def read_telnet(self, host, port, stop):
+        """SparkGap's cluster telnet, logged in as --call, each line to on_telnet_line; reconnects."""
+        while not stop.is_set():
+            try:
+                with socket.create_connection((host, port), timeout=60) as s:
+                    self.log.info('telnet %s:%d connected (CW and RTTY spots)', host, port)
+                    time.sleep(0.5)
+                    s.settimeout(2)
+                    try:
+                        s.recv(4096)                       # the banner / callsign prompt
+                    except TimeoutError:
+                        pass
+                    s.settimeout(300)
+                    s.sendall(f'{self.args.call}\r\n'.encode('ascii'))
+                    buf = b''
+                    while not stop.is_set():
+                        chunk = s.recv(8192)
+                        if not chunk:
+                            self.log.warning('telnet %s:%d closed', host, port)
+                            break
+                        buf += chunk
+                        while b'\n' in buf:
+                            line, buf = buf.split(b'\n', 1)
+                            text = line.decode('ascii', errors='replace')
+                            if 'DX de' in text:
+                                self.on_telnet_line(text)
+            except OSError as e:
+                self.log.warning('telnet %s:%d: %s, reconnecting in 10 s', host, port, e)
+            stop.wait(10)
 
     def on_mqtt_msg(self, client, userdata, msg, properties=None):
         try:
@@ -211,13 +270,14 @@ class PSKReporterFeeder:
             return
         # 5-min per-call dedup
         now = time.time()
-        last = self.dedup_cache.get(spot['call'], 0)
-        if now - last < DEDUP_TIMEOUT:
-            self.totals['deduped'] += 1
-            return
-        self.dedup_cache[spot['call']] = now
-        self.spot_queue.append(spot)
-        self.totals['queued'] += 1
+        with self.lock:
+            last = self.dedup_cache.get(spot['call'], 0)
+            if now - last < DEDUP_TIMEOUT:
+                self.totals['deduped'] += 1
+                return
+            self.dedup_cache[spot['call']] = now
+            self.spot_queue.append(spot)
+            self.totals['queued'] += 1
         self.log.debug('queued %s @ %d Hz, %s grid', spot['call'],
                        spot['freq_hz'], spot.get('grid', '?'))
 
@@ -258,8 +318,9 @@ class PSKReporterFeeder:
         try:
             while self.spot_queue or (first_packet and include_templates):
                 spots = []
-                while self.spot_queue and len(spots) < SPOTS_PER_PACKET:
-                    spots.append(self.spot_queue.popleft())
+                with self.lock:
+                    while self.spot_queue and len(spots) < SPOTS_PER_PACKET:
+                        spots.append(self.spot_queue.popleft())
                 # Only include templates on the FIRST packet of this tick
                 templates_this_packet = include_templates and first_packet
                 self._send_packet(spots, include_templates=templates_this_packet)
@@ -273,23 +334,33 @@ class PSKReporterFeeder:
             self.last_send_ts = now
             # Trim dedup cache (entries older than 10 min)
             cutoff = now - 600
-            self.dedup_cache = {k: v for k, v in self.dedup_cache.items() if v >= cutoff}
+            with self.lock:
+                self.dedup_cache = {k: v for k, v in self.dedup_cache.items() if v >= cutoff}
         except Exception as e:
             self.log.error('send failed: %s', e)
             self.totals['send_errors'] += 1
 
     def run(self):
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                             client_id='pskr_feeder')
-        if self.args.mqtt_user:
-            client.username_pw_set(self.args.mqtt_user, self.args.mqtt_pass or '')
-        client.on_message = self.on_mqtt_msg
-        client.connect(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
-        client.subscribe(self.args.topic, qos=0)
-        client.loop_start()
-        self.log.info('PSKR feeder up: subscribed to %s on %s:%d, '
-                      'sending to %s:%d (%s)',
-                      self.args.topic, self.args.mqtt_host, self.args.mqtt_port,
+        client = None
+        if not self.args.no_mqtt:
+            import paho.mqtt.client as mqtt
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                 client_id='pskr_feeder')
+            if self.args.mqtt_user:
+                client.username_pw_set(self.args.mqtt_user, self.args.mqtt_pass or '')
+            client.on_message = self.on_mqtt_msg
+            client.connect(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
+            client.subscribe(self.args.topic, qos=0)
+            client.loop_start()
+        stop = threading.Event()
+        for hp in self.args.telnet:
+            host, _, port = hp.rpartition(':')
+            threading.Thread(target=self.read_telnet, args=(host or '127.0.0.1', int(port), stop),
+                             daemon=True, name='telnet').start()
+        self.log.info('PSKR feeder up: %s%s, sending to %s:%d (%s)',
+                      'no MQTT' if client is None else
+                      f'subscribed to {self.args.topic} on {self.args.mqtt_host}:{self.args.mqtt_port}',
+                      ''.join(f', CW/RTTY from telnet {hp}' for hp in self.args.telnet),
                       self.args.host, self.args.port,
                       'DRY-RUN' if self.args.dry_run else 'LIVE')
         last_status = time.time()
@@ -303,13 +374,15 @@ class PSKReporterFeeder:
                 time.sleep(2)
         except KeyboardInterrupt:
             self.log.info('shutdown — final totals: %s', self.totals)
-            client.loop_stop()
-            client.disconnect()
+            stop.set()
+            if client is not None:
+                client.loop_stop()
+                client.disconnect()
 
 
 def main():
     p = argparse.ArgumentParser(
-        description='PSKReporter feeder for SparkGap FT8 spots')
+        description='PSKReporter feeder for SparkGap FT8/FT4 spots, and CW/RTTY with --telnet')
     # Receiver identity
     p.add_argument('--call', required=True, help='Your callsign (e.g. WF8Z)')
     p.add_argument('--grid', required=True, help='Your grid square (e.g. EM79SM)')
@@ -335,12 +408,19 @@ def main():
                    help='MQTT password (env: MQTT_PASS)')
     p.add_argument('--topic', default='skimmer/ft8/raw',
                    help='MQTT topic to subscribe')
+    p.add_argument('--no-mqtt', action='store_true',
+                   help='no MQTT (no FT8/FT4): only the --telnet CW and RTTY spots')
+    p.add_argument('--telnet', action='append', default=[], metavar='HOST:PORT',
+                   help="also report the CW and RTTY CQ spots of SparkGap's cluster telnet port "
+                        '(e.g. 127.0.0.1:7300; repeat for more)')
     # Modes
     p.add_argument('--dry-run', action='store_true',
                    help='Encode + log packets, do NOT send to PSKReporter')
     p.add_argument('--log-level', default='INFO',
                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = p.parse_args()
+    if args.no_mqtt and not args.telnet:
+        p.error('--no-mqtt needs --telnet: nothing to report')
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format='%(asctime)s %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')

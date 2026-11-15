@@ -283,6 +283,11 @@ connects at its first FT8 decode; if the broker can't be reached then, it logs `
 publisher init failed (will not retry)` and runs on without FT8 uploads until it is restarted.
 CW and RTTY spots don't use MQTT.
 
+`pskr_feeder.py --telnet 127.0.0.1:7300` also reports CW and RTTY to PSKReporter (off unless given): the
+CQ-tagged CW and RTTY spots of SparkGap's cluster telnet port, the same ones the RBN feeders upload
+(never a caller), as mode CW or RTTY, each call once per mode and band in 5 minutes. `--no-mqtt` with
+`--telnet` reports CW and RTTY alone, with no broker.
+
 ### WSJT-X UDP (GridTracker, JTAlert, N1MM, Aggregator)
 
 `wsjtx_udp.py` sends the same decodes as WSJT-X's UDP messages, so programs written for WSJT-X
