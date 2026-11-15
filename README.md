@@ -99,7 +99,11 @@ from one contest weekend. The harness to reproduce them is in `tools/eval/` and 
   for about a third of a core over 9 bands (depth 2: about 75% more for about 1.4 cores). With
   `"enable_wspr": true` each band's WSPR frequency is decoded every 2 minutes with WSJT-X's `wsprd` (install WSJT-X, or set
   `wsprd_path`; `wspr_deep` for its deeper search), and `wspr_feeder.py` uploads the spots to WSPRnet, which
-  feeds wspr.live and the balloon trackers.
+  feeds wspr.live and the balloon trackers. `"enable_fst4w": true` decodes the same 2 minutes as FST4W-120
+  with WSJT-X's `jt9 -W` (`jt9_path`, `fst4w_depth` 1-3, default 2; under half a second per band when
+  nothing is there); its spots go to WSPRnet as FST4W. On HF FST4W is about 2% of WSPR's spots (wspr.live,
+  a week in November 2026: 35-76 transmitters a band on 80-20m). The 5, 15 and 30 minute FST4W periods
+  are not decoded.
 - **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
   transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
   is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of
@@ -143,6 +147,7 @@ Off unless set, except where a default is given:
 | `itila_max_bins` | Most bins at once per band |
 | `ftx_decoder`, `jt9_depth` | `jt9` decodes FT8 and FT4 with WSJT-X's own decoder instead of `decode_ft8` (above); depth 1 (default) to 3 |
 | `enable_wspr`, `wsprd_path`, `wspr_deep` | Decode each band's WSPR frequency every 2 minutes with WSJT-X's `wsprd` (above) |
+| `enable_fst4w`, `jt9_path`, `fst4w_depth` | Decode the same 2 minutes as FST4W-120 with WSJT-X's `jt9` (above) |
 | `ft8_windows`, `ft8_band_cut` | `aligned` FT8 windows around each slot (keep the PC clock synced) or `sliding`; `fft` or `resample` band cut |
 
 Work in progress is in the [open pull requests](https://github.com/hotairfred/SparkGap/pulls).
@@ -290,11 +295,11 @@ send. `deploy/wsjtx_udp.service` is a systemd unit for it.
 SparkGap decodes a minute at a time, so a minute's decodes arrive together, a few seconds after
 the minute, each stamped with its own slot time and DT.
 
-### WSPRnet (WSPR)
+### WSPRnet (WSPR, FST4W)
 
-With `enable_wspr`, each WSPR decode is published on MQTT topic `skimmer/wspr/raw` (same broker as FT8), and
+With `enable_wspr` (and `enable_fst4w`), each WSPR (and FST4W) decode is published on MQTT topic `skimmer/wspr/raw` (same broker as FT8), and
 `wspr_feeder.py --call YOUR_CALL --grid YOUR_GRID` posts each one to WSPRnet the way WSJT-X does: one form
-post per spot to `wsprnet.org/post/`, only the message shapes WSJT-X sends. `--dry-run` logs what it would
+post per spot to `wsprnet.org/post/`, only the message shapes WSJT-X sends, FST4W-120 as mode 3 as WSJT-X marks it. `--dry-run` logs what it would
 post; `deploy/wspr_feeder.service` is the unit. Like FT8, WSPR needs 192 kHz.
 
 ### RBN
