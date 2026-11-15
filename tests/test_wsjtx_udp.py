@@ -136,3 +136,15 @@ def test_instance_names() -> None:
     for bad in ('SG', 'SG {band}', 'SG {mode}', 'SG {band} {mode} {nope}', 'SG {band} {mode} {'):
         with pytest.raises(ValueError):
             w.check_name(bad)
+
+
+def test_fst4w_goes_as_a_decode() -> None:
+    s = _sender()
+    seen = []
+    s.send = lambda pkt, what='': seen.append(pkt)
+    s.on_wspr({'snr': -24, 'dt': 0.5, 'freq_hz': 14097050, 'drift': 0, 'msg': 'K1ABC FN42 37',
+               'dial_hz': 14095600, 'ts': 1792605600, 'mode': 'FST4W', 'tr_s': 120})
+    r = Reader(seen[-1])
+    assert r.head() == (w.DECODE, 'SG 20m FST4W')
+    r.take('?'), r.take('I')
+    assert (r.take('i'), r.take('d'), r.take('I'), r.utf8(), r.utf8()) == (-24, 0.5, 1450, '`', 'K1ABC FN42 37')

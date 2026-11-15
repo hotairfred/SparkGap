@@ -32,8 +32,8 @@ SCHEMA = 2
 HEARTBEAT, STATUS, DECODE, CLEAR, REPLY, QSO_LOGGED, CLOSE = 0, 1, 2, 3, 4, 5, 6
 WSPR_DECODE = 10
 MAX_SCHEMA = 3
-DECODE_MODE = {'FT8': '~', 'FT4': '+'}      # the mode character WSJT-X puts in a Decode
-TR_PERIOD_S = {'FT8': 15, 'FT4': 7, 'WSPR': 120}
+DECODE_MODE = {'FT8': '~', 'FT4': '+', 'FST4W': '`'}   # the mode character WSJT-X puts in a Decode
+TR_PERIOD_S = {'FT8': 15, 'FT4': 7, 'WSPR': 120, 'FST4W': 120}
 log = logging.getLogger('wsjtx_udp')
 STATUS_EVERY_S = 15.0
 IDLE_CLOSE_S = 600.0                        # an instance silent this long is closed (its band went quiet)
@@ -224,7 +224,15 @@ class Sender:
         self.send(decode(name, slot, snr, dt, df, mode, msg), f'{name} {snr:+d} {dt:.1f} {df} {msg}')
 
     def on_wspr(self, d):
+        """A skimmer/wspr/raw decode: WSPR as a WSPRDecode; FST4W (enable_fst4w) as a Decode marked '`', as
+        WSJT-X sends its own FST4W decodes."""
         dial = int(d.get('dial_hz') or d['freq_hz'] // 1000 * 1000)
+        if d.get('mode') == 'FST4W':
+            if d.get('msg'):
+                name = self.instance(dial, 'FST4W')
+                self.send(decode(name, float(d.get('ts', time.time())), d.get('snr', 0), d.get('dt', 0.0),
+                                 int(d['freq_hz']) - dial, 'FST4W', d['msg']), f"{name} {d['msg']}")
+            return
         call, grid, dbm = wspr_fields(d.get('msg', ''))
         if not call:
             return

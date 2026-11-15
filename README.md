@@ -277,7 +277,8 @@ such as 224.0.0.73:2237 works). Each band and mode is its own WSJT-X instance, n
 "SG 20m FT8" and so on, because a WSJT-X instance has one dial. `--name` sets the name from `{band}`,
 `{mode}`, `{dial}` (kHz) and `{call}` (default `"SG {band} {mode}"`; `"{band} {mode}"` is shorter
 still in GridTracker's tabs), and must hold the band or dial and the mode. Each instance sends a
-Heartbeat and a Status every 15 s, one Decode per decode, and a Close when it stops or a band
+Heartbeat and a Status every 15 s, one Decode per decode (WSPR as a WSPRDecode, FST4W as a Decode as
+WSJT-X sends it), and a Close when it stops or a band
 has been quiet for 10 minutes. The program only sends; replies from those programs (call this
 station, halt Tx) are ignored, since there is no transmitter. `--dry-run` logs what it would
 send. `deploy/wsjtx_udp.service` is a systemd unit for it.
