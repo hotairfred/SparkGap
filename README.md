@@ -216,6 +216,13 @@ firmware and make sure it's reachable on your LAN. Copy `sk_5band.json` and edit
 }
 ```
 
+**6m.** `"6m"` in `bands` is 6m's CW segment, 50.000-50.100 MHz (centre 50.0768 at 192 kHz). FT8
+(50.313) and FT4 (50.318) are 200 kHz higher, too far for the same 192 kHz receiver, so they need a
+second one: `{"name": "6m digital", "center_khz": 50290}` (its span, 50.194-50.386, also holds WSPR's
+50.293 and MSK144's 50.260 and 50.380); `enable_ft8`, `enable_ft4` and `enable_wspr` decode its dials as
+on any band, and it decodes no CW. The receiver has to reach 50 MHz: an RX888 at 129.6 MHz sampling (`samprate =
+129m6` in radiod's `[rx888]`, see `radiod_sparkgap.example.conf`), a Red Pitaya or a Flex.
+
 `recent_band_floor.peers` ships empty. Any spot source you add there (another cluster on your
 LAN, RBN's telnet) is connected at start even with `gate_recent_band_floor` off.
 
