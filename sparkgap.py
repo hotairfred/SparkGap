@@ -90,6 +90,7 @@ def _gui_settings(cfg, sample_rate):
         'ftx_decoder': str(cfg.get('ftx_decoder', 'ft8_lib')).lower(),
         'jt9_depth': _jt9_depth(cfg) if str(cfg.get('ftx_decoder', '')).lower() == 'jt9' else None,
         'enable_wspr': bool(cfg.get('enable_wspr', False)),
+        'enable_fst4w': bool(cfg.get('enable_fst4w', False)),
         'spot_rule': rule,
         'spot_rule_cq_groups': repeat,         # _make_spot_rule: always on with the repeat rule
         'spot_rule_lockon': repeat,
@@ -759,6 +760,8 @@ FT4_DIALS_KHZ = (3575, 7047.5, 10140, 14080, 18104, 21140, 24919, 28180)
 # above the dial. Decoded by WSJT-X's wsprd from two minute snapshots joined (wspr_dial_khz, _wspr_decode).
 WSPR_DIALS_KHZ = (1836.6, 3568.6, 7038.6, 10138.7, 14095.6, 18104.6, 21094.6, 24924.6, 28124.6)
 _WSPR_LINE = re.compile(r"^\s*(\d{4})\s+(-?\d+)\s+(-?[\d.]+)\s+([\d.]+)\s+(-?\d+)\s+(\S.*?)\s*$")
+# jt9 -W (FST4W) output: "1800 -28  0.5 1520 `  K1ABC FN42 37": time, SNR, DT, audio Hz, the FST4 mark, message
+_FST4W_LINE = re.compile(r"^\s*(\d{4})\s+(-?\d+)\s+(-?[\d.]+)\s+(\d+)\s+`\s+(\S.*?)\s*$")
 FT8_CENTRE_DIALS = {3590: 3573, 7090: 7074, 10118: 10136, 14090: 14074, 18083: 18100,
                     21090: 21074, 24902: 24915, 28090: 28074}
 
@@ -786,16 +789,30 @@ def wspr_dial_khz(center_khz, fs=192000):
     return next((d for d in WSPR_DIALS_KHZ if center_khz - half <= d and d + 3.0 <= center_khz + half), None)
 
 
+def _fst4w_depth(cfg):
+    """fst4w_depth as 1-3; anything else (null, text) is 2, the default, with a warning."""
+    v = cfg.get('fst4w_depth', 2)
+    try:
+        return min(3, max(1, int(v)))
+    except (TypeError, ValueError):
+        log.warning("fst4w_depth %r is not 1, 2 or 3: using 2", v)
+        return 2
+
+
 def _wspr_decoder(cfg):
-    """enable_wspr: (wsprd program, deep search, work dir), else None. wsprd_path, default "wsprd" on the PATH
-    (WSJT-X installs it); wspr_deep runs wsprd -d (slower, a few more decodes)."""
-    if not cfg.get('enable_wspr', False):
+    """enable_wspr / enable_fst4w: (wsprd program or None, deep search, work dir, FST4W), else None.
+    wsprd_path, default "wsprd" on the PATH (WSJT-X installs it); wspr_deep runs wsprd -d (slower, a few more
+    decodes). enable_fst4w decodes the same 2 minutes as FST4W-120 with WSJT-X's jt9 -W: FST4W is (jt9 program,
+    depth) or None, jt9_path default "jt9", fst4w_depth 1-3 default 2."""
+    wspr, fst4w = bool(cfg.get('enable_wspr', False)), bool(cfg.get('enable_fst4w', False))
+    if not (wspr or fst4w):
         return None
     work = os.path.join(tempfile.gettempdir(), 'sparkgap_wspr_%d' % os.getpid())
     if not os.path.isdir(work):
         os.makedirs(work, exist_ok=True)
-        atexit.register(shutil.rmtree, work, True)     # wsprd's files go with the process
-    return (cfg.get('wsprd_path') or 'wsprd', bool(cfg.get('wspr_deep', False)), work)
+        atexit.register(shutil.rmtree, work, True)     # wsprd's and jt9's files go with the process
+    jt9 = (cfg.get('jt9_path') or 'jt9', _fst4w_depth(cfg)) if fst4w else None
+    return ((cfg.get('wsprd_path') or 'wsprd') if wspr else None, bool(cfg.get('wspr_deep', False)), work, jt9)
 
 
 def _minute_modes(cfg):
@@ -832,10 +849,12 @@ def _wspr_minute(x, late_s, fs=12000):
 
 
 def _wspr_decode(items, skimmer, wspr):
-    """Decode each (band, cycle minute, dial, 2 min of 12 kHz complex) with wsprd; log and publish each decode on
-    MQTT topic skimmer/wspr/raw (wspr_feeder.py uploads them to WSPRnet). Returns the decodes."""
+    """Decode each (band, cycle minute, dial, 2 min of 12 kHz complex) with wsprd, and as FST4W-120 with jt9 when
+    enable_fst4w is on; log and publish each decode on MQTT topic skimmer/wspr/raw (wspr_feeder.py uploads them to
+    WSPRnet). Returns the decodes."""
     import wave
-    prog, deep, work = wspr
+    prog, deep, work = wspr[:3]
+    fst4w = wspr[3] if len(wspr) > 3 else None
     total = 0
     try:
         for bn, minute, dial_khz, x in items:
@@ -855,18 +874,24 @@ def _wspr_decode(items, skimmer, wspr):
                 wf.setframerate(12000)
                 wf.writeframes((audio * 32767).astype(np.int16).tobytes())
             try:
-                r = subprocess.run([prog, '-f', f'{dial_khz / 1000.0:.6f}', '-a', d] + (['-d'] if deep else [])
-                                   + [fn], capture_output=True, text=True, timeout=110, cwd=d, check=False)
-            except (OSError, subprocess.SubprocessError) as e:
-                log.warning("WSPR %s: wsprd failed: %s", bn, e)
-                continue
+                out = ''
+                if prog:
+                    try:
+                        out = subprocess.run([prog, '-f', f'{dial_khz / 1000.0:.6f}', '-a', d]
+                                             + (['-d'] if deep else []) + [fn],
+                                             capture_output=True, text=True, timeout=110, cwd=d, check=False).stdout
+                    except (OSError, subprocess.SubprocessError) as e:
+                        log.warning("WSPR %s: wsprd failed: %s", bn, e)
+                if fst4w:
+                    total += _fst4w_decode(bn, fn, d, t, minute, dial_khz, fst4w)
             finally:
-                # the WAV, and wsprd's logs, which -a appends to every cycle (kept: its wisdom and the
-                # hash table of calls heard, which reads <call> messages)
-                for f in (fn, os.path.join(d, 'ALL_WSPR.TXT'), os.path.join(d, 'wspr_spots.txt')):
+                # the WAV, wsprd's logs, which -a appends to every cycle, and jt9's decoded.txt (kept: wsprd's
+                # wisdom and the hash tables of calls heard, which read <call> messages)
+                for f in (fn, os.path.join(d, 'ALL_WSPR.TXT'), os.path.join(d, 'wspr_spots.txt'),
+                          os.path.join(d, 'decoded.txt')):
                     with contextlib.suppress(OSError):
                         os.remove(f)
-            for line in (r.stdout or '').splitlines():
+            for line in (out or '').splitlines():
                 m = _WSPR_LINE.match(line)
                 if not m or line.startswith('<'):
                     continue
@@ -878,7 +903,7 @@ def _wspr_decode(items, skimmer, wspr):
                         pub.publish('skimmer/wspr/raw', json.dumps({
                             'date': time.strftime('%y%m%d', t), 'time': m[1], 'snr': int(m[2]),
                             'dt': float(m[3]), 'freq_hz': round(float(m[4]) * 1e6), 'drift': int(m[5]),
-                            'msg': m[6], 'dial_hz': round(dial_khz * 1000), 'ts': minute * 60,
+                            'msg': m[6], 'dial_hz': round(dial_khz * 1000), 'ts': minute * 60, 'mode': 'WSPR',
                         }), qos=0)
                     except (OSError, ValueError) as e:
                         log.debug("WSPR MQTT publish failed: %s", e)
@@ -917,6 +942,36 @@ def _jt9_args(jt9, mode):
     return (['-8', '-p', '15'] if mode == 'FT8' else ['-5', '-p', '7']) + ['-d', str(depth), '-a', work, '-t', work]
 
 
+def _fst4w_decode(bn, fn, d, t, minute, dial_khz, fst4w):
+    """enable_fst4w: one band's 2-minute WAV decoded as FST4W-120 with jt9 -W (1400-1600 Hz, the WSPR sub-band, as
+    WSJT-X); each decode logged and published on skimmer/wspr/raw with mode "FST4W". Returns the decodes."""
+    prog, depth = fst4w
+    try:
+        out = subprocess.run([prog, '-W', '-p', '120', '-f', '1500', '-F', '100', '-d', str(depth), '-a', d,
+                              '-t', d, fn], capture_output=True, text=True, timeout=110, cwd=d, check=False).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("FST4W %s: jt9 failed: %s", bn, e)
+        return 0
+    n = 0
+    for line in (out or '').splitlines():
+        m = _FST4W_LINE.match(line)
+        if not m:
+            continue
+        n += 1
+        log.info("FST4W %s: %s", bn, line.strip())
+        pub = _get_mqtt_publisher()
+        if pub is not None:
+            try:
+                pub.publish('skimmer/wspr/raw', json.dumps({
+                    'date': time.strftime('%y%m%d', t), 'time': m[1], 'snr': int(m[2]), 'dt': float(m[3]),
+                    'freq_hz': round(dial_khz * 1000) + int(m[4]), 'drift': 0, 'msg': m[5],
+                    'dial_hz': round(dial_khz * 1000), 'ts': minute * 60, 'mode': 'FST4W', 'tr_s': 120,
+                }), qos=0)
+            except (OSError, ValueError) as e:
+                log.debug("FST4W MQTT publish failed: %s", e)
+    return n
+
+
 # The minute cycle: FT8 then RTTY per band from one FFT, on a thread, for either receive path.
 def _ft8_decode(jobs, skimmer):
     # Whatever goes wrong in a cycle, the next minute must run.
@@ -937,6 +992,9 @@ def _ft8_cycle(jobs, skimmer):
     enable_ft4  = bool(skimmer.cfg.get('enable_ft4',  False))
     jt9 = _jt9_decoder(skimmer.cfg)       # ftx_decoder "jt9": (program, depth, work dir), else None
     wspr = _wspr_decoder(skimmer.cfg)     # enable_wspr: (wsprd, deep, work dir), else None
+
+
+    wspr = _wspr_decoder(skimmer.cfg)     # enable_wspr / enable_fst4w: (wsprd, deep, work dir, jt9), else None
     wspr_items = []
     import subprocess, wave
     from scipy.signal import resample_poly

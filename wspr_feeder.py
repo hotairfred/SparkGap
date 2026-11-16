@@ -52,6 +52,15 @@ def parse_message(msg):
     return None
 
 
+def wsprnet_mode(spot):
+    """WSPRnet's mode field as WSJT-X's WSPRNet::encode_mode sets it: WSPR-2 is 2; FST4W is its T/R period in
+    minutes, but FST4W-120 is 3 so WSPRnet can tell it from WSPR-2."""
+    if spot.get('mode', 'WSPR') != 'FST4W':
+        return '2'
+    tr = int(int(spot.get('tr_s', 120)) / 60 + 0.5)
+    return str(tr + 1 if tr == 2 else tr)
+
+
 def spot_query(spot, rcall, rgrid, version):
     """The form fields WSJT-X posts for one decode, URL-encoded, or None for a message it would not post."""
     parsed = parse_message(spot.get('msg', ''))
@@ -65,7 +74,7 @@ def spot_query(spot, rcall, rgrid, version):
         ('sig', str(int(spot['snr']))), ('dt', f"{float(spot['dt']):.1f}"), ('drift', str(int(spot['drift']))),
         ('tqrg', f"{int(spot['freq_hz']) / 1e6:.6f}"),
         ('tcall', tcall), ('tgrid', tgrid), ('dbm', str(dbm)),
-        ('version', version), ('mode', '2'),
+        ('version', version), ('mode', wsprnet_mode(spot)),
     ])
 
 
@@ -85,7 +94,7 @@ class WsprFeeder:
         if q is None:
             self.totals['not_wsprnet_shape'] += 1
             return None
-        key = (spot['date'], spot['time'], parse_message(spot['msg'])[0], spot['dial_hz'])
+        key = (spot['date'], spot['time'], parse_message(spot['msg'])[0], spot['dial_hz'], spot.get('mode', 'WSPR'))
         now = time.time()
         if key in self.seen:
             self.totals['deduped'] += 1

@@ -1,4 +1,4 @@
-"""enable_wspr: each band's WSPR dial is cut from the minute snapshots, two minutes joined into the 2-minute
+"""enable_wspr / enable_fst4w: each band's WSPR dial is cut from the minute snapshots, two minutes joined into the 2-minute
 cycle and decoded by wsprd; each decode is published on MQTT skimmer/wspr/raw. wspr_feeder.py posts them to
 WSPRnet as WSJT-X does."""
 
@@ -80,7 +80,8 @@ def test_decode_publishes_each_spot(monkeypatch, tmp_path) -> None:
     assert not list(tmp_path.rglob("*.wav"))                  # the cycle's WAV is removed
     assert {p[0] for p in pubs} == {"skimmer/wspr/raw"}
     assert pubs[0][1] == {"date": "261021", "time": "1208", "snr": 16, "dt": 5.8, "freq_hz": 14097064,
-                          "drift": 0, "msg": "KR4CQD EL96 23", "dial_hz": 14095600, "ts": int(T_EVEN)}
+                          "drift": 0, "msg": "KR4CQD EL96 23", "dial_hz": 14095600, "ts": int(T_EVEN),
+                          "mode": "WSPR"}
     assert [p[1]["msg"] for p in pubs] == ["KR4CQD EL96 23", "ON6FDP/P 37", "<WA1KPD/C> FN54FA 23"]
 
 
@@ -217,3 +218,63 @@ def test_feeder_subscribes_on_every_connect(monkeypatch) -> None:
     except KeyboardInterrupt:
         pass
     assert subs == ["skimmer/wspr/raw", "skimmer/wspr/raw"]
+
+
+JT9_OUT = ("1208 -28  0.5 1520 `  K1ABC FN42 37                                   \n"
+           "<DecodeFinished>   0   1        0\n")
+
+
+def test_fst4w_with_wspr_same_wav(monkeypatch, tmp_path) -> None:
+    """enable_fst4w: jt9 -W decodes the same 2-minute WAV as FST4W-120; its decodes go out with mode FST4W."""
+    runs, pubs = [], []
+
+    def fake_run(args, **kw):
+        runs.append(args)
+        assert any(a.endswith(".wav") for a in args) and (tmp_path / "20m").exists()
+        return types.SimpleNamespace(stdout=JT9_OUT if "-W" in args else WSPRD_OUT)
+
+    class Pub:
+        def publish(self, topic, payload, qos=0):
+            pubs.append((topic, json.loads(payload)))
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(sparkgap, "_get_mqtt_publisher", lambda: Pub())
+    dec = sparkgap._wspr_decoder({"enable_wspr": True, "enable_fst4w": True, "jt9_path": "/opt/jt9"})
+    dec = dec[:2] + (str(tmp_path),) + dec[3:]
+    sk = types.SimpleNamespace()
+    n = sparkgap._wspr_decode([("20m", int(T_EVEN // 60), 14095.6, np.zeros(120 * 12000, np.complex64))], sk, dec)
+    assert n == 4 and [r[0] for r in runs] == ["wsprd", "/opt/jt9"]
+    assert runs[1][1:12] == ["-W", "-p", "120", "-f", "1500", "-F", "100", "-d", "2", "-a", str(tmp_path / "20m")]
+    f = [p[1] for p in pubs if p[1]["mode"] == "FST4W"]
+    assert f == [{"date": "261021", "time": "1208", "snr": -28, "dt": 0.5, "freq_hz": 14097120, "drift": 0,
+                  "msg": "K1ABC FN42 37", "dial_hz": 14095600, "ts": int(T_EVEN), "mode": "FST4W", "tr_s": 120}]
+    assert not list(tmp_path.rglob("*.wav"))
+
+
+def test_fst4w_alone_runs_no_wsprd(monkeypatch, tmp_path) -> None:
+    runs, _ = _stub(monkeypatch)
+    dec = sparkgap._wspr_decoder({"enable_fst4w": True, "fst4w_depth": 9})
+    assert dec[0] is None and dec[3] == ("jt9", 3)
+    sparkgap._wspr_decode([("20m", int(T_EVEN // 60), 14095.6, np.zeros(10, np.complex64))], types.SimpleNamespace(),
+                          (None, False, str(tmp_path), ("jt9", 1)))
+    assert [r[0] for r in runs] == ["jt9"]
+    assert sparkgap._gui_settings({}, 192000)[0]["enable_fst4w"] is False
+
+
+def test_feeder_fst4w_mode_as_wsjtx() -> None:
+    """WSJT-X's WSPRNet::encode_mode: WSPR-2 -> 2, FST4W-120 -> 3 (to tell it from WSPR-2), FST4W-900 -> 15."""
+    assert wf.wsprnet_mode(SPOT) == "2"
+    assert wf.wsprnet_mode({**SPOT, "mode": "FST4W", "tr_s": 120}) == "3"
+    assert wf.wsprnet_mode({**SPOT, "mode": "FST4W", "tr_s": 900}) == "15"
+    q = dict(p.split("=", 1) for p in wf.spot_query({**SPOT, "mode": "FST4W", "tr_s": 120}, "WF8Z", "EM79SM",
+                                                    "SparkGap").split("&"))
+    assert q["mode"] == "3"
+    f = wf.WsprFeeder(_args())
+    assert f.on_spot(SPOT) is not None and f.on_spot({**SPOT, "mode": "FST4W", "tr_s": 120}) is not None
+
+
+def test_fst4w_depth_parse() -> None:
+    """Review (#171's nit applies): null or text fst4w_depth is the default 2, not a start-up error."""
+    for bad, want in ((None, 2), ("deep", 2), (0, 1), (5, 3), ("3", 3)):
+        assert sparkgap._wspr_decoder({"enable_fst4w": True, "fst4w_depth": bad})[3][1] == want
