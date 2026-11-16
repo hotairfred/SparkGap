@@ -975,9 +975,11 @@ def _ft8_cycle(jobs, skimmer):
                                 'mode':    mode,
                                 'msg':     msg,
                                 'ts':      int(time.time()),
-                                # for wsjtx_udp.py: the dial and audio offset, and the slot and DT
-                                'dial_hz': int(rf_khz_corr * 1000) - audio_hz,
-                                'df_hz':   audio_hz,
+                                # for wsjtx_udp.py: the dial and audio offset, and the slot and DT. The
+                                # dial is the band's own, fixed (ppm_offset moves the offset, not the dial,
+                                # so a listener sees one dial per instance); freq_hz = dial_hz + df_hz
+                                'dial_hz': round(dial_khz * 1000),
+                                'df_hz':   int(rf_khz_corr * 1000) - round(dial_khz * 1000),
                             }
                             if aligned and t0 > 0:
                                 spot['slot_ts'], spot['dt'] = ftx_slot_time(

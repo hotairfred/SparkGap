@@ -148,3 +148,23 @@ def test_fst4w_goes_as_a_decode() -> None:
     assert r.head() == (w.DECODE, 'SG 20m FST4W')
     r.take('?'), r.take('I')
     assert (r.take('i'), r.take('d'), r.take('I'), r.utf8(), r.utf8()) == (-24, 0.5, 1450, '`', 'K1ABC FN42 37')
+
+
+def test_dial_fixed_under_ppm_offset(monkeypatch) -> None:
+    """Review: with ppm_offset set, every decode of a band carries the same dial (one Status per instance)."""
+    sent = []
+
+    def fake_run(args, **kw):
+        return types.SimpleNamespace(stdout="000000 +05.0 +0.80 1803 ~  CQ N4DWD EM86\n"
+                                            "000000 +02.0 +0.40 2511 ~  CQ K4DB EM84\n")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    pub = types.SimpleNamespace(publish=lambda topic, payload, qos=0: sent.append(json.loads(payload)))
+    monkeypatch.setattr(sparkgap, "_get_mqtt_publisher", lambda: pub)
+    sk = types.SimpleNamespace(cfg={"enable_ft8": True, "enable_rtty": False}, spot_count=0, managers=[],
+                               _corrected_freq_khz=lambda f: f * (1 - 0.7e-6), broadcast=lambda **s: None)
+    z = np.zeros(60 * 192000, dtype=np.float32)
+    sparkgap._ft8_cycle([("20m", 0, 14090.0, 14074, z, z, len(z), 1792605660.0)], sk)
+    assert {d["dial_hz"] for d in sent} == {14074000}
+    assert all(d["dial_hz"] + d["df_hz"] == d["freq_hz"] for d in sent)
