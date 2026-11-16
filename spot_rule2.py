@@ -6,7 +6,8 @@ checked in this order; a call not spotted is dropped by the first gate that is f
   1 Shape              prefix (@, @@, #@ or #@@), 1 to 4 digits, 1 to 6 letters
   2 Not banned         the call is not on the banned list or in the Bad Calls file
   3 Reads              reads in the buffer: 2 for a patt3ch.lst + pattern, 3 unflagged, 5 none
-                       (CW Skimmer, Normal); a call decoded twice is read twice
+                       (CW Skimmer, Normal), one more for a call not on the node's known-call list
+                       (spot_validation_calls); a call decoded twice is read twice
   4 Best reading       the most-read call in the buffer wins; a tie spots neither. A call split by a
                        gap (K1V UT) is a read of the longer call read whole there (K1VUT); a
                        cut-off copy of a longer call read there (N5T of N5TJ) never wins; noise or
@@ -58,6 +59,7 @@ QUALIFIERS = frozenset({"SS", "NA", "FD", "CWT", "SST", "MST", "POTA", "SOTA", "
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?(?:[A-Z]{1,2}|[0-9][A-Z]{1,2})[0-9]{1,4}[A-Z]{1,6}"
                      r"(?:/[A-Z0-9]{1,3})?$")                # a call token, #@@ included
 READS = {"active": 2, "rare": 3, None: 5}   # gate 3, by patt3ch.lst pattern (CW Skimmer)
+UNLISTED_READS = 1            # gate 3: more reads for a call not on the known-call list
 BUFFER_CHARS = 256            # a signal's decoded text judged at once
 DE_LOOKBACK = LOOKAHEAD       # gate 7: words searched before DE for the keyword, as after it
 SIGNOFF = frozenset({"AR", "KN", "SK", "BK", "TU"})   # gate 7: ends the CQ (not K, not BT)
@@ -215,7 +217,7 @@ class GateSpotRule:
                  best_reading: bool = True, qualifiers: Iterable[str] = (),
                  notched: Iterable[tuple[float, float]] = ()):
         self.shape = shape                  # patt3ch.lst: "active" (+), "rare" or None
-        self.listed = listed                # kept for the caller's interface; no gate reads it
+        self.listed = listed                # gate 3: the known-call list, or None
         self.banned = frozenset(banned)
         self.segments = [tuple(s) for s in segments] if segments else None
         self.notched = [tuple(n) for n in notched]
@@ -356,10 +358,12 @@ class GateSpotRule:
             return self._decide(now, f, call, 2)
         beacon = self.beacon(call, f)
         kind = self.shape(b)
-        need = READS[kind]
+        unlisted = self.listed is not None and not self.listed(b)
+        need = READS[kind] + (UNLISTED_READS if unlisted else 0)
         n = reads(call, buf)
         if n < need:
-            return self._decide(now, f, call, 3, f"{n} of {need} reads ({kind or 'no'} pattern)")
+            return self._decide(now, f, call, 3, f"{n} of {need} reads ({kind or 'no'} pattern"
+                                                 f"{', not listed' if unlisted else ''})")
         if self.best_reading:
             counts = best_reads(buf)
             longer = next((t for t in counts if counts[t] > 0 and clip_of(call, t)), None)

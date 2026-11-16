@@ -2874,7 +2874,7 @@ def _make_spot_rule(config, tracker, local=None):
             else:
                 notched = read_notched(path)
         log.info("spot rule gates: %d bad calls, %d notched ranges", len(bad), len(notched))
-        calls = (local or {}).get('validation_calls', config.get('spot_validation_calls')) or 'scp'
+        calls = (local or {}).get('validation_calls', config.get('spot_validation_calls'))
         return GateSpotRule(
             tracker._matches_patt3ch,
             listed=_validation_list(config, tracker, calls),

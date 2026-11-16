@@ -45,6 +45,13 @@ def test_3_reads_by_pattern() -> None:
     assert _why(r, "TT5T") == 3
 
 
+def test_3_unlisted_call_needs_one_more_read() -> None:
+    r = _rule(listed=lambda c: c == "K7IUK")
+    assert _feed(r, "CQ K7IUK K7IUK") == ["K7IUK"]                               # listed: 2 of 2
+    assert _feed(r, "CQ K7IUM K7IUM", f=7030.0) == [] and _why(r, "K7IUM") == 3   # unlisted: 2/3
+    assert _feed(r, "CQ K7IUM", t=30, f=7030.0) == ["K7IUM"]                     # 3 reads
+
+
 def test_3_buffer_is_256_characters() -> None:
     r = _rule()
     _feed(r, "CQ N5RG", w=1)
