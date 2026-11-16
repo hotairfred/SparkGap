@@ -195,7 +195,9 @@ def validation_of(cfg: dict[str, Any]) -> str:
     level = cfg.get("spot_validation")  # absent is off, as in sparkgap.py
     if level not in VALIDATION and level not in VALIDATION_OFF:
         raise ValueError(f"spot_validation is {level!r}: not a level sparkgap.py knows")
-    return "Off" if level in VALIDATION_OFF else VALIDATION[level]
+    if level in VALIDATION_OFF:
+        return "Normal" if cfg.get("spot_rule_gates") else "Off"  # the gate rule applies normal
+    return VALIDATION[level]
 
 
 @dataclass

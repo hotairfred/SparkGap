@@ -463,6 +463,12 @@ def test_the_validation_level_is_sparkgap_s_own(level: Any, sent: str) -> None:
     assert f.seat_settings({**SEAT, "spot_validation": level}).validation == sent
 
 
+def test_validation_off_under_the_gate_rule_is_normal() -> None:
+    cfg = {k: v for k, v in SEAT.items() if k != "spot_validation"}
+    assert f.seat_settings({**cfg, "spot_rule_gates": True}).validation == "Normal"
+    assert f.seat_settings({**SEAT, "spot_rule_gates": True, "spot_validation": "off"}).validation == "Normal"
+
+
 def test_validation_absent_is_off_as_in_sparkgap() -> None:
     cfg = {k: v for k, v in SEAT.items() if k != "spot_validation"}
     assert f.seat_settings(cfg).validation == "Off"

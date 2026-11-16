@@ -121,6 +121,22 @@ def test_11_beacon() -> None:
     assert _feed(r, "4U1UN 4U1UN", f=14100.0) == ["4U1UN"]                 # no keyword needed
 
 
+def test_3_call_validation_level_steps_the_reads() -> None:
+    for level, need in (("permissive", 1), ("normal", 2), ("aggressive", 3)):
+        r = _rule(level=level)
+        assert _feed(r, "CQ" + " K1ABC" * (need - 1)) == []
+        assert _feed(r, "CQ" + " K1ABC" * need, t=1.0) == ["K1ABC"]
+    r = _rule(level="aggressive", listed=lambda c: False)
+    assert _feed(r, "CQ K1ABC K1ABC K1ABC") == [] and _why(r, "K1ABC") == 3
+    assert r.trace[-1][4] == "3 of 4 reads (active pattern, aggressive, not listed)"
+
+
+def test_3_unknown_level_is_refused() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="call validation level"):
+        _rule(level="off")
+
+
 def test_11_known_beacon_spots_on_one_read() -> None:
     r = _rule()
     assert _feed(r, "KH6RS T", f=21150.0) == ["KH6RS"]                     # once a slot

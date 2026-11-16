@@ -2857,7 +2857,7 @@ def _make_spot_rule(config, tracker, local=None):
         global _gates_on
         _gates_on = True    # C-worker bins close when idle (see _ItilaScanner.collect)
         # spot_rule_gates (off by default): spot_rule2.GateSpotRule, the call requirements in order
-        from spot_rule2 import GateSpotRule, read_bad_calls, read_notched
+        from spot_rule2 import LEVEL_READS, READS, UNLISTED_READS, GateSpotRule, read_bad_calls, read_notched
         # spot_rule_bad_calls, spot_rule_notched_freqs (off by default): BadCalls.txt and
         # NotchedFreqs.txt beside the config file, as the Aggregator's (Node Profile)
         here = os.path.dirname(_config_path or '.')
@@ -2875,9 +2875,21 @@ def _make_spot_rule(config, tracker, local=None):
                 notched = read_notched(path)
         log.info("spot rule gates: %d bad calls, %d notched ranges", len(bad), len(notched))
         calls = (local or {}).get('validation_calls', config.get('spot_validation_calls'))
+        listed = _validation_list(config, tracker, calls)
+        # spot_validation: the call validation level steps gate 3's reads; off or unset is normal
+        level = (local or {}).get('validation', config.get('spot_validation'))
+        off = level in (None, False, 'off', '')
+        level = 'normal' if off else level
+        if level not in LEVEL_READS:
+            raise ValueError("spot_validation %r: not one of %s" % (level, ', '.join(LEVEL_READS)))
+        log.info("call validation level %s: gate 3 reads %s%s",
+                 "off (the gate rule applies normal)" if off else level,
+                 "/".join(str(READS[k] + LEVEL_READS[level]) for k in ('active', 'rare', None)),
+                 ", +%d read when not on the known call list" % UNLISTED_READS if listed else "")
         return GateSpotRule(
             tracker._matches_patt3ch,
-            listed=_validation_list(config, tracker, calls),
+            listed=listed,
+            level=level,
             banned=bad,
             segments=config.get('spot_rule_segments'),
             notched=notched,

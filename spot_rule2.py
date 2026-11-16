@@ -63,6 +63,7 @@ QUALIFIERS = frozenset({"SS", "NA", "FD", "CWT", "SST", "MST", "POTA", "SOTA", "
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?(?:[A-Z]{1,2}|[0-9][A-Z]{1,2})[0-9]{1,4}[A-Z]{1,6}"
                      r"(?:/[A-Z0-9]{1,3})?$")                # a call token, #@@ included
 READS = {"active": 2, "rare": 3, None: 5}   # gate 3, by patt3ch.lst pattern (CW Skimmer)
+LEVEL_READS = {"permissive": -1, "normal": 0, "aggressive": 1}   # gate 3: call validation level
 UNLISTED_READS = 1            # gate 3: more reads for a call not on the known-call list
 BEACON_READS = 1              # gate 12: an NCDXF or listed beacon sends its call once a slot
 BUFFER_CHARS = 256            # a signal's decoded text judged at once
@@ -221,8 +222,11 @@ class GateSpotRule:
                  banned: Iterable[str] = (), segments: Iterable[tuple[float, float]] | None = None,
                  beacons: dict[str, float] | None = None, stronger_db: float | None = STRONGER_DB,
                  best_reading: bool = True, qualifiers: Iterable[str] = (),
-                 notched: Iterable[tuple[float, float]] = ()):
+                 notched: Iterable[tuple[float, float]] = (), level: str = "normal"):
+        if level not in LEVEL_READS:
+            raise ValueError(f"call validation level {level!r}: not one of {list(LEVEL_READS)}")
         self.shape = shape                  # patt3ch.lst: "active" (+), "rare" or None
+        self.level = level                  # gate 3: spot_validation
         self.listed = listed                # gate 3: the known-call list, or None
         self.banned = frozenset(banned)
         self.segments = [tuple(s) for s in segments] if segments else None
@@ -377,11 +381,12 @@ class GateSpotRule:
         known = self.known_beacon(call, f)
         kind = self.shape(b)
         unlisted = self.listed is not None and not self.listed(b)
-        need = BEACON_READS if known else READS[kind] + (UNLISTED_READS if unlisted else 0)
+        need = (BEACON_READS if known
+                else READS[kind] + LEVEL_READS[self.level] + (UNLISTED_READS if unlisted else 0))
         n = reads(call, buf)
         if n < need:
-            return self._decide(now, f, call, 3, f"{n} of {need} reads ({kind or 'no'} pattern"
-                                                 f"{', not listed' if unlisted else ''})")
+            why = f"{kind or 'no'} pattern, {self.level}{', not listed' if unlisted else ''}"
+            return self._decide(now, f, call, 3, f"{n} of {need} reads ({why})")
         if self.best_reading:
             counts = best_reads(buf)
             longer = next((t for t in counts if counts[t] > 0 and clip_of(call, t)), None)
