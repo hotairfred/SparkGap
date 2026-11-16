@@ -60,3 +60,45 @@ def test_packet_carries_the_cw_record() -> None:
     assert body[j + 7:j + 7 + m] == b"CW"
     k = j + 7 + m
     assert body[k] == 0 and body[k + 1] == 1 and struct.unpack_from(">I", body, k + 2)[0] == 1792605600
+
+
+def test_quiet_telnet_keeps_the_connection(monkeypatch) -> None:
+    """Review: a recv timeout (no spot for 5 min) keeps reading on the same connection, no reconnect."""
+    import threading
+
+    f = _feeder()
+    stop = threading.Event()
+    conns = []
+
+    class Sock:
+        def __init__(self):
+            self.reads = iter([b"banner\r\n", TimeoutError(), TimeoutError(), (CW + "\n").encode(), b""])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def sendall(self, b):
+            pass
+
+        def recv(self, n):
+            r = next(self.reads)
+            if isinstance(r, Exception):
+                raise r
+            if r == b"":
+                stop.set()
+            return r
+
+    def connect(addr, timeout=None):
+        conns.append(addr)
+        return Sock()
+
+    monkeypatch.setattr(pf.socket, "create_connection", connect)
+    monkeypatch.setattr(pf.time, "sleep", lambda s: None)
+    f.read_telnet("127.0.0.1", 7300, stop)
+    assert len(conns) == 1 and [s["call"] for s in f.spot_queue] == ["N5TOO"]

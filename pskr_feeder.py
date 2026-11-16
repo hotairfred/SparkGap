@@ -243,7 +243,10 @@ class PSKReporterFeeder:
                     s.sendall(f'{self.args.call}\r\n'.encode('ascii'))
                     buf = b''
                     while not stop.is_set():
-                        chunk = s.recv(8192)
+                        try:
+                            chunk = s.recv(8192)
+                        except TimeoutError:
+                            continue                       # a quiet band: no spot for 5 min is no fault
                         if not chunk:
                             self.log.warning('telnet %s:%d closed', host, port)
                             break
@@ -349,8 +352,9 @@ class PSKReporterFeeder:
             if self.args.mqtt_user:
                 client.username_pw_set(self.args.mqtt_user, self.args.mqtt_pass or '')
             client.on_message = self.on_mqtt_msg
+            # subscribe on every connect: a broker restart drops the subscription, and paho reconnects
+            client.on_connect = lambda c, u, f, rc, p=None: c.subscribe(self.args.topic, qos=0)
             client.connect(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
-            client.subscribe(self.args.topic, qos=0)
             client.loop_start()
         stop = threading.Event()
         for hp in self.args.telnet:
