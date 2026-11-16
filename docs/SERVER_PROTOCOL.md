@@ -136,7 +136,7 @@ connected`).
   `rec/`), the on/off decoder options
   `spot_rule_contest_words`, `spot_rule_cq_repeats`, `spot_rule_doubled_calls`,
   `spot_rule_split_up`, `spot_rule_owner_cell`, `spot_rule_owned_two_windows`, `spot_rule_clip_busts`,
-  `spot_rule_la1d`, `spot_rule_gluek`,
+  `spot_rule_la1d`, `spot_rule_gluek`, `spot_rule_bad_calls`, `spot_rule_notched_freqs`,
   `spot_rule_norival` and `itila2_snr_decoder`, and `spot_rule_fragments`
   (`any`, `any,stray`, `even`, `even,stray`) and `spot_rule_strongest_db`
   (3, 6, 10), where null is off

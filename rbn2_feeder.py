@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -43,6 +43,7 @@ from urllib import request as urlreq
 
 import rbn_feeder as base
 from process_link import ProcessLink
+from spot_rule2 import BEACON_KHZ, NCDXF, NCDXF_KHZ
 
 log = logging.getLogger("rbn2_feeder")
 
@@ -69,6 +70,7 @@ QSY_KHZ = 1.0  # sparkgap.py's re-spot rule: a call more than this away is a new
 VALIDATION_ORDER = ("Off", "Permissive", "Normal", "Aggressive")
 MODE_CODE = {"CW": "1", "RTTY": "11"}  # Aggregator 6.7's mode table
 CQ_CODE = {"CQ": "1", "DX": "2", "BCN": "3", "BEACON": "3"}
+LISTED_BEACON, SLASH_B, NCDXF_BEACON = "3", "4", "5"  # the Aggregator's beacon types
 HIDDEN = ("fingerPrint", "fp", "h", "shortHash", "skimSignIn")  # never in a log
 
 
@@ -162,6 +164,7 @@ class Seat:
     port: int
     mode: str  # "dry" or "live"
     rtty: bool = True  # enable_rtty (on unless false, as in sparkgap.py): its ranges go in rTTYBandLimits too
+    beacons: dict[str, float] = field(default_factory=dict)  # spot_rule_beacons: call -> kHz
 
 
 def spotter_id(cfg: dict[str, Any]) -> str:
@@ -188,6 +191,7 @@ def seat_settings(cfg: dict[str, Any]) -> Seat:
         port=int(cfg.get("telnet_port", 7300)),
         mode=mode,
         rtty=bool(cfg.get("enable_rtty", True)),
+        beacons=dict(cfg.get("spot_rule_beacons") or {}),
     )
 
 
@@ -195,7 +199,9 @@ def validation_of(cfg: dict[str, Any]) -> str:
     level = cfg.get("spot_validation")  # absent is off, as in sparkgap.py
     if level not in VALIDATION and level not in VALIDATION_OFF:
         raise ValueError(f"spot_validation is {level!r}: not a level sparkgap.py knows")
-    return "Off" if level in VALIDATION_OFF else VALIDATION[level]
+    if level in VALIDATION_OFF:
+        return "Normal" if cfg.get("spot_rule_gates") else "Off"  # the gate rule applies normal
+    return VALIDATION[level]
 
 
 @dataclass
@@ -207,6 +213,7 @@ class Receiver:
     respot_s: float
     validation: str
     rtty: bool = True  # enable_rtty, on unless false as in sparkgap.py
+    beacons: dict[str, float] = field(default_factory=dict)  # spot_rule_beacons: call -> kHz
 
 
 def receiver_settings(config_dir: Path, name: str) -> Receiver:
@@ -222,7 +229,7 @@ def receiver_settings(config_dir: Path, name: str) -> Receiver:
     if not math.isfinite(respot) or respot <= 0:
         respot = RESPOT_S
     return Receiver(name, int(cfg.get("telnet_port", 7300)), respot, validation_of(cfg),
-                    bool(cfg.get("enable_rtty", True)))
+                    bool(cfg.get("enable_rtty", True)), dict(cfg.get("spot_rule_beacons") or {}))
 
 
 def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
@@ -239,7 +246,20 @@ def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
     level = min((r.validation for r in receivers), key=VALIDATION_ORDER.index)
     return Seat(call=call, grid=grid, name=radio.get("op_name") or "", qth=radio.get("qth") or "",
                 validation=level, host="127.0.0.1", port=receivers[0].port, mode=mode,
-                rtty=any(r.rtty for r in receivers))
+                rtty=any(r.rtty for r in receivers),
+                beacons={c: f for r in receivers for c, f in r.beacons.items()})
+
+
+def spot_type(call: str, freq: float, cq_flag: str, beacons: dict[str, float]) -> str:
+    """The spot's type code as the Aggregator sets it: a beacon match overrides CQ, and an NCDXF
+    match a listed one, as spot_rule2's gate 12 finds them."""
+    if call in NCDXF and any(abs(freq - x) <= BEACON_KHZ for x in NCDXF_KHZ):
+        return NCDXF_BEACON
+    if call in beacons and abs(freq - beacons[call]) <= BEACON_KHZ:
+        return LISTED_BEACON
+    if call.upper().endswith("/B"):
+        return SLASH_B
+    return CQ_CODE.get(cq_flag, "1")
 
 
 class Respot:
@@ -299,6 +319,7 @@ class Session:
         dry_run: bool,
         bands_of: Callable[[], list[tuple[float, float]]] | None = None,
         rtty: bool = False,
+        beacons: dict[str, float] | None = None,
     ) -> None:
         if auth is None and not dry_run:
             raise AuthError("no auth library: a session without one may only dry-run")
@@ -307,6 +328,7 @@ class Session:
         self.validation, self.port, self.bands = validation, port, bands
         self.bands_of = bands_of  # read again before each id.php: a seat changes band while it runs
         self.rtty = rtty
+        self.beacons = dict(beacons or {})  # spot_rule_beacons, for the spot type
         self.auth, self.version, self.fingerprint, self.dry_run = (
             auth,
             version,
@@ -369,7 +391,7 @@ class Session:
             [
                 f"{spot['freq']:.2f}",
                 spot["call"],
-                CQ_CODE.get(spot["cq_flag"], "1"),
+                spot_type(spot["call"], spot["freq"], spot["cq_flag"], self.beacons),
                 str(spot["snr"]),
                 str(spot["wpm"]),
                 "dB",
@@ -745,6 +767,7 @@ def main() -> None:
         dry_run=dry_run,
         bands_of=bands_now,
         rtty=seat.rtty,
+        beacons=seat.beacons,
     )
     mode = "dry run" if dry_run else "LIVE"
     log.info("SparkGap version %s, spotter %s, %s", sess.version, sess.call, mode)

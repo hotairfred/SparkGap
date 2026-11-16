@@ -143,6 +143,22 @@ def test_a_malformed_hash_is_a_refusal(bad: bytes) -> None:
     assert sess.id_body() is None
 
 
+def test_beacon_spots_carry_the_aggregator_s_types() -> None:
+    sess = _session(_auth())
+    sess.beacons = {"K6FRC": 28250.0}
+    spots = [{**SPOT, "freq": 21150.0, "call": "KH6RS"}, {**SPOT, "freq": 28251.0, "call": "K6FRC"},
+             {**SPOT, "freq": 14020.5, "call": "W6ETA/B"}, {**SPOT, "freq": 7025.0, "call": "KH6RS"}]
+    body = sess.spots_body(spots, 1_761_000_000.0)
+    assert body is not None and [r[2] for r in body["s"]] == ["5", "3", "4", "1"]
+
+
+def test_receivers_beacon_lists_reach_the_node() -> None:
+    rx = [f.Receiver("a", 7300, 120.0, "Normal", beacons={"K6FRC": 28250.0}),
+          f.Receiver("b", 7301, 120.0, "Normal", beacons={"W6ETA": 14020.5})]
+    radio = {"rbn_upload": "dry", "callsign": "N0CALL-1", "grid": "FN31pr"}
+    assert f.node_settings(radio, rx).beacons == {"K6FRC": 28250.0, "W6ETA": 14020.5}
+
+
 def test_the_library_is_looked_for_in_the_run_root() -> None:
     from pathlib import Path
 
@@ -461,6 +477,12 @@ def test_a_seat_without_a_call_or_grid_does_not_feed(key: str) -> None:
 )
 def test_the_validation_level_is_sparkgap_s_own(level: Any, sent: str) -> None:
     assert f.seat_settings({**SEAT, "spot_validation": level}).validation == sent
+
+
+def test_validation_off_under_the_gate_rule_is_normal() -> None:
+    cfg = {k: v for k, v in SEAT.items() if k != "spot_validation"}
+    assert f.seat_settings({**cfg, "spot_rule_gates": True}).validation == "Normal"
+    assert f.seat_settings({**SEAT, "spot_rule_gates": True, "spot_validation": "off"}).validation == "Normal"
 
 
 def test_validation_absent_is_off_as_in_sparkgap() -> None:

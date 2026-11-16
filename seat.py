@@ -80,6 +80,8 @@ OPTION_FLAGS = (
     "spot_rule_stray_known",
     "spot_rule_clean_cq",
     "spot_rule_clip_busts",
+    "spot_rule_bad_calls",
+    "spot_rule_notched_freqs",
     "itila2_snr_decoder",
 )
 OPTION_CHOICES: dict[str, tuple[Any, ...]] = {
