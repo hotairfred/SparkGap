@@ -99,7 +99,7 @@ class RtpReceiver:
     """
 
     def __init__(self, group, port=5004, sample_rate=192000, encoding="f32le", iface=None,
-                 ssrcs=None, use_dns=False):
+                 ssrcs=None, use_dns=False, status=None):
         if encoding not in ENCODINGS:
             raise ValueError(f"rtp_encoding must be one of {ENCODINGS}, got {encoding!r}")
         self.group = group
@@ -127,8 +127,12 @@ class RtpReceiver:
         self._seen = {}        # SSRC -> wall time of its last packet
         self._checked = set()  # SSRCs whose rate is checked
         self._stalled = set()  # SSRCs logged as silent
+        # rtp_create_channels: radiod's status group; SparkGap asks radiod for its channels (radiod_control)
+        self.status = status
+        self._keeper = None
 
-    # -- tuning: radiod's config sets the channels; this only says which SSRC is which band --
+    # -- tuning: radiod's config sets the channels, or with status (rtp_create_channels) SparkGap asks radiod
+    #    for them; either way this says which SSRC is which band --
     def set_frequency(self, rx_index, freq_hz):
         self.frequencies[rx_index] = freq_hz
         by_ssrc = {}           # built aside and swapped in one step: the receive thread reads it
@@ -140,9 +144,16 @@ class RtpReceiver:
                             ssrc, self.frequencies[by_ssrc[ssrc]], f, by_ssrc[ssrc])
             by_ssrc[ssrc] = k
         self._by_ssrc = by_ssrc
+        if self._keeper is not None:
+            self._keeper.set_channels(self._wanted())
+
+    def _wanted(self):
+        """rtp_create_channels: {SSRC: centre Hz} of the bands, for radiod_control.ChannelKeeper."""
+        return {self._fixed_ssrc.get(k, ssrc_for(f)): f for k, f in self.frequencies.items()}
 
     def retune(self, freq_hz):
-        """One band: follow a channel at another frequency (radiod must carry it)."""
+        """One band: follow a channel at another frequency (radiod must carry it, or with rtp_create_channels
+        radiod is asked for it)."""
         self.set_frequency(0, freq_hz)
         self._seq.clear()
         self._ts.clear()
@@ -190,6 +201,11 @@ class RtpReceiver:
         return struct.pack("=4s4si", group, socket.inet_aton("0.0.0.0"), idx)
 
     def start(self):
+        if self.status and self._keeper is None:
+            from radiod_control import ChannelKeeper
+            self._keeper = ChannelKeeper(self.status, self._wanted(), samprate=self.sample_rate,
+                                         encoding=self.encoding, iface=self.iface, use_dns=self.use_dns)
+            self._keeper.start()
         if self.sock is None:
             self.sock = self._open()
             log.info("RTP: listening on %s:%d (%s, %s, %d Hz), SSRCs %s", self.group, self.port,
@@ -198,9 +214,13 @@ class RtpReceiver:
 
     def stop(self):
         self._running = False
+        if self._keeper is not None:
+            self._keeper.stop()
 
     def close(self):
         self._running = False
+        if self._keeper is not None:
+            self._keeper.stop()
         if self.packets or self.other:
             log.info("RTP: %d packets, %d lost (filled), %d late (dropped), %d for other SSRCs, %d restarts",
                      self.packets, self.lost, self.late, self.other, self.resyncs)

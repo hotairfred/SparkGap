@@ -193,7 +193,11 @@ puts in radiod, the RX888 firmware and its udev rules). Start from `radiod_spark
 in kHz); its comments cover loopback multicast, the socket buffer, FFTW wisdom and checking the gain.
 Then copy `skimmer_rtp.example.json`: `"sdr_type": "rtp"`, `rtp_group` (radiod's data group), `rtp_encoding`
 (`f32le` or `s16be`, as radiod sends) and, on one computer, `rtp_iface` 127.0.0.1. CW, FT8, RTTY and IQ
-recording all run from the channels. The RX888 has no input filtering, and everything on HF shares
+recording all run from the channels. Or let SparkGap make the channels: `"rtp_create_channels": true` with
+`rtp_status` (radiod's status group, its config's `status =`) asks radiod for each band's channel at start,
+at the SparkGap's sample rate and `rtp_encoding`, keeps it alive while SparkGap runs, moves it on a live band
+change and ends it when SparkGap stops; radiod's config then needs no channel section, so a band (6m
+included) is one line in `bands`. The RX888 has no input filtering, and everything on HF shares
 its one ADC and gain: feed it from a protected receive path (a transceiver's receive loop, or a
 limiter), a broadcast-band filter helps near strong AM stations, and keep it and its USB and coax
 away from noisy computer power supplies, whose hash it hears on the low bands.
