@@ -757,7 +757,10 @@ class RepeatSpotRule:
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._bins: dict[int, int] = {}                         # window id -> bin
         self._next_window = 0
-        self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}   # (call, MHz) -> (time, freq)
+        # (call, MHz) -> [(time, freq)]: each frequency the call was spotted on in the band, with when. Every one is
+        # kept, not just the last: a call read on two frequencies (a caller's QSO partner, QTC traffic, two
+        # bins) re-spotted at each switch between them (WAE RTTY 11-14/15: all 26 and 44 of W3RGA's dupes)
+        self._last_spot: dict[tuple[str, int], list[tuple[float, float]]] = {}
         self.spot_snr: dict[str, float] = {}                    # call -> SNR of the copy that gave its last spot
         self._pruned = 0.0
 
@@ -836,9 +839,9 @@ class RepeatSpotRule:
             if self.strongest_db is not None and self._stronger_elsewhere(best, now):
                 continue          # a spur or image of a stronger signal of the same call
             key = (call, int(spot_f // 1000))     # per band: a station running two bands
-            last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
-            if last is None or now - last[0] >= RESPOT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
-                self._last_spot[key] = (now, spot_f)
+            seen = self._last_spot.get(key, [])   # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
+            if all(now - t >= RESPOT_S or abs(spot_f - f) >= MOVE_KHZ for t, f in seen):
+                self._last_spot[key] = [(t, f) for t, f in seen if abs(spot_f - f) >= MOVE_KHZ] + [(now, spot_f)]
                 best = max((c for c in near if c.call == call), key=lambda c: c.snr)   # the copy spot_f came from
                 reports = [c.report for c in near if c.call == call and c.report is not None]
                 if best.report is not None:
@@ -853,8 +856,8 @@ class RepeatSpotRule:
         return spots
 
     def last_spots(self) -> list[list]:
-        """The re-spot table, for spot_rule_memory: [[call, MHz, time, freq], ...]."""
-        return [[c, mhz, t, f] for (c, mhz), (t, f) in self._last_spot.items()]
+        """The re-spot table, for spot_rule_memory: [[call, MHz, time, freq], ...], a row per frequency."""
+        return [[c, mhz, t, f] for (c, mhz), seen in self._last_spot.items() for t, f in seen]
 
     def restore_last_spots(self, rows: list, now: float) -> int:
         """Load a saved re-spot table: entries younger than RESPOT_S, so a restart does not spot
@@ -866,7 +869,7 @@ class RepeatSpotRule:
             except (TypeError, ValueError, IndexError):
                 continue
             if 0 <= now - t < RESPOT_S:
-                self._last_spot[(call, mhz)] = (t, f)
+                self._last_spot.setdefault((call, mhz), []).append((t, f))
                 kept += 1
         return kept
 
@@ -1074,7 +1077,8 @@ class RepeatSpotRule:
             self._runners.popleft()
         if now - self._pruned >= 60.0:
             self._pruned = now
-            self._last_spot = {k: v for k, v in self._last_spot.items() if v[0] >= cutoff}
+            kept = {k: [(t, f) for t, f in v if t >= cutoff] for k, v in self._last_spot.items()}
+            self._last_spot = {k: v for k, v in kept.items() if v}
             self._window_ids = {k: v for k, v in self._window_ids.items() if v[1] >= cutoff}
             live = {v[0] for v in self._window_ids.values()}
             self._bins = {w: b for w, b in self._bins.items() if w in live}
