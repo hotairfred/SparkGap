@@ -27,13 +27,30 @@ def test_wspr_dials_in_the_span() -> None:
 
 def test_even_minute_held_odd_joins() -> None:
     sk = types.SimpleNamespace()
-    a, b = np.ones(5, np.complex64), 2 * np.ones(5, np.complex64)
+    n = 60 * 12000
+    a, b = np.ones(n, np.complex64), 2 * np.ones(n, np.complex64)
     assert sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN, a) is None
     minute, dial, x = sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN + 60, b)
-    assert minute == T_EVEN / 60 and dial == 14095.6 and list(x) == [1] * 5 + [2] * 5
+    assert minute == T_EVEN / 60 and dial == 14095.6 and len(x) == 2 * n
+    assert x[0] == 1 and x[n - 1] == 1 and x[n] == 2 and x[-1] == 2
     assert sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN + 180, b) is None    # odd, no even before it
     sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN, a)
     assert sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN + 180, b) is None    # a minute missing
+
+
+def test_short_snapshots_join_on_time() -> None:
+    """Review: a live minute can start up to 1 s late; each is placed on its minute, so the join has no gap."""
+    sk = types.SimpleNamespace()
+    n, fs = 60 * 12000, 12000
+    t = np.arange(2 * n)                                   # a sample's index in the 2 minutes = its time
+    first = t[int(0.8 * fs):n].astype(np.complex64)        # started 0.8 s late
+    second = t[n + int(0.5 * fs):2 * n - fs // 4].astype(np.complex64)   # 0.5 s late, ended 0.25 s early
+    sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN + 0.8, first)
+    _, _, x = sparkgap._wspr_keep(sk, "20m", 14095.6, T_EVEN + 60.5, second)
+    assert len(x) == 2 * n
+    have = x != 0
+    assert np.array_equal(x[have].real, t[have])           # every sample at its own time
+    assert not have[:int(0.8 * fs)].any() and not have[n:n + int(0.5 * fs)].any()
 
 
 def _stub(monkeypatch):
@@ -130,3 +147,73 @@ def test_feeder_dedup_post_and_retry(monkeypatch) -> None:
 def test_feeder_dry_run_posts_nothing() -> None:
     f = wf.WsprFeeder(_args(dry_run=True), post=lambda q: pytest.fail("posted in a dry run"))
     assert f.send_one(f.on_spot(SPOT)) is True
+
+
+def test_wsprd_logs_removed_hash_table_kept(monkeypatch, tmp_path) -> None:
+    """Review: wsprd -a appends ALL_WSPR.TXT each cycle; it goes after the decode, the hash table stays."""
+    d = tmp_path / "20m"
+
+    def fake_run(args, **kw):
+        d.mkdir(exist_ok=True)
+        for f in ("ALL_WSPR.TXT", "wspr_spots.txt", "hashtable.txt"):
+            (d / f).write_text("x")
+        return types.SimpleNamespace(stdout=WSPRD_OUT)
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(sparkgap, "_get_mqtt_publisher", lambda: None)
+    sparkgap._wspr_decode([("20m", int(T_EVEN // 60), 14095.6, np.zeros(10, np.complex64))],
+                          types.SimpleNamespace(), ("wsprd", False, str(tmp_path)))
+    assert sorted(p.name for p in d.iterdir()) == ["hashtable.txt"]
+
+
+def test_wspr_alone_takes_the_minute() -> None:
+    """Review: WSPR (or FST4W) on with FT8 and RTTY off still cuts each band's minute."""
+    assert sparkgap._minute_modes({"enable_ft8": False, "enable_rtty": False, "enable_wspr": True})
+    assert sparkgap._minute_modes({"enable_ft8": False, "enable_rtty": False, "enable_fst4w": True})
+    assert not sparkgap._minute_modes({"enable_ft8": False, "enable_rtty": False})
+    assert sparkgap._minute_modes({})                       # FT8 and RTTY on unless set off, as before
+
+
+def test_feeder_subscribes_on_every_connect(monkeypatch) -> None:
+    """Review: a broker restart drops the subscription; it is made again on each (re)connect."""
+    import sys
+
+    subs = []
+
+    class Client:
+        def __init__(self, *a, **k):
+            self.on_connect = None
+
+        def username_pw_set(self, *a):
+            pass
+
+        def connect(self, *a, **k):
+            pass
+
+        def loop_start(self):
+            self.on_connect(self, None, None, 0)
+            self.on_connect(self, None, None, 0)           # reconnected
+
+        def subscribe(self, topic, qos=0):
+            subs.append(topic)
+
+        def loop_stop(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+    mod = types.SimpleNamespace(Client=Client, CallbackAPIVersion=types.SimpleNamespace(VERSION2=2))
+    monkeypatch.setitem(sys.modules, "paho", types.SimpleNamespace(mqtt=types.SimpleNamespace(client=mod)))
+    monkeypatch.setitem(sys.modules, "paho.mqtt", types.SimpleNamespace(client=mod))
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", mod)
+    monkeypatch.setattr(wf.threading, "Thread", lambda **k: types.SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(wf.time, "sleep", lambda s: (_ for _ in ()).throw(KeyboardInterrupt))
+    f = wf.WsprFeeder(_args(topic="skimmer/wspr/raw", mqtt_user="", mqtt_pass="", mqtt_host="h", mqtt_port=1,
+                            url="http://x/"))
+    try:
+        f.run()
+    except KeyboardInterrupt:
+        pass
+    assert subs == ["skimmer/wspr/raw", "skimmer/wspr/raw"]

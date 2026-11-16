@@ -139,8 +139,9 @@ class WsprFeeder:
         if self.args.mqtt_user:
             client.username_pw_set(self.args.mqtt_user, self.args.mqtt_pass or '')
         client.on_message = self.on_mqtt_msg
+        # subscribe on every connect: a broker restart drops the subscription, and paho reconnects by itself
+        client.on_connect = lambda c, u, f, rc, p=None: c.subscribe(self.args.topic, qos=0)
         client.connect(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
-        client.subscribe(self.args.topic, qos=0)
         client.loop_start()
         threading.Thread(target=self.sender, daemon=True).start()
         self.log.info('WSPR feeder up: %s on %s:%d -> %s (%s), %s %s', self.args.topic, self.args.mqtt_host,

@@ -792,8 +792,17 @@ def _wspr_decoder(cfg):
     if not cfg.get('enable_wspr', False):
         return None
     work = os.path.join(tempfile.gettempdir(), 'sparkgap_wspr_%d' % os.getpid())
-    os.makedirs(work, exist_ok=True)
+    if not os.path.isdir(work):
+        os.makedirs(work, exist_ok=True)
+        atexit.register(shutil.rmtree, work, True)     # wsprd's files go with the process
     return (cfg.get('wsprd_path') or 'wsprd', bool(cfg.get('wspr_deep', False)), work)
+
+
+def _minute_modes(cfg):
+    """Whether any mode needs each band's minute of 192 kHz IQ: FT8, RTTY, WSPR or FST4W (FT8 and RTTY on
+    unless set off, as before; WSPR and FST4W off unless set on)."""
+    return bool(cfg.get('enable_ft8', True) or cfg.get('enable_rtty', True)
+                or cfg.get('enable_wspr', False) or cfg.get('enable_fst4w', False))
 
 
 def _wspr_keep(skimmer, bn, dial_khz, t0, x):
@@ -801,13 +810,25 @@ def _wspr_keep(skimmer, bn, dial_khz, t0, x):
     minute after it completes the cycle: returns (cycle minute, dial, two minutes joined), else None."""
     held = skimmer.__dict__.setdefault('_wspr_half', {})
     minute = round(t0 / 60.0)
+    x = _wspr_minute(x, t0 - minute * 60.0)
     if minute % 2 == 0:
-        held[bn] = (minute, dial_khz, np.asarray(x, dtype=np.complex64))
+        held[bn] = (minute, dial_khz, x)
         return None
     prev = held.pop(bn, None)
     if prev is None or prev[0] != minute - 1 or prev[1] != dial_khz:
         return None
-    return prev[0], dial_khz, np.concatenate([prev[2], np.asarray(x, dtype=np.complex64)])
+    return prev[0], dial_khz, np.concatenate([prev[2], x])
+
+
+def _wspr_minute(x, late_s, fs=12000):
+    """A minute's slice placed on the minute: exactly 60 s of samples, zeros where the snapshot started late_s
+    after the minute (a live snapshot can be up to a second short) or ended early, so the second minute joins
+    the first at the right time and a 110 s WSPR transmission stays in step across the join."""
+    n = 60 * fs
+    x = np.asarray(x, dtype=np.complex64)
+    off = int(round(late_s * fs))
+    x = x[-off:] if off < 0 else np.concatenate([np.zeros(off, np.complex64), x])
+    return np.concatenate([x, np.zeros(max(0, n - len(x)), np.complex64)])[:n]
 
 
 def _wspr_decode(items, skimmer, wspr):
@@ -840,8 +861,11 @@ def _wspr_decode(items, skimmer, wspr):
                 log.warning("WSPR %s: wsprd failed: %s", bn, e)
                 continue
             finally:
-                with contextlib.suppress(OSError):
-                    os.remove(fn)
+                # the WAV, and wsprd's logs, which -a appends to every cycle (kept: its wisdom and the
+                # hash table of calls heard, which reads <call> messages)
+                for f in (fn, os.path.join(d, 'ALL_WSPR.TXT'), os.path.join(d, 'wspr_spots.txt')):
+                    with contextlib.suppress(OSError):
+                        os.remove(f)
             for line in (r.stdout or '').splitlines():
                 m = _WSPR_LINE.match(line)
                 if not m or line.startswith('<'):
@@ -8690,9 +8714,7 @@ class SparkGap:
         # to /tmp/diag_<band>_<HHMMSS>.wav for live-vs-replay diagnostics.
         # Reuses the FT8/RTTY capture buffer (requires either enable_ft8
         # or enable_rtty so the C-side accumulator is allocated).
-        if (getattr(self, '_use_c_receiver', False)
-                and (self.cfg.get('enable_ft8',  True)
-                     or self.cfg.get('enable_rtty', True))):
+        if getattr(self, '_use_c_receiver', False) and _minute_modes(self.cfg):
             try:
                 signal.signal(signal.SIGUSR1, self._diag_iq_snapshot)
                 log.info("SIGUSR1 handler installed: kill -USR1 %d for IQ snapshot", os.getpid())
@@ -9005,7 +9027,7 @@ class SparkGap:
         if not (sec < 5 and prev >= 55):
             return
         busy = getattr(self, '_ft8_running', False)
-        digital = bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True))
+        digital = _minute_modes(self.cfg)
         fs, jobs = 192000, []
         n60 = fs * 60
         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
@@ -9049,10 +9071,9 @@ class SparkGap:
         log.info("IQ stream started")
         # The Python receive path (RTP, Flex) keeps each band's minute itself for FT8 and RTTY
         self._py_minute = (not use_c and self.cfg.get('sample_rate', 48000) == 192000
-                           and bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)
-                                    or self._iq_rec is not None))
-        if not use_c and not self._py_minute and (self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)):
-            log.info("FT8/RTTY need 192 kHz IQ; this receiver runs at %s: CW only", self.cfg.get('sample_rate', 48000))
+                           and (_minute_modes(self.cfg) or self._iq_rec is not None))
+        if not use_c and not self._py_minute and _minute_modes(self.cfg):
+            log.info("FT8/RTTY/WSPR need 192 kHz IQ; this receiver runs at %s: CW only", self.cfg.get('sample_rate', 48000))
 
         scan_interval = self.cfg.get('scan_interval', 5)
         status_interval = self.cfg.get('status_interval', 30)
@@ -9173,7 +9194,7 @@ class SparkGap:
                             log.warning("FT8 windows are aligned to this PC's clock, and timedatectl says "
                                         "it isn't NTP-synchronised: FT8 needs it within about a second "
                                         "(enable NTP, or set ft8_windows: sliding)")
-                    if enable_ft8 or enable_rtty or self._iq_rec is not None:
+                    if _minute_modes(self.cfg) or self._iq_rec is not None:
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
                             ft8_khz = ft8_dial_khz(ck)
@@ -9682,9 +9703,7 @@ class SparkGap:
             # IQ snapshot.  Run if EITHER is enabled.  FT8 + RTTY are gated
             # individually below.
             if use_c and getattr(self, '_worker_started', False) \
-                    and (self.cfg.get('enable_ft8', True)
-                         or self.cfg.get('enable_rtty', True)
-                         or self._iq_rec is not None):
+                    and (_minute_modes(self.cfg) or self._iq_rec is not None):
                 ft8_now = time.time()
                 ft8_sec = ft8_now % 60
                 ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
@@ -10141,7 +10160,7 @@ def run_file_mode(args, config):
     if getattr(args, 'digital', False):
         if file_rate != _FileDigital.FS:
             log.warning("--digital: needs a %d Hz recording, this one is %d; off", _FileDigital.FS, file_rate)
-        elif config.get('enable_ft8', True) or config.get('enable_rtty', True):
+        elif _minute_modes(config):
             digital = _FileDigital(config, tracker, manager, center_khz, t0)
             log.info("File mode: FT8 %s, RTTY %s each minute of audio, as live (--digital)",
                      'on' if config.get('enable_ft8', True) else 'off',
