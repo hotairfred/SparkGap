@@ -2873,7 +2873,20 @@ def _make_spot_rule(config, tracker, local=None):
                 bad += read_bad_calls(path)
             else:
                 notched = read_notched(path)
-        log.info("spot rule gates: %d bad calls, %d notched ranges", len(bad), len(notched))
+        # spot_rule_scp (off by default): a call not in Super Check Partial (SCP.DB, scp_db.py) fails gate 2
+        scp = None
+        if config.get('spot_rule_scp'):
+            cache = tracker.__dict__.setdefault('_validation_lists', {})
+            if 'scp_db' not in cache:
+                import scp_db
+                from pathlib import Path
+                cache['scp_db'] = scp_db.refresh(Path(config.get('rbn_known_dir', 'rbn_known')))
+            if cache['scp_db']:
+                scp = cache['scp_db'].__contains__
+            else:
+                log.warning("spot_rule_scp is on but no SCP.DB could be read: the SCP check is off")
+        log.info("spot rule gates: %d bad calls, %d notched ranges%s", len(bad), len(notched),
+                 ", SCP check on" if scp else "")
         calls = (local or {}).get('validation_calls', config.get('spot_validation_calls'))
         listed = _validation_list(config, tracker, calls)
         # spot_validation: the call validation level steps gate 3's reads; off or unset is normal
@@ -2893,6 +2906,7 @@ def _make_spot_rule(config, tracker, local=None):
             banned=bad,
             segments=config.get('spot_rule_segments'),
             notched=notched,
+            scp=scp,
             beacons=config.get('spot_rule_beacons'),
             qualifiers=config.get('spot_rule_qualifiers', ()),
             stronger_db=(float(config['spot_rule_strongest_db'])

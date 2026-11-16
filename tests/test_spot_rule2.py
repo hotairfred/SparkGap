@@ -275,6 +275,18 @@ def test_2_bad_calls_file(tmp_path) -> None:
     assert _feed(r, "CQ WX7U WX7U") == [] and _why(r, "WX7U") == 2
 
 
+def test_2_not_in_scp() -> None:
+    scp = {"K1ABC", "NP4Z", "FR/G3TXF"}
+    r = _rule(scp=scp.__contains__)
+    assert _feed(r, "CQ K1ABC K1ABC") == ["K1ABC"]
+    assert _feed(r, "CQ K1ABD K1ABD", f=7030.0) == [] and _why(r, "K1ABD") == 2
+    assert r.trace[-1][4] == "not in SCP"
+    assert _feed(r, "CQ HK3/NP4Z HK3/NP4Z", f=21030.0) == ["HK3/NP4Z"]        # its base call
+    assert _feed(r, "CQ FR/G3TXF FR/G3TXF", f=3530.0) == ["FR/G3TXF"]         # listed portable
+    assert _feed(r, "VE8AT T", f=14100.0) == ["VE8AT"]                        # a beacon need not be
+    assert _feed(_rule(), "CQ K1ABD K1ABD", f=7030.0) == ["K1ABD"]            # off: no check
+
+
 def test_11_notched_freqs_file(tmp_path) -> None:
     from spot_rule2 import read_notched
     (tmp_path / "NotchedFreqs.txt").write_text("7074\n14079.5-14081\n14090 14092\nnote\n")
