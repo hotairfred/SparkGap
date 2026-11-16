@@ -17,6 +17,7 @@ Environment="MQTT_USER=YOUR_MQTT_USER"
 Environment="MQTT_PASS=YOUR_MQTT_PASSWORD"
 
 ExecStart=/usr/bin/python3 /home/sparkgap/csdr-skimmer/pskr_feeder.py --call YOUR_CALL --grid YOUR_GRID
+# CW and RTTY too: add --telnet 127.0.0.1:7300 (SparkGap's telnet_port) to the line above
 
 StandardOutput=append:/tmp/pskr_feeder.log
 StandardError=append:/tmp/pskr_feeder.log
