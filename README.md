@@ -69,7 +69,7 @@ from one contest weekend. The harness to reproduce them is in `tools/eval/` and 
 - **CW.** A scanner finds every signal in each band and opens one channel on it; each channel
   is decoded by **itila2**, a two-state HMM decoder with its timing fitted from the sender's own
   keying (`docs/ITILA2.md`). Each band is decoded across its whole CW segment, to the top of the US
-  CW/data segment (3600, 7125, 10150, 14150, 18110, 21200, 24930, 28300) as far as the receiver's span
+  CW/data segment (2000, 3600, 7125, 10150, 14150, 18110, 21200, 24930, 28300) as far as the receiver's span
   reaches, with the FT8 and JS8 frequencies inside it skipped (and FT4 where CW doesn't go);
   `"cw_whole_segment": false` stops each band below FT8 as before.
 - **Spotting the runner, not the caller.** The repeat spot rule (`spot_rule.py`) follows what
