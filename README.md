@@ -259,12 +259,32 @@ FT8 and FT4 decodes travel from `sparkgap.py` to `pskr_feeder.py` through an MQT
 or any other): SparkGap publishes one JSON message per decode on topic `skimmer/ft8/raw`, and
 the feeder batches them to PSKReporter under your call and grid (`pskr_feeder.py --call
 YOUR_CALL --grid YOUR_GRID`). The payload is described at the top of `pskr_feeder.py`
-(`call`, `grid`, `freq_hz`, `snr`, `mode`, `msg`, `ts`). Both read the broker from the
+(`call`, `grid`, `freq_hz`, `snr`, `mode`, `msg`, `ts`, and for `wsjtx_udp.py` the `dial_hz`,
+`df_hz`, `slot_ts` and `dt`). Both read the broker from the
 environment: `MQTT_HOST` (default `localhost`), `MQTT_PORT` (1883), `MQTT_USER` and `MQTT_PASS`;
 `deploy/sparkgap.service` and `deploy/pskr_feeder.service` show where to set them. SparkGap
 connects at its first FT8 decode; if the broker can't be reached then, it logs `FT8 MQTT
 publisher init failed (will not retry)` and runs on without FT8 uploads until it is restarted.
 CW and RTTY spots don't use MQTT.
+
+### WSJT-X UDP (GridTracker, JTAlert, N1MM, Aggregator)
+
+`wsjtx_udp.py` sends the same decodes as WSJT-X's UDP messages, so programs written for WSJT-X
+can read SparkGap: GridTracker, JTAlert, N1MM Logger+, or the RBN Aggregator's FT# page. It reads
+`skimmer/ft8/raw` (and `skimmer/wspr/raw` when WSPR is on) from the same broker and sends to
+127.0.0.1:2237 unless told otherwise (`--to HOST:PORT`, as many as you need; a multicast group
+such as 224.0.0.73:2237 works). Each band and mode is its own WSJT-X instance, named
+"SG 20m FT8" and so on, because a WSJT-X instance has one dial. `--name` sets the name from `{band}`,
+`{mode}`, `{dial}` (kHz) and `{call}` (default `"SG {band} {mode}"`; `"{band} {mode}"` is shorter
+still in GridTracker's tabs), and must hold the band or dial and the mode. Each instance sends a
+Heartbeat and a Status every 15 s, one Decode per decode (WSPR as a WSPRDecode, FST4W as a Decode as
+WSJT-X sends it), and a Close when it stops or a band
+has been quiet for 10 minutes. The program only sends; replies from those programs (call this
+station, halt Tx) are ignored, since there is no transmitter. `--dry-run` logs what it would
+send. `deploy/wsjtx_udp.service` is a systemd unit for it.
+
+SparkGap decodes a minute at a time, so a minute's decodes arrive together, a few seconds after
+the minute, each stamped with its own slot time and DT.
 
 ### RBN
 

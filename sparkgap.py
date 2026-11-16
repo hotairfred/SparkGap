@@ -672,6 +672,13 @@ def ft8_slot_dt(window_t, time_sec):
     return ((window_t + time_sec - 0.5 + FT8_SLOT_S / 2) % FT8_SLOT_S) - FT8_SLOT_S / 2
 
 
+def ftx_slot_time(tx_t, slot_s):
+    """(slot start epoch, DT) of a transmission that began at wall time tx_t: the slot it belongs to and how
+    far it started from that slot's start plus 0.5 s, as WSJT-X shows DT (FT8 15 s slots, FT4 7.5 s)."""
+    slot = round((tx_t - 0.5) / slot_s) * slot_s
+    return slot, round(tx_t - 0.5 - slot, 2)
+
+
 class Ft8ClockWatch:
     """Warns when FT8 decodes' DT sits far from 0, the sign of a PC clock that is off: aligned
     windows cover a transmission from about 1 s early to 2.3 s late on the clock (cdub89, #76).
@@ -960,7 +967,7 @@ def _ft8_cycle(jobs, skimmer):
                     _pub = _get_mqtt_publisher()
                     if _pub is not None:
                         try:
-                            _pub.publish('skimmer/ft8/raw', json.dumps({
+                            spot = {
                                 'call':    ft8_call,
                                 'grid':    ft8_grid,
                                 'freq_hz': int(rf_khz_corr * 1000),
@@ -968,7 +975,16 @@ def _ft8_cycle(jobs, skimmer):
                                 'mode':    mode,
                                 'msg':     msg,
                                 'ts':      int(time.time()),
-                            }), qos=0)
+                                # for wsjtx_udp.py: the dial and audio offset, and the slot and DT. The
+                                # dial is the band's own, fixed (ppm_offset moves the offset, not the dial,
+                                # so a listener sees one dial per instance); freq_hz = dial_hz + df_hz
+                                'dial_hz': round(dial_khz * 1000),
+                                'df_hz':   int(rf_khz_corr * 1000) - round(dial_khz * 1000),
+                            }
+                            if aligned and t0 > 0:
+                                spot['slot_ts'], spot['dt'] = ftx_slot_time(
+                                    t0 + start / 12000.0 + time_sec, slot_s)
+                            _pub.publish('skimmer/ft8/raw', json.dumps(spot), qos=0)
                         except Exception:
                             pass
                     log.info("*** SPOT: %10.1f  %-12s  %+d dB  %s  [%s] ***",
