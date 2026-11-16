@@ -8635,11 +8635,17 @@ class SparkGap:
                                         sample_rate=rx_sample_rate,
                                         encoding=self.cfg.get('rtp_encoding', 'f32le'),
                                         iface=self.cfg.get('rtp_iface'),
-                                        use_dns=bool(self.cfg.get('rtp_use_dns', False)))
+                                        use_dns=bool(self.cfg.get('rtp_use_dns', False)),
+                                        status=(self.cfg.get('rtp_status')
+                                                if self.cfg.get('rtp_create_channels') else None))
+            if self.cfg.get('rtp_create_channels') and not self.cfg.get('rtp_status'):
+                log.error("rtp_create_channels needs rtp_status: radiod's status group (its config's status =)")
+                return False
             for _name, center_hz, rx_idx in self._band_meta:
                 self.receiver.set_frequency(rx_idx, center_hz)
-            log.info("Using radiod RTP channels from %s (SSRC = centre in kHz: %s)", group,
-                     ", ".join(str(round(c / 1000)) for _n, c, _r in self._band_meta))
+            log.info("Using radiod RTP channels from %s (SSRC = centre in kHz: %s)%s", group,
+                     ", ".join(str(round(c / 1000)) for _n, c, _r in self._band_meta),
+                     ', created by SparkGap (rtp_create_channels)' if self.cfg.get('rtp_create_channels') else '')
         elif sdr_type == 'flex':
             # FlexRadio DAX-IQ path — single-band only for now
             _, center_hz, _ = self._band_meta[0]
