@@ -108,7 +108,7 @@ def test_the_same_band_is_already_done() -> None:
     "change, cfg, why",
     [
         ({"band": "20m", "x": 1}, {}, "only the band"),
-        ({"band": "6m"}, {}, "unknown band"),
+        ({"band": "2m"}, {}, "unknown band"),
         ({"band": []}, {}, "unknown band"),
         ({"band": "20m"}, {"per_band_min_snr": {"20m": 9}}, "per-band settings"),
         ({"band": "20m"}, {"pfb_scanner_bands": ["20m"]}, "per-band settings"),

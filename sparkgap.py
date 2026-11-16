@@ -486,6 +486,7 @@ CW_BAND_PLAN_R2 = [
     (21000,  21070,     21070,        21074),   # 15m   — FT4=21140 above FT8 (unreachable)
     (24890,  24913,     24913,        24915),   # 12m   — no FT4
     (28000,  28070,     28070,        28074),   # 10m   — FT4=28180 above FT8 (unreachable)
+    (50000,  50100,     50100,        0),       # 6m    — CW 50.000-50.100; FT8 50.313 is a second receiver's
 ]
 
 # Whole CW segment (cw_whole_segment, on by default; cdub89/SparkGap#48): the CW window runs from the
@@ -493,7 +494,7 @@ CW_BAND_PLAN_R2 = [
 # digital dials inside are skipped zones instead of ending the window. Before, each band stopped
 # below FT8 (40m 7000-7070), so CQs at 7.114 or 14.080 were never decoded.
 CW_SEGMENT_TOP_KHZ = {1810: 2000, 3500: 3600, 7000: 7125, 10100: 10150, 14000: 14150,
-                      18068: 18110, 21000: 21200, 24890: 24930, 28000: 28300}
+                      18068: 18110, 21000: 21200, 24890: 24930, 28000: 28300, 50000: 50100}
 # Dials skipped inside the segment, each from CW_SKIP_BELOW_KHZ under it to CW_SKIP_ABOVE_KHZ over
 # it (the 3 kHz of audio above the dial): FT8 and JS8, and FT4 where CW does not reach it (30m,
 # 17m, 15m, 12m, 10m: 21140 was half the extra 15m decoding on the SS replay and gave no spot), with
@@ -509,7 +510,7 @@ CW_SKIP_HOLD_SEC = 1e8       # an exclusion zone that never lapses
 # Band names for the config's bands[]: each is centred so the band's lower CW edge above sits
 # BAND_EDGE_MARGIN of the sample rate inside the IQ span, past the receiver's roll-off: a
 # FLEX-6400 is flat from 8.3% in at 48 and 96 kHz, a Red Pitaya from ~3% at 192 kHz (#63)
-BANDS = dict(zip(('160m', '80m', '40m', '30m', '20m', '17m', '15m', '12m', '10m'),
+BANDS = dict(zip(('160m', '80m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m'),
                  (row[0] for row in CW_BAND_PLAN_R2)))
 BAND_EDGE_MARGIN = 0.10
 
@@ -753,12 +754,16 @@ def _ft8_decoder(cfg):
     return FT8_DECODER_BUILT if os.path.exists(FT8_DECODER_BUILT) else FT8_DECODER_OLD
 
 
-# FT8 dials, kHz, and the Red Pitaya node's receiver centres (kHz) with the dial each decodes
-FT8_DIALS_KHZ = (1840, 3573, 7074, 10136, 14074, 18100, 21074, 24915, 28074)
-FT4_DIALS_KHZ = (3575, 7047.5, 10140, 14080, 18104, 21140, 24919, 28180)
+# FT8 dials, kHz, and the Red Pitaya node's receiver centres (kHz) with the dial each decodes. 6m's
+# 50313 / 50318 sit 200 kHz above its CW segment: a receiver centred near them decodes them (SIX_M_DIGITAL_KHZ).
+FT8_DIALS_KHZ = (1840, 3573, 7074, 10136, 14074, 18100, 21074, 24915, 28074, 50313)
+FT4_DIALS_KHZ = (3575, 7047.5, 10140, 14080, 18104, 21140, 24919, 28180, 50318)
+# 6m's digital receiver centre for a config band {"name": "6m digital", "center_khz": 50290}: at 192 kHz
+# its span (50194-50386 kHz) holds FT8 50313, FT4 50318, WSPR 50293 and MSK144 50260 and 50380.
+SIX_M_DIGITAL_KHZ = 50290
 # enable_wspr: WSPR dials (kHz); a 2-minute WSPR cycle starts each even UTC minute and its signals sit 1400-1600 Hz
 # above the dial. Decoded by WSJT-X's wsprd from two minute snapshots joined (wspr_dial_khz, _wspr_decode).
-WSPR_DIALS_KHZ = (1836.6, 3568.6, 7038.6, 10138.7, 14095.6, 18104.6, 21094.6, 24924.6, 28124.6)
+WSPR_DIALS_KHZ = (1836.6, 3568.6, 7038.6, 10138.7, 14095.6, 18104.6, 21094.6, 24924.6, 28124.6, 50293.0)
 _WSPR_LINE = re.compile(r"^\s*(\d{4})\s+(-?\d+)\s+(-?[\d.]+)\s+([\d.]+)\s+(-?\d+)\s+(\S.*?)\s*$")
 # jt9 -W (FST4W) output: "1800 -28  0.5 1520 `  K1ABC FN42 37": time, SNR, DT, audio Hz, the FST4 mark, message
 _FST4W_LINE = re.compile(r"^\s*(\d{4})\s+(-?\d+)\s+(-?[\d.]+)\s+(\d+)\s+`\s+(\S.*?)\s*$")
@@ -6239,6 +6244,11 @@ class InstanceManager:
                                     "match, using fallback [%.0f, %.0f] kHz",
                                     center_khz, bmin, bmax)
                 self.decode_khz = _decode_span(bmin, bmax, center_khz, self.sample_rate)
+                if self.decode_khz[1] <= self.decode_khz[0]:
+                    # a receiver for a band's digital dials only (6m digital at 50290 kHz): its CW
+                    # segment is outside the span, so the scanner finds no bins and decodes no CW
+                    log.info("CW window for %.0f kHz: the band's CW segment [%.0f, %.0f] kHz is outside "
+                             "this receiver's span: no CW here", center_khz, bmin, bmax)
                 self._itila_scanner = _ItilaScanner(
                     self.sample_rate, center_khz,
                     ev_thresh=self.itila_ev_thresh,

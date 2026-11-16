@@ -32,5 +32,5 @@ def test_hz_and_dict_entries_unchanged() -> None:
 def test_cw_windows_fit_the_flat_part(rate: int) -> None:
     flat_hz = rate * (1 - 2 * BAND_EDGE_MARGIN)
     for lo, _, hi_with_ft4, _ in CW_BAND_PLAN_R2:
-        if lo != 1810:  # 160m is wider than any span; its bottom stays anchored
+        if lo not in (1810, 50000):  # 160m and 6m are wider than a 96 kHz span; their bottoms stay anchored
             assert (hi_with_ft4 - lo) * 1000 <= flat_hz
