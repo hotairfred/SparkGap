@@ -94,6 +94,9 @@ from one contest weekend. The harness to reproduce them is in `tools/eval/` and 
   it says the PC clock is off. With `"enable_ft4": true` each band's FT4 frequency (3575, 7047.5,
   10140, 14080, 18104, 21140, 24919, 28180) is decoded too, with the same `decode_ft8 -ft4` on FT4's
   7.5 s slots, and its spots go out as FT4 (about 4% of a core for 9 bands).
+  `"ftx_decoder": "jt9"` decodes both with WSJT-X's own `jt9` instead (install WSJT-X, or set
+  `jt9_path`; `jt9_depth` 1-3, default 1): on the same audio about 45% more FT8 and FT4 decodes at depth 1,
+  for about a third of a core over 9 bands (depth 2: about 75% more for about 1.4 cores).
 - **SSB (voice), experimental.** Voices are found in the IQ by their filter shape and speech rhythm,
   transcribed with Whisper (faster-whisper `large-v3-turbo` on a CUDA GPU), and the station calling CQ
   is spotted on its own telnet port, by spoken versions of the same rules: runner copies, the better of
@@ -135,6 +138,7 @@ Off unless set, except where a default is given:
 | `spot_rule_fragments` | Pieces of a longer call heard near it are held back (K1V of K1VUT) |
 | `signal_min_snr` | Scanner threshold to open a bin, dB over the local noise (12) |
 | `itila_max_bins` | Most bins at once per band |
+| `ftx_decoder`, `jt9_depth` | `jt9` decodes FT8 and FT4 with WSJT-X's own decoder instead of `decode_ft8` (above); depth 1 (default) to 3 |
 | `ft8_windows`, `ft8_band_cut` | `aligned` FT8 windows around each slot (keep the PC clock synced) or `sliding`; `fft` or `resample` band cut |
 
 Work in progress is in the [open pull requests](https://github.com/hotairfred/SparkGap/pulls).
