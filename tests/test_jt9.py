@@ -24,6 +24,29 @@ def test_depth_and_path() -> None:
     assert sparkgap._jt9_decoder({"ftx_decoder": "JT9", "jt9_depth": 0})[1] == 1
     assert sparkgap._jt9_args(("jt9", 2, work), "FT8") == ["-8", "-p", "15", "-d", "2", "-a", work, "-t", work]
     assert sparkgap._jt9_args(("jt9", 2, work), "FT4")[:3] == ["-5", "-p", "7"]
+    for bad in (None, "deep", [2]):                           # review: null or text no longer stops the start
+        assert sparkgap._jt9_decoder({"ftx_decoder": "jt9", "jt9_depth": bad})[1] == 1
+        assert sparkgap._gui_settings({"ftx_decoder": "jt9", "jt9_depth": bad}, 192000)[0]["jt9_depth"] == 1
+
+
+def test_missing_program_warned_once(monkeypatch, caplog) -> None:
+    import subprocess
+    import types
+
+    import numpy as np
+
+    def fake_run(args, **kw):
+        raise FileNotFoundError(2, "No such file or directory", args[0])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(sparkgap, "_get_mqtt_publisher", lambda: None)
+    sk = types.SimpleNamespace(cfg={"enable_ft8": True, "enable_rtty": False, "ftx_decoder": "jt9",
+                                    "jt9_path": "/nope/jt9"},
+                               spot_count=0, managers=[], _corrected_freq_khz=lambda f: f, broadcast=lambda **s: None)
+    z = np.zeros(60 * 192000, dtype=np.float32)
+    with caplog.at_level("WARNING"):
+        sparkgap._ft8_cycle([("20m", 0, 14090.0, 14074, z, z, len(z), 1792551360.0)], sk)
+    assert sum("FT8/FT4 decodes fail" in r.message for r in caplog.records) == 1
 
 
 def _cycle(monkeypatch, cfg):

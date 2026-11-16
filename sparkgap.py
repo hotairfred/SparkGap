@@ -20,6 +20,7 @@ import faulthandler
 faulthandler.enable()
 
 import argparse
+import atexit
 import asyncio
 import json
 import logging
@@ -86,7 +87,7 @@ def _gui_settings(cfg, sample_rate):
         'enable_ft8': bool(cfg.get('enable_ft8', True)),
         'enable_ft4': bool(cfg.get('enable_ft4', False)),
         'ftx_decoder': str(cfg.get('ftx_decoder', 'ft8_lib')).lower(),
-        'jt9_depth': min(3, max(1, int(cfg.get('jt9_depth', 1)))) if str(cfg.get('ftx_decoder', '')).lower() == 'jt9' else None,
+        'jt9_depth': _jt9_depth(cfg) if str(cfg.get('ftx_decoder', '')).lower() == 'jt9' else None,
         'spot_rule': rule,
         'spot_rule_cq_groups': repeat,         # _make_spot_rule: always on with the repeat rule
         'spot_rule_lockon': repeat,
@@ -767,14 +768,26 @@ def ft4_dial_khz(center_khz, fs=192000):
     return next((d for d in FT4_DIALS_KHZ if center_khz - half <= d and d + 3.0 <= center_khz + half), None)
 
 
+def _jt9_depth(cfg):
+    """jt9_depth as 1-3; anything else (null, text) is 1, the default, with a warning."""
+    v = cfg.get('jt9_depth', 1)
+    try:
+        return min(3, max(1, int(v)))
+    except (TypeError, ValueError):
+        log.warning("jt9_depth %r is not 1, 2 or 3: using 1", v)
+        return 1
+
+
 def _jt9_decoder(cfg):
     """ftx_decoder "jt9": (program, depth, work dir) for _ft8_cycle, else None (decode_ft8). jt9_path, default
     "jt9" on the PATH; jt9_depth 1-3, default 1; a work dir of this process for jt9's data and temp files."""
     if str(cfg.get('ftx_decoder', 'ft8_lib')).lower() != 'jt9':
         return None
-    depth = min(3, max(1, int(cfg.get('jt9_depth', 1))))
+    depth = _jt9_depth(cfg)
     work = os.path.join(tempfile.gettempdir(), 'sparkgap_jt9_%d' % os.getpid())
-    os.makedirs(work, exist_ok=True)
+    if not os.path.isdir(work):
+        os.makedirs(work, exist_ok=True)
+        atexit.register(shutil.rmtree, work, True)     # jt9's data and temp files go with the process
     return (cfg.get('jt9_path') or 'jt9', depth, work)
 
 
@@ -875,7 +888,12 @@ def _ft8_cycle(jobs, skimmer):
                     r = subprocess.run(([jt9[0]] if jt9 else [ft8_bin]) + mode_args + [wav_fn],
                         capture_output=True, text=True, timeout=20)
                 except Exception as e:
-                    log.debug("decode_ft8 err %s p%d: %s", bn, part, e)
+                    prog = 'jt9' if jt9 else 'decode_ft8'
+                    if isinstance(e, OSError) and not getattr(skimmer, '_ftx_prog_warned', False):
+                        skimmer._ftx_prog_warned = True    # a missing or broken program: say so once
+                        log.warning("%s %s p%d: %s (FT8/FT4 decodes fail until it runs)", prog, bn, part, e)
+                    else:
+                        log.debug("%s err %s p%d: %s", prog, bn, part, e)
                     continue
                 for line in (r.stdout or '').strip().split('\n'):
                     line = line.strip()
@@ -889,7 +907,7 @@ def _ft8_cycle(jobs, skimmer):
                         snr = int(float(parts_o[1]))
                         time_sec = float(parts_o[2])
                         audio_hz = int(parts_o[3])
-                        msg = _JT9_AP.sub('', parts_o[5]).strip()
+                        msg = (_JT9_AP.sub('', parts_o[5]) if jt9 else parts_o[5]).strip()
                     except (ValueError, IndexError):
                         continue
                     # RF freq = dial + audio offset
