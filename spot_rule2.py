@@ -6,7 +6,7 @@ checked in this order; a call not spotted is dropped by the first gate that is f
   1 Shape              prefix (@, @@, #@ or #@@), 1 to 4 digits, 1 to 6 letters
   2 Not banned         the call is not on the banned list or in the Bad Calls file
   3 Reads              reads in the buffer: 2 for a patt3ch.lst + pattern, 3 unflagged, 5 none
-                       (CW Skimmer, Normal), one more for a call not on the node's known-call list
+                       (normal level), one more for a call not on the node's known-call list
                        (spot_validation_calls); a call decoded twice is read twice
   4 Best reading       the most-read call in the buffer wins; a tie spots neither. A call split by a
                        gap (K1V UT) is a read of the longer call read whole there (K1VUT); a
