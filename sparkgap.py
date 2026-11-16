@@ -22,6 +22,7 @@ faulthandler.enable()
 import argparse
 import atexit
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -88,6 +89,7 @@ def _gui_settings(cfg, sample_rate):
         'enable_ft4': bool(cfg.get('enable_ft4', False)),
         'ftx_decoder': str(cfg.get('ftx_decoder', 'ft8_lib')).lower(),
         'jt9_depth': _jt9_depth(cfg) if str(cfg.get('ftx_decoder', '')).lower() == 'jt9' else None,
+        'enable_wspr': bool(cfg.get('enable_wspr', False)),
         'spot_rule': rule,
         'spot_rule_cq_groups': repeat,         # _make_spot_rule: always on with the repeat rule
         'spot_rule_lockon': repeat,
@@ -753,6 +755,10 @@ def _ft8_decoder(cfg):
 # FT8 dials, kHz, and the Red Pitaya node's receiver centres (kHz) with the dial each decodes
 FT8_DIALS_KHZ = (1840, 3573, 7074, 10136, 14074, 18100, 21074, 24915, 28074)
 FT4_DIALS_KHZ = (3575, 7047.5, 10140, 14080, 18104, 21140, 24919, 28180)
+# enable_wspr: WSPR dials (kHz); a 2-minute WSPR cycle starts each even UTC minute and its signals sit 1400-1600 Hz
+# above the dial. Decoded by WSJT-X's wsprd from two minute snapshots joined (wspr_dial_khz, _wspr_decode).
+WSPR_DIALS_KHZ = (1836.6, 3568.6, 7038.6, 10138.7, 14095.6, 18104.6, 21094.6, 24924.6, 28124.6)
+_WSPR_LINE = re.compile(r"^\s*(\d{4})\s+(-?\d+)\s+(-?[\d.]+)\s+([\d.]+)\s+(-?\d+)\s+(\S.*?)\s*$")
 FT8_CENTRE_DIALS = {3590: 3573, 7090: 7074, 10118: 10136, 14090: 14074, 18083: 18100,
                     21090: 21074, 24902: 24915, 28090: 28074}
 
@@ -773,6 +779,113 @@ def ft4_dial_khz(center_khz, fs=192000):
     span with 2 kHz to spare, as ft8_dial_khz (14080 at 14090, 21140 at 21090; 160m has none)."""
     half = fs / 2000.0 - 2.0
     return next((d for d in FT4_DIALS_KHZ if center_khz - half <= d and d + 3.0 <= center_khz + half), None)
+
+def wspr_dial_khz(center_khz, fs=192000):
+    """enable_wspr: the WSPR dial a band's IQ decodes, or None, by ft8_dial_khz's rule (its audio in the span)."""
+    half = fs / 2000.0 - 2.0
+    return next((d for d in WSPR_DIALS_KHZ if center_khz - half <= d and d + 3.0 <= center_khz + half), None)
+
+
+def _wspr_decoder(cfg):
+    """enable_wspr: (wsprd program, deep search, work dir), else None. wsprd_path, default "wsprd" on the PATH
+    (WSJT-X installs it); wspr_deep runs wsprd -d (slower, a few more decodes)."""
+    if not cfg.get('enable_wspr', False):
+        return None
+    work = os.path.join(tempfile.gettempdir(), 'sparkgap_wspr_%d' % os.getpid())
+    if not os.path.isdir(work):
+        os.makedirs(work, exist_ok=True)
+        atexit.register(shutil.rmtree, work, True)     # wsprd's files go with the process
+    return (cfg.get('wsprd_path') or 'wsprd', bool(cfg.get('wspr_deep', False)), work)
+
+
+def _minute_modes(cfg):
+    """Whether any mode needs each band's minute of 192 kHz IQ: FT8, RTTY, WSPR or FST4W (FT8 and RTTY on
+    unless set off, as before; WSPR and FST4W off unless set on)."""
+    return bool(cfg.get('enable_ft8', True) or cfg.get('enable_rtty', True)
+                or cfg.get('enable_wspr', False) or cfg.get('enable_fst4w', False))
+
+
+def _wspr_keep(skimmer, bn, dial_khz, t0, x):
+    """One band's WSPR slice of a minute (12 kHz complex, first sample at t0). An even UTC minute is held; the odd
+    minute after it completes the cycle: returns (cycle minute, dial, two minutes joined), else None."""
+    held = skimmer.__dict__.setdefault('_wspr_half', {})
+    minute = round(t0 / 60.0)
+    x = _wspr_minute(x, t0 - minute * 60.0)
+    if minute % 2 == 0:
+        held[bn] = (minute, dial_khz, x)
+        return None
+    prev = held.pop(bn, None)
+    if prev is None or prev[0] != minute - 1 or prev[1] != dial_khz:
+        return None
+    return prev[0], dial_khz, np.concatenate([prev[2], x])
+
+
+def _wspr_minute(x, late_s, fs=12000):
+    """A minute's slice placed on the minute: exactly 60 s of samples, zeros where the snapshot started late_s
+    after the minute (a live snapshot can be up to a second short) or ended early, so the second minute joins
+    the first at the right time and a 110 s WSPR transmission stays in step across the join."""
+    n = 60 * fs
+    x = np.asarray(x, dtype=np.complex64)
+    off = int(round(late_s * fs))
+    x = x[-off:] if off < 0 else np.concatenate([np.zeros(off, np.complex64), x])
+    return np.concatenate([x, np.zeros(max(0, n - len(x)), np.complex64)])[:n]
+
+
+def _wspr_decode(items, skimmer, wspr):
+    """Decode each (band, cycle minute, dial, 2 min of 12 kHz complex) with wsprd; log and publish each decode on
+    MQTT topic skimmer/wspr/raw (wspr_feeder.py uploads them to WSPRnet). Returns the decodes."""
+    import wave
+    prog, deep, work = wspr
+    total = 0
+    try:
+        for bn, minute, dial_khz, x in items:
+            d = os.path.join(work, re.sub(r'[^A-Za-z0-9]', '_', str(bn)))
+            os.makedirs(d, exist_ok=True)
+            spec = np.fft.fft(x.astype(np.complex128))     # USB: drop the negative frequencies, take the real part
+            spec[len(spec) // 2:] = 0
+            audio = np.fft.ifft(spec).real * 2
+            peak = np.max(np.abs(audio))
+            if peak > 0:
+                audio = audio / peak * 0.9
+            t = time.gmtime(minute * 60)
+            fn = os.path.join(d, time.strftime('%y%m%d_%H%M.wav', t))
+            with wave.open(fn, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(12000)
+                wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+            try:
+                r = subprocess.run([prog, '-f', f'{dial_khz / 1000.0:.6f}', '-a', d] + (['-d'] if deep else [])
+                                   + [fn], capture_output=True, text=True, timeout=110, cwd=d, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning("WSPR %s: wsprd failed: %s", bn, e)
+                continue
+            finally:
+                # the WAV, and wsprd's logs, which -a appends to every cycle (kept: its wisdom and the
+                # hash table of calls heard, which reads <call> messages)
+                for f in (fn, os.path.join(d, 'ALL_WSPR.TXT'), os.path.join(d, 'wspr_spots.txt')):
+                    with contextlib.suppress(OSError):
+                        os.remove(f)
+            for line in (r.stdout or '').splitlines():
+                m = _WSPR_LINE.match(line)
+                if not m or line.startswith('<'):
+                    continue
+                total += 1
+                log.info("WSPR %s: %s", bn, line.strip())
+                pub = _get_mqtt_publisher()
+                if pub is not None:
+                    try:
+                        pub.publish('skimmer/wspr/raw', json.dumps({
+                            'date': time.strftime('%y%m%d', t), 'time': m[1], 'snr': int(m[2]),
+                            'dt': float(m[3]), 'freq_hz': round(float(m[4]) * 1e6), 'drift': int(m[5]),
+                            'msg': m[6], 'dial_hz': round(dial_khz * 1000), 'ts': minute * 60,
+                        }), qos=0)
+                    except (OSError, ValueError) as e:
+                        log.debug("WSPR MQTT publish failed: %s", e)
+        log.info("WSPR cycle done: %d spots across %d bands", total, len(items))
+    finally:
+        skimmer._wspr_running = False
+    return total
 
 
 def _jt9_depth(cfg):
@@ -823,6 +936,8 @@ def _ft8_cycle(jobs, skimmer):
     enable_rtty = bool(skimmer.cfg.get('enable_rtty', True))
     enable_ft4  = bool(skimmer.cfg.get('enable_ft4',  False))
     jt9 = _jt9_decoder(skimmer.cfg)       # ftx_decoder "jt9": (program, depth, work dir), else None
+    wspr = _wspr_decoder(skimmer.cfg)     # enable_wspr: (wsprd, deep, work dir), else None
+    wspr_items = []
     import subprocess, wave
     from scipy.signal import resample_poly
     from numpy.fft import fft, ifft
@@ -847,7 +962,7 @@ def _ft8_cycle(jobs, skimmer):
         except Exception as e:
             log.warning("RTTY scan %s: %s", bn, e)
 
-    for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 or enable_ft4 else []):
+    for bn, ri, ck, ft8_khz, fi, fq, n, t0 in (jobs if enable_ft8 or enable_ft4 or wspr else []):
         # (mode, dial kHz, slot s, window offsets, decode_ft8 arguments): FT8, and FT4 with enable_ft4
         modes = [('FT8', ft8_khz, FT8_SLOT_S, FT8_SLOT_OFFSETS_S, [])] if enable_ft8 else []
         ft4_khz = ft4_dial_khz(ck) if enable_ft4 else None
@@ -989,6 +1104,12 @@ def _ft8_cycle(jobs, skimmer):
                             pass
                     log.info("*** SPOT: %10.1f  %-12s  %+d dB  %s  [%s] ***",
                              rf_khz, ft8_call, snr, mode, msg)
+        wspr_khz = wspr_dial_khz(ck) if wspr else None
+        if wspr_khz:                      # this minute's WSPR slice, from the same FFT when there is one
+            got = _wspr_keep(skimmer, bn, wspr_khz, t0,
+                             band_slice_12k(fi[:n], fq[:n], (wspr_khz - ck) * 1000, z=z))
+            if got:
+                wspr_items.append((bn,) + got)
         # this band's RTTY now, from the same FFT, so the minute is
         # transformed once and its FFT freed before the next band
         if rtty_lib is not None and z is not None:
@@ -1004,6 +1125,14 @@ def _ft8_cycle(jobs, skimmer):
                  '' if med is None else ', median DT %+.2f s' % med)
         if warn:
             log.warning(warn)
+    if wspr_items:                        # a completed WSPR cycle: wsprd off the minute's thread
+        if getattr(skimmer, 'wspr_sync', False):
+            _wspr_decode(wspr_items, skimmer, wspr)
+        elif getattr(skimmer, '_wspr_running', False):
+            log.info("WSPR: the last cycle's decode is still running, this cycle skipped")
+        else:
+            skimmer._wspr_running = True
+            threading.Thread(target=_wspr_decode, args=(wspr_items, skimmer, wspr), daemon=True).start()
     if enable_ft4:
         log.info("FT4 cycle done: %d spots across %d bands", total_ft4,
                  sum(1 for job in jobs if ft4_dial_khz(job[2])))
@@ -8585,9 +8714,7 @@ class SparkGap:
         # to /tmp/diag_<band>_<HHMMSS>.wav for live-vs-replay diagnostics.
         # Reuses the FT8/RTTY capture buffer (requires either enable_ft8
         # or enable_rtty so the C-side accumulator is allocated).
-        if (getattr(self, '_use_c_receiver', False)
-                and (self.cfg.get('enable_ft8',  True)
-                     or self.cfg.get('enable_rtty', True))):
+        if getattr(self, '_use_c_receiver', False) and _minute_modes(self.cfg):
             try:
                 signal.signal(signal.SIGUSR1, self._diag_iq_snapshot)
                 log.info("SIGUSR1 handler installed: kill -USR1 %d for IQ snapshot", os.getpid())
@@ -8900,7 +9027,7 @@ class SparkGap:
         if not (sec < 5 and prev >= 55):
             return
         busy = getattr(self, '_ft8_running', False)
-        digital = bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True))
+        digital = _minute_modes(self.cfg)
         fs, jobs = 192000, []
         n60 = fs * 60
         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
@@ -8944,10 +9071,9 @@ class SparkGap:
         log.info("IQ stream started")
         # The Python receive path (RTP, Flex) keeps each band's minute itself for FT8 and RTTY
         self._py_minute = (not use_c and self.cfg.get('sample_rate', 48000) == 192000
-                           and bool(self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)
-                                    or self._iq_rec is not None))
-        if not use_c and not self._py_minute and (self.cfg.get('enable_ft8', True) or self.cfg.get('enable_rtty', True)):
-            log.info("FT8/RTTY need 192 kHz IQ; this receiver runs at %s: CW only", self.cfg.get('sample_rate', 48000))
+                           and (_minute_modes(self.cfg) or self._iq_rec is not None))
+        if not use_c and not self._py_minute and _minute_modes(self.cfg):
+            log.info("FT8/RTTY/WSPR need 192 kHz IQ; this receiver runs at %s: CW only", self.cfg.get('sample_rate', 48000))
 
         scan_interval = self.cfg.get('scan_interval', 5)
         status_interval = self.cfg.get('status_interval', 30)
@@ -9068,7 +9194,7 @@ class SparkGap:
                             log.warning("FT8 windows are aligned to this PC's clock, and timedatectl says "
                                         "it isn't NTP-synchronised: FT8 needs it within about a second "
                                         "(enable NTP, or set ft8_windows: sliding)")
-                    if enable_ft8 or enable_rtty or self._iq_rec is not None:
+                    if _minute_modes(self.cfg) or self._iq_rec is not None:
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
                             ft8_khz = ft8_dial_khz(ck)
@@ -9577,9 +9703,7 @@ class SparkGap:
             # IQ snapshot.  Run if EITHER is enabled.  FT8 + RTTY are gated
             # individually below.
             if use_c and getattr(self, '_worker_started', False) \
-                    and (self.cfg.get('enable_ft8', True)
-                         or self.cfg.get('enable_rtty', True)
-                         or self._iq_rec is not None):
+                    and (_minute_modes(self.cfg) or self._iq_rec is not None):
                 ft8_now = time.time()
                 ft8_sec = ft8_now % 60
                 ft8_prev_sec = getattr(self, '_ft8_prev_sec', 60)
@@ -9793,6 +9917,7 @@ class _FileDigital:
     def __init__(self, config, tracker, manager, center_khz, t0):
         self.cfg, self.tracker, self.managers = config, tracker, [manager]
         self.spot_count, self._rtty_excluded, self._ft8_running = 0, 0, False
+        self.wspr_sync = True                   # enable_wspr: decode each cycle in line, in audio order
         self.center_khz, self.t0 = center_khz, t0 or 0.0
         self.bn = 'file%d' % os.getpid()        # decode_ft8's temp WAVs are named by band
         self.audio_t = 0.0
@@ -10035,7 +10160,7 @@ def run_file_mode(args, config):
     if getattr(args, 'digital', False):
         if file_rate != _FileDigital.FS:
             log.warning("--digital: needs a %d Hz recording, this one is %d; off", _FileDigital.FS, file_rate)
-        elif config.get('enable_ft8', True) or config.get('enable_rtty', True):
+        elif _minute_modes(config):
             digital = _FileDigital(config, tracker, manager, center_khz, t0)
             log.info("File mode: FT8 %s, RTTY %s each minute of audio, as live (--digital)",
                      'on' if config.get('enable_ft8', True) else 'off',
