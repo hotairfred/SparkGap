@@ -62,7 +62,7 @@ QUALIFIERS = frozenset({"SS", "NA", "FD", "CWT", "SST", "MST", "POTA", "SOTA", "
                         "SKCC", "QRP", "DX"})                           # gate 6; enabled per node
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?(?:[A-Z]{1,2}|[0-9][A-Z]{1,2})[0-9]{1,4}[A-Z]{1,6}"
                      r"(?:/[A-Z0-9]{1,3})?$")                # a call token, #@@ included
-READS = {"active": 2, "rare": 3, None: 5}   # gate 3, by patt3ch.lst pattern (CW Skimmer)
+READS = {"active": 2, "rare": 3, None: 5}   # gate 3, by patt3ch.lst pattern
 LEVEL_READS = {"permissive": -1, "normal": 0, "aggressive": 1}   # gate 3: call validation level
 UNLISTED_READS = 1            # gate 3: more reads for a call not on the known-call list
 BEACON_READS = 1              # gate 12: an NCDXF or listed beacon sends its call once a slot
