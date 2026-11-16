@@ -17,7 +17,7 @@ def _rule(**kw) -> GateSpotRule:
 
 def _feed(rule: GateSpotRule, text: str, t: float = 0.0, f: float = 14025.0, w: int | None = None,
           snr: float | None = None) -> list[str]:
-    win = rule.window_id(int(round(f * 10)), int(t) if w is None else w, t)
+    win = rule.window_id(round(f * 10), int(t) if w is None else w, t)
     rule.feed(win, f, text, t, snr)
     return [c for c, _ in rule.end_pass()]
 
@@ -121,6 +121,24 @@ def test_11_beacon() -> None:
     assert _feed(r, "4U1UN 4U1UN", f=14100.0) == ["4U1UN"]                 # no keyword needed
 
 
+def test_11_known_beacon_spots_on_one_read() -> None:
+    r = _rule()
+    assert _feed(r, "KH6RS T", f=21150.0) == ["KH6RS"]                     # once a slot
+    assert _feed(r, "4U1UN T E ZL6B", f=14100.0) == ["4U1UN", "ZL6B"]     # beacons are not rivals
+    assert _feed(r, "K6RS/B", f=28250.0) == [] and _why(r, "K6RS/B") == 3  # /B keeps gate 3
+    assert _feed(r, "KH6RS", f=7025.0) == []                               # off a beacon frequency
+
+
+def test_11_garbled_beacon_spots_the_beacon() -> None:
+    r = _rule()
+    assert _feed(r, "UH6RS T", f=21150.0) == ["KH6RS"]                     # the beacon, no garble
+    assert _feed(r, "L6B G", f=14100.0) == ["ZL6B"]                        # a missing letter
+    assert _feed(r, "OA2B", f=14100.5) == []                               # OH2B or OA4B: neither
+    assert _feed(r, "UH6RS T", f=7025.0) == []                             # off a beacon frequency
+    r = _rule(listed=lambda c: c == "OH2BH")
+    assert _feed(r, "OH2BH", f=14100.0) == [] and _why(r, "OH2BH") == 3    # known: no garble
+
+
 def test_5_keywords_only() -> None:
     r = _rule()
     assert _feed(r, "SS N6RO N6RO") == [] and _why(r, "N6RO") == 5
@@ -190,7 +208,7 @@ def test_1_shape_accepts_digit_two_letter_prefix() -> None:
 def test_s_buffer_ends_with_its_bin() -> None:
     r = _rule()
     _feed(r, "CQ K1ABC", w=1)
-    r.close_bin(int(round(14025.0 * 10)))
+    r.close_bin(round(14025.0 * 10))
     assert _feed(r, "CQ K1ABC", t=30, w=2) == [] and _why(r, "K1ABC") == 3
 
 
@@ -207,14 +225,14 @@ def test_9_a_copy_on_another_band_does_not_block() -> None:
 def test_9_both_bands_of_one_pass_spot() -> None:
     r = _rule()                   # WebRX 11-14 13:46Z, OK/OM DX: OM3GI on 15 and 10 m, confirmed
     for f, snr in ((21012.3, 20.0), (28013.8, 18.0)):
-        r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ TEST OM3GI OM3GI", 0.0, snr)
+        r.feed(r.window_id(round(f * 10), 1, 0.0), f, "CQ TEST OM3GI OM3GI", 0.0, snr)
     assert sorted(r.end_pass()) == [("OM3GI", 21012.3), ("OM3GI", 28013.8)]
 
 
 def test_9_images_fed_before_the_real_copy_in_one_pass() -> None:
     r = _rule()
     for f, snr in ((7036.0, 17.0), (7061.5, 10.0), (7052.0, 88.0)):
-        r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
+        r.feed(r.window_id(round(f * 10), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
     assert [(c, f) for c, f in r.end_pass()] == [("WX7V", 7052.0)]
 
 
@@ -222,7 +240,7 @@ def test_9_images_within_6_db_of_each_other_spot_none() -> None:
     r = _rule()                               # WebRX 11-14 00:21:45Z, LakeDog on 7061
     copies = ((21004.1, 12.3), (21004.3, 12.4), (21000.1, 15.1))   # the 15 m copies
     for f, snr in copies:
-        r.feed(r.window_id(int(round(f * 10)), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
+        r.feed(r.window_id(round(f * 10), 1, 0.0), f, "CQ CQ DE WX7V WX7V WX7V K", 0.0, snr)
     assert r.end_pass() == []
 
 

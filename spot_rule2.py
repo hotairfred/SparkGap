@@ -27,7 +27,11 @@ checked in this order; a call not spotted is dropped by the first gate that is f
  10 Re-spot            not spotted on this band in the last 10 minutes, unless moved 1 kHz
  11 Window             the frequency is inside the configured CW segments and outside every
                        range in the Notched Freqs file
- 12 Beacon             a /B, NCDXF or listed beacon skips 5 to 8
+ 12 Beacon             a /B, NCDXF or listed beacon skips 5 to 8; an NCDXF or listed beacon
+                       spots on one read (it sends its call once a slot), and other such
+                       beacons in its buffer are not its rivals at gate 4; on an NCDXF
+                       frequency a word one letter off one NCDXF call is read as that call
+                       (UH6RS is KH6RS), unless it is on the known-call list
 
 Every decision is kept in .trace and logged at debug level as (gate, reason)."""
 
@@ -60,6 +64,7 @@ CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?(?:[A-Z]{1,2}|[0-9][A-Z]{1,2})[0-9]{1
                      r"(?:/[A-Z0-9]{1,3})?$")                # a call token, #@@ included
 READS = {"active": 2, "rare": 3, None: 5}   # gate 3, by patt3ch.lst pattern (CW Skimmer)
 UNLISTED_READS = 1            # gate 3: more reads for a call not on the known-call list
+BEACON_READS = 1              # gate 12: an NCDXF or listed beacon sends its call once a slot
 BUFFER_CHARS = 256            # a signal's decoded text judged at once
 DE_LOOKBACK = LOOKAHEAD       # gate 7: words searched before DE for the keyword, as after it
 SIGNOFF = frozenset({"AR", "KN", "SK", "BK", "TU"})   # gate 7: ends the CQ (not K, not BT)
@@ -74,6 +79,7 @@ BEACON_KHZ = 5.0              # gate 12: a listed beacon within this of its freq
 NCDXF = frozenset({"4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O", "VR2B",
                    "4S7B", "ZS6DN", "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA", "OA4B", "YV5B"})
 NCDXF_KHZ = (14100.0, 18110.0, 21150.0, 24930.0, 28200.0)
+BEACON_MIN_CHARS = 3          # gate 12: shorter words are not read as an NCDXF call
 
 REASONS = {1: "not a callsign structure", 2: "banned call", 3: "not read enough",
            4: "not the best reading", 5: "no keyword", 7: "call not with the keyword",
@@ -293,8 +299,17 @@ class GateSpotRule:
         return toks[::-1]
 
     def beacon(self, call: str, f: float) -> bool:
-        if call.endswith("/B"):
-            return True
+        return call.endswith("/B") or self.known_beacon(call, f)
+
+    def _ncdxf(self, tok: str) -> str:
+        """Gate 12: the NCDXF call a word on an NCDXF frequency is one letter off, if only one."""
+        if (tok in NCDXF or len(tok) < BEACON_MIN_CHARS
+                or (self.listed is not None and self.listed(base(tok)))):
+            return tok
+        near = [c for c in NCDXF if _lev1(tok, c)]
+        return near[0] if len(near) == 1 else tok
+
+    def known_beacon(self, call: str, f: float) -> bool:
         if call in NCDXF:
             return any(abs(f - x) <= BEACON_KHZ for x in NCDXF_KHZ)
         return call in self.beacons and abs(f - self.beacons[call]) <= BEACON_KHZ
@@ -307,6 +322,8 @@ class GateSpotRule:
         more than once (the two filter paths) keeps its latest text."""
         self._expire(now)
         text = " ".join(tokens(split_runs(text, de_rejoin=True)))     # CQCQDE -> CQ CQ DE
+        if any(abs(freq_khz - x) <= BEACON_KHZ for x in NCDXF_KHZ):
+            text = " ".join(self._ncdxf(t) for t in text.split())
         b = self._win_bin.setdefault(window, window)
         texts = self._bins.setdefault(b, {})
         texts.pop(window, None)
@@ -357,9 +374,10 @@ class GateSpotRule:
         if call in self.banned or b in self.banned:
             return self._decide(now, f, call, 2)
         beacon = self.beacon(call, f)
+        known = self.known_beacon(call, f)
         kind = self.shape(b)
         unlisted = self.listed is not None and not self.listed(b)
-        need = READS[kind] + (UNLISTED_READS if unlisted else 0)
+        need = BEACON_READS if known else READS[kind] + (UNLISTED_READS if unlisted else 0)
         n = reads(call, buf)
         if n < need:
             return self._decide(now, f, call, 3, f"{n} of {need} reads ({kind or 'no'} pattern"
@@ -372,7 +390,8 @@ class GateSpotRule:
             mine = counts[call]
             # neither W1AW/7 nor a cut-off copy (C6X of NC6X) is a rival
             rival = max(((c, t) for t, c in counts.items()
-                         if base(t) != base(call) and not clip_of(t, call)), default=(0, ""))
+                         if base(t) != base(call) and not clip_of(t, call)
+                         and not (known and self.known_beacon(t, f))), default=(0, ""))
             if rival[0] >= mine:
                 return self._decide(now, f, call, 4, f"{rival[1]} read {rival[0]}x, this {mine}x")
         kw = None
