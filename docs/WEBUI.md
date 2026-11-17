@@ -94,8 +94,8 @@ A receiver's settings:
   the same receiver (SCU) has the same antenna and RF gain, and the radio
   decides which SCU a panadapter uses. Changing one receiver can change
   another, or an operator's panadapter in SmartSDR or Maestro.
-- **RECORDING**: starts and stops without a restart; on a Web-888 at the next
-  minute, every band.
+- **RECORDING**: starts and stops without a restart. A Web-888 records every
+  band: its files start within two minutes and stop at the next minute.
 - **DECODED TEXT**: SparkGap reads each signal twice, through a wide and a
   narrow filter. **Lowest cost** (the default) shows whichever it is surer of;
   you can show both, or only one. This is for this browser, all receivers.

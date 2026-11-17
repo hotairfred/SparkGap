@@ -63,7 +63,7 @@ const OPTION_HINTS = {
 
 const HINTS = {
   window: "How much signal each decoded window holds (itila_window_sec). Shorter windows show text sooner but fit each signal's timing on less of it and cost more CPU; 15 and 7.5 s are untried. Applying restarts the skimmer.",
-  record: "Saves the raw signal to disk for replay; needs 5 GB free. Starts and stops in place, at the next minute on a Web-888 (every band).",
+  record: "Saves the raw signal to disk for replay; needs 5 GB free. Starts and stops in place. A Web-888 records every band: its first minute readies the capture, so files start within two minutes, and stop at the next minute.",
   afc: "Each signal's decoder follows its keyed tone, which helps weak and slightly off-tune signals (itila2_afc). Applying restarts the skimmer.",
   validation: "A confidence score decides which calls are spotted: permissive spots more, aggressive fewer (docs/ITILA2.md). Off: a set number of copies, 2 to 4 by how common the call's pattern is.",
   call_source: "Calls known from this list score higher in validation: SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster.",

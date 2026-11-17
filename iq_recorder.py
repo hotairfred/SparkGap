@@ -96,6 +96,11 @@ class BandRecorder:
         log.info("IQ recorder ready: %s (%d-bit); touch %s to record",
                  rec_dir, bits, os.path.join(rec_dir, 'RECORD'))
 
+    def largest_bytes(self):
+        """The audio bytes in the largest band file open now (each file stops at the WAV limit), 0 before
+        the first minute is written."""
+        return max((n for _w, _t, n, _p in list(self._writers.values())), default=0)
+
     def active(self):
         return os.path.exists(os.path.join(self.dir, 'RECORD'))
 

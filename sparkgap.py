@@ -9079,6 +9079,8 @@ class SparkGap:
                 rec = {'file': os.path.abspath(self._wav_path), 'bytes': os.path.getsize(self._wav_path)}
             except OSError:
                 rec = {'file': os.path.abspath(self._wav_path), 'bytes': None}
+        elif self._iq_rec is not None and self._iq_rec.active():   # every band, to record_iq_dir
+            rec = {'file': os.path.abspath(self._iq_rec.dir), 'bytes': self._iq_rec.largest_bytes()}
         return {'radio': radio,
                 'telnet': {'port': self.cfg.get('telnet_port', 7300),
                            'clients': self.telnet.client_count if self.telnet else 0},
