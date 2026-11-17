@@ -88,6 +88,8 @@ CLIP_S = REPEAT_S             # ...and this recently
 CLIP_MIN = 10                 # clip_busts: the longer call had this many skimmers on a day (rbn_known.MIN_SKIMMERS)
 CLIP_RATIO_END = 2.0          # ...and this many times the clip's: an end or a start cut off (K1AY of K1AYZ, H8A of KH8A)
 CLIP_RATIO_FIRST = 5.0        # ...this many for a first character that lost its leading elements (MX4U of 3X4U)
+LEAD_DITS = 2                 # lead_dits: a call whose Morse is a longer call's with this many leading dits or more lost...
+LEAD_RATIO = 2.0              # ...while the longer call was decoded nearby in this many times the windows
 
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:[A-Z]{1,2}|[0-9][A-Z])[0-9]{1,4}[A-Z]{1,6}"
@@ -624,6 +626,18 @@ def clip_of(short: str, long_: str, strength: Callable[[str], int],
     return False
 
 
+def lead_dits_of(short: str, long_: str) -> bool:
+    """short is long_ read with its first LEAD_DITS or more dits lost, letter gaps aside: MX4U and WX4U
+    of 3X4U (...-- read as -- or .--), M5IMO of SM5IMO. Only dits: a lost dah or a whole letter is
+    too often a real prefix (OE/DJ7PR, EW1WC and W1WC). Portable forms are not this (W1AW of W1AW/3)."""
+    if short == long_ or "/" in short or "/" in long_ or len(short) < 3:
+        return False
+    a = "".join(_MORSE.get(ch, "?") for ch in short)
+    b = "".join(_MORSE.get(ch, "?") for ch in long_)
+    lead = b[:len(b) - len(a)]
+    return len(b) > len(a) and b.endswith(a) and len(lead) >= LEAD_DITS and set(lead) == {"."}
+
+
 def _regap(a: str, b: str) -> bool:
     """a and b are one keying read with the letter gaps in different places (C0TT, NN0TT), or
     one's Morse elements start the other's (N7HR, N7HRK/M)."""
@@ -694,7 +708,7 @@ class RepeatSpotRule:
                  window_join: bool = False, validation_threshold: float | None = None,
                  garbled_runner: bool = False, stray_known: bool = False, clean_cq: bool = False,
                  cq_tail: bool = False, clip_strength: Callable[[str], int] | None = None,
-                 clip_keep: Callable[[str], bool] | None = None) -> None:
+                 clip_keep: Callable[[str], bool] | None = None, lead_dits: bool = False) -> None:
         if validation is not None and validation not in VALIDATION:
             raise ValueError(f"validation must be one of {list(VALIDATION)}, got {validation!r}")
         if listed_by not in _WEIGHTS_LISTED:
@@ -702,6 +716,7 @@ class RepeatSpotRule:
         self.tier = tier
         self.clip_strength = clip_strength      # clip_busts: RBN skimmers of a call on its best recent day, see clip_of()
         self.clip_keep = clip_keep
+        self.lead_dits = lead_dits              # lead_dits: MX4U of 3X4U decoded here, see _lead_dit_bust()
         self._clip_toks: dict[int, deque[tuple[float, float, frozenset[str]]]] = {}   # 0.1 kHz bin: (time, kHz, tokens)
         # validation_threshold (spot_validation_threshold): the score a call needs, in place of the level's
         self.threshold = (None if not validation else
@@ -781,7 +796,7 @@ class RepeatSpotRule:
             text = split_runs(text, self.de_rejoin)
         if self.window_join:
             text = self._joined(window, freq_khz, text, now)
-        if self.clip_strength is not None:
+        if self.clip_strength is not None or self.lead_dits:
             self._clip_toks.setdefault(round(freq_khz * 10), deque()).append(
                 (now, freq_khz, frozenset(tokens(text, self.gluek))))
         if self.threshold is not None:
@@ -829,6 +844,8 @@ class RepeatSpotRule:
                 continue          # a piece of a longer call heard here (K1V of K1VUT): wait
             if self.clip_strength is not None and self._clipped(call, freq_khz, now):
                 continue          # the call RBN knows, with this one's end or start, was decoded here: a clip
+            if self.lead_dits and self._lead_dit_bust(call, freq_khz, now):
+                continue          # 3X4U decoded here far more often than this MX4U: its first dits lost
             if owned is not None and owned != call and len({c.window for c in near if c.call == call}) < 2:
                 continue          # another call owns this frequency: a caller read as the runner waits
             best = max((c for c in near if c.call == call), key=lambda c: c.snr)
@@ -1062,6 +1079,25 @@ class RepeatSpotRule:
         return any(clip_of(call, k, self.clip_strength, self.clip_keep)
                    for i in range(b - r, b + r + 1) for t, f, toks in self._clip_toks.get(i, ())
                    if now - t <= CLIP_S and abs(f - freq_khz) <= CLIP_KHZ for k in toks)
+
+    def _lead_dit_bust(self, call: str, freq_khz: float, now: float) -> bool:
+        """lead_dits: a call that call is with its leading dits lost (lead_dits_of) was decoded within
+        CLIP_KHZ in the last CLIP_S, in 2 windows or more and LEAD_RATIO times as many as call. The
+        ratio keeps a real call whose garbled copy carries stray dits in front (SW0YB beside W0YB)."""
+        b, r = round(freq_khz * 10), int(CLIP_KHZ * 10) + 1
+        own: set[int] = set()
+        longer: dict[str, set[int]] = {}
+        for i in range(b - r, b + r + 1):
+            for t, f, toks in self._clip_toks.get(i, ()):
+                if now - t > CLIP_S or abs(f - freq_khz) > CLIP_KHZ:
+                    continue
+                w = int(t // self.window_s)
+                for k in toks:
+                    if k == call:
+                        own.add(w)
+                    elif lead_dits_of(call, k):
+                        longer.setdefault(k, set()).add(w)
+        return any(len(ws) >= 2 and len(ws) >= LEAD_RATIO * max(1, len(own)) for ws in longer.values())
 
     def _expire(self, now: float) -> None:
         cutoff = now - REPEAT_S
