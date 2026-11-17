@@ -81,6 +81,7 @@ OPTION_FLAGS = (
     "spot_rule_clean_cq",
     "spot_rule_clip_busts",
     "spot_rule_bad_calls",
+    "spot_rule_scp",
     "spot_rule_notched_freqs",
     "itila2_snr_decoder",
 )

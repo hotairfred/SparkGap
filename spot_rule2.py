@@ -4,7 +4,8 @@ checked in this order; a call not spotted is dropped by the first gate that is f
   S Buffer             each signal (decoder bin) keeps its last 256 decoded characters, one
                        continuous text, first in first out; the buffer ends with its bin
   1 Shape              prefix (@, @@, #@ or #@@), 1 to 4 digits, 1 to 6 letters
-  2 Not banned         the call is not on the banned list or in the Bad Calls file
+  2 Not banned         the call is not on the banned list or in the Bad Calls file, and is in
+                       SCP when the node checks it (spot_rule_scp; a beacon need not be)
   3 Reads              reads in the buffer: 2 for a patt3ch.lst + pattern, 3 unflagged, 5 none
                        (normal level), one more for a call not on the node's known-call list
                        (spot_validation_calls); a call decoded twice is read twice
@@ -222,13 +223,15 @@ class GateSpotRule:
                  banned: Iterable[str] = (), segments: Iterable[tuple[float, float]] | None = None,
                  beacons: dict[str, float] | None = None, stronger_db: float | None = STRONGER_DB,
                  best_reading: bool = True, qualifiers: Iterable[str] = (),
-                 notched: Iterable[tuple[float, float]] = (), level: str = "normal"):
+                 notched: Iterable[tuple[float, float]] = (), level: str = "normal",
+                 scp: Callable[[str], bool] | None = None):
         if level not in LEVEL_READS:
             raise ValueError(f"call validation level {level!r}: not one of {list(LEVEL_READS)}")
         self.shape = shape                  # patt3ch.lst: "active" (+), "rare" or None
         self.level = level                  # gate 3: spot_validation
         self.listed = listed                # gate 3: the known-call list, or None
         self.banned = frozenset(banned)
+        self.scp = scp                      # gate 2: in Super Check Partial, or None
         self.segments = [tuple(s) for s in segments] if segments else None
         self.notched = [tuple(n) for n in notched]
         self.beacons = dict(beacons or {})
@@ -378,6 +381,8 @@ class GateSpotRule:
         if call in self.banned or b in self.banned:
             return self._decide(now, f, call, 2)
         beacon = self.beacon(call, f)
+        if self.scp is not None and not beacon and not (self.scp(call) or self.scp(b)):
+            return self._decide(now, f, call, 2, "not in SCP")
         known = self.known_beacon(call, f)
         kind = self.shape(b)
         unlisted = self.listed is not None and not self.listed(b)
