@@ -99,13 +99,13 @@ A receiver's settings:
 - **DECODED TEXT**: SparkGap reads each signal twice, through a wide and a
   narrow filter. **Lowest cost** (the default) shows whichever it is surer of;
   you can show both, or only one. This is for this browser, all receivers.
-- **Decoder options** (click to open): the decode window, call validation,
-  the known call list, AFC and the spot rule's options. The line beside it
-  sums them up. Changes restart the receiver. **Reset to defaults** goes back
-  to the shipped settings.
-- **Window**: how much signal each decoded window holds. Shorter windows show
-  text sooner but give the decoder less signal to work from and use more
-  CPU; 15 and 7.5 s are untried.
+- **Decoder options** (click to open): the spot rule, call validation, the
+  known call list, the decode window, AFC and, under the Gated Rule, its
+  filters. The line beside it sums them up. Changes restart the receiver.
+  **Reset to defaults** goes back to the shipped settings.
+- **Window (Experimental)**: how much signal each decoded window holds.
+  Shorter windows show text sooner but give the decoder less signal to work
+  from and use more CPU; 30 and 60 s are measured, 20 and 10 s untried.
 - **Details** (click to open): health, packets, reconnects, recent warnings
   and errors.
 - **Remove**: stops the receiver and takes it off the radio's list, on
@@ -119,31 +119,35 @@ Settings, in plain terms:
 - **Recording**: saves the raw signal to disk so it can be replayed later. It
   uses a lot of space (it needs at least 5 GB free); leave it off unless you
   were asked to record.
+- **Spot Rule**: the Repeat Rule spots a call after enough copies of it in
+  CQs. The Gated Rule spots a call only when it passes each of 12 yes/no
+  checks in order, and the log names the check that decided
+  ([SPOT_RULES.md](SPOT_RULES.md)).
 - **Call validation**: how sure SparkGap must be before it spots a call.
   Permissive spots more calls but gets more wrong; aggressive spots fewer but
   surer ones. Normal suits most stations. Off uses no score: a call is spotted
   once it is copied a set number of times (2, 3 or 4, by how common its
-  pattern is), and the known call list is not used.
+  pattern is), and the known call list is not used. Under the Gated Rule it
+  steps the reads a call needs instead: permissive one fewer, aggressive one
+  more; off applies normal.
 - **AFC**: each signal's decoder follows the signal's own tone, which helps
   weak signals and ones slightly off tune. Changing it restarts the receiver.
   It acts only with the itila2 decoder and is greyed out with any other.
 - **Known call list**: calls on this list count as more likely to be right.
   SCP is the contest call list; RBN adds calls other RBN skimmers heard in the
-  past week; RBN + SKCC adds the SKCC roster, good for hand-keyed CW.
-- **Spot rule options**, under Decoder Options: each changes which calls are
-  spotted. All are off unless set. A config with `local_spot_rule` keeps its
-  own validation and spot rule for the local port, which these settings do not
-  change. Some spot more calls with some risk of a wrong one:
-  - **Split runs**: reads `CQCQDE` as `CQ CQ DE`, for fists that run words
-    together.
-  - **Contest words**: treats CWT, SST or MST before a call like CQ, for
-    runners who skip the CQ.
-  - **CQ repeats**: spots a station sooner when it sends CQ several times in a
-    row.
+  past week; RBN + SKCC adds the SKCC roster, good for hand-keyed CW. Under
+  the Gated Rule a call not on the list needs one more read. None: no list.
+- **Gated Rule filters**, shown only under the Gated Rule, as the Aggregator
+  has them: **Bad Calls** (calls in `BadCalls.txt`), **Notched Freqs**
+  (frequencies in `NotchedFreqs.txt`), each with the file's path beside the
+  config, and **SCP only** (no spot for a call in neither Super Check Partial
+  nor the known call list, beacons excepted). All are off unless set.
 
-  Others keep wrong calls out, such as **Owner listed**, **Fragments** and
-  **Strongest copy**. **Decoder SNR** measures a spot's signal the way CW
-  Skimmer does.
+The Repeat Rule's own options (contest words, CQ repeats, fragments and the
+rest), Strongest copy and Decoder SNR are config keys, not shown here: the
+shipped defaults suit most stations. A config with `local_spot_rule` keeps its
+own validation and spot rule for the local port, which these settings do not
+change.
 
 Hover over a setting for a one-line reminder.
 

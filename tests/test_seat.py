@@ -115,21 +115,34 @@ def test_afc_is_written_to_the_config(seat: Seat) -> None:
 
 def test_decoder_options_are_written_and_off_removes_the_key(seat: Seat) -> None:
     i = seat.instance("dallas1")
-    seat.change("dallas1", {"spot_rule_owner_cell": True, "spot_rule_strongest_db": 6})
-    assert seat.config(i)["spot_rule_owner_cell"] is True
-    assert seat.settings(i)["spot_rule_strongest_db"] == 6
-    seat.change("dallas1", {"spot_rule_strongest_db": None})
-    assert "spot_rule_strongest_db" not in seat.config(i)
-    assert seat.settings(i)["spot_rule_strongest_db"] is None
+    seat.change("dallas1", {"spot_rule": "gates", "spot_rule_bad_calls": True, "call_source": "rbn"})
+    cfg = seat.config(i)
+    assert cfg["spot_rule_gates"] is True and cfg["spot_rule_bad_calls"] is True
+    assert seat.settings(i)["spot_rule"] == "gates"
+    assert seat.settings(i)["rule_files"]["spot_rule_bad_calls"] == str(i.config.parent / "BadCalls.txt")
+    seat.change("dallas1", {"spot_rule": "repeat", "call_source": None})    # back: the keys go
+    assert "spot_rule_gates" not in seat.config(i) and "spot_validation_calls" not in seat.config(i)
+    assert seat.settings(i)["spot_rule"] == "repeat" and seat.settings(i)["call_source"] is None
 
 
 def test_the_decode_window_reads_its_default_and_takes_listed_lengths(seat: Seat) -> None:
     i = seat.instance("dallas1")
     assert seat.settings(i)["itila_window_sec"] == seat.config(i).get("itila_window_sec", 60)
-    seat.change("dallas1", {"itila_window_sec": 7.5})
+    seat.change("dallas1", {"itila_window_sec": 20})
+    assert seat.config(i)["itila_window_sec"] == 20
+    with pytest.raises(SeatError, match="itila_window_sec must be one of: 60, 30, 20, 10"):
+        seat.change("dallas1", {"itila_window_sec": 45})
+    seat.change("dallas1", {"itila_window_sec": 7.5})          # an earlier choice a config may hold
     assert seat.config(i)["itila_window_sec"] == 7.5
-    with pytest.raises(SeatError, match="itila_window_sec must be one of: 60, 30, 15, 7.5"):
-        seat.change("dallas1", {"itila_window_sec": 10})
+
+
+def test_choosing_a_rule_runs_it_over_spot_rule_off(seat: Seat) -> None:
+    i = seat.instance("dallas1")
+    write_config(i.config, {"spot_rule": "off", "spot_rule_gates": True})
+    assert seat.settings(i)["spot_rule"] == "off"                  # neither rule runs: shown as itself
+    seat.change("dallas1", {"spot_rule": "repeat"})
+    assert seat.config(i)["spot_rule"] == "repeat" and "spot_rule_gates" not in seat.config(i)
+    assert seat.settings(i)["spot_rule"] == "repeat"
 
 
 def test_a_stopped_copy_is_only_written(seat: Seat) -> None:
@@ -144,12 +157,15 @@ def test_a_stopped_copy_is_only_written(seat: Seat) -> None:
         ({"rbn_auth": "x"}, "cannot be changed"),
         ({"band": "6m"}, "band must be one of: 40m 20m 17m"),
         ({"validation": "loose"}, "validation must be one of"),
-        ({"spot_rule_owner_cell": "yes"}, "true or false"),
+        ({"spot_rule_bad_calls": "yes"}, "true or false"),
+        ({"spot_rule_owner_cell": True}, "cannot be changed"),          # a config key (cdub89/SparkGap#51 R10)
+        ({"itila2_snr_decoder": True}, "cannot be changed"),
+        ({"spot_rule": "gated"}, "spot rule must be one of: repeat, gates"),
+        ({"call_source": "skcc"}, "call source must be one of: none, scp"),
         ({"spot_rule_split_runs": True}, "cannot be changed"),          # built in (cdub89/SparkGap#46)
         ({"afc": "on"}, "afc must be true or false"),
-        ({"spot_rule_strongest_db": 4}, "strongest_db must be one of: off, 3"),
+        ({"spot_rule_strongest_db": 6}, "cannot be changed"),
         ({"spot_rule_takeover_idle_s": 180}, "cannot be changed"),      # built in
-        ({"spot_rule_strongest_db": True}, "strongest_db must be one of"),
         ({}, "nothing to change"),
     ],
 )
