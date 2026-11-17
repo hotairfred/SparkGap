@@ -12,28 +12,14 @@ const SERVER_PORT = 7320;  // a machine's server: it runs that machine's copies 
 const SERVER_PROTOCOL = "sparkgap.server.v1";
 const SERVER_LOG_KEPT = 200;  // server log lines kept for its console
 const VALIDATION = ["off", "permissive", "normal", "aggressive"];
-const CALL_SOURCES = [["scp", "SCP"], ["rbn", "RBN"], ["rbn+skcc", "RBN + SKCC"]];
-// Decoder Options: [config key, label, hint, values ([value, label]; none: on/off)]; null is off
+const CALL_SOURCES = [[null, "None"], ["scp", "SCP"], ["rbn", "RBN"], ["rbn+skcc", "RBN + SKCC"]];
+const SPOT_RULES = [["repeat", "Repeat Rule"], ["gates", "Gated Rule"]];
+// Decoder Options: [config key, label, hint]: on/off filters that only the Gated Rule reads, as the
+// Aggregator's. The repeat rule's tuning, Strongest copy and Decoder SNR are config keys (cdub89/SparkGap#51 R10).
 const DECODER_OPTIONS = [
-  ["spot_rule_contest_words", "Contest words", "CWT, SST or MST right before a call opens a CQ group as CQ does: runners who send CWT K5AX without the CQ."],
-  ["spot_rule_cq_repeats", "CQ repeats", "Back-to-back CQs from one call count as separate copies, so a runner is spotted sooner."],
-  ["spot_rule_doubled_calls", "Doubled calls", "A call sent twice in one CQ (CQ K8TLJ K8TLJ) counts as two copies. Used only while call validation is off; validation scores it itself."],
-  ["spot_rule_split_up", "Split up", "TU <call> UP, a station working split, counts as a copy of that call."],
-  ["spot_rule_garbled_runner", "Garbled runner", "A call right after a CQ word and a token that reads as a broken call (CQ POTAQ0SN K5LG) is the caller of that runner, not a CQ copy; a misread of the call after it (CQ K?9X KG9X) still is."],
-  ["spot_rule_stray_known", "Stray, copied", "A 4-character call followed by one letter that completes a call copied near here in the last 10 minutes (DE K1PU G after DE K1PUG) is that longer call split at a gap, not a copy of the shorter one."],
-  ["spot_rule_owner_cell", "Owner cell", "A new owner replaces only the owner within 0.25 kHz: a neighbour 0.5 kHz away keeps its frequency."],
-  ["spot_rule_owned_two_windows", "Owned: two windows", "A call challenging a frequency another call owns needs copies in two windows."],
-  ["spot_rule_la1d", "Noise letters", "A lone E, T, I or S between CQ and the call is skipped, and a sign-off (K AR KN SK BK TU) ends the search: CQ CQ E E HFT ON6FT names ON6FT."],
-  ["spot_rule_gluek", "Glued K", "CALL+K reads as CALL K when the call is also heard on its own (WB0MQA ... WB0MQAK)."],
-  ["spot_rule_norival", "No unlisted rival", "Validation: an unlisted call read on the other path does not count against a listed one."],
-  ["spot_rule_bad_calls", "Bad Calls", "spot_rule_gates: never spot a call in BadCalls.txt beside the config (one call per line, as the Aggregator's)."],
-  ["spot_rule_scp", "SCP only", "spot_rule_gates: never spot a call in neither Super Check Partial (SCP.DB, fetched at start, at most once a day) nor the known call list; beacons excepted."],
-  ["spot_rule_notched_freqs", "Notched Freqs", "spot_rule_gates: never spot on a frequency in NotchedFreqs.txt beside the config (a kHz or a range per line, as the Aggregator's)."],
-  ["itila2_snr_decoder", "Decoder SNR", "Spot SNR from the decoded window's key-down power, in 500 Hz as CW Skimmer measures it."],
-  ["spot_rule_fragments", "Fragments", "A call that is part of a longer call heard with it is not spotted: even, when the longer one is read as often; any, when it is read at all. Stray: TEST K1V U T is no copy of K1V.",
-    [[null, "off"], ["any", "any"], ["any,stray", "any + stray"], ["even", "even"], ["even,stray", "even + stray"]]],
-  ["spot_rule_strongest_db", "Strongest copy", "No spot when the same call is read this many dB stronger elsewhere in the band.",
-    [[null, "off"], [3, "3 dB"], [6, "6 dB"], [10, "10 dB"]]],
+  ["spot_rule_bad_calls", "Bad Calls", "Never spot a call in BadCalls.txt beside the config (one call per line, as the Aggregator's): a node's own call and its busts while it transmits."],
+  ["spot_rule_scp", "SCP only", "Never spot a call in neither Super Check Partial (SCP.DB, fetched at start, at most once a day) nor the known call list; beacons excepted. Cuts busts; a call on the known list needs no SCP entry."],
+  ["spot_rule_notched_freqs", "Notched Freqs", "Never spot on a frequency in NotchedFreqs.txt beside the config (a kHz or a range per line, as the Aggregator's)."],
 ];
 const RX_KEYS = ["antenna", "loop_a", "loop_b", "rf_gain"];  // a Flex copy's receive path: the radio's, changed live
 const SHARED_NOTE = "Loops are shared by every pan on that antenna, and RF gain by every pan on the same receiver (SCU): "
@@ -42,31 +28,20 @@ const SHARED_NOTE = "Loops are shared by every pan on that antenna, and RF gain 
 const OPTION_HINTS = {
   afc: "Each signal's decoder follows its tone as it drifts.",
   itila_window_sec: "How much audio each decoded window holds; shorter shows text sooner and costs more CPU.",
-  spot_rule_contest_words: "Treats CWT, SST or MST before a call like a CQ.",
-  spot_rule_cq_repeats: "Counts back-to-back CQs as separate copies, so a runner is spotted sooner.",
-  spot_rule_doubled_calls: "Counts a call sent twice in one CQ as two copies (only while validation is off).",
-  spot_rule_split_up: "Counts TU <call> UP from a station working split as a copy of that call.",
-  spot_rule_garbled_runner: "Takes the call after a misread runner call (CQ POTAQ0SN K5LG) as a caller.",
-  spot_rule_stray_known: "Reads DE K1PU G after a copy of K1PUG as K1PUG, not K1PU.",
-  spot_rule_owner_cell: "A new owner replaces only the owner within 0.25 kHz, never a neighbour.",
-  spot_rule_owned_two_windows: "A call taking over a frequency another call owns needs copies in two windows.",
-  spot_rule_la1d: "Skips a lone E, T, I or S between CQ and the call; a sign-off ends the search.",
-  spot_rule_gluek: "Reads CALL+K as CALL K when the call is also heard on its own.",
-  spot_rule_norival: "An unlisted call read on the other decoder path does not count against a listed one.",
   spot_rule_bad_calls: "Never spots a call listed in BadCalls.txt.",
   spot_rule_scp: "Never spots a call in neither Super Check Partial nor the known call list.",
   spot_rule_notched_freqs: "Never spots on a frequency listed in NotchedFreqs.txt.",
-  itila2_snr_decoder: "Measures spot SNR as CW Skimmer does: key-down power in 500 Hz.",
-  spot_rule_fragments: "Skips a call that is part of a longer call heard with it.",
-  spot_rule_strongest_db: "Skips a spot when the same call is read much stronger elsewhere in the band.",
 };
 
 const HINTS = {
-  window: "How much signal each decoded window holds (itila_window_sec). Shorter windows show text sooner but fit each signal's timing on less of it and cost more CPU; 15 and 7.5 s are untried. Applying restarts the skimmer.",
+  window: "How much signal each decoded window holds (itila_window_sec). Shorter windows show text sooner but fit each signal's timing on less of it and cost more CPU. Experimental: 30 and 60 s are measured, 20 and 10 s untried. Applying restarts the skimmer.",
   record: "Saves the raw signal to disk for replay; needs 5 GB free. Starts and stops in place. A Web-888 records every band: its first minute readies the capture, so files start within two minutes, and stop at the next minute.",
   afc: "Each signal's decoder follows its keyed tone, which helps weak and slightly off-tune signals (itila2_afc). Applying restarts the skimmer.",
+  spot_rule: "Repeat Rule: a call spots after enough copies of it in CQs; with call validation on, a confidence score decides. Gated Rule: a call spots only when it passes each of 12 yes/no checks in order, and the log names the check that decided (docs/SPOT_RULES.md). Choosing either sets a spot_rule other than repeat back to repeat. Applying restarts the skimmer.",
   validation: "A confidence score decides which calls are spotted: permissive spots more, aggressive fewer (docs/ITILA2.md). Off: a set number of copies, 2 to 4 by how common the call's pattern is.",
+  validation_gates: "Steps the reads a call needs (gate 3): permissive one fewer, aggressive one more than normal's 2, 3 or 5 by the call's pattern. Off applies normal, and RBN is told Normal.",
   call_source: "Calls known from this list score higher in validation: SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster.",
+  call_source_gates: "A call not on this list needs one more read (gate 3): SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster. None: no list.",
 };
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LENGTH = 6;
@@ -81,22 +56,22 @@ const LOCKOUT_S = 600;
 const DB_FLOOR = 4.0;
 const DB_TOP = 32.0;
 const TRACE_MIN_PX = 5;
-const PEAK_BINS = 2;  // zoomed in: a signal is drawn this many bins tall at its centre (a carrier's width),
-const PEAK_MIN_PX = 7;  // a trace zoomed out: TRACE_MIN_PX plus a carrier's spread
-const PEAK_MAX_PX = 12;  // kept from PEAK_MIN_PX to this: it neither shrinks nor balloons on zooming in
-const MIN_SPAN = 0.05;  // the deepest zoom: this fraction of the band
+const PEAK_PX = 7;  // zoomed in: a signal is drawn this tall at its centre, as a trace is zoomed out
+const MIN_SPAN_KHZ = 5;  // the deepest zoom, on every radio
 const PEAK_FROM_PX = 1;  // from this many pixels a bin, peaks are drawn instead of stretched bins
+const FLOOR_HZ = 500;  // zoomed in: the background is the lowest bin within this, so a strong signal's skirt is not drawn
+const PEAK_SEP_HZ = 150;  // zoomed in: a peak is drawn when it is the highest bin within this (one CW signal)
 const FREQ_MATCH_KHZ = 0.15;
 const SEARCH_MAX = 8;
 const NO_FIT = 999.0;
 // the decode window: 30 s is what the test seats run; 15 and 7.5 s are untried
-const WINDOWS = [[60, "60 s"], [30, "30 s"], [15, "15 s"], [7.5, "7.5 s"]];
+const WINDOWS = [[60, "60 s"], [30, "30 s"], [20, "20 s"], [10, "10 s"]];
   // the dialog's header; its ? button shows help
 const NEWS_SHOWN = 4;  // What's new entries shown in the dialog; the guide has them all
 const NOTHING = '<span class="nothing">(nothing decoded)</span>';  // a path whose window decoded no text
 const DECODED = ["both", "wide", "narrow", "lowest"];
 const DECODED_LABELS = ["Both", "Wide", "Narrow", "Lowest cost"];  // which readings of each window the panel shows
-const ZOOM_STEPS = [["Full", 1], ["Half", 2], ["Quarter", 4]];  // the zoom button: name and fraction of the band
+const ZOOM_STEPS = [["Full", 1], ["Half", 2], ["Quarter", 4], ["Max", 0]];  // the zoom button: name and fraction of the band (0: the deepest)
 const ZOOM_MATCH = 0.05;  // a view within 5% of a step's span is at that step
 const DETAIL_MATCH_KHZ = 0.06;
 const CALL_RE = /^(?:[A-Z]{1,2}|[A-Z]\d|\d[A-Z])\d[A-Z]{1,4}$/;
@@ -628,7 +603,7 @@ class Waterfall {
   setView(lo, hi) {
     const inst = this.inst;
     if (inst && inst.nBins) {
-      const full = inst.highKhz - inst.lowKhz, span = Math.min(Math.max(hi - lo, full * MIN_SPAN), full);
+      const full = inst.highKhz - inst.lowKhz, span = Math.min(Math.max(hi - lo, MIN_SPAN_KHZ), full);
       lo = Math.min(Math.max(lo, inst.lowKhz), inst.highKhz - span);
       hi = lo + span;
     }
@@ -678,8 +653,9 @@ class Waterfall {
     }
     const peak = pxPerBin >= PEAK_FROM_PX;  // bin index of row y's centre: top - (y + 0.5) / pxPerBin
     const top = (this.hi * 1000 - inst.firstHz) / inst.hzPerBin - 0.5;
-    const peakPx = Math.min(PEAK_MAX_PX, Math.max(PEAK_MIN_PX, Math.round(PEAK_BINS * pxPerBin)));
-    this.map = { interp: pxPerBin >= 1, a, b, frac, grow: peak ? 0 : grow, peak, top, pxPerBin, peakPx };
+    const peakPx = PEAK_PX;
+    const floorK = Math.max(2, Math.round(FLOOR_HZ / inst.hzPerBin)), sepK = Math.max(1, Math.round(PEAK_SEP_HZ / inst.hzPerBin));
+    this.map = { interp: pxPerBin >= 1, a, b, frac, grow: peak ? 0 : grow, peak, top, pxPerBin, peakPx, floorK, sepK };
     this.v = new Float32Array(inst.nBins);
     this.wide = new Float32Array(inst.nBins);
     this.pxCol = new Float32Array(h);
@@ -707,7 +683,7 @@ class Waterfall {
       const low = this.wide, col = this.pxCol;
       for (let i = 0; i < n; i++) {
         let x2 = v[i];
-        for (let k = 1; k <= 2; k++) {
+        for (let k = 1; k <= m.floorK; k++) {
           if (i >= k && v[i - k] < x2) x2 = v[i - k];
           if (i + k < n && v[i + k] < x2) x2 = v[i + k];
         }
@@ -717,6 +693,9 @@ class Waterfall {
       for (let i = 1; i < n - 1; i++) {
         const a = v[i - 1], b = v[i], c = v[i + 1];
         if (!(b >= a && b > c && b > DB_FLOOR)) continue;
+        let top = true;  // the highest bin of its signal: its skirt's ripples are not peaks of their own
+        for (let k = 2; k <= m.sepK && top; k++) top = !(i >= k && v[i - k] > b) && !(i + k < n && v[i + k] >= b);
+        if (!top) continue;
         const den = a - 2 * b + c, d = den < 0 ? Math.min(0.5, Math.max(-0.5, 0.5 * (a - c) / den)) : 0;
         const yc = Math.round((m.top - (i + d)) * m.pxPerBin - 0.5);
         for (let y = yc - (m.peakPx >> 1); y < yc - (m.peakPx >> 1) + m.peakPx; y++) if (y >= 0 && y < h && b > col[y]) col[y] = b;
@@ -1382,17 +1361,20 @@ function zoomTo(span, at) {
 // the zoom step the view is at (index into ZOOM_STEPS), or -1 between steps
 function zoomStep(i) {
   const full = i.highKhz - i.lowKhz, span = wf.hi - wf.lo;
-  return ZOOM_STEPS.findIndex(([, d]) => Math.abs(span - full / d) <= full / d * ZOOM_MATCH);
+  return ZOOM_STEPS.findIndex(([, d]) => Math.abs(span - stepSpan(full, d)) <= stepSpan(full, d) * ZOOM_MATCH);
 }
+// a zoom step's span in kHz: a fraction of the band, or the deepest zoom
+function stepSpan(full, d) { return d ? full / d : Math.min(MIN_SPAN_KHZ, full); }
 
 function renderView() {
   const i = inst(), full = i ? i.highKhz - i.lowKhz : 0, span = wf.hi - wf.lo;
-  const k = i && full > 0 ? zoomStep(i) : 0;  // the button names the zoom shown
-  $("full").textContent = k >= 0 ? ZOOM_STEPS[k][0] : Math.round(100 * span / full) + "%";
+  // the button names the zoom: its step (Full, Half, Quarter, Max), else how many times in (6×)
+  const k = i && full > 0 ? zoomStep(i) : 0, times = full > 0 && span > 0 ? full / span : 1;
+  $("full").textContent = k >= 0 ? ZOOM_STEPS[k][0] : `${times < 10 ? Math.round(times * 10) / 10 : Math.round(times)}\u00d7`;
   $("range").textContent = wf.hi > wf.lo ? `${wf.lo.toFixed(1)} – ${wf.hi.toFixed(1)} kHz` : "";
   const s = $("span");
   s.max = Math.max(3, full);
-  s.min = full * MIN_SPAN;
+  s.min = Math.min(MIN_SPAN_KHZ, full);
   if (document.activeElement !== s) s.value = span;
   $("spanText").textContent = span > 0 ? span.toFixed(0) + " kHz" : "";
   // the scroll bar covers the receiver's span; its thumb is the part on screen
@@ -1568,18 +1550,25 @@ function navItem(k, kind, name, label, value, on) {
 function decoderOptions(at, st, pend) {
   const row = (label, control) => `<div class="frow"><span class="flabel">${label}</span><span class="fctl">${control}</span></div>`;
   const valid = st.validation || "off", win = st.itila_window_sec === undefined || st.itila_window_sec === null ? 60 : st.itila_window_sec;
-  const ons = DECODER_OPTIONS.filter(([key, , , values]) => values ? st[key] !== null && st[key] !== undefined : !!st[key]).length + (st.afc ? 1 : 0);
+  const gates = st.spot_rule === "gates", files = st.rule_files || {};
+  const filters = gates ? DECODER_OPTIONS : [];  // the Aggregator's filters: only the Gated Rule reads them
+  const ons = filters.filter(([key]) => !!st[key]).length;
   const choose = (key, opts, cur, off) => `<div class="seg${key in pend ? " pend" : ""}${off ? " off" : ""}" ${at} data-key="${key}"${off ? ` title="${esc(off)}"` : ""}>${opts.map(([v, l]) =>
     `<span${off ? "" : ` data-value="${esc(JSON.stringify(v))}"`}${v === cur ? ' class="on"' : ""}>${esc(l)}</span>`).join("")}</div>`;
   const hinted = (hint, html) => html.replace('<div class="frow"', `<div class="frow" title="${esc(hint)}"`);
   const short = key => OPTION_HINTS[key] ? `<div class="frow ohint"><span></span><span class="fhint">${esc(OPTION_HINTS[key])}</span></div>` : "";
-  const decRows = [hinted(HINTS.validation, row("Call validation", choose("validation", VALIDATION.map(v => [v, v]), valid))),
-    hinted(HINTS.call_source, row("Known call list", choose("call_source", CALL_SOURCES, st.call_source, valid === "off" ? "not used while call validation is off" : ""))),
-    hinted(HINTS.window, row("Window", choose("itila_window_sec", WINDOWS, win))) + short("itila_window_sec"),
+  const where = key => files[key] ? `<div class="frow ohint"><span></span><span class="fhint">${esc(files[key])}</span></div>` : "";
+  const windows = WINDOWS.some(([v]) => v === win) ? WINDOWS : [...WINDOWS, [win, `${win} s`]];  // a config's own value stays shown
+  const decRows = [hinted(HINTS.spot_rule, row("Spot Rule", choose("spot_rule", SPOT_RULES, gates ? "gates" : "repeat"))),
+    hinted(gates ? HINTS.validation_gates : HINTS.validation, row("Call validation", choose("validation", VALIDATION.map(v => [v, gates && v === "off" ? "off (normal applied)" : v]), valid))),
+    hinted(gates ? HINTS.call_source_gates : HINTS.call_source, row("Known call list", choose("call_source", CALL_SOURCES, st.call_source ?? null,
+      !gates && valid === "off" ? "not used while call validation is off" : ""))),
+    hinted(HINTS.window, row("Window (Experimental)", choose("itila_window_sec", windows, win))) + short("itila_window_sec"),
     hinted(HINTS.afc, row("AFC", choose("afc", [[false, "off"], [true, "on"]], !!st.afc, st.decoder && st.decoder !== "itila2" ? "acts only with the itila2 decoder" : ""))) + short("afc"),
-    ...DECODER_OPTIONS.map(([key, label, hint, values]) => `<div class="frow" title="${esc(hint || "")}"><span class="flabel">${esc(label)}</span><span class="fctl">${
-      values ? choose(key, values, st[key] === undefined ? null : st[key]) : choose(key, [[false, "off"], [true, "on"]], !!st[key])}</span></div>` + short(key))];
-  return { decRows, win, valid, ons, choose };
+    ...filters.map(([key, label, hint]) => `<div class="frow" title="${esc(hint)}"><span class="flabel">${esc(label)}</span><span class="fctl">${
+      choose(key, [[false, "off"], [true, "on"]], !!st[key])}</span></div>` + short(key) + where(key))];
+  const summary = `${gates ? "Gated Rule" : "Repeat Rule"} · ${win} s windows · validation ${gates && valid === "off" ? "normal" : valid}${gates ? ` · ${ons} of ${filters.length} filters on` : ""}`;
+  return { decRows, win, valid, ons, choose, summary };
 }
 
 // room on radio rn for another receiver: its free DAX-IQ channels, or why there is none
@@ -1639,7 +1628,7 @@ function addPaneHtml(k, sv, rn) {
 // Reset to defaults: every decoder option that differs from the shipped defaults goes pending, for Apply
 function resetDefaults(link, name) {
   const d = (link.seat && link.seat.default_settings) || {};
-  for (const key of ["validation", "call_source", "itila_window_sec", "afc", ...DECODER_OPTIONS.map(([k]) => k)]) {
+  for (const key of OPTION_KEYS) {
     if (key in d) pickSetting(link, name, key, d[key]);
   }
 }
@@ -1800,10 +1789,10 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
     .replace('<div class="frow"', `<div class="frow" title="${esc(HINTS.record)}"`));
   if (!node && !own) rows.push(`<div class="frow"><span></span><span class="fhint">${list ? `Run, recording, decoder options and details: ${esc(radioName)}'s Node, for all its receivers.`
     : `Decoder options: ${esc(radioName)}'s Node, for all its receivers.`}</span></div>`);
-  const { decRows, win, valid, ons } = decoderOptions(at, st, pend);
+  const { decRows, summary } = decoderOptions(at, st, pend);
   const fold = app.fold || {}, decOpen = !!fold.decoder, detOpen = !!fold.details;
   const feed = app.instances.find(x => x.server === sv && copyName(x) === i.name) || null;
-  const entries = (!node && !own ? "" : `<button class="fentry" data-act="fold" data-fold="decoder" aria-expanded="${decOpen}"><span>Decoder options</span><span class="fnote">${esc(`${win} s windows · validation ${valid} · ${ons} of ${DECODER_OPTIONS.length + 1} on`)}</span><span class="chev">${decOpen ? "\u25BE" : "\u25B8"}</span></button>`
+  const entries = (!node && !own ? "" : `<button class="fentry" data-act="fold" data-fold="decoder" aria-expanded="${decOpen}"><span>Decoder options</span><span class="fnote">${esc(summary)}</span><span class="chev">${decOpen ? "\u25BE" : "\u25B8"}</span></button>`
     + (decOpen ? `<div class="fold"><div class="form">${decRows.join("")}</div><div class="fhint">${rr ? `Shared by ${esc(all)}: changes restart them all.` : `Changes restart ${esc(i.name)}.`} Hover over an option for more.</div>`
       + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div></div>` : ""))
     + (list && !node ? "" : `<button class="fentry" data-act="fold" data-fold="details" aria-expanded="${detOpen}"><span>Details</span><span class="fnote">packets, reconnects, warnings, log</span><span class="chev">${detOpen ? "\u25BE" : "\u25B8"}</span></button>`
@@ -1811,9 +1800,10 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
   const others = Object.keys(pend).filter(x => !RX_KEYS.includes(x));
   const live = run && others.every(k => k === "band" || k === "record") && others.length <= 1;  // a band or recording changes in place
   const label = { run: "run", band: "band", antenna: "antenna", rf_gain: "RF gain", record: "recording", afc: "AFC", itila_window_sec: "window",
-    validation: "call validation", call_source: "known call list", ...Object.fromEntries(DECODER_OPTIONS.map(([key, l]) => [key, l])) };
+    spot_rule: "spot rule", validation: "call validation", call_source: "known call list", ...Object.fromEntries(DECODER_OPTIONS.map(([key, l]) => [key, l])) };
   const what = pend.remove ? "remove" : Object.entries(pend).map(([key, v]) => key === "rx_bands" ? Object.entries(v).map(([n, b]) => `${radioName}-${n} ${b}`).join(", ")
-    : `${label[key] || key} ${v === true ? "on" : v === false ? "off" : key === "rf_gain" ? `${v} dB` : v}`).join(", ");
+    : `${label[key] || key} ${v === true ? "on" : v === false ? "off" : v === null ? "none" : key === "rf_gain" ? `${v} dB`
+      : key === "spot_rule" ? (SPOT_RULES.find(([x]) => x === v) || [, v])[1] : v}`).join(", ");
   const bar = n ? `<div class="fbar"><span>${n} change${n > 1 ? "s" : ""} not applied: ${esc(what)}</span><span class="grow"></span>`
     + `<button class="btn small primary" ${at} data-cmd="apply"${busy ? " disabled" : ""}>${pend.remove ? `Apply (removes ${esc(typeof pend.remove === "string" ? pend.remove : i.name)})` : "run" in pend ? `Apply (${pend.run ? "starts" : "stops"} ${esc(i.name)})` : live ? "Apply (live)" : run ? `Apply (restarts ${esc(i.name)})` : "Save"}</button>`
     + `<button class="btn small" ${at} data-cmd="discard">Discard</button></div>` : "";
@@ -1839,7 +1829,7 @@ const RADIO_TYPES = [["flex", "FlexRadio"], ["hpsdr", "HPSDR (Web-888)"]];  // r
 // The same steps as sparkgap.sh setup, run by the server (discover, node, rename, remove_radio).
 const TYPE_NAMES = { flex: "FlexRadio", hpsdr: "HPSDR" };
 const LINK_WORDS = { up: "connected", down: "not connected", wait: "reconnecting", first: "connecting" };
-const OPTION_KEYS = ["validation", "call_source", "itila_window_sec", "afc", ...DECODER_OPTIONS.map(([k]) => k)];
+const OPTION_KEYS = ["spot_rule", "validation", "call_source", "itila_window_sec", "afc", ...DECODER_OPTIONS.map(([k]) => k)];
 
 function radioFileOf(sv, name) { return ((sv.link.seat || {}).radio_files || []).find(x => x.name === name); }
 
@@ -1926,8 +1916,8 @@ function nodePaneHtml(k, sv, name) {
 
 // the decoder options of a radio whose receivers are separate copies (Flex): one set, sent to every copy
 function nodeKey(radio) { return `+node:${radio}`; }
-function nodeBase(seat, radio) {
-  const c = (seat.instances || []).find(i => i.radio === radio);
+function nodeBase(seat, radio) {  // a running copy's options, so a stopped copy never drives what Apply sets
+  const mine = (seat.instances || []).filter(i => i.radio === radio), c = mine.find(i => i.state === "running") || mine[0];
   return (c && c.settings) || seat.default_settings || {};
 }
 function nodeDiffers(seat, radio) {
@@ -1937,12 +1927,12 @@ function nodeDiffers(seat, radio) {
 function nodeOptionsHtml(k, sv, radio, copies) {
   const seat = sv.link.seat || {}, name = nodeKey(radio), at = `data-server="${k}" data-name="${esc(name)}"`;
   const pend = app.pending[pendKey(sv, name)] || {}, st = { ...nodeBase(seat, radio), ...pend }, n = Object.keys(pend).length;
-  const { decRows, win, valid, ons } = decoderOptions(at, st, pend), differ = nodeDiffers(seat, radio);
+  const { decRows, summary } = decoderOptions(at, st, pend), differ = nodeDiffers(seat, radio);
   const running = copies.filter(c => c.state === "running").map(c => c.name), names = copies.map(c => c.name).join(", ");
   const bar = n || differ.length ? `<div class="fbar"><span>${n ? `${n} change${n > 1 ? "s" : ""} not applied` : `${esc(names)} differ`}</span><span class="grow"></span>`
     + `<button class="btn small primary" ${at} data-cmd="apply">${running.length ? `Apply (restarts ${esc(running.join(", "))})` : "Save"}</button>`
     + (n ? `<button class="btn small" ${at} data-cmd="discard">Discard</button>` : "") + `</div>` : "";
-  return `<div class="psec"><span class="psectitle">Decoder options</span><span class="muted">${esc(`${win} s windows · validation ${valid} · ${ons} of ${DECODER_OPTIONS.length + 1} on`)}</span></div>` + bar
+  return `<div class="psec"><span class="psectitle">Decoder options</span><span class="muted">${esc(summary)}</span></div>` + bar
     + (differ.length ? `<div class="fhint">${esc(names)} run different ${esc(differ.join(", "))}: Apply sets every receiver to what shows here.</div>` : "")
     + `<div class="form">${decRows.join("")}</div><div class="fhint">Every receiver of ${esc(radio)} runs these: changes restart the running ones. Hover over an option for more.</div>`
     + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div>`;
@@ -2556,12 +2546,12 @@ function bindInput() {
   });
 
   $("span").oninput = e => zoomTo(Number(e.target.value), (wf.lo + wf.hi) / 2);
-  $("full").onclick = () => {  // the next step: Full, Half, Quarter of the band, about the pick or the view's centre
+  $("full").onclick = () => {  // the next step: Full, Half, Quarter of the band, Max, about the pick or the view's centre
     const i = inst();
     if (!i || !i.nBins) return;
     const k = zoomStep(i), d = ZOOM_STEPS[k < 0 ? 0 : (k + 1) % ZOOM_STEPS.length][1];
     if (d === 1) wf.setView(i.lowKhz, i.highKhz);
-    else zoomTo((i.highKhz - i.lowKhz) / d, (wf.lo + wf.hi) / 2);
+    else zoomTo(stepSpan(i.highKhz - i.lowKhz, d), (wf.lo + wf.hi) / 2);
   };
   window.addEventListener("resize", () => { wf.dirty = true; renderView(); });
 }

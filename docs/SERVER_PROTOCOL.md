@@ -52,9 +52,11 @@ one address lock it out for 10 minutes (close 4429).
                 "pid": 2014134, "band": "17m", "radio": "Dallas",
                 "feed_port": 7321, "feed_web": true, "telnet_port": 7331,
                 "settings": {"band": "17m", "bands_known": ["160m", "80m"],
-                             "validation": "normal", "call_source": "rbn+skcc",
-                             "spot_rule_contest_words": false,
-                             "spot_rule_cq_repeats": false, "record": false},
+                             "spot_rule": "gates", "validation": "normal",
+                             "call_source": "rbn+skcc",
+                             "spot_rule_bad_calls": true, "record": false,
+                             "rule_files": {"spot_rule_bad_calls":
+                                            "/srv/sparkgap/config/BadCalls.txt"}},
                 "spots": 12, "top_calls": [["K8TLJ", 3]], "errors": 0,
                 "last_error": null, "warnings": 2, "reconnects": 0,
                 "log": "Dallas-1_17m_20261022_152327Z.log",
@@ -130,20 +132,18 @@ connected`).
   and stopped after its last.
 - `set` writes the settings to the instance's config and restarts it if it is
   running. Only these, each checked: `band` (a band the instance's SparkGap
-  knows), `validation` (`off`, `permissive`, `normal`, `aggressive`),
-  `call_source` (`scp`, `rbn`, `rbn+skcc`), `afc` (true or false, written as
-  `itila2_afc`), `record` (true or false; recording on needs 5 GB free in
-  `rec/`; on a running copy it changes in place: an HPSDR radio's all-band
-  recorder by its `record_iq_dir` RECORD file at the next minute, any other
-  copy's `record_wav` file over its feed), the on/off decoder options
-  `spot_rule_contest_words`, `spot_rule_cq_repeats`, `spot_rule_doubled_calls`,
-  `spot_rule_split_up`, `spot_rule_owner_cell`, `spot_rule_owned_two_windows`, `spot_rule_clip_busts`,
-  `spot_rule_la1d`, `spot_rule_gluek`, `spot_rule_bad_calls`, `spot_rule_scp`, `spot_rule_notched_freqs`,
-  `spot_rule_norival` and `itila2_snr_decoder`, and `spot_rule_fragments`
-  (`any`, `any,stray`, `even`, `even,stray`) and `spot_rule_strongest_db`
-  (3, 6, 10), where null is off
-  and removes the key, and `itila_window_sec` (60, 30, 15, 7.5). Anything
-  else is refused and nothing is written.
+  knows), `spot_rule` (`repeat`, or `gates`, written as `spot_rule_gates`),
+  `validation` (`off`, `permissive`, `normal`, `aggressive`), `call_source`
+  (`scp`, `rbn`, `rbn+skcc`, or null for none, which removes the key), `afc`
+  (true or false, written as `itila2_afc`), `record` (true or false;
+  recording on needs 5 GB free in `rec/`; on a running copy it changes in place:
+  an HPSDR radio's all-band recorder by its `record_iq_dir` RECORD file at the
+  next minute, any other copy's `record_wav` file over its feed), the on/off
+  Gated Rule filters `spot_rule_bad_calls`, `spot_rule_scp` and
+  `spot_rule_notched_freqs`, and
+  `itila_window_sec` (60, 30, 20, 10). Anything else is refused and nothing
+  is written: the repeat rule's options, `spot_rule_strongest_db` and
+  `itila2_snr_decoder` are config keys.
 - A running copy given the band alone is changed live: the server writes the
   band to the config (the startup band), then asks the copy over its feed (a
   `control` message, `GUI_FEED_PROTOCOL.md`, waiting up to 20 s) to change band

@@ -72,8 +72,11 @@ def _gui_settings(cfg, sample_rate):
     behaviour built into the repeat rule. Defaults mirror where each key is read."""
     import rbn_known
     rule = _spot_rule_name(cfg)
+    gates = rule == 'repeat' and bool(cfg.get('spot_rule_gates'))
+    rule = 'gates' if gates else rule        # spot_rule_gates runs spot_rule2 in the repeat rule's place
     validation = cfg.get('spot_validation') or None
     validation = None if validation == 'off' else validation
+    validation = validation or ('normal' if gates else None)   # the Gated Rule applies normal when off
     calls = cfg.get('spot_validation_calls') if validation else None
     repeat = rule == 'repeat'
     eff = {
@@ -2857,7 +2860,7 @@ def _make_spot_rule(config, tracker, local=None):
         global _gates_on
         _gates_on = True    # C-worker bins close when idle (see _ItilaScanner.collect)
         # spot_rule_gates (off by default): spot_rule2.GateSpotRule, the call requirements in order
-        from spot_rule2 import LEVEL_READS, READS, UNLISTED_READS, GateSpotRule, read_bad_calls, read_notched
+        from spot_rule2 import LEVEL_READS, READS, STRONGER_DB, UNLISTED_READS, GateSpotRule, read_bad_calls, read_notched
         # spot_rule_bad_calls, spot_rule_notched_freqs (off by default): BadCalls.txt and
         # NotchedFreqs.txt beside the config file, as the Aggregator's (Node Profile)
         here = os.path.dirname(_config_path or '.')
@@ -2899,6 +2902,8 @@ def _make_spot_rule(config, tracker, local=None):
                  "off (the gate rule applies normal)" if off else level,
                  "/".join(str(READS[k] + LEVEL_READS[level]) for k in ('active', 'rare', None)),
                  ", +%d read when not on the known call list" % UNLISTED_READS if listed else "")
+        # spot_rule_strongest_db: gate 9's margin, 6 dB unless the config sets one; null or 0 turns gate 9 off
+        stronger = config.get('spot_rule_strongest_db', STRONGER_DB)
         return GateSpotRule(
             tracker._matches_patt3ch,
             listed=listed,
@@ -2909,8 +2914,7 @@ def _make_spot_rule(config, tracker, local=None):
             scp=scp,
             beacons=config.get('spot_rule_beacons'),
             qualifiers=config.get('spot_rule_qualifiers', ()),
-            stronger_db=(float(config['spot_rule_strongest_db'])
-                         if config.get('spot_rule_strongest_db') is not None else None))
+            stronger_db=float(stronger) if stronger else None)
     if config.get('spot_rule_scp') and local is None:
         log.warning("spot_rule_scp is on but spot_rule_gates is off: the SCP check acts only with the gate rule")
     # spot_validation (off by default): permissive / normal / aggressive confidence score in

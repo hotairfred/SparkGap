@@ -67,3 +67,19 @@ def test_afc_is_reported_for_itila2() -> None:
     eff, defaults, _ = _gui_settings({}, 48_000)
     assert eff["itila2_afc"] is False and "itila2_afc" in defaults
     assert _gui_settings({"cw_decoder": "itila"}, 48_000)[0]["itila2_afc"] is None
+
+
+def test_the_gated_rule_is_reported_with_the_level_it_applies() -> None:
+    eff, _, _ = _gui_settings({"spot_rule_gates": True, "spot_validation_calls": "rbn"}, 48_000)
+    assert eff["spot_rule"] == "gates" and eff["spot_rule_cq_groups"] is False
+    assert eff["spot_validation"] == "normal" and eff["spot_validation_calls"] == "rbn"
+    assert _gui_settings({"spot_rule_gates": True, "spot_rule": "off"}, 48_000)[0]["spot_rule"] == "off"
+
+
+def test_the_gated_rule_takes_6_db_at_gate_9_unless_set() -> None:
+    from sparkgap import _make_spot_rule
+    tracker = type("T", (), {"_matches_patt3ch": lambda self, c: "active"})()
+    assert _make_spot_rule({"spot_rule_gates": True}, tracker).stronger_db == 6.0
+    assert _make_spot_rule({"spot_rule_gates": True, "spot_rule_strongest_db": 10}, tracker).stronger_db == 10.0
+    for off in (None, 0):
+        assert _make_spot_rule({"spot_rule_gates": True, "spot_rule_strongest_db": off}, tracker).stronger_db is None

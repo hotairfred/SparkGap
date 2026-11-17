@@ -61,35 +61,23 @@ RADIO_RE = re.compile(
     r"^[A-Za-z0-9.:-]{1,64}$"
 )  # it goes into file names: a host name or address only
 VALIDATION = ("off", "permissive", "normal", "aggressive")
-CALL_SOURCES = ("scp", "rbn", "rbn+skcc")
+CALL_SOURCES = (None, "scp", "rbn", "rbn+skcc")  # None: no known call list
+SPOT_RULES = ("repeat", "gates")  # the Repeat Rule, or the Gated Rule (spot_rule_gates, spot_rule2.py)
 DISCOVER_S = radios.DISCOVER_S
 RBN_MODES = ("off", "dry", "live")  # rbn_upload: dry logs what it would post, live posts
 # decoder options by config key: on/off ones, and ones with a few values (None: off, key removed).
-# split runs, runner signs, window join, owner listed and the takeover are built in (cdub89/SparkGap#46)
+# Only an operator's own choices are here (cdub89/SparkGap#51 R10): the Gated Rule's Aggregator
+# filters. The repeat rule's tuning, spot_rule_strongest_db and itila2_snr_decoder are config keys.
 OPTION_FLAGS = (
-    "spot_rule_contest_words",
-    "spot_rule_cq_repeats",
-    "spot_rule_doubled_calls",
-    "spot_rule_split_up",
-    "spot_rule_owner_cell",
-    "spot_rule_owned_two_windows",
-    "spot_rule_la1d",
-    "spot_rule_gluek",
-    "spot_rule_norival",
-    "spot_rule_garbled_runner",
-    "spot_rule_stray_known",
-    "spot_rule_clean_cq",
-    "spot_rule_clip_busts",
     "spot_rule_bad_calls",
     "spot_rule_scp",
     "spot_rule_notched_freqs",
-    "itila2_snr_decoder",
 )
 OPTION_CHOICES: dict[str, tuple[Any, ...]] = {
-    "spot_rule_fragments": (None, "any", "any,stray", "even", "even,stray"),
-    "spot_rule_strongest_db": (None, 3, 6, 10),
-    "itila_window_sec": (60, 30, 15, 7.5),
+    "itila_window_sec": (60, 30, 20, 10),
 }
+WINDOW_KEPT = (15, 7.5)  # earlier window choices: a config holding one may still be sent back
+RULE_FILES = {"spot_rule_bad_calls": "BadCalls.txt", "spot_rule_notched_freqs": "NotchedFreqs.txt"}
 OPTION_DEFAULTS: dict[str, Any] = {"itila_window_sec": 60}  # where the key is read
 # a Flex copy's receive path: setting -> (the copy's live key, its config key).  SparkGap follows
 # the radio: a running copy changes it live; the config keys are the operator's startup values
@@ -201,8 +189,11 @@ def recording(cfg: dict[str, Any]) -> bool:
 def decoder_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     """A config's decoder, spot rule and recording settings, as SparkGap Web shows them."""
     return {
+        # the rule SparkGap runs: spot_rule_gates takes the repeat rule's place; another spot_rule shows as itself
+        "spot_rule": (("gates" if cfg.get("spot_rule_gates") else "repeat")
+                      if cfg.get("spot_rule", "repeat") == "repeat" else cfg.get("spot_rule")),
         "validation": cfg.get("spot_validation") or "off",
-        "call_source": cfg.get("spot_validation_calls") or "scp",
+        "call_source": cfg.get("spot_validation_calls") or None,
         "afc": bool(cfg.get("itila2_afc", False)),
         "decoder": cfg.get("cw_decoder", "itila2"),  # shown only: AFC acts with itila2
         **{k: bool(cfg.get(k, False)) for k in OPTION_FLAGS},
@@ -623,6 +614,8 @@ class Seat:
             "bands_known": self.bands_known(i),
             "multi_band": self.multi_band(i),
             **decoder_settings(cfg),
+            # the Gated Rule's files, beside the config, as SparkGap reads them
+            "rule_files": {k: str(i.config.parent / f) for k, f in RULE_FILES.items()},
             "rbn_upload": self.upload_mode(i),
             # a Flex copy's receive path as its config sets it at start (None: the radio's own)
             **{k: cfg.get(c) for k, (_, c) in RX_SETTINGS.items()},
@@ -685,20 +678,28 @@ class Seat:
                 changes["bands"] = [value]
             elif key == "rx_bands":  # {receiver number: band}, an HPSDR radio's receivers
                 changes["bands"] = self._rx_bands(i, value)
+            elif key == "spot_rule":
+                if value not in SPOT_RULES:
+                    raise SeatError(f"spot rule must be one of: {', '.join(SPOT_RULES)}")
+                changes["spot_rule_gates"] = True if value == "gates" else None
+                if self.config(i).get("spot_rule", "repeat") != "repeat":
+                    changes["spot_rule"] = "repeat"     # both run in the repeat rule's place
             elif key == "validation":
                 if value not in VALIDATION:
                     raise SeatError(f"validation must be one of: {', '.join(VALIDATION)}")
                 changes["spot_validation"] = value
             elif key == "call_source":
                 if value not in CALL_SOURCES:
-                    raise SeatError(f"call source must be one of: {', '.join(CALL_SOURCES)}")
+                    shown = ", ".join("none" if v is None else v for v in CALL_SOURCES)
+                    raise SeatError(f"call source must be one of: {shown}")
                 changes["spot_validation_calls"] = value
             elif key in OPTION_FLAGS:
                 if not isinstance(value, bool):
                     raise SeatError(f"{key} must be true or false")
                 changes[key] = value
             elif key in OPTION_CHOICES:
-                if isinstance(value, bool) or value not in OPTION_CHOICES[key]:
+                kept = key == "itila_window_sec" and value in WINDOW_KEPT
+                if isinstance(value, bool) or (value not in OPTION_CHOICES[key] and not kept):
                     shown = ", ".join("off" if v is None else str(v) for v in OPTION_CHOICES[key])
                     raise SeatError(f"{key} must be one of: {shown}")
                 changes[key] = value
