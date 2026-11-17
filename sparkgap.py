@@ -8477,6 +8477,7 @@ class SparkGap:
         self._rtty_excluded = 0     # RTTY signals CW bins were kept off (rtty_excludes_cw)
         self.start_time = None
         self._iq_lock = threading.Lock()
+        self._wav_lock = threading.Lock()   # the receive thread writes; a live record change opens and closes
         self._iq_trimmed = 0  # IQ samples discarded by the Python receiver path
         # Per-band IQ buffers keyed by rx_index.  For single-band configs
         # rx_index=0 is the only key (same as before).
@@ -8587,6 +8588,7 @@ class SparkGap:
         # All-band IQ recorder (see iq_recorder.py): the C receiver's minute swaps, or the Python receive
         # path's minute buffers (_py_minute_tick) at 192 kHz. record_wav below is the older single-band one.
         self._iq_rec = None
+        self._iq_cap = set()   # the C receiver's bands whose minute capture runs (its buffers held)
         if self.cfg.get('record_iq_dir'):
             from iq_recorder import BandRecorder
             self._iq_rec = BandRecorder(self.cfg['record_iq_dir'],
@@ -8594,22 +8596,8 @@ class SparkGap:
 
         self._wav_record = None
         self._wav_path = None
-        record_wav = self.cfg.get('record_wav')
-        if record_wav:
-            import wave as _wave, datetime as _dt
-            ts = _dt.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
-            center_hz = self._resolve_band(self.cfg.get('bands', [0])[0],
-                                           self.cfg.get('sample_rate', 48000))[1]
-            band_khz = center_hz // 1000
-            rec_path = record_wav.format(ts=ts, band=band_khz)
-            self._wav_base, self._wav_part, self._wav_bytes = rec_path, 1, 0
-            self._wav_record = _wave.open(rec_path, 'wb')
-            self._wav_record.setnchannels(2)
-            self._wav_record.setsampwidth(2)
-            self._wav_record.setframerate(self.cfg.get('sample_rate', 192000))
-            self._wav_path = rec_path
-            self._write_rec_info(rec_path, center_hz, self.cfg.get('sample_rate', 192000))
-            log.info("Recording IQ to %s", rec_path)
+        if self.cfg.get('record_wav'):
+            self._open_wav(self.cfg['record_wav'])
         calls, blacklist, add_calls = load_callsign_db(
             self.cfg.get('master_scp', 'MASTER.SCP'),
             self._add_calls_path,
@@ -8945,14 +8933,14 @@ class SparkGap:
         RF gain), checked against what the radio offers."""
         if set(change) == {'rx'}:
             return await self._live_rx(change['rx'], reply)
+        if set(change) == {'record'}:
+            return self._live_record(change['record'], reply)
         band = change.get('band')
         why = None
         if set(change) != {'band'}:
             why = "only the band can be changed live"
         elif len(self._band_meta) != 1:
             why = "not supported with more than one band"
-        elif self._wav_record:
-            why = "not supported while recording"
         elif not isinstance(band, str) or band not in BANDS:
             why = "unknown band %r" % (band,)
         elif self.cfg.get('per_band_min_snr') or self.cfg.get('pfb_scanner_bands'):
@@ -9116,10 +9104,8 @@ class SparkGap:
             await self.telnet.stop()
         if self.telnet_local:
             await self.telnet_local.stop()
-        if self._wav_record:
-            self._wav_record.close()
-            self._wav_record = None
-            _wav_drop_cache(self._wav_path)
+        with self._wav_lock:
+            self._close_wav()
         if getattr(self, '_iq_rec', None) is not None:
             self._iq_rec.close()
         elapsed = time.time() - self.start_time if self.start_time else 0
@@ -9144,9 +9130,75 @@ class SparkGap:
             if self._wav_record and rx_index == 0:
                 iq = np.asarray(iq_samples, dtype=np.float64) * 32767
                 pcm = np.clip(np.trunc(iq), -32768, 32767).astype('<i2')
-                self._wav_write(pcm.tobytes())
+                with self._wav_lock:
+                    if self._wav_record:
+                        self._wav_write(pcm.tobytes())
         except Exception:
             pass  # Don't let errors kill the receiver thread
+
+    def _open_wav(self, record_wav):
+        """Open the single-band recording (record_wav: a file name with {band} and {ts}) on the band now
+        received; its path."""
+        import wave as _wave, datetime as _dt
+        ts = _dt.datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
+        rate = self.cfg.get('sample_rate', 192000)
+        center_hz = self._resolve_band(self.cfg.get('bands', [0])[0], self.cfg.get('sample_rate', 48000))[1]
+        rec_path = record_wav.format(ts=ts, band=center_hz // 1000)
+        self._wav_base, self._wav_part, self._wav_bytes = rec_path, 1, 0
+        self._wav_record = _wave.open(rec_path, 'wb')
+        self._wav_record.setnchannels(2)
+        self._wav_record.setsampwidth(2)
+        self._wav_record.setframerate(rate)
+        self._wav_path = rec_path
+        self._write_rec_info(rec_path, center_hz, rate)
+        log.info("Recording IQ to %s", rec_path)
+        return rec_path
+
+    def _close_wav(self):
+        if self._wav_record:
+            self._wav_record.close()
+            self._wav_record = None
+            _wav_drop_cache(self._wav_path)
+            log.info("Recording IQ stopped: %s", self._wav_path)
+
+    def _live_record(self, record_wav, reply):
+        """{"record": <record_wav file name> | null}: the single-band recording opened or closed in place
+        (cdub89/SparkGap#32). The C receiver records every band with record_iq_dir instead, switched by
+        its RECORD file at the next minute."""
+        if getattr(self, '_use_c_receiver', False):
+            return reply(False, "this receiver records every band with record_iq_dir")
+        if len(self._band_meta) != 1:
+            return reply(False, "not supported with more than one band")
+        if record_wav is not None and not (isinstance(record_wav, str) and record_wav):
+            return reply(False, "record must be a file name or null")
+        with self._wav_lock:
+            if record_wav is None:
+                if not self._wav_record:
+                    return reply(True, "not recording")
+                self._close_wav()
+                return reply(True, "recording stopped")
+            if self._wav_record:
+                return reply(True, "already recording to %s" % os.path.basename(self._wav_path))
+            try:
+                path = self._open_wav(record_wav)
+            except (OSError, ValueError, KeyError) as e:
+                self._wav_record = None
+                return reply(False, "recording not started: %s" % e)
+        return reply(True, "recording to %s" % os.path.basename(path))
+
+    def _enable_iq_capture(self):
+        """The C receiver's minute capture for every band not yet capturing, once a recording is on: its
+        buffers (65 s of IQ per band) are taken then, not at start, and kept until the receiver stops
+        (cdub89/SparkGap#32)."""
+        import ctypes as _ct
+        for (bn, ch, ri) in self._band_meta:
+            if ri in self._iq_cap:
+                continue
+            ck = ch / 1000
+            self.receiver.lib.hpsdr_enable_ft8(self.receiver._h, ri, _ct.c_double((ft8_dial_khz(ck) or ck) * 1000.0),
+                                               _ct.c_double(float(ch)))
+            self._iq_cap.add(ri)
+            log.info("IQ-capture accumulator enabled rx%d for the recording: %s", ri, bn)
 
     def _write_rec_info(self, rec_path, center_hz, rate, retune=None):
         """<recording>.json beside the WAV: centre, rate, build and the config it ran with, so a
@@ -9394,9 +9446,12 @@ class SparkGap:
                         for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                             ck = ch / 1000
                             ft8_khz = ft8_dial_khz(ck)
-                            if not ft8_khz and self._iq_rec is not None:
-                                ft8_khz = ck      # recorder only: capture every band
+                            if not _minute_modes(self.cfg):
+                                ft8_khz = None    # FT8/RTTY off: only a recording captures
+                            if self._iq_rec is not None and self._iq_rec.active():
+                                ft8_khz = ft8_khz or ck   # recording at start: capture every band
                             if ft8_khz:
+                                self._iq_cap.add(ri)
                                 self.receiver.lib.hpsdr_enable_ft8(
                                     self.receiver._h, ri,
                                     _ct.c_double(ft8_khz * 1000.0),
@@ -9924,13 +9979,15 @@ class SparkGap:
                     log.info("FT8 trigger: sec=%.2f pkts=%d lost=%d (%.2f%%)",
                              ft8_sec, pkts, pkt_lost,
                              100.0*pkt_lost/max(pkts+pkt_lost, 1))
+                    if self._iq_rec is not None and self._iq_rec.active():
+                        self._enable_iq_capture()   # recording turned on while running: capture from now
                     # Snapshot all bands first (one swap each — fast, atomic).
                     # Each snapshot is the previous minute's data filling the
                     # active buffer between the prior swap and this one.
                     for (bn, ch, ri), mgr in zip(self._band_meta, self.managers):
                         ck = ch / 1000
                         ft8_khz = ft8_dial_khz(ck)
-                        if not ft8_khz and self._iq_rec is None:
+                        if ri not in self._iq_cap:
                             continue
                         fi = np.empty(buf_cap, dtype=np.float32)
                         fq = np.empty(buf_cap, dtype=np.float32)

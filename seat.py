@@ -191,6 +191,13 @@ def bands_in(code: Path) -> list[str]:
         return []
 
 
+def recording(cfg: dict[str, Any]) -> bool:
+    """A config records: its single-band recording (record_wav), or the C receiver's all-band recorder
+    (record_iq_dir, iq_recorder.py) while its RECORD file is there."""
+    iq_dir = cfg.get("record_iq_dir")
+    return bool(cfg.get("record_wav")) or bool(iq_dir and (Path(iq_dir) / "RECORD").exists())
+
+
 def decoder_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     """A config's decoder, spot rule and recording settings, as SparkGap Web shows them."""
     return {
@@ -200,7 +207,7 @@ def decoder_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         "decoder": cfg.get("cw_decoder", "itila2"),  # shown only: AFC acts with itila2
         **{k: bool(cfg.get(k, False)) for k in OPTION_FLAGS},
         **{k: cfg.get(k, OPTION_DEFAULTS.get(k)) for k in OPTION_CHOICES},
-        "record": bool(cfg.get("record_wav")),
+        "record": recording(cfg),
     }
 
 
@@ -650,16 +657,22 @@ class Seat:
         settings: dict[str, Any],
         live: Callable[[str, str], str | None] | None = None,
         live_rx: Callable[[str, dict[str, Any]], tuple[bool, str] | None] | None = None,
+        live_record: Callable[[str, str | None], tuple[bool, str] | None] | None = None,
     ) -> str:
         """Check every setting, write them all at once, restart the copy if it runs. A band change
         alone first goes to live(name, band), which moves the running copy in place and returns its
         answer, None when it could not (then the copy restarts, onto the band just written), or
         raises SeatError while the copy recovers from a radio outage (nothing written).
+        Recording on a running copy goes live too (cdub89/SparkGap#32): an HPSDR radio's RECORD file
+        switches its all-band recorder at the next minute; any other copy's single-band file goes to
+        live_record(name, file name or None), with a restart when it gives no answer.
         Receive path settings (RX_SETTINGS) on a running copy go to live_rx(name, change) only;
         given to a stopped copy, they are written as its startup values."""
         i = self.instance(name)
         changes: dict[str, Any] = {}
         rx: dict[str, Any] = {}
+        iq_dir: Path | None = None   # an HPSDR radio's all-band recorder: its folder
+        record_wav: str | None = None
         for key, value in settings.items():
             if key in RX_SETTINGS:
                 self._check_rx(i, key, value)
@@ -696,19 +709,25 @@ class Seat:
             elif key == "record":
                 if not isinstance(value, bool):
                     raise SeatError("record must be true or false")
+                cfg = self.config(i)
+                if cfg.get("sdr_type") == "hpsdr":  # every band, switched by the recorder's RECORD file
+                    iq_dir = Path(cfg.get("record_iq_dir") or self.rec / name)
+                    if "record_iq_dir" not in cfg:
+                        changes["record_iq_dir"] = str(iq_dir)
+                else:
+                    record_wav = str(self.rec / f"{name}_{{band}}_{{ts}}.wav") if value else None
+                    changes["record_wav"] = record_wav
                 if value:
-                    self.rec.mkdir(parents=True, exist_ok=True)
-                    free_gb = shutil.disk_usage(self.rec).free // 2**30
+                    where = iq_dir or self.rec
+                    where.mkdir(parents=True, exist_ok=True)
+                    free_gb = shutil.disk_usage(where).free // 2**30
                     if free_gb < REC_MIN_GB:
                         raise SeatError(
                             f"only {free_gb} GB free in rec/ (recording needs {REC_MIN_GB})"
                         )
-                changes["record_wav"] = (
-                    str(self.rec / f"{name}_{{band}}_{{ts}}.wav") if value else None
-                )
             else:
                 raise SeatError(f"{key} cannot be changed here")
-        if not changes and not rx:
+        if not changes and not rx and iq_dir is None:  # an HPSDR recording may change only its RECORD file
             raise SeatError("nothing to change")
         done = f"{name}: {', '.join(f'{k} {v}' for k, v in settings.items())}"
         rest = {k: v for k, v in settings.items() if k not in rx}
@@ -724,15 +743,32 @@ class Seat:
                 done = f"{name}: {took[1]}"
             elif rx:
                 changes.update({RX_SETTINGS[k][1]: v for k, v in rx.items()})
+            said: list[str] = []
+            if "record" in rest:
+                on = rest["record"]
+                if iq_dir is not None:
+                    flag = iq_dir / "RECORD"
+                    if on:
+                        flag.touch()
+                    else:
+                        flag.unlink(missing_ok=True)
+                    if "record_iq_dir" not in changes:  # its recorder runs: no restart
+                        said.append(f"recording {'on' if on else 'off'} at the next minute")
+                        del rest["record"]
+                elif running and live_record is not None:
+                    took = live_record(name, record_wav)
+                    if took is not None and took[0]:
+                        said.append(took[1])
+                        del rest["record"]
             answer = None
             if running and live is not None and set(rest) == {"band"}:
                 answer = live(name, settings["band"])  # before the write: a refusal changes nothing
             if changes:
                 write_config(i.config, changes)
             if not running or not rest:
-                return done
+                return f"{name}: {'; '.join(said)}" if said and running else done
             if answer:
-                return f"{name}: {answer}"
+                return f"{name}: {'; '.join([*said, answer])}"
             self._stop(i)
             return f"{done}; {self._start(i)}"
 
@@ -1180,7 +1216,7 @@ class Seat:
             "receiver_list": self.receiver_list(i, cfg, stats),
             "rec_free_gb": (
                 shutil.disk_usage(self.rec).free // 2**30
-                if cfg.get("record_wav") and self.rec.exists()
+                if recording(cfg) and self.rec.exists()
                 else None
             ),
         }

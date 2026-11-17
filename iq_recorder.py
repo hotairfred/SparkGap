@@ -29,7 +29,7 @@ loses up to 55 s of that band; it shows up here as a logged gap.
 
 Writing happens on a background thread so the decode loop never waits on
 the disk. 8 bands x 192 kHz x 24-bit = ~9 MB/s (~33 GB/hour). The queue holds
-MAX_QUEUE band-minutes (69 MB each at 24-bit, about two minutes of 8 bands); a
+MAX_QUEUE band-minutes (69 MB each at 24-bit, about one minute of 8 bands); a
 disk slower than that drops whole minutes (logged) instead of growing memory.
 """
 import datetime
@@ -45,7 +45,7 @@ log = logging.getLogger('sparkgap')
 
 GAP_TOL_S = 0.05
 MAX_DATA_BYTES = 4_000_000_000    # under the WAV format's 2**32 - 1 byte limit
-MAX_QUEUE = 16                    # band-minutes waiting for the disk (~1.1 GB at 24-bit)
+MAX_QUEUE = 8                     # band-minutes waiting for the disk (~550 MB at 24-bit)
 CLOSE_TIMEOUT_S = 10.0            # close() gives up waiting on a stalled disk after this
 
 
@@ -65,6 +65,21 @@ def pack_iq(i, q, bits, in_scale=8388608.0):
     return v.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()     # 24-bit
 
 
+def drop_cache(path):
+    """Let Linux drop a recording's written pages from its file cache; under WSL that cache is
+    Windows memory (cdub89/SparkGap#32)."""
+    if not hasattr(os, 'posix_fadvise'):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 class BandRecorder:
     def __init__(self, rec_dir, bits=24, rate=192000, max_queue=MAX_QUEUE, in_scale=8388608.0):
         if bits not in (16, 24):
@@ -73,6 +88,7 @@ class BandRecorder:
         os.makedirs(rec_dir, exist_ok=True)
         self._q = queue.Queue(maxsize=max_queue)
         self._writers = {}            # band_khz -> (wave, next_expected_t, data bytes, part)
+        self._paths = {}              # band_khz -> the file it writes
         self.max_data_bytes = MAX_DATA_BYTES
         self._session = None          # UTC stamp of the open session
         self.dropped = 0
@@ -104,14 +120,16 @@ class BandRecorder:
                             % (self._session, band_khz, self.rate, self.bits,
                                '' if part == 1 else '_p%d' % part))
         w = wave.open(path, 'wb')
+        self._paths[band_khz] = path
         w.setnchannels(2)
         w.setsampwidth(self.bits // 8)
         w.setframerate(self.rate)
         return w
 
     def _close_all(self):
-        for w, _t, _n, _p in self._writers.values():
+        for band_khz, (w, _t, _n, _p) in self._writers.items():
             w.close()
+            drop_cache(self._paths[band_khz])
         if self._writers:
             log.info("IQ recording stopped: session %s (%d band files)",
                      self._session, len(self._writers))
@@ -140,6 +158,7 @@ class BandRecorder:
                         log.info("IQ recording %s kHz: continuing in part %d", band_khz, part)
                 w.writeframes(data)
                 self._writers[band_khz] = (w, t_first + n / self.rate, nbytes + len(data), part)
+                drop_cache(self._paths[band_khz])   # a minute written: out of the page cache
             except Exception as e:                 # never kill the recorder thread
                 log.error("IQ recorder error: %s", e)
             finally:
