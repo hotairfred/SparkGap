@@ -728,7 +728,8 @@ class Server:
             return self._with(down, self.seat.restart(name), self._feeder_up(name))
         if cmd == "set" and set(settings) == {"rbn_upload"}:
             return self._set_upload(name, settings["rbn_upload"])
-        return self.seat.change(name, settings, live=self._live_band, live_rx=self._live_rx)
+        return self.seat.change(name, settings, live=self._live_band, live_rx=self._live_rx,
+                                live_record=self._live_record)
 
     # ---- the RBN feeder, through its link to the hub ----
 
@@ -867,6 +868,15 @@ class Server:
             log.info("Server: %s did not change band live (%s): restarting it", name, text)
             return None
         return text
+
+    def _live_record(self, name: str, record_wav: str | None) -> tuple[bool, str] | None:
+        """Ask the running copy to open (a file name) or close (None) its single-band recording; (ok,
+        its answer), or None when it gave none (cdub89/SparkGap#32)."""
+        target = self._feed_target(name)
+        answer = feed_control(*target, {"record": record_wav}) if target else None
+        if answer is None:
+            log.warning("Server: %s gave no answer to a live recording change: restarting it", name)
+        return answer
 
     def _live_rx(self, name: str, rx: dict[str, Any]) -> tuple[bool, str] | None:
         """Ask the running copy to change its pan's receive path; (ok, its answer), or None when

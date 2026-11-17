@@ -122,15 +122,48 @@ def test_what_cannot_change_live_is_refused_untouched(
     assert not ok and why in text and not events
 
 
-def test_recording_or_two_bands_is_refused() -> None:
+def test_two_bands_are_refused() -> None:
     events: list[str] = []
-    sg = _copy(events)
-    sg._wav_record = object()
-    assert "recording" in _change(sg, {"band": "20m"})[1]
     sg = _copy(events)
     sg._band_meta.append(("20m", 14_038_400, 1))
     assert "more than one band" in _change(sg, {"band": "20m"})[1]
     assert not events
+
+
+def test_a_recording_goes_on_across_a_band_change(tmp_path: Any) -> None:
+    """cdub89/SparkGap#32 R2: the file stays open; its .json notes the retune."""
+    import json
+    events: list[str] = []
+    sg = _copy(events)
+    sg._wav_record, sg._wav_base = object(), str(tmp_path / "rec.wav")
+    (tmp_path / "rec.json").write_text("{}")
+    assert _change(sg, {"band": "20m"}) == (True, "retuned to 20m")
+    assert json.loads((tmp_path / "rec.json").read_text())["retunes"][0]["band"] == "20m"
+
+
+def test_recording_turns_on_and_off_live(tmp_path: Any) -> None:
+    """cdub89/SparkGap#32 R1: {"record": <file name>} opens the single-band recording, null closes it."""
+    import wave
+    sg = _copy([])
+    ok, text = _change(sg, {"record": str(tmp_path / "rx_{band}_{ts}.wav")})
+    assert ok and text.startswith("recording to rx_7038_") and sg._wav_record
+    path = sg._wav_path
+    assert _change(sg, {"record": str(tmp_path / "other.wav")})[1].startswith("already recording")
+    sg._iq_callback(0, [[0.5, -0.5]] * 4)                                       # I/Q pairs, as the receiver gives them
+    assert _change(sg, {"record": None}) == (True, "recording stopped") and sg._wav_record is None
+    with wave.open(path) as w:
+        assert w.getframerate() == RATE and w.getnframes() > 0
+    assert _change(sg, {"record": None}) == (True, "not recording")
+
+
+def test_live_recording_is_refused_where_it_cannot_record(tmp_path: Any) -> None:
+    sg = _copy([])
+    sg._use_c_receiver = True
+    assert "record_iq_dir" in _change(sg, {"record": str(tmp_path / "x.wav")})[1]
+    sg = _copy([])
+    sg._band_meta.append(("20m", 14_038_400, 1))
+    assert "more than one band" in _change(sg, {"record": str(tmp_path / "x.wav")})[1]
+    assert _change(_copy([]), {"record": 5}) == (False, "record must be a file name or null")
 
 
 def test_a_second_change_while_one_is_under_way_is_busy() -> None:

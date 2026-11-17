@@ -133,7 +133,9 @@ connected`).
   knows), `validation` (`off`, `permissive`, `normal`, `aggressive`),
   `call_source` (`scp`, `rbn`, `rbn+skcc`), `afc` (true or false, written as
   `itila2_afc`), `record` (true or false; recording on needs 5 GB free in
-  `rec/`), the on/off decoder options
+  `rec/`; on a running copy it changes in place: an HPSDR radio's all-band
+  recorder by its `record_iq_dir` RECORD file at the next minute, any other
+  copy's `record_wav` file over its feed), the on/off decoder options
   `spot_rule_contest_words`, `spot_rule_cq_repeats`, `spot_rule_doubled_calls`,
   `spot_rule_split_up`, `spot_rule_owner_cell`, `spot_rule_owned_two_windows`, `spot_rule_clip_busts`,
   `spot_rule_la1d`, `spot_rule_gluek`, `spot_rule_bad_calls`, `spot_rule_scp`, `spot_rule_notched_freqs`,

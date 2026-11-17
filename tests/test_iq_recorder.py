@@ -118,6 +118,22 @@ def test_rotates_before_wav_size_limit():
         assert [len(g[0]) for g in got] == [800, 800, 400]
 
 
+def test_written_minutes_leave_the_page_cache(monkeypatch):
+    """cdub89/SparkGap#32: each written minute, and each file at close, is dropped from the page cache."""
+    dropped = []
+    monkeypatch.setattr(R, 'drop_cache', dropped.append)
+    rng = np.random.default_rng(2)
+    with tempfile.TemporaryDirectory() as d:
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        open(os.path.join(d, 'RECORD'), 'w').close()
+        i1, q1 = _swap(rng, 600)
+        rec.submit(7090, 100.0, i1, q1, 600)
+        _wait(rec)
+        assert len(dropped) == 1 and dropped[0].endswith('_7090kHz_%d_24bit.wav' % RATE)
+        rec.close()
+        assert len(dropped) == 2
+
+
 if __name__ == '__main__':
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     ok = 0

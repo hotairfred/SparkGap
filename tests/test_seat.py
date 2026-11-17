@@ -695,3 +695,38 @@ def test_radio_log_flex_station_and_hpsdr_link_lines(seat: Seat) -> None:
         "12:00:00 INFO Using direct SDR IP: 192.0.2.7\n12:00:01 INFO ITILA raw 7030.0 kHz: 'CQ'\n")
     assert seat.radio_log("Web888") == ["12:00:00 INFO Using direct SDR IP: 192.0.2.7"]
     assert len(seat.radio_log("Lake", lines=1)) == 1
+
+
+def test_hpsdr_recording_is_its_record_file(seat: Seat) -> None:
+    """cdub89/SparkGap#32: an HPSDR radio records every band with record_iq_dir; its RECORD file is the switch."""
+    i = seat.instance("dallas1")
+    write_config(i.config, {"sdr_type": "hpsdr"})
+    seat.change("dallas1", {"record": True})                    # first time: the folder goes in the config
+    iq_dir = Path(seat.config(i)["record_iq_dir"])
+    assert iq_dir == seat.rec / "dallas1" and (iq_dir / "RECORD").exists() and "record_wav" not in seat.config(i)
+    assert seat.settings(i)["record"] is True
+    before = i.config.read_text()
+    seat.change("dallas1", {"record": False})
+    assert not (iq_dir / "RECORD").exists() and i.config.read_text() == before
+    assert seat.settings(i)["record"] is False
+
+
+def test_a_running_copy_records_live_and_restarts_only_without_an_answer(
+    seat: Seat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(seat, "pid", lambda name: 4242)
+    monkeypatch.setattr(seat, "_stop", lambda i: calls.append("stop"))
+    monkeypatch.setattr(seat, "_start", lambda i: calls.append("start") or "started")
+    asked: list[str | None] = []
+
+    def live(name: str, record_wav: str | None) -> tuple[bool, str] | None:
+        asked.append(record_wav)
+        return (True, "recording to dallas1_7038.wav") if record_wav else (True, "recording stopped")
+
+    assert seat.change("dallas1", {"record": True}, live_record=live) == "dallas1: recording to dallas1_7038.wav"
+    assert asked == [str(seat.rec / "dallas1_{band}_{ts}.wav")] and not calls
+    assert seat.change("dallas1", {"record": False}, live_record=live) == "dallas1: recording stopped"
+    assert asked[-1] is None and not calls
+    seat.change("dallas1", {"record": True}, live_record=lambda name, f: None)     # no answer: a restart
+    assert calls == ["stop", "start"]

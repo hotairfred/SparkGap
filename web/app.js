@@ -63,7 +63,7 @@ const OPTION_HINTS = {
 
 const HINTS = {
   window: "How much signal each decoded window holds (itila_window_sec). Shorter windows show text sooner but fit each signal's timing on less of it and cost more CPU; 15 and 7.5 s are untried. Applying restarts the skimmer.",
-  record: "Saves the raw signal to disk for replay; needs 5 GB free. Restarts the skimmer.",
+  record: "Saves the raw signal to disk for replay; needs 5 GB free. Starts and stops in place. A Web-888 records every band: its first minute readies the capture, so files start within two minutes, and stop at the next minute.",
   afc: "Each signal's decoder follows its keyed tone, which helps weak and slightly off-tune signals (itila2_afc). Applying restarts the skimmer.",
   validation: "A confidence score decides which calls are spotted: permissive spots more, aggressive fewer (docs/ITILA2.md). Off: a set number of copies, 2 to 4 by how common the call's pattern is.",
   call_source: "Calls known from this list score higher in validation: SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster.",
@@ -1796,7 +1796,7 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
       : r.num_scu > 1 ? `Antenna and RF gain are shared by the receivers on the same SCU (${r.num_scu} SCUs; the radio does not say which): check the others after a change.` : SHARED_NOTE;
     rows.push(`<div class="frow"><span></span><span class="fhint">${esc(note)}</span></div>`);
   } else if (i.radio && !run && radioOf(sv, i).rx_settings && radioOf(sv, i).rx_settings.length) rows.push(`<div class="frow"><span></span><span class="fhint">Antenna and RF gain show while ${esc(i.name)} runs.</span></div>`);
-  if (!list || node) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">restarts ${esc(i.name)}</span>` : "")
+  if (!list || node) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">${run ? "in place, no restart" : "from the next start"}</span>` : "")
     .replace('<div class="frow"', `<div class="frow" title="${esc(HINTS.record)}"`));
   if (!node && !own) rows.push(`<div class="frow"><span></span><span class="fhint">${list ? `Run, recording, decoder options and details: ${esc(radioName)}'s Node, for all its receivers.`
     : `Decoder options: ${esc(radioName)}'s Node, for all its receivers.`}</span></div>`);
@@ -1809,7 +1809,7 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
     + (list && !node ? "" : `<button class="fentry" data-act="fold" data-fold="details" aria-expanded="${detOpen}"><span>Details</span><span class="fnote">packets, reconnects, warnings, log</span><span class="chev">${detOpen ? "\u25BE" : "\u25B8"}</span></button>`
     + (detOpen ? `<div class="fold details">${feed && feed.status ? statusHtml(feed, i, false) : stoppedInfoHtml(i)}</div>` : ""));
   const others = Object.keys(pend).filter(x => !RX_KEYS.includes(x));
-  const live = run && (!others.length || (others.length === 1 && others[0] === "band"));
+  const live = run && others.every(k => k === "band" || k === "record") && others.length <= 1;  // a band or recording changes in place
   const label = { run: "run", band: "band", antenna: "antenna", rf_gain: "RF gain", record: "recording", afc: "AFC", itila_window_sec: "window",
     validation: "call validation", call_source: "known call list", ...Object.fromEntries(DECODER_OPTIONS.map(([key, l]) => [key, l])) };
   const what = pend.remove ? "remove" : Object.entries(pend).map(([key, v]) => key === "rx_bands" ? Object.entries(v).map(([n, b]) => `${radioName}-${n} ${b}`).join(", ")

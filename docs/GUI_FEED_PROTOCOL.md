@@ -292,7 +292,10 @@ Changes the running SparkGap, live.
   receive path: any of `rxant` (one of the pan's `ant_list`), `loopa` and
   `loopb` (true or false, only on a model that has that loop) and
   `rfgain` (in the radio's `rfgain_range` steps), as in
-  `{"rx": {"rxant": "ANT2", "rfgain": 16}}`.
+  `{"rx": {"rxant": "ANT2", "rfgain": 16}}`, or `record`: a file name with
+  `{band}` and `{ts}` opens the single-band recording, null closes it (a copy
+  on the Python receive path with one band; the C receiver records every band
+  with `record_iq_dir` instead). A recording goes on across a band change.
 
 The answer goes only to the client that asked:
 
