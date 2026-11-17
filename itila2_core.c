@@ -1649,13 +1649,13 @@ static int find_carry_cut(itila_state_t *st, const int8_t *marks, int T, double 
     int fitted, lw_fitted;
     double dah;
     double unit_sp = fit_unit(runs, n_runs, unit_samples(wpm), &fitted, &dah);
-    double letter_word = letter_word_boundary(st, runs, n_runs, unit_sp, &lw_fitted);
-    /* Cut midway between the letter and word gap centres, fitted as the beam fits them,
-     * so the cut and the text agree on what a word gap is. */
+    double letter_word = letter_word_boundary(st, runs, n_runs, unit_sp, &lw_fitted);  /* fallback: no gap fit, no stored centres */
+    /* Cut where the beam switches from letter to word gap (equal log-normal likelihood),
+     * fitted as the beam fits them, so the cut and the text agree on what a word gap is. */
     double gap_l, gap_w;
     if (fit_gap_centres(runs, n_runs, unit_sp, st->log_B, &gap_l, &gap_w) ||
         prev_gap_centres(st, unit_sp, &gap_l, &gap_w))
-        letter_word = sqrt(gap_l * gap_w);
+        letter_word = exp((GAP_SD_WORD * log(gap_l) + GAP_SD_LETTER * log(gap_w)) / (GAP_SD_LETTER + GAP_SD_WORD));
 
     if (!runs[n_runs - 1].is_mark && runs[n_runs - 1].dur >= letter_word) return T;
 
@@ -1816,11 +1816,12 @@ static double mark_power(const double *pow, const int8_t *marks, int n) {
     return m >= SNR_MARK_MIN ? sum / m : NAN;
 }
 
-/* Blank the marks of segments that are not CW. A segment is keying between pauses of 5 units
+/* Blank the marks of segments in [t, n) that are not CW. A segment is keying between pauses of 5 units
  * or more of the fastest speed candidate; its log Bayes factor (fresh forward pass, mean over the speed bins, against all
- * noise) must reach SEG_RATE_MIN per second. */
-static void gate_segments(itila_state_t *st, const double *env, int n, double A, double nm,
-                          double s2, double unit, const double *cands, int n_cands) {
+ * noise) must reach SEG_RATE_MIN per second.  With leave_open, a last segment no pause closes before n is
+ * left as it is; returns its start, else n. */
+static int gate_segments(itila_state_t *st, const double *env, int t, int n, double A, double nm,
+                         double s2, double unit, const double *cands, int n_cands, int leave_open) {
     int gap = (int)(5.0 * unit), pad = (int)unit;
     double lc = -0.5 * log(2.0 * M_PI * s2);
     /* Speed bins near the window's candidates (all bins when none): the keyed case is the
@@ -1844,7 +1845,6 @@ static void gate_segments(itila_state_t *st, const double *env, int n, double A,
             use[n_use++] = best;
         }
     }
-    int t = 0;
     while (t < n) {
         while (t < n && !st->marks[t]) t++;
         if (t >= n) break;
@@ -1853,6 +1853,7 @@ static void gate_segments(itila_state_t *st, const double *env, int n, double A,
             if (st->marks[t]) { last = t; sp = 0; }
             else if (++sp >= gap) break;
         }
+        if (leave_open && t >= n) return t0;
         int a = t0 - pad < 0 ? 0 : t0 - pad;
         int b = last + 1 + pad > n ? n : last + 1 + pad;
         int len = b - a;
@@ -1881,6 +1882,19 @@ static void gate_segments(itila_state_t *st, const double *env, int n, double A,
         if (lbf < SEG_RATE_MIN * len / (double)BAYES_RATE)
             memset(st->marks + t0, 0, (size_t)(last + 1 - t0));
     }
+    return n;
+}
+
+/* Gate, then cut; returns the cut.  Gating first keeps noise blips out of the cut's gap fit.  A segment
+ * still open at the window's end is not gated here, so a start the gate would blank alone is carried
+ * and gated whole next window; only the part of it the cut decodes now is gated, as before. */
+static int gate_and_cut(itila_state_t *st, const double *env, int n, double A, double nm, double s2,
+                        const double *cands, int n_cands) {
+    double unit = unit_samples(cands[n_cands - 1]);
+    int open = gate_segments(st, env, 0, n, A, nm, s2, unit, cands, n_cands, 1);
+    int n_dec = find_carry_cut(st, st->marks, n, cands[0]);
+    if (n_dec > open) gate_segments(st, env, open, n_dec, A, nm, s2, unit, cands, n_cands, 0);
+    return n_dec;
 }
 
 const char* itila_feed(itila_t h, const double* envelope, int n,
@@ -1940,10 +1954,7 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     st->last_timing_cost = compute_timing_cost(st->marks, n, wpm_em,
                                                 st->sc_runs);
 
-    /* Gate before the cut: noise blips the gate removes must not set the cut's gap fit. */
-    gate_segments(st, envelope, n, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]),
-                  wpm_cands, n_cands);
-    int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
+    int n_dec = gate_and_cut(st, envelope, n, A, noise_mean, sigma2_obs, wpm_cands, n_cands);
     st->carry_n = n - n_dec;
     memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
     if (st->pow_in) memcpy(st->carry_pow, st->feed_pow + n_dec, (size_t)st->carry_n * sizeof(double));
@@ -2279,7 +2290,7 @@ int itila2_test_gate_segments(const double *env, int8_t *marks, int n, double A,
     itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
     if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
     memcpy(st->marks, marks, (size_t)n);
-    gate_segments(st, env, n, A, nm, s2, unit, NULL, 0);
+    gate_segments(st, env, 0, n, A, nm, s2, unit, NULL, 0, 0);
     memcpy(marks, st->marks, (size_t)n);
     int kept = 0;
     for (int i = 0; i < n; i++) kept += marks[i];
@@ -2342,6 +2353,17 @@ int itila2_test_decode_runs_after(const int *prev_mark, const int *prev_dur, int
     snprintf(out, (size_t)out_len, "%s", nt > 0 ? texts[0] : "");
     itila_free(st); free(texts);
     return nt;
+}
+
+/* gate_and_cut at one speed, fresh handle; marks is updated in place.  Returns the cut sample or -1. */
+int itila2_test_gate_and_cut(const double *env, int8_t *marks, int n, double A, double nm, double s2, double wpm) {
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
+    memcpy(st->marks, marks, (size_t)n);
+    int cut = gate_and_cut(st, env, n, A, nm, s2, &wpm, 1);
+    memcpy(marks, st->marks, (size_t)n);
+    itila_free(st);
+    return cut;
 }
 
 /* find_carry_cut on the mark sequence built from runs, fresh handle.  Returns the cut sample or -1. */
