@@ -129,7 +129,7 @@ Call validation:
 | `spot_validation_calls` | none | 3 | The known call list (`scp`, `rbn` or `rbn+skcc`); a call not on it needs one more read. Not reported to RBN |
 | `spot_rule_banned_calls` | none | 2 | Calls that never spot |
 | `spot_rule_bad_calls` | off | 2 | Calls in `BadCalls.txt` beside the config never spot: a node's own call and its busts while it transmits |
-| `spot_rule_scp` | off | 2 | A call not in `SCP.DB` never spots, beacons excepted. `SCP.DB` is downloaded at most once a day into `rbn_known_dir`; without it the check is off |
+| `spot_rule_scp` | off | 2 | A call not in `SCP.DB` never spots, beacons excepted. `SCP.DB` is downloaded when SparkGap starts, at most once a day, into `rbn_known_dir`; without it the check is off. It acts only with `spot_rule_gates` |
 
 Spot decision:
 

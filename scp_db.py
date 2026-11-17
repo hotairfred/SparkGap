@@ -1,8 +1,8 @@
 """Super Check Partial calls (SCP.DB), for spot_rule_scp.
 
 SCP.DB (SCP_URL) is the SQLite form of Super Check Partial: every call seen in the contest logs it
-is built from, about 69,000, where MASTER.SCP keeps the 50,000 most active. It is fetched at most
-once a day into the cache directory; offline, the cached copy is used.
+is built from, about 69,000, where MASTER.SCP keeps the 50,000 most active. It is fetched when
+SparkGap starts, at most once a day, into the cache directory; offline, the cached copy is used.
 """
 
 import logging

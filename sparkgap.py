@@ -2911,6 +2911,8 @@ def _make_spot_rule(config, tracker, local=None):
             qualifiers=config.get('spot_rule_qualifiers', ()),
             stronger_db=(float(config['spot_rule_strongest_db'])
                          if config.get('spot_rule_strongest_db') is not None else None))
+    if config.get('spot_rule_scp') and local is None:
+        log.warning("spot_rule_scp is on but spot_rule_gates is off: the SCP check acts only with the gate rule")
     # spot_validation (off by default): permissive / normal / aggressive confidence score in
     # place of the tier count; spot_validation_calls adds a call list to the score: "scp"
     # (MASTER.SCP), "rbn" (RBN known calls, rbn_known.py, refreshed from the archives here) or

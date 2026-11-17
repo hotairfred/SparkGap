@@ -75,3 +75,10 @@ def test_spot_rule_scp_without_scp_db_is_off(tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(scp_db, "_fetch", offline)
     cfg = {"spot_rule_gates": True, "spot_rule_scp": True, "rbn_known_dir": str(tmp_path)}
     assert sparkgap._make_spot_rule(cfg, _tracker()).scp is None
+
+
+def test_spot_rule_scp_without_the_gate_rule_says_so(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+    caplog.set_level(logging.WARNING, logger="sparkgap")
+    sparkgap._make_spot_rule({"spot_rule": "repeat", "spot_rule_scp": True}, _tracker())
+    assert "spot_rule_scp is on but spot_rule_gates is off" in caplog.text
