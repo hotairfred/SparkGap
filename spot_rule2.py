@@ -5,7 +5,8 @@ checked in this order; a call not spotted is dropped by the first gate that is f
                        continuous text, first in first out; the buffer ends with its bin
   1 Shape              prefix (@, @@, #@ or #@@), 1 to 4 digits, 1 to 6 letters
   2 Not banned         the call is not on the banned list or in the Bad Calls file, and is in
-                       SCP when the node checks it (spot_rule_scp; a beacon need not be)
+                       SCP or the known-call list when the node checks it (spot_rule_scp; a
+                       beacon need not be)
   3 Reads              reads in the buffer: 2 for a patt3ch.lst + pattern, 3 unflagged, 5 none
                        (normal level), one more for a call not on the node's known-call list
                        (spot_validation_calls); a call decoded twice is read twice
@@ -381,8 +382,9 @@ class GateSpotRule:
         if call in self.banned or b in self.banned:
             return self._decide(now, f, call, 2)
         beacon = self.beacon(call, f)
-        if self.scp is not None and not beacon and not (self.scp(call) or self.scp(b)):
-            return self._decide(now, f, call, 2, "not in SCP")
+        if (self.scp is not None and not beacon and not (self.scp(call) or self.scp(b))
+                and (self.listed is None or not self.listed(b))):     # a known call needs no SCP entry
+            return self._decide(now, f, call, 2, "not in SCP" if self.listed is None else "not in SCP or the known calls")
         known = self.known_beacon(call, f)
         kind = self.shape(b)
         unlisted = self.listed is not None and not self.listed(b)

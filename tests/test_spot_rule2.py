@@ -287,6 +287,13 @@ def test_2_not_in_scp() -> None:
     assert _feed(_rule(), "CQ K1ABD K1ABD", f=7030.0) == ["K1ABD"]            # off: no check
 
 
+def test_2_a_known_call_needs_no_scp_entry() -> None:
+    r = _rule(scp={"K1ABC"}.__contains__, listed=lambda c: c in {"KF0KFH"})
+    assert _feed(r, "CQ KF0KFH KF0KFH KF0KFH") == ["KF0KFH"]                  # new ham, on the RBN list
+    assert _feed(r, "CQ E2AD E2AD E2AD", f=7030.0) == [] and _why(r, "E2AD") == 2
+    assert r.trace[-1][4] == "not in SCP or the known calls"
+
+
 def test_11_notched_freqs_file(tmp_path) -> None:
     from spot_rule2 import read_notched
     (tmp_path / "NotchedFreqs.txt").write_text("7074\n14079.5-14081\n14090 14092\nnote\n")

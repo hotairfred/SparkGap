@@ -44,7 +44,7 @@ level (`spot_validation`) and, when the node sets one, the known call list (`spo
 | --- | --- | --- | --- |
 | S | Buffer | Each signal (decoder bin) keeps its last 256 decoded characters as one continuous text, first in, first out, with no age limit. The buffer ends with its bin | CW Skimmer (256 characters per decoder) |
 | 1 | Shape | Prefix `@`, `@@`, `#@` or `#@@`, then 1 to 4 digits, then 1 to 6 letters | CW Skimmer (patt3ch.lst shapes) |
-| 2 | Not banned | The call is not in `spot_rule_banned_calls` or, when `spot_rule_bad_calls` is on, in `BadCalls.txt`; and when `spot_rule_scp` is on, the call is in Super Check Partial (`SCP.DB`), unless gate 12 takes it as a beacon | Aggregator (Bad Calls, Only in MASTER.SCP); SparkGap (banned list, SCP.DB) |
+| 2 | Not banned | The call is not in `spot_rule_banned_calls` or, when `spot_rule_bad_calls` is on, in `BadCalls.txt`; and when `spot_rule_scp` is on, the call is in Super Check Partial (`SCP.DB`) or on the known call list, unless gate 12 takes it as a beacon | Aggregator (Bad Calls, Only in MASTER.SCP); SparkGap (banned list, SCP.DB) |
 | 3 | Reads | Read in the buffer at least the count for the call's patt3ch.lst pattern at the node's call validation level: at normal, 2 for a `+` pattern, 3 for an unflagged pattern, 5 for no pattern; one fewer at permissive, one more at aggressive. Off or unset applies normal. A call decoded twice is read twice. A call not on the node's known call list needs one more read; a known call list never lowers the count. Example at aggressive: a call not on the list with a `+` pattern needs 4 reads (`3 of 4 reads (active pattern, aggressive, not listed)`) | SparkGap |
 | 4 | Best reading | The most-read call in its buffer wins; a tie (N5AL and W5AL read equally) spots neither. A call split by a gap (`K1V UT`) is a read of the longer call read whole there (K1VUT). A cut-off copy of a longer call read there (N5T of N5TJ) never wins. Noise or sign-off letters (E T I S K) never make a longer call (K1TRE, `KE8UEX K`), nor does a portable form (W1AW/7 is W1AW) | SparkGap |
 
@@ -111,7 +111,7 @@ decided a spot, and drop it before it is posted.
 
 | Filter | What it drops | SparkGap |
 | --- | --- | --- |
-| Only in MASTER.SCP | Every spot whose call is not in MASTER.SCP, beacons excepted. CW Skimmer's Paranoid level; the RBN team recommends against it | Default off (`spot_rule_scp`, gate 2), from `SCP.DB`, which holds every MASTER.SCP call and about 19,000 more |
+| Only in MASTER.SCP | Every spot whose call is not in MASTER.SCP, beacons excepted. CW Skimmer's Paranoid level; the RBN team recommends against it | Default off (`spot_rule_scp`, gate 2), from `SCP.DB`, which holds every MASTER.SCP call and about 19,000 more; a call on the known call list passes without it |
 | Bad Calls | Calls in `BadCalls.txt`, one per line | Default off (`spot_rule_bad_calls`, gate 2) |
 | Notched Freqs | Frequencies in `NotchedFreqs.txt`: a kHz or a range per line, `7074-7077` or `7074 7077` | Default off (`spot_rule_notched_freqs`, gate 11) |
 | Grid squares | Calls shaped like a grid square, above 28.145 MHz | Not implemented |
@@ -129,7 +129,7 @@ Call validation:
 | `spot_validation_calls` | none | 3 | The known call list (`scp`, `rbn` or `rbn+skcc`); a call not on it needs one more read. Not reported to RBN |
 | `spot_rule_banned_calls` | none | 2 | Calls that never spot |
 | `spot_rule_bad_calls` | off | 2 | Calls in `BadCalls.txt` beside the config never spot: a node's own call and its busts while it transmits |
-| `spot_rule_scp` | off | 2 | A call not in `SCP.DB` never spots, beacons excepted. `SCP.DB` is downloaded when SparkGap starts, at most once a day, into `rbn_known_dir`; without it the check is off. It acts only with `spot_rule_gates` |
+| `spot_rule_scp` | off | 2 | A call in neither `SCP.DB` nor the known call list (`spot_validation_calls`) never spots, beacons excepted; with no list, `SCP.DB` alone decides. `SCP.DB` is downloaded when SparkGap starts, at most once a day, into `rbn_known_dir`; without it the check is off. It acts only with `spot_rule_gates` |
 
 Spot decision:
 
