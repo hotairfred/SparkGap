@@ -2618,8 +2618,13 @@ def _select_parallel_decode(on):
 
 _snr_decoder = False   # config itila2_snr_decoder: spot SNR from the decoder's window (marks over spaces)
 
+def _snr_decoder_on(cfg):
+    """itila2_snr_decoder unless set: on with the itila2 decoder (WF8Z-1 since 10-29 read within +3 to -2 dB of
+    other RBN skimmers, the scanner's SNR 5 to 12 dB high); itila has no key-down power to measure."""
+    return cfg.get('itila2_snr_decoder', cfg.get('cw_decoder', 'itila2') == 'itila2')
+
 def _select_snr_decoder(on):
-    """Config key itila2_snr_decoder (default off): spot SNR in 500 Hz as CW Skimmer measures it: the
+    """Config key itila2_snr_decoder (default on with itila2): spot SNR in 500 Hz as CW Skimmer measures it: the
     mean linear power over a decoded window's key-down samples (itila_feed_pow, itila_get_mark_power)
     less the noise in its path, over the band's noise density (itila_sc_drain_env_pow)."""
     global _snr_decoder
@@ -8624,7 +8629,7 @@ class SparkGap:
         _select_bin_liveness(self.cfg.get('itila2_bin_liveness', False), _liveness_list(self.cfg, self.tracker),
                              _spot_rule_name(self.cfg) == 'repeat')
         _select_decode_threads(self.cfg.get('itila_decode_threads', 1))
-        _select_snr_decoder(self.cfg.get('itila2_snr_decoder', False))
+        _select_snr_decoder(_snr_decoder_on(self.cfg))
         _select_afc(self.cfg.get('itila2_afc', False))
         _select_fold_mask(self.cfg.get('itila2_fold_mask', False))
         _select_tone_lock(self.cfg.get('itila2_tone_lock_hz', 0))
@@ -10250,7 +10255,7 @@ def run_file_mode(args, config):
     _select_bin_liveness(config.get('itila2_bin_liveness', False), _liveness_list(config, tracker),
                          _spot_rule_name(config) == 'repeat')
     _select_decode_threads(config.get('itila_decode_threads', 1))
-    _select_snr_decoder(config.get('itila2_snr_decoder', False))
+    _select_snr_decoder(_snr_decoder_on(config))
     _select_afc(config.get('itila2_afc', False))
     _select_fold_mask(config.get('itila2_fold_mask', False))
     _select_tone_lock(config.get('itila2_tone_lock_hz', 0))

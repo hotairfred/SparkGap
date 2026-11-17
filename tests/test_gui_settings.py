@@ -83,3 +83,11 @@ def test_the_gated_rule_takes_6_db_at_gate_9_unless_set() -> None:
     assert _make_spot_rule({"spot_rule_gates": True, "spot_rule_strongest_db": 10}, tracker).stronger_db == 10.0
     for off in (None, 0):
         assert _make_spot_rule({"spot_rule_gates": True, "spot_rule_strongest_db": off}, tracker).stronger_db is None
+
+
+def test_decoder_snr_is_on_with_itila2_unless_set() -> None:
+    from sparkgap import _snr_decoder_on
+    assert _snr_decoder_on({}) and _snr_decoder_on({"cw_decoder": "itila2"})
+    assert not _snr_decoder_on({"cw_decoder": "itila"})
+    assert not _snr_decoder_on({"itila2_snr_decoder": False})
+    assert _snr_decoder_on({"cw_decoder": "itila", "itila2_snr_decoder": True})
