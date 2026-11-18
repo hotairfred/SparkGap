@@ -30,8 +30,9 @@ checked in this order; a call not spotted is dropped by the first gate that is f
  11 Window             the frequency is inside the configured CW segments and outside every
                        range in the Notched Freqs file
  12 Beacon             a /B, NCDXF or listed beacon skips 5 to 8; an NCDXF or listed beacon
-                       spots on one read (it sends its call once a slot), and other such
-                       beacons in its buffer are not its rivals at gate 4; on an NCDXF
+                       spots on one read (it sends its call once a slot); an NCDXF beacon on its
+                       frequency skips 4 too (its fading dashes decode as noise words that tie
+                       it), and other such beacons are not a listed beacon's rivals; on an NCDXF
                        frequency a word one letter off one NCDXF call is read as that call
                        (UH6RS is KH6RS), unless it is on the known-call list
 
@@ -108,6 +109,19 @@ def said(gate: int, why: str) -> str:
     if gate == 2 and why.startswith("not in SCP"):     # gate 2's SCP check, not the bad calls list
         return "Not in SCP"
     return SAID.get(gate, "Not spotted")
+
+
+def beacon_kind(call: str, khz: float, beacons: dict[str, float] | None = None) -> str | None:
+    """How RBN types a spot of this call: "NCDXF" (an NCDXF call within 5 kHz of an NCDXF frequency),
+    "listed" (a spot_rule_beacons call near its kHz) or "/B" (any call ending /B); None for a CQ spot.
+    The feeder sends it as the spot's type, the archive's mode column shows NCDXF B or BEACON."""
+    if call in NCDXF and any(abs(khz - x) <= BEACON_KHZ for x in NCDXF_KHZ):
+        return "NCDXF"
+    if beacons and call in beacons and abs(khz - beacons[call]) <= BEACON_KHZ:
+        return "listed"
+    if call.upper().endswith("/B"):
+        return "/B"
+    return None
 
 
 def read_bad_calls(path: str | Path) -> list[str]:
@@ -431,7 +445,7 @@ class GateSpotRule:
         if n < need:
             why = f"{kind or 'no'} pattern, {self.level}{', not listed' if unlisted else ''}"
             return self._decide(now, f, call, 3, f"{n} of {need} reads ({why})")
-        if self.best_reading:
+        if self.best_reading and not (known and call in NCDXF):   # gate 12: an NCDXF beacon has no rival
             counts = best_reads(buf)
             longer = next((t for t in counts if counts[t] > 0 and clip_of(call, t)), None)
             if longer:

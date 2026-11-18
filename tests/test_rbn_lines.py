@@ -36,6 +36,21 @@ def test_an_rtty_spot_is_a_row_with_its_baud(caplog: Caplog) -> None:
     assert (got["band"], got["mode"], got["speed"], got["tx_mode"]) == ("20m", "CQ", "45", "RTTY")
 
 
+@pytest.mark.parametrize("khz, call, beacons, mode", [
+    (14100.0, "4U1UN", None, "NCDXF B"),               # an NCDXF beacon on its frequency
+    (7030.0, "4U1UN", None, "CQ"),                     # off it: not a beacon spot
+    (28250.0, "K6RS/B", None, "BEACON"),
+    (7039.0, "W5ABC", {"W5ABC": 7039.0}, "BEACON"),     # spot_rule_beacons
+])
+def test_a_beacon_spot_is_typed_as_rbn_stores_it(caplog: Caplog, khz: float, call: str,
+                                                 beacons: dict[str, float] | None, mode: str) -> None:
+    """The mode column RBN's archive shows, as the feeder types the spot (cdub89/SparkGap#49)."""
+    with caplog.at_level(logging.INFO, logger="sparkgap"):
+        sparkgap._log_rbn_row("n0call", khz, call, 12, 22, T, beacons=beacons)
+    (row,) = _lines(caplog, "RBN: ")
+    assert dict(zip(COLUMNS, next(csv.reader([row]), []), strict=True))["mode"] == mode
+
+
 def test_the_spotter_keeps_a_node_suffix_but_not_the_default() -> None:
     assert sparkgap._rbn_spotter({"callsign": "WF8Z", "skimmer_suffix": "-1"}) == "WF8Z-1"
     assert sparkgap._rbn_spotter({"callsign": "WF8Z", "skimmer_suffix": "-#"}) == "WF8Z"

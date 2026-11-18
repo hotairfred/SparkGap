@@ -437,3 +437,12 @@ def test_a_lead_dit_bust_is_never_the_best_reading() -> None:
     _feed(r, "TU I MX4U UP CQ 3X4U UP", t=30.0, w=1)
     _feed(r, "CQ MX4U UP CQ 3X4U 3X4U UP", t=60.0, w=2)
     assert "MX4U" not in [c for _, _, c, g, _ in r.trace if g == 0]
+
+
+def test_12_an_ncdxf_beacon_skips_gate_4() -> None:
+    """The fading dashes between NCDXF beacons decode as noise words; one read of one tied a beacon
+    at gate 4 (VE8AT and I6BT on WX7V-1, 11-17). A listed beacon keeps gate 4."""
+    r = _rule()
+    assert _feed(r, "VE8AT I6BT", f=14100.0) == ["VE8AT"]
+    r = _rule(beacons={"W5ABC": 7039.0})
+    assert _feed(r, "W5ABC I6BT", f=7039.0) == [] and _why(r, "W5ABC") == 4
