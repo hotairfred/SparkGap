@@ -628,8 +628,8 @@ def clip_of(short: str, long_: str, strength: Callable[[str], int],
 
 def lead_dits_of(short: str, long_: str) -> bool:
     """short is long_ read with its first LEAD_DITS or more dits lost, letter gaps aside: MX4U and WX4U
-    of 3X4U (...-- read as -- or .--), M5IMO of SM5IMO. Only dits: a lost dah or a whole letter is
-    too often a real prefix (OE/DJ7PR, EW1WC and W1WC). Portable forms are not this (W1AW of W1AW/3)."""
+    of 3X4U (...-- read as -- or .--), M5IMO of SM5IMO. Only dits, and 2 or more: a lost dah or a
+    lone dit (E) is too often a real prefix (OE/DJ7PR, EW1WC and W1WC); S or I lost whole counts. Portable forms are not this (W1AW of W1AW/3)."""
     if short == long_ or "/" in short or "/" in long_ or len(short) < 3:
         return False
     a = "".join(_MORSE.get(ch, "?") for ch in short)
