@@ -114,6 +114,7 @@ def _gui_settings(cfg, sample_rate):
         'spot_rule_owned_two_windows': repeat and bool(cfg.get('spot_rule_owned_two_windows', False)),
         'spot_rule_clean_cq': repeat and bool(validation) and bool(cfg.get('spot_rule_clean_cq', False)),
         'spot_rule_clip_busts': repeat and calls in ('rbn', 'rbn+skcc') and bool(cfg.get('spot_rule_clip_busts', False)),
+        'spot_rule_lead_dits': repeat and bool(cfg.get('spot_rule_lead_dits', False)),
         'itila_window_sec': float(cfg.get('itila_window_sec', 60.0)),
         'itila_max_bins': int(cfg.get('itila_max_bins', 200)),
         'itila_decode_threads': int(cfg.get('itila_decode_threads', 1)),
@@ -2973,7 +2974,8 @@ def _make_spot_rule(config, tracker, local=None):
         stray_known=bool(config.get('spot_rule_stray_known', False)),
         clean_cq=bool(config.get('spot_rule_clean_cq', False)),
         clip_strength=_clip_strength(config, calls, tracker),
-        clip_keep=lambda c: c in tracker.valid_calls)
+        clip_keep=lambda c: c in tracker.valid_calls,
+        lead_dits=bool(config.get('spot_rule_lead_dits', False)))
 
 
 def _clip_strength(config, calls, tracker):
