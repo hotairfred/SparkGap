@@ -80,6 +80,7 @@ NEAR_KHZ = 0.5                # copies within this of each other are one frequen
 REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call and band per 10 minutes
 RESPOT_S = REPEAT_S + 15.0     # re-spot after 10 minutes as RBN times them: its clock is the upload, a few s after ours
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
+SLASH_MIN = 2                 # a base call goes out in its portable form read in this many windows here
 OWNER_CELL_KHZ = 0.25         # owner_cell: a new owner replaces only the owner within this
 STRONGEST_S = 60.0            # strongest: a stronger copy of the call elsewhere in the band this recently
 LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
@@ -95,6 +96,9 @@ CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:[A-Z]{1,2}|[0-9][A-Z])[0-9]{1,4}[A-Z]{1,6}"
                      r"(?:/[A-Z0-9]{1,3})?$")                          # /0, /P
 _SPLIT_RE = re.compile(r"[^A-Z0-9?/]+")   # keep / for HK3/NP4Z, N5AW/0
+# a portable suffix a split call may be joined with (_slash_join): a digit, P M A B, an area with a digit
+# that starts with a letter (W1, VE3, KH6; not a report or sign-off read after a stray slash: 73, 88, 5NN), MM AM QRP
+_SUFFIX_RE = re.compile(r"^(?:[0-9]|[PMAB]|MM|AM|QRP|(?=[A-Z0-9]{2,3}$)[A-Z]+[0-9][A-Z0-9]*)$")
 _RST_RE = re.compile(r"^[5E][9N][9N]$")    # 599, 5NN, ENN: contest report before the number
 GRID_RE = re.compile(r"^(?!RR73$)[A-R]{2}[0-9]{2}$")  # a 4-character grid square: the exchange of
 #                                                      Makrothen RTTY; RR73 (a sign-off) has the shape but is not one
@@ -227,6 +231,54 @@ def split_runs(text: str, de_rejoin: bool = False) -> str:
         out.extend(parts if parts and len(parts) > 1 else [w])
         i += 1
     return " ".join(out)
+
+
+def _slash_join(a: str, b: str) -> str | None:
+    """a/b when the decoder put a word gap at the slash of a portable call: CALL /P, CALL / 7,
+    VE2PID /W1 (suffix), TI5 /VA3RA (prefix). A suffix with a K glued on (W7KFI / 5K) loses the K."""
+    if CALL_RE.match(a) and "/" not in a and b.isalnum():
+        if b in _PROSIGNS:                            # CALL / K, CALL / BK: a prosign, not a suffix
+            return None
+        if len(b) >= 2 and b.endswith("K"):
+            b = b[:-1]
+        if not _SUFFIX_RE.match(b):                   # CALL/ T: a noise letter, not a suffix
+            return None
+        return f"{a}/{b}" if CALL_RE.match(f"{a}/{b}") else None
+    if CALL_RE.match(b) and "/" not in b and a.isalnum() and len(a) <= 3 and any(ch.isdigit() for ch in a):
+        return f"{a}/{b}" if CALL_RE.match(f"{a}/{b}") else None
+    return None
+
+
+def _rejoin_slashes(parts: list[str]) -> list[str]:
+    """Join the pieces of a portable call the decoder split at its slash (see _slash_join)."""
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        nxt = parts[i + 1] if i + 1 < len(parts) else ""
+        if p == "/" and out and nxt and (j := _slash_join(out[-1], nxt.strip("/"))):
+            out[-1] = j                               # CALL / 7
+            i += 2
+            continue
+        if p.startswith("/") and len(p) > 1 and out and (j := _slash_join(out[-1], p.strip("/"))):
+            out[-1] = j                               # CALL /P, TI5 /VA3RA
+            i += 1
+            continue
+        if p.endswith("/") and len(p) > 1 and nxt and not nxt.startswith("/") and (j := _slash_join(p.strip("/"), nxt)):
+            out.append(j)                             # CALL/ P, TI5/ VA3RA
+            i += 2
+            continue
+        out.append(p)
+        i += 1
+    return out
+
+
+def slash_forms(text: str) -> set[str]:
+    """Portable calls in decoded text, whole (VE2PID/W1) or split at the slash by a word gap
+    (VE2PID /W1, W7KFI / 5K, TI5 /VA3RA; see _slash_join). The spot rule counts copies as tokens()
+    reads them and only sends a call in the form read here, see RepeatSpotRule._slash_form()."""
+    return {t for t in _rejoin_slashes([p for p in _SPLIT_RE.split(text.upper()) if p])
+            if "/" in t.strip("/") and CALL_RE.match(t.strip("/"))}
 
 
 def tokens(text: str, gluek: bool = False) -> list[str]:
@@ -763,6 +815,7 @@ class RepeatSpotRule:
         self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
         self._signed: dict[int, set[str]] = {}    # validation: window -> calls that signed a CQ in it
         self._clean: dict[int, set[str]] = {}     # validation, clean_cq: window -> calls that signed one cleanly
+        self._forms: dict[int, set[str]] = {}     # window -> portable calls read in it, see _slash_form()
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
         self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
         self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
@@ -799,6 +852,9 @@ class RepeatSpotRule:
         if self.clip_strength is not None or self.lead_dits:
             self._clip_toks.setdefault(round(freq_khz * 10), deque()).append(
                 (now, freq_khz, frozenset(tokens(text, self.gluek))))
+        forms = slash_forms(text)
+        if forms:
+            self._forms.setdefault(window, set()).update(forms)
         if self.threshold is not None:
             toks = tokens(text, self.gluek)
             self._paths.setdefault(window, []).append(Counter(toks))
@@ -852,22 +908,37 @@ class RepeatSpotRule:
             spot_f = best.freq_khz
             if self.strongest_db is not None and self._stronger_elsewhere(best, now):
                 continue          # a spur or image of a stronger signal of the same call
-            key = (call, int(spot_f // 1000))     # per band: a station running two bands
+            call_out = self._slash_form(call, near)    # VE2PID read as VE2PID/W1 here too: spot VE2PID/W1
+            key = (call_out, int(spot_f // 1000))     # per band: a station running two bands
             last = self._last_spot.get(key)       # (multi-op, SO2R, 2BSIQ) is not re-spotted at each switch
             if last is None or now - last[0] >= RESPOT_S or abs(spot_f - last[1]) >= MOVE_KHZ:
                 self._last_spot[key] = (now, spot_f)
                 best = max((c for c in near if c.call == call), key=lambda c: c.snr)   # the copy spot_f came from
                 reports = [c.report for c in near if c.call == call and c.report is not None]
                 if best.report is not None:
-                    self.spot_snr[call] = best.report
+                    self.spot_snr[call_out] = best.report
                 elif reports:
-                    self.spot_snr[call] = reports[-1]
+                    self.spot_snr[call_out] = reports[-1]
                 elif best.snr != float("-inf"):        # a copy fed without an SNR keeps the window's
-                    self.spot_snr[call] = best.snr
+                    self.spot_snr[call_out] = best.snr
                 else:
-                    self.spot_snr.pop(call, None)
-                spots.append((call, spot_f))
+                    self.spot_snr.pop(call_out, None)
+                spots.append((call_out, spot_f))
         return spots
+
+    def _slash_form(self, call: str, near: list[_Copy]) -> str:
+        """The call as it goes out: a base call whose portable form (VE2PID/W1, TI5/VA3RA) was
+        read at this frequency in SLASH_MIN windows or more goes out in that form, as other
+        skimmers spot it. One read is not enough: a suffix garbled once would send a wrong call."""
+        if "/" in call:
+            return call
+        wins: dict[str, set[int]] = {}
+        for c in near:
+            for form in self._forms.get(c.window, ()):
+                if call in form.split("/") and (c.call == call or c.call == form):
+                    wins.setdefault(form, set()).add(c.window)
+        best = max(wins.items(), key=lambda kv: len(kv[1]), default=(call, set()))
+        return best[0] if len(best[1]) >= SLASH_MIN else call
 
     def last_spots(self) -> list[list]:
         """The re-spot table, for spot_rule_memory: [[call, MHz, time, freq], ...]."""
@@ -1118,6 +1189,7 @@ class RepeatSpotRule:
             self._paths = {w: p for w, p in self._paths.items() if w in live}
             self._signed = {w: c for w, c in self._signed.items() if w in live}
             self._clean = {w: c for w, c in self._clean.items() if w in live}
+            self._forms = {w: f for w, f in self._forms.items() if w in live}
             for q in self._clip_toks.values():
                 while q and q[0][0] < now - CLIP_S:
                     q.popleft()
