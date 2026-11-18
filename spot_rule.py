@@ -95,8 +95,8 @@ CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?"                      # HK3/
                      r"(?:/[A-Z0-9]{1,3})?$")                          # /0, /P
 _SPLIT_RE = re.compile(r"[^A-Z0-9?/]+")   # keep / for HK3/NP4Z, N5AW/0
 # a portable suffix a split call may be joined with (_slash_join): a digit, P M A B, an area with a digit
-# (W1, VE3, KH6), MM AM QRP
-_SUFFIX_RE = re.compile(r"^(?:[0-9]|[PMAB]|MM|AM|QRP|(?=[A-Z0-9]{2,3}$)[A-Z]*[0-9][A-Z0-9]*)$")
+# that starts with a letter (W1, VE3, KH6; not a report or sign-off read after a stray slash: 73, 88, 5NN), MM AM QRP
+_SUFFIX_RE = re.compile(r"^(?:[0-9]|[PMAB]|MM|AM|QRP|(?=[A-Z0-9]{2,3}$)[A-Z]+[0-9][A-Z0-9]*)$")
 _RST_RE = re.compile(r"^[5E][9N][9N]$")    # 599, 5NN, ENN: contest report before the number
 GRID_RE = re.compile(r"^(?!RR73$)[A-R]{2}[0-9]{2}$")  # a 4-character grid square: the exchange of
 #                                                      Makrothen RTTY; RR73 (a sign-off) has the shape but is not one

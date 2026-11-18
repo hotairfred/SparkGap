@@ -63,3 +63,11 @@ def test_form_and_base_are_one_spot() -> None:
 def test_call_without_a_form_is_unchanged() -> None:
     rule = RepeatSpotRule(_tier2)
     assert [c for c, _ in _feed(rule, ["CQ CQ DE K1ABC K1ABC K", "CQ CQ DE K1ABC K1ABC K"])] == ["K1ABC"]
+
+
+def test_a_report_or_sign_off_after_a_stray_slash_is_no_area() -> None:
+    from spot_rule import _SUFFIX_RE
+    for area in ("W1", "VE3", "KH6", "W7", "7", "P", "QRP", "MM"):
+        assert _SUFFIX_RE.match(area), area
+    for word in ("73", "88", "55", "5NN", "599"):          # AE7AP / 73, K1ABC / 5NN (Chris on #190)
+        assert not _SUFFIX_RE.match(word), word
