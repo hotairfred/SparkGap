@@ -7880,12 +7880,12 @@ class SpotTracker:
                 continue
             seen = self._pass_intents.pop(id(rule), {})
             for call, f in rule.end_pass():
+                why = rule.spot_why.pop((call, f), None)    # taken for every spot, or spot_why grows
                 intent = seen.get(f)
                 if call in self.blacklist or intent is None:
                     continue
                 spots.append({'call': call, 'freq_khz': f, 'snr': rule.spot_snr.get(call, intent.snr_db),
-                              'wpm': intent.wpm, 'method': 'repeat', 'stream': stream,
-                              'why': rule.spot_why.pop((call, f), None)})
+                              'wpm': intent.wpm, 'method': 'repeat', 'stream': stream, 'why': why})
         return spots
 
     def process_intent(self, intent):

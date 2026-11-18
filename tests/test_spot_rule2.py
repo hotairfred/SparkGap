@@ -397,6 +397,8 @@ def test_said_names_the_word_that_passed_or_the_group_that_failed() -> None:
         "Spotted CQ", "Spotted POTA", "Spotted beacon"]
     _feed(r, "CQ KX9QQ", f=7040.0)
     assert said(*r.latest("KX9QQ", 7040.0)) == "Not copied clearly enough"
-    assert [said(g, "") for g in (1, 2, 3, 4, 5, 7, 8, 9, 10, 11)] == [
-        "Not a valid call"] * 2 + ["Not copied clearly enough"] * 2 + ["Not heard calling CQ"] * 3 + [
+    assert said(2, "banned call") == "On the bad calls list"
+    assert said(2, "not in SCP") == said(2, "not in SCP or the known calls") == "Not in SCP"
+    assert [said(g, "") for g in (1, 3, 4, 5, 7, 8, 9, 10, 11)] == [
+        "Not a valid call"] + ["Not copied clearly enough"] * 2 + ["Not heard calling CQ"] * 3 + [
         "Already spotted"] * 2 + ["Outside the spotted range"]

@@ -105,3 +105,16 @@ def test_why_answers_from_the_gate_rule() -> None:
     assert _why_answer(rule, "W1AW", 7031.0) == "No decision on this call yet"
     assert _why_answer(RepeatSpotRule(lambda c: "active"), "K1VUT", 7031.0) == "No reasons under the Repeat Rule"
     assert _why_answer(None, "K1VUT", 7031.0) == "No spot rule running"
+
+
+def test_a_spot_s_reason_is_taken_even_when_it_does_not_go_out() -> None:
+    """A blacklisted call's reason is taken too, so spot_why does not grow over a long run."""
+    from types import SimpleNamespace
+    import sparkgap
+    from spot_rule2 import GateSpotRule
+    rule = GateSpotRule(lambda c: "active")
+    t = sparkgap.SpotTracker.__new__(sparkgap.SpotTracker)
+    t.spot_rule, t.local_rule, t.blacklist = rule, None, {"K1ABC"}
+    rule.feed(rule.window_id(1, 1, 0.0), 7030.0, "CQ CQ DE K1ABC K1ABC K", 0.0)
+    t._pass_intents = {id(rule): {7030.0: SimpleNamespace(snr_db=10.0, wpm=20)}}
+    assert t.flush_pass() == [] and rule.spot_why == {}

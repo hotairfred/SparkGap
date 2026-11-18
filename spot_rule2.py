@@ -88,7 +88,7 @@ REASONS = {1: "not a callsign structure", 2: "banned call", 3: "not read enough"
            4: "not the best reading", 5: "no keyword", 7: "call not with the keyword",
            8: "the keyword follows another call", 9: "stronger copy elsewhere",
            10: "spotted in the last 10 min", 11: "outside the RBN window or notched"}
-SAID = {1: "Not a valid call", 2: "Not a valid call", 3: "Not copied clearly enough",
+SAID = {1: "Not a valid call", 2: "On the bad calls list", 3: "Not copied clearly enough",
         4: "Not copied clearly enough", 5: "Not heard calling CQ", 7: "Not heard calling CQ",
         8: "Not heard calling CQ", 9: "Already spotted", 10: "Already spotted",
         11: "Outside the spotted range"}       # SparkGap Web's words for a gate; the log keeps REASONS
@@ -96,8 +96,13 @@ SAID = {1: "Not a valid call", 2: "Not a valid call", 3: "Not copied clearly eno
 
 def said(gate: int, why: str) -> str:
     """A decision in SparkGap Web's words: a pass names the keyword or qualifier that passed
-    (Spotted CQ, Spotted POTA, Spotted beacon), a fail its group of gates."""
-    return why.split(",")[0] if gate == 0 else SAID.get(gate, "Not spotted")
+    (Spotted CQ, Spotted POTA, Spotted beacon), a fail its group of gates; gate 2 says which list
+    stopped the call, so an owner knows what to change."""
+    if gate == 0:
+        return why.split(",")[0]
+    if gate == 2 and why.startswith("not in SCP"):     # gate 2's SCP check, not the bad calls list
+        return "Not in SCP"
+    return SAID.get(gate, "Not spotted")
 
 
 def read_bad_calls(path: str | Path) -> list[str]:
