@@ -129,7 +129,7 @@ Settings, in plain terms:
   once it is copied a set number of times (2, 3 or 4, by how common its
   pattern is), and the known call list is not used. Under the Gated Rule it
   steps the reads a call needs instead: permissive one fewer, aggressive one
-  more; off applies normal.
+  more; unset is normal, so only those three show.
 - **AFC**: each signal's decoder follows the signal's own tone, which helps
   weak signals and ones slightly off tune. Changing it restarts the receiver.
   It acts only with the itila2 decoder and is greyed out with any other.

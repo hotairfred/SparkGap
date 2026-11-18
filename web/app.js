@@ -39,7 +39,7 @@ const HINTS = {
   afc: "Each signal's decoder follows its keyed tone, which helps weak and slightly off-tune signals (itila2_afc). Applying restarts the skimmer.",
   spot_rule: "Repeat Rule: a call spots after enough copies of it in CQs; with call validation on, a confidence score decides. Gated Rule: a call spots only when it passes each of 12 yes/no checks in order, and the log names the check that decided (docs/SPOT_RULES.md). Choosing either sets a spot_rule other than repeat back to repeat. Applying restarts the skimmer.",
   validation: "A confidence score decides which calls are spotted: permissive spots more, aggressive fewer (docs/ITILA2.md). Off: a set number of copies, 2 to 4 by how common the call's pattern is.",
-  validation_gates: "Steps the reads a call needs (gate 3): permissive one fewer, aggressive one more than normal's 2, 3 or 5 by the call's pattern. Off applies normal, and RBN is told Normal.",
+  validation_gates: "Steps the reads a call needs (gate 3): permissive one fewer, aggressive one more than normal's 2, 3 or 5 by the call's pattern. Unset is normal, and RBN is told Normal.",
   call_source: "Calls known from this list score higher in validation: SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster.",
   call_source_gates: "A call not on this list needs one more read (gate 3): SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster. None: no list.",
 };
@@ -74,6 +74,7 @@ const DECODED_LABELS = ["Both", "Wide", "Narrow", "Lowest cost"];  // which read
 const ZOOM_STEPS = [["Full", 1], ["Half", 2], ["Quarter", 4], ["Max", 0]];  // the zoom button: name and fraction of the band (0: the deepest)
 const ZOOM_MATCH = 0.05;  // a view within 5% of a step's span is at that step
 const DETAIL_MATCH_KHZ = 0.06;
+const WHY_MATCH_KHZ = 1.0;  // a spot's reason holds within this of it, as the rule's gates 9 and 10 count a frequency
 const CALL_RE = /^(?:[A-Z]{1,2}|[A-Z]\d|\d[A-Z])\d[A-Z]{1,4}$/;
 const HEARD_S = 90.0;
 const GUESS_WINDOWS = 4;
@@ -130,6 +131,8 @@ class Instance {
     this.heardList = [];
     this.selKhz = null;
     this.selCall = "";
+    this.why = null;  // the node's answer for the picked call: { call, text }
+    this.whyId = 0;
     this.since = 0;  // when this console last connected (status page)
     this.reconnects = 0;
     this.goKhz = null;  // a search match on another band: centred once that band's rows arrive
@@ -245,7 +248,7 @@ class Instance {
       this.on("ladder");
     } else if (m.type === "window") {
       this.addWindow(m);
-      if (this.matchesSelection(m.khz)) this.on("detail");
+      if (this.matchesSelection(m.khz)) { this.askWhy(); this.on("detail"); }
     } else if (m.type === "spot") {
       const first = !this.spots.has(m.call);
       this.spots.set(m.call, m);
@@ -254,6 +257,9 @@ class Instance {
     } else if (m.type === "status") {
       this.status = m;
       this.on("status");
+    } else if (m.type === "why_result" && m.id === this.whyId) {
+      this.why = { call: m.call, text: m.ok ? m.message : "" };
+      this.on("detail");
     }
   }
 
@@ -478,7 +484,14 @@ class Instance {
     });
   }
 
-  select(khz, call) { this.selKhz = khz; this.selCall = call; this.on("detail"); }
+  select(khz, call) { this.selKhz = khz; this.selCall = call; this.askWhy(); this.on("detail"); }
+
+  // a picked call heard but not spotted: ask the node which gate stopped it (an older node does not answer)
+  askWhy() {
+    const d = this.detail;
+    if (!d || !d.call || d.spotHere || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "why", id: ++this.whyId, call: d.call, khz: d.khz }));
+  }
 
   // a decoded signal near khz if there is one, else the strongest trace near it, else -1
   nearestSignal(khz, tol) {
@@ -556,7 +569,10 @@ class Instance {
     if (snr === null) { const p = this.peak(k, FREQ_MATCH_KHZ); snr = p ? p[1] : null; }
     const note = rows.length ? "" : "No decoded text at this frequency yet. SparkGap skips the FT8 and digital segments, "
       + "and starts a decoder only on a steady signal above its SNR threshold. Text appears here if it does.";
-    return { khz: k, spotKhz: spot ? spot.khz : null, call, spotted: !!spot, wpm: src.wpm ?? null, snr, windows: rows, note };
+    // the spot's reason where it was spotted; elsewhere the node's latest decision there
+    const spotHere = !!spot && Math.abs(spot.khz - k) < WHY_MATCH_KHZ;
+    const why = spotHere ? spot.why || "" : this.why && this.why.call === call ? this.why.text : "";
+    return { khz: k, spotKhz: spot ? spot.khz : null, call, spotted: !!spot, spotHere, wpm: src.wpm ?? null, snr, why, windows: rows, note };
   }
 }
 
@@ -1410,6 +1426,8 @@ function renderDetail() {
   $("dKhz").textContent = d ? d.khz.toFixed(2) : "-";
   $("dWpm").textContent = d && d.wpm ? Math.round(d.wpm) : "-";
   $("dSnr").textContent = d && d.snr ? Math.round(d.snr) + " dB" : "-";
+  $("dWhy").hidden = !(d && d.why);
+  $("dWhy").textContent = d ? d.why : "";
   $("dNote").hidden = !(d && d.note);
   $("dNote").textContent = d ? d.note : "";
   // both decodes of each window: wide filter on top, narrow dimmed
@@ -1560,7 +1578,7 @@ function decoderOptions(at, st, pend) {
   const where = key => files[key] ? `<div class="frow ohint"><span></span><span class="fhint">${esc(files[key])}</span></div>` : "";
   const windows = WINDOWS.some(([v]) => v === win) ? WINDOWS : [...WINDOWS, [win, `${win} s`]];  // a config's own value stays shown
   const decRows = [hinted(HINTS.spot_rule, row("Spot Rule", choose("spot_rule", SPOT_RULES, gates ? "gates" : "repeat"))),
-    hinted(gates ? HINTS.validation_gates : HINTS.validation, row("Call validation", choose("validation", VALIDATION.map(v => [v, gates && v === "off" ? "off (normal applied)" : v]), valid))),
+    hinted(gates ? HINTS.validation_gates : HINTS.validation, row("Call validation", choose("validation", VALIDATION.filter(v => !gates || v !== "off").map(v => [v, v]), gates && valid === "off" ? "normal" : valid))),
     hinted(gates ? HINTS.call_source_gates : HINTS.call_source, row("Known call list", choose("call_source", CALL_SOURCES, st.call_source ?? null,
       !gates && valid === "off" ? "not used while call validation is off" : ""))),
     hinted(HINTS.window, row("Window (Experimental)", choose("itila_window_sec", windows, win))) + short("itila_window_sec"),
@@ -2194,7 +2212,8 @@ function pickSetting(link, name, key, value) {
   const saved = (i && i.settings) || tpl || {}, pend = app.pending[k] || (app.pending[k] = {});
   const base = key === "run" ? !!i && i.state === "running"  // run on or off, applied as a start or stop
     : RX_KEYS.includes(key) ? (rxOf(link.server, name) || {})[key] : saved[key];  // the receive path: the radio's
-  if (base === value || (key === "validation" && (saved[key] || "off") === value)) delete pend[key]; else pend[key] = value;
+  const gated = { ...saved, ...pend }.spot_rule === "gates", level = v => gated && (!v || v === "off") ? "normal" : v || "off";  // the Gated Rule reads unset as normal
+  if (base === value || (key === "validation" && level(saved[key]) === level(value))) delete pend[key]; else pend[key] = value;
   if (!Object.keys(pend).length) delete app.pending[k];
   renderSettings();
 }

@@ -44,7 +44,7 @@ def sent(feed: FeedServer, kind: str) -> dict[str, Any]:
         feed.publish_window(7021.2, "CQ DE W1AW W1AW K", 22, 18.0, 0.4)
         kept = feed.windows
     else:
-        feed.publish_spot(7021.2, "W1AW", 18.0, 22)
+        feed.publish_spot(7021.2, "W1AW", 18.0, 22, "Spotted CQ")
         kept = feed.spots
     t = time.monotonic()
     while not kept:
