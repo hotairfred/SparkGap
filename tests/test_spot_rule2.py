@@ -402,3 +402,38 @@ def test_said_names_the_word_that_passed_or_the_group_that_failed() -> None:
     assert [said(g, "") for g in (1, 3, 4, 5, 7, 8, 9, 10, 11)] == [
         "Not a valid call"] + ["Not copied clearly enough"] * 2 + ["Not heard calling CQ"] * 3 + [
         "Already spotted"] * 2 + ["Outside the spotted range"]
+
+
+def test_portable_form_split_at_the_slash_goes_out_whole() -> None:
+    # VE2PID /W1: the decoder put a word gap at the slash; read so in two windows, it spots as VE2PID/W1
+    r = _rule()
+    assert _feed(r, "CQ CQ DE VE2PID /W1 K", t=0.0, w=0) == []                  # 1 read of 2
+    assert _feed(r, "CQ CQ DE VE2PID /W1 K", t=30.0, w=1) == ["VE2PID/W1"]
+    assert r.spot_why == {("VE2PID/W1", 14025.0): "Spotted CQ"}          # under the call that went out
+
+
+def test_one_window_of_a_portable_form_is_not_enough() -> None:
+    r = _rule()
+    assert _feed(r, "CQ CQ DE VE2PID VE2PID /W1 VE2PID K", t=0.0, w=0) == ["VE2PID"]
+
+
+def test_portable_form_and_base_call_are_one_spot() -> None:
+    r = _rule()
+    _feed(r, "CQ CQ DE VE2PID /W1 K", t=0.0, w=0)
+    assert _feed(r, "CQ CQ DE VE2PID /W1 K", t=30.0, w=1) == ["VE2PID/W1"]
+    assert _feed(r, "CQ CQ DE VE2PID /W1 K", t=60.0, w=2) == []                 # gate 10: spotted
+
+
+def test_a_report_after_a_stray_slash_is_no_portable_form() -> None:
+    r = _rule()
+    _feed(r, "CQ DE K1ABC / 5NN K1ABC", t=0.0, w=0)
+    assert _feed(r, "CQ DE K1ABC / 73 K1ABC K", t=30.0, w=1) == ["K1ABC"]
+
+
+def test_a_lead_dit_bust_is_never_the_best_reading() -> None:
+    # 3X4U read whole more often than MX4U (its 3 ...-- lost two dits): gate 4's best reading holds MX4U
+    r = _rule()
+    _feed(r, "CQ 3X4U 3X4U UP TU 3X4U UP", t=0.0, w=0)
+    _feed(r, "TU I MX4U UP CQ 3X4U UP", t=30.0, w=1)
+    _feed(r, "CQ MX4U UP CQ 3X4U 3X4U UP", t=60.0, w=2)
+    assert "MX4U" not in [c for _, _, c, g, _ in r.trace if g == 0]

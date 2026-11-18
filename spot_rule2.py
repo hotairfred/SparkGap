@@ -35,6 +35,9 @@ checked in this order; a call not spotted is dropped by the first gate that is f
                        frequency a word one letter off one NCDXF call is read as that call
                        (UH6RS is KH6RS), unless it is on the known-call list
 
+A spotted base call goes out in its portable form (VE2PID/W1, TI5/VA3RA) when the decoder read
+that form, split at the slash or whole, in 2 windows or more of its buffer (spot_rule.SLASH_MIN).
+
 Every decision is kept in .trace and logged at debug level as (gate, reason)."""
 
 from __future__ import annotations
@@ -50,9 +53,11 @@ from spot_rule import (
     _NOISE_LETTERS,
     LOOKAHEAD,
     RESPOT_S,
+    SLASH_MIN,
     _fragment,
     _lev1,
     is_exchange,
+    slash_forms,
     split_runs,
     tokens,
 )
@@ -264,7 +269,8 @@ class GateSpotRule:
         self._reads: deque[tuple[float, str, float, float]] = deque()  # (t, call, kHz, SNR): gate 9
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}
         # gate 9: calls that passed every gate this pass, spotted by end_pass()
-        self._held: list[tuple[float, str, float, float | None, float | None, str]] = []
+        self._held: list[tuple[float, str, float, float | None, float | None, str, int]] = []
+        self._forms: dict[int, set[str]] = {}     # window -> portable calls read in it, see _slash_form()
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._pruned = 0.0
         self._next_window = 0
@@ -293,6 +299,7 @@ class GateSpotRule:
             self._window_ids = {k: v for k, v in self._window_ids.items() if now - v[1] <= WINDOW_S}
             live = {v[0] for v in self._window_ids.values()}
             self._win_bin = {w: b for w, b in self._win_bin.items() if w in live}
+            self._forms = {w: f for w, f in self._forms.items() if w in live}
 
     def close_bin(self, bin_id: int) -> None:
         """Gate S: the buffer ends with its bin."""
@@ -345,6 +352,11 @@ class GateSpotRule:
         stronger copy in another bin whatever order the bins were fed in). A window decoded
         more than once (the two filter paths) keeps its latest text."""
         self._expire(now)
+        forms = slash_forms(text)                     # VE2PID /W1: tokens() below splits it at the slash
+        if forms:
+            self._forms[window] = forms
+        else:
+            self._forms.pop(window, None)             # a window decoded again keeps its latest text
         text = " ".join(tokens(split_runs(text, de_rejoin=True)))     # CQCQDE -> CQ CQ DE
         if any(abs(freq_khz - x) <= BEACON_KHZ for x in NCDXF_KHZ):
             text = " ".join(self._ncdxf(t) for t in text.split())
@@ -361,7 +373,7 @@ class GateSpotRule:
             if snr is not None:
                 self._reads.append((now, call, freq_khz, snr))
             if self._check(call, buf, tied, freq_khz, now, snr):
-                self._held.append((now, call, freq_khz, snr, report, self.trace[-1][4]))
+                self._held.append((now, call, freq_khz, snr, report, self.trace[-1][4], window))
         return []
 
     def _stronger(self, call: str, f: float, snr: float | None) -> bool:
@@ -384,18 +396,19 @@ class GateSpotRule:
         pass is in. Returns [(call, kHz)]."""
         spots: list[tuple[str, float]] = []
         held, self._held = self._held, []
-        for now, call, f, snr, report, why in held:
+        for now, call, f, snr, report, why, window in held:
             if self._stronger(call, f, snr):
                 self._decide(now, f, call, 9)
                 continue
             last = self._last_spot.get((call, int(f // 1000)))
             if last and now - last[0] < RESPOT_S and abs(f - last[1]) < MOVE_KHZ:
                 continue                              # the other filter path of a call just spotted
-            spots.append((call, f))
+            out = self._slash_form(call, window)       # VE2PID read as VE2PID/W1 here too: spot VE2PID/W1
+            spots.append((out, f))
             self._last_spot[(call, int(f // 1000))] = (now, f)
-            self.spot_why[(call, f)] = said(0, why)
+            self.spot_why[(out, f)] = said(0, why)             # flush_pass takes it under the call sent
             if report is not None or snr is not None:
-                self.spot_snr[call] = report if report is not None else snr      # type: ignore[assignment]
+                self.spot_snr[out] = report if report is not None else snr      # type: ignore[assignment]
         return spots
 
     def _check(self, call: str, buf: list[str], tied: list[tuple[int, str, bool]],
@@ -450,6 +463,22 @@ class GateSpotRule:
         if any(lo <= f <= hi for lo, hi in self.notched):
             return self._decide(now, f, call, 11, "notched frequency")
         return self._decide(now, f, call, 0, f"Spotted {'beacon' if beacon else kw}, {n} reads")
+
+    def _slash_form(self, call: str, window: int) -> str:
+        """The call as it goes out: a base call whose portable form (VE2PID/W1, TI5/VA3RA) was read
+        in SLASH_MIN windows or more of its signal's buffer goes out in that form, as other skimmers
+        spot it (spot_rule.RepeatSpotRule._slash_form). The gates judge the base call, read as
+        tokens() reads it; one read of a form is not enough, a suffix garbled once would send a
+        wrong call."""
+        if "/" in call:
+            return call
+        wins: dict[str, int] = {}
+        for w in self._bins.get(self._win_bin.get(window, -1), {}):
+            for form in self._forms.get(w, ()):
+                if call in form.split("/"):
+                    wins[form] = wins.get(form, 0) + 1
+        best = max(wins.items(), key=lambda kv: kv[1], default=(call, 0))
+        return best[0] if best[1] >= SLASH_MIN else call
 
     def last_spots(self) -> list[list]:
         return [[c, mhz, t, f] for (c, mhz), (t, f) in self._last_spot.items()]
