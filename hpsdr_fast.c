@@ -113,6 +113,7 @@ typedef struct {
         Ft8Buf bufs[2];
         int active;        /* recv_thread writes to bufs[active] */
         pthread_mutex_t mu;
+        int mu_ready;      /* mu is created once and kept, so capture can go off and on */
     } ft8_cap[MAX_RX];
 
     /* Per-receiver scanner handles + function pointers + window for worker thread.
@@ -249,7 +250,8 @@ static void parse_frame(HpsdrFast *h, const uint8_t *iq_data, int n_rx) {
     for (int rx = 0; rx < n_rx; rx++) {
         if (h->ft8_cap[rx].enabled) {
             pthread_mutex_lock(&h->ft8_cap[rx].mu);
-            ft8_locked[rx] = 1;
+            if (h->ft8_cap[rx].enabled) ft8_locked[rx] = 1;    /* not turned off while we waited */
+            else pthread_mutex_unlock(&h->ft8_cap[rx].mu);
         }
     }
 
@@ -315,16 +317,18 @@ static void fill_gap(HpsdrFast *h, uint32_t k, int n_rx) {
         if (!h->rx_enabled[rx]) continue;
         if (h->ft8_cap[rx].enabled) {
             pthread_mutex_lock(&h->ft8_cap[rx].mu);
-            Ft8Buf *b = &h->ft8_cap[rx].bufs[h->ft8_cap[rx].active];
-            if (b->n == 0 && n > 0) {          /* the gap opens a snapshot: it began n samples ago */
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                b->t_first = ts.tv_sec + ts.tv_nsec / 1e9 - (double)n / h->sample_rate;
-            }
-            for (uint64_t j = 0; j < n && b->n < FT8_BUF_CAP; j++) {
-                b->i[b->n] = 0.0f;
-                b->q[b->n] = 0.0f;
-                b->n++;
+            if (h->ft8_cap[rx].enabled) {              /* not turned off while we waited */
+                Ft8Buf *b = &h->ft8_cap[rx].bufs[h->ft8_cap[rx].active];
+                if (b->n == 0 && n > 0) {          /* the gap opens a snapshot: it began n samples ago */
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    b->t_first = ts.tv_sec + ts.tv_nsec / 1e9 - (double)n / h->sample_rate;
+                }
+                for (uint64_t j = 0; j < n && b->n < FT8_BUF_CAP; j++) {
+                    b->i[b->n] = 0.0f;
+                    b->q[b->n] = 0.0f;
+                    b->n++;
+                }
             }
             pthread_mutex_unlock(&h->ft8_cap[rx].mu);
         }
@@ -796,13 +800,11 @@ void hpsdr_destroy(HpsdrFast *h) {
     close(h->sock);
     pthread_mutex_destroy(&h->lock);
     for (int i = 0; i < MAX_RX; i++) {
-        if (h->ft8_cap[i].bufs[0].i) {
-            free(h->ft8_cap[i].bufs[0].i);
-            free(h->ft8_cap[i].bufs[0].q);
-            free(h->ft8_cap[i].bufs[1].i);
-            free(h->ft8_cap[i].bufs[1].q);
-            pthread_mutex_destroy(&h->ft8_cap[i].mu);
-        }
+        free(h->ft8_cap[i].bufs[0].i);
+        free(h->ft8_cap[i].bufs[0].q);
+        free(h->ft8_cap[i].bufs[1].i);
+        free(h->ft8_cap[i].bufs[1].q);
+        if (h->ft8_cap[i].mu_ready) pthread_mutex_destroy(&h->ft8_cap[i].mu);
         free((void *)h->tap[i].i);
         free((void *)h->tap[i].q);
     }
@@ -979,8 +981,18 @@ void hpsdr_enable_ft8(HpsdrFast *h, int rx, double ft8_freq, double center_freq)
         h->ft8_cap[rx].bufs[1].i = (float *)calloc(FT8_BUF_CAP, sizeof(float));
         h->ft8_cap[rx].bufs[1].q = (float *)calloc(FT8_BUF_CAP, sizeof(float));
         if (!h->ft8_cap[rx].bufs[0].i || !h->ft8_cap[rx].bufs[0].q ||
-            !h->ft8_cap[rx].bufs[1].i || !h->ft8_cap[rx].bufs[1].q) return;
-        pthread_mutex_init(&h->ft8_cap[rx].mu, NULL);
+            !h->ft8_cap[rx].bufs[1].i || !h->ft8_cap[rx].bufs[1].q) {
+            for (int k = 0; k < 2; k++) {
+                free(h->ft8_cap[rx].bufs[k].i);
+                free(h->ft8_cap[rx].bufs[k].q);
+                h->ft8_cap[rx].bufs[k].i = h->ft8_cap[rx].bufs[k].q = NULL;
+            }
+            return;
+        }
+        if (!h->ft8_cap[rx].mu_ready) {
+            pthread_mutex_init(&h->ft8_cap[rx].mu, NULL);
+            h->ft8_cap[rx].mu_ready = 1;
+        }
     }
     pthread_mutex_lock(&h->ft8_cap[rx].mu);
     h->ft8_cap[rx].freq_hz = ft8_freq;
@@ -992,6 +1004,25 @@ void hpsdr_enable_ft8(HpsdrFast *h, int rx, double ft8_freq, double center_freq)
     h->ft8_cap[rx].bufs[1].t_first = 0;
     h->ft8_cap[rx].enabled = 1;
     pthread_mutex_unlock(&h->ft8_cap[rx].mu);
+}
+
+/* Turn capture off on this receiver and free its buffers (cdub89/SparkGap#32). Call it from the
+ * thread that calls hpsdr_ft8_swap_read; the receive thread re-checks enabled under the lock. */
+void hpsdr_disable_ft8(HpsdrFast *h, int rx) {
+    if (rx < 0 || rx >= MAX_RX || !h->ft8_cap[rx].mu_ready) return;
+    float *p[4];
+    pthread_mutex_lock(&h->ft8_cap[rx].mu);
+    h->ft8_cap[rx].enabled = 0;
+    p[0] = h->ft8_cap[rx].bufs[0].i;
+    p[1] = h->ft8_cap[rx].bufs[0].q;
+    p[2] = h->ft8_cap[rx].bufs[1].i;
+    p[3] = h->ft8_cap[rx].bufs[1].q;
+    for (int k = 0; k < 2; k++) {
+        h->ft8_cap[rx].bufs[k].i = h->ft8_cap[rx].bufs[k].q = NULL;
+        h->ft8_cap[rx].bufs[k].n = 0;
+    }
+    pthread_mutex_unlock(&h->ft8_cap[rx].mu);
+    for (int k = 0; k < 4; k++) free(p[k]);
 }
 
 /* Atomically swap the active buffer and copy the now-frozen snapshot.

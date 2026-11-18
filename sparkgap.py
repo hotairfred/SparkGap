@@ -316,6 +316,11 @@ def _get_hpsdr_fast():
             except AttributeError:
                 pass
             try:
+                lib.hpsdr_disable_ft8.restype = None
+                lib.hpsdr_disable_ft8.argtypes = [_ct.c_void_p, _ct.c_int]
+            except AttributeError:
+                pass
+            try:
                 lib.hpsdr_set_restart_after.argtypes = [_ct.c_void_p, _ct.c_double]
                 lib.hpsdr_restarts.restype = _ct.c_uint64
                 lib.hpsdr_restarts.argtypes = [_ct.c_void_p]
@@ -8598,12 +8603,8 @@ class SparkGap:
 
         # All-band IQ recorder (see iq_recorder.py): the C receiver's minute swaps, or the Python receive
         # path's minute buffers (_py_minute_tick) at 192 kHz. record_wav below is the older single-band one.
-        self._iq_rec = None
+        self._iq_rec = self._make_iq_recorder()
         self._iq_cap = set()   # the C receiver's bands whose minute capture runs (its buffers held)
-        if self.cfg.get('record_iq_dir'):
-            from iq_recorder import BandRecorder
-            self._iq_rec = BandRecorder(self.cfg['record_iq_dir'],
-                                        bits=int(self.cfg.get('record_iq_bits', 24)))
 
         self._wav_record = None
         self._wav_path = None
@@ -9199,6 +9200,14 @@ class SparkGap:
                 return reply(False, "recording not started: %s" % e)
         return reply(True, "recording to %s" % os.path.basename(path))
 
+    def _make_iq_recorder(self):
+        """The all-band recorder when record_iq_dir is set; its queue holds at least one minute of every band."""
+        if not self.cfg.get('record_iq_dir'):
+            return None
+        from iq_recorder import BandRecorder, MAX_QUEUE
+        return BandRecorder(self.cfg['record_iq_dir'], bits=int(self.cfg.get('record_iq_bits', 24)),
+                            max_queue=max(MAX_QUEUE, len(self.cfg.get('bands') or ())))
+
     def _enable_iq_capture(self):
         """The C receiver's minute capture for every band not yet capturing, once a recording is on: its
         buffers (65 s of IQ per band) are taken then, not at start, and kept until the receiver stops
@@ -9212,6 +9221,28 @@ class SparkGap:
                                                _ct.c_double(float(ch)))
             self._iq_cap.add(ri)
             log.info("IQ-capture accumulator enabled rx%d for the recording: %s", ri, bn)
+
+    def _disable_iq_capture(self):
+        """Recording off: the C receiver's minute capture stops and its buffers are freed on every band
+        that captured only for the recording; FT8/RTTY bands keep theirs (cdub89/SparkGap#32)."""
+        if not hasattr(self.receiver.lib, 'hpsdr_disable_ft8'):
+            return
+        for (bn, ch, ri) in self._band_meta:
+            if ri not in self._iq_cap or (_minute_modes(self.cfg) and ft8_dial_khz(ch / 1000)):
+                continue
+            self.receiver.lib.hpsdr_disable_ft8(self.receiver._h, ri)
+            self._iq_cap.discard(ri)
+            log.info("IQ-capture accumulator freed rx%d, recording off: %s", ri, bn)
+
+    def _poll_iq_record(self, sec):
+        """Once a second on the C receiver: a RECORD file that appears starts the capture now, not at the
+        minute; in the last 5 s of a minute the swap starts it, so a first file never opens with a sliver."""
+        now = int(time.time())
+        if now == getattr(self, '_iq_rec_polled', None) or not 5 <= sec < 55:
+            return
+        self._iq_rec_polled = now
+        if self._iq_rec.active():
+            self._enable_iq_capture()
 
     def _write_rec_info(self, rec_path, center_hz, rate, retune=None):
         """<recording>.json beside the WAV: centre, rate, build and the config it ran with, so a
@@ -9992,8 +10023,6 @@ class SparkGap:
                     log.info("FT8 trigger: sec=%.2f pkts=%d lost=%d (%.2f%%)",
                              ft8_sec, pkts, pkt_lost,
                              100.0*pkt_lost/max(pkts+pkt_lost, 1))
-                    if self._iq_rec is not None and self._iq_rec.active():
-                        self._enable_iq_capture()   # recording turned on while running: capture from now
                     # Snapshot all bands first (one swap each — fast, atomic).
                     # Each snapshot is the previous minute's data filling the
                     # active buffer between the prior swap and this one.
@@ -10034,6 +10063,10 @@ class SparkGap:
                         t0 = t_first.value + (n - take) / 192000.0 if t_first.value > 0 else 0.0
                         ft8_jobs.append((bn, ri, ck, ft8_khz,
                                          fi_60, fq_60, take, t0))
+                    if self._iq_rec is not None and self._iq_rec.active():
+                        self._enable_iq_capture()   # recording on: capture from now; after the swaps, so its first is a whole minute
+                    elif self._iq_rec is not None and self._iq_cap:
+                        self._disable_iq_capture()  # recording off: its last files closed above
                     if ft8_jobs:
                         threading.Thread(target=_ft8_decode,
                                          args=(ft8_jobs, self),
@@ -10041,6 +10074,8 @@ class SparkGap:
                     else:
                         self._ft8_running = False
                 self._ft8_prev_sec = ft8_sec
+                if self._iq_rec is not None:
+                    self._poll_iq_record(ft8_sec)
             elif getattr(self, '_py_minute', False):
                 self._py_minute_tick()
 

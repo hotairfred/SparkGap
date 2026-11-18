@@ -137,8 +137,12 @@ connected`).
   (`scp`, `rbn`, `rbn+skcc`, or null for none, which removes the key), `afc`
   (true or false, written as `itila2_afc`), `record` (true or false;
   recording on needs 5 GB free in `rec/`; on a running copy it changes in place:
-  an HPSDR radio's all-band recorder by its `record_iq_dir` RECORD file at the
-  next minute, any other copy's `record_wav` file over its feed), the on/off
+  the all-band recorder of an HPSDR radio, or of an RTP node with more than one
+  band at 192 kHz, by its `record_iq_dir` RECORD file (on at once, off at the
+  next minute), any
+  other copy's `record_wav` file over its feed, refused when the copy does not
+  answer; a stopped copy takes only false, and each start clears `record_wav`,
+  so a copy comes up not recording), the on/off
   Gated Rule filters `spot_rule_bad_calls`, `spot_rule_scp` and
   `spot_rule_notched_freqs`, and
   `itila_window_sec` (60, 30, 20, 10). Anything else is refused and nothing
@@ -162,7 +166,8 @@ connected`).
   restores it. SparkGap never writes the startup values itself.
 - `add` makes a Flex receiver `<radio>-<n>` on DAX-IQ channel n, its telnet port
   7330 plus n and UDP port 7790 plus n, or the next free on the machine
-  (`settings`: `band`, and any setting `set` takes): its config from the shipped
+  (`settings`: `band`, and any setting `set` takes but `record`, which waits
+  until it runs): its config from the shipped
   defaults (`skimmer_flex.example.json` in the server's code), or the one it had
   before it was removed, with the radio file's spotter ID and grid and no
   antenna or RF gain; its instances line runs the server's own code. Then it

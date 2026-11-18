@@ -59,13 +59,14 @@ Click **⚙**. The top line shows the radio: **Connected**, **Connecting**,
 **Reconnecting** or **Not connected**, its model, address and pans in use.
 The left side lists each server's radios. Under each radio:
 
-- **Node**: the spotter ID, grid and operator its spots go out under, and
-  whether RBN upload is off, dry or live.
+- **Node**: the spotter ID, grid and operator its spots go out under,
+  whether RBN upload is off, dry or live, and what every receiver shares:
+  recording and decoder options (a Web-888 also its run switch and details).
 - **Feeder**: what sends those spots to RBN, and whether it is signed in.
 - **Receivers**: each one with its band and state. Click one to see its
   settings on the right.
 - **+ Add a receiver**: pick a free DAX-IQ channel and a band, check the
-  recording and decoder options, and Apply. The receiver starts at once.
+  decoder options, and Apply. The receiver starts at once.
 
 Below the radios, **Server** holds the join code, Setup, RBN upload and the
 server's log.
@@ -94,8 +95,12 @@ A receiver's settings:
   the same receiver (SCU) has the same antenna and RF gain, and the radio
   decides which SCU a panadapter uses. Changing one receiver can change
   another, or an operator's panadapter in SmartSDR or Maestro.
-- **RECORDING**: starts and stops without a restart. A Web-888 records every
-  band: its files start within two minutes and stop at the next minute.
+- **RECORDING**: on the Node, for every running receiver (a receiver with no
+  radio file has its own). It starts and stops without a restart, and is off
+  after a restart. A Web-888 records every band: it
+  starts at once, its files appear at the next minute, and it stops at the
+  next minute; while its RECORD file is there, it records across a restart.
+  While it records, the Node card says so and the switch shows on in orange.
 - **DECODED TEXT**: SparkGap reads each signal twice, through a wide and a
   narrow filter. **Lowest cost** (the default) shows whichever it is surer of;
   you can show both, or only one. This is for this browser, all receivers.

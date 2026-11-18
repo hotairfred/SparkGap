@@ -7,6 +7,7 @@ import os
 import signal
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -186,12 +187,28 @@ def test_recording_needs_free_space(seat: Seat, monkeypatch: pytest.MonkeyPatch)
         seat.change("dallas1", {"record": True})
 
 
-def test_recording_on_and_off_sets_the_template(seat: Seat) -> None:
-    seat.change("dallas1", {"record": True})
+def _live(name: str, record_wav: str | None) -> tuple[bool, str]:
+    return (True, "recording to dallas1_7038.wav") if record_wav else (True, "recording stopped")
+
+
+def test_recording_on_and_off_sets_the_template(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(seat, "pid", lambda name: 4242)
+    seat.change("dallas1", {"record": True}, live_record=_live)
     cfg = json.loads((seat.root / "config" / "dallas1.local.json").read_text())
     assert cfg["record_wav"] == str(seat.rec / "dallas1_{band}_{ts}.wav")
-    seat.change("dallas1", {"record": False})
+    seat.change("dallas1", {"record": False}, live_record=_live)
     assert "record_wav" not in json.loads((seat.root / "config" / "dallas1.local.json").read_text())
+
+
+def test_a_stopped_copy_does_not_take_recording_and_a_start_comes_up_not_recording(seat: Seat) -> None:
+    """cdub89/SparkGap#32: recording is off after a restart, as on the Web-888 without its RECORD file."""
+    i = seat.instance("dallas1")
+    with pytest.raises(SeatError, match="recording turns on while it runs"):
+        seat.change("dallas1", {"record": True})
+    assert "record_wav" not in seat.config(i)
+    write_config(i.config, {"record_wav": str(seat.rec / "dallas1_{band}_{ts}.wav")})   # it was recording
+    assert seat.start("dallas1").startswith("dallas1: live")
+    assert "record_wav" not in seat.config(i) and seat.settings(i)["record"] is False
 
 
 def test_an_unknown_or_odd_name_is_refused(seat: Seat) -> None:
@@ -727,7 +744,7 @@ def test_hpsdr_recording_is_its_record_file(seat: Seat) -> None:
     assert seat.settings(i)["record"] is False
 
 
-def test_a_running_copy_records_live_and_restarts_only_without_an_answer(
+def test_a_running_copy_records_live_and_never_restarts_for_it(
     seat: Seat, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
@@ -744,5 +761,34 @@ def test_a_running_copy_records_live_and_restarts_only_without_an_answer(
     assert asked == [str(seat.rec / "dallas1_{band}_{ts}.wav")] and not calls
     assert seat.change("dallas1", {"record": False}, live_record=live) == "dallas1: recording stopped"
     assert asked[-1] is None and not calls
-    seat.change("dallas1", {"record": True}, live_record=lambda name, f: None)     # no answer: a restart
-    assert calls == ["stop", "start"]
+    with pytest.raises(SeatError, match="did not answer; recording not changed"):
+        seat.change("dallas1", {"record": True}, live_record=lambda name, f: None)
+    with pytest.raises(SeatError, match="busy; recording not changed"):
+        seat.change("dallas1", {"record": True}, live_record=lambda name, f: (False, "busy"))
+    assert not calls and "record_wav" not in seat.config(seat.instance("dallas1"))
+
+
+def test_a_multi_band_rtp_node_records_every_band_by_its_record_file(seat: Seat) -> None:
+    """An RTP (radiod) node with several bands at 192 kHz takes the all-band recorder, as an HPSDR radio
+    does: record_wav, which a multi-band copy refuses live, would restart it and record one band."""
+    i = seat.instance("dallas1")
+    write_config(i.config, {"sdr_type": "rtp", "bands": ["40m", "20m"], "sample_rate": 192_000})
+    seat.change("dallas1", {"record": True})
+    iq_dir = Path(seat.config(i)["record_iq_dir"])
+    assert (iq_dir / "RECORD").exists() and "record_wav" not in seat.config(i)
+    seat.change("dallas1", {"record": False})
+    assert not (iq_dir / "RECORD").exists()
+
+
+@pytest.mark.parametrize("cfg", [
+    {"sdr_type": "rtp", "bands": ["40m", "20m"], "sample_rate": 48_000},   # its minutes are not kept below 192 kHz
+    {"sdr_type": "flex", "bands": ["40m", "20m"], "sample_rate": 192_000},  # a Flex copy receives its first band only
+])
+def test_nodes_the_all_band_recorder_cannot_feed_keep_record_wav(
+    seat: Seat, cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    i = seat.instance("dallas1")
+    write_config(i.config, cfg)
+    monkeypatch.setattr(seat, "pid", lambda name: 4242)
+    seat.change("dallas1", {"record": True}, live_record=_live)
+    assert seat.config(i)["record_wav"] and "record_iq_dir" not in seat.config(i)
