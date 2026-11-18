@@ -370,7 +370,8 @@ A pass reads as the spot's `why`: `Spotted` and the keyword or qualifier that
 passed (`Spotted CQ`, `Spotted POTA`) or `Spotted beacon`. A fail names its
 group of gates: `Not a valid call` (1), `On the bad calls list` or `Not in SCP`
 (2), `Not copied clearly enough` (3, 4), `Not heard calling CQ` (5, 7, 8),
-`Already spotted` (9, 10) or `Outside the spotted range` (11); the debug log keeps the gate and its detail. With no
+`Already spotted` (9, 10) or `Outside the spotted range` (11); the debug log
+keeps the gate and its detail. With no
 decision kept on the call (the rule keeps its last 10,000) the message is `No
 decision on this call yet`; under the repeat rule, `No reasons under the Repeat
 Rule`. A refusal (`call must be a
