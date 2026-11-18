@@ -159,6 +159,7 @@ def station_view(radio: str, running: bool, health: dict[str, Any] | None) -> di
         rtt_ms=health.get("rtt_ms"),
         losses_hour=len(hour),
         last_loss=hour[-1] if hour else None,
+        pans=health.get("pans"),  # every pan on the radio, SmartSDR's and Maestro's too
     )
     return out
 

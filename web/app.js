@@ -414,8 +414,9 @@ class Instance {
     const t = now();
     for (const [khz, w] of this.signals) {
       if (khz < lo || khz > hi || t - w.utc > HEARD_S) continue;
-      if (taken.some(k => Math.abs(khz - k) <= FREQ_MATCH_KHZ)) continue;
+      if (taken.some(k => Math.abs(khz - k) <= DETAIL_MATCH_KHZ)) continue;  // a neighbour 100 Hz off is its own row
       const guess = this.guessCall(khz);
+      if (items.some(x => x.call === guess && Math.abs(x.khz - khz) <= FREQ_MATCH_KHZ)) continue;
       if (guess) { items.push({ call: guess, khz, wpm: w.wpm, spot: false }); taken.push(khz); }
     }
     const sel = this.selKhz;
@@ -434,7 +435,7 @@ class Instance {
     }
     const n = new Map();
     for (const [k, texts] of this.recent) {
-      if (Math.abs(k - khz) > FREQ_MATCH_KHZ) continue;
+      if (Math.abs(k - khz) > DETAIL_MATCH_KHZ) continue;
       for (const text of texts) {
         for (const word of text.split(/\s+/)) {
           const base = baseCall(word);
@@ -493,8 +494,17 @@ class Instance {
     this.ws.send(JSON.stringify({ type: "why", id: ++this.whyId, call: d.call, khz: d.khz }));
   }
 
-  // a decoded signal near khz if there is one, else the strongest trace near it, else -1
+  // the stream under a tap: of the bins heard near khz, the one keying hardest now (of a QSO's two
+  // sides, the one sending); else a decoded signal near khz; else the strongest trace near it; else -1
   nearestSignal(khz, tol) {
+    const reach = Math.max(tol, FREQ_MATCH_KHZ), t = now();
+    let pick = -1, most = 0;
+    for (const [k, w] of this.signals) {
+      if (Math.abs(k - khz) > reach || t - w.utc > HEARD_S) continue;
+      const level = this.keyLevel(k);
+      if (level > most || (level === most && level > 0 && Math.abs(k - khz) < Math.abs(pick - khz))) { pick = k; most = level; }
+    }
+    if (pick > 0) return pick;
     const cands = [...[...this.spots.values()].map(s => s.khz), ...this.signals.keys()];
     if (cands.length) {
       const best = cands.reduce((a, b) => (Math.abs(b - khz) < Math.abs(a - khz) ? b : a));
@@ -526,6 +536,17 @@ class Instance {
     return cols.length > 0 && on / cols.length >= TRACE_DUTY;
   }
 
+  // mean level in khz's own waterfall bin over the last PEAK_LOOK_S, keyed columns only; 0 below TRACE_DUTY
+  keyLevel(khz) {
+    if (!this.ring || !this.cols) return 0;
+    const b = Math.floor((khz * 1000 - this.firstHz) / this.hzPerBin);
+    if (b < 0 || b >= this.nBins) return 0;
+    const cols = this.recentCols(), need = PEAK_MIN_DB / this.dbUnit;
+    let on = 0, sum = 0;
+    for (const c of cols) { const v = this.ring[c * this.nBins + b]; if (v >= need) { on++; sum += v; } }
+    return cols.length > 0 && on / cols.length >= TRACE_DUTY ? sum / cols.length : 0;
+  }
+
   // [khz, dB] of the strongest bin within tol of khz over the last PEAK_LOOK_S
   peak(khz, tol) {
     if (!this.ring || !this.cols) return null;
@@ -552,7 +573,10 @@ class Instance {
     if (this.selKhz === null) return null;
     const k = this.selKhz;
     let call = this.selCall;
-    if (!call) for (const [c, s] of this.spots) if (Math.abs(s.khz - k) <= FREQ_MATCH_KHZ) { call = c; break; }
+    if (!call) {  // the spot nearest the pick: of two stations 100 Hz apart, this one's, not its neighbour's
+      let gap = FREQ_MATCH_KHZ;
+      for (const [c, s] of this.spots) if (Math.abs(s.khz - k) <= gap) { call = c; gap = Math.abs(s.khz - k); }
+    }
     call = call || this.guessCall(k);
     const wins = this.windows.filter(w => Math.abs(w.khz - k) <= DETAIL_MATCH_KHZ).slice(-40);
     const last = wins[wins.length - 1] || {};
@@ -1877,7 +1901,7 @@ function radioPaneHtml(k, sv, name) {
   const inUse = users.filter(i => i.state === "running").reduce((n, x) => n + ((x.receivers || []).length || 1), 0);
   const facts = [TYPE_NAMES[r.type] || r.type || "radio", r.model, r.address, r.board_id ? `board ${r.board_id}` : "", r.firmware ? `firmware ${r.firmware}` : "",
     view.num_scu ? `${view.num_scu} SCU` : ""].filter(Boolean).join(" · ");
-  const held = r.max_panadapters ? `${inUse} of ${r.max_panadapters} pans` : r.receivers ? `${inUse} of ${r.receivers} receivers` : `${inUse} running`;
+  const held = r.max_panadapters ? `${st.pans ?? inUse} of ${r.max_panadapters} pans` : r.receivers ? `${inUse} of ${r.receivers} receivers` : `${inUse} running`;
   const link = LINK_WORDS[radioLink(seat, r.name)] || (r.type === "hpsdr" ? (runs ? "receiving" : "stopped") : "no station");
   const health = [st.station, st.rtt_ms != null ? `${Math.round(st.rtt_ms)} ms round trip` : "",
     st.losses_hour != null ? `${st.losses_hour} link loss${st.losses_hour === 1 ? "" : "es"} this hour` : "",
@@ -2074,7 +2098,8 @@ function radioHeadHtml(pick) {
   if (!r) return "";
   const mine = (seatOf.instances || []).filter(x => x.radio === r.name && x.state === "running"), running = mine.length;
   const inUse = mine.reduce((n, x) => n + ((x.receivers || []).length || 1), 0);
-  const facts = [r.model || r.type, r.address, r.num_scu ? `${r.num_scu} SCU` : "", r.max_panadapters ? `${running} of ${r.max_panadapters} pans in use` : "",
+  const pans = ((seatOf.stations || []).find(x => x.radio === r.name) || {}).pans ?? running;  // the radio's count, other clients' pans too
+  const facts = [r.model || r.type, r.address, r.num_scu ? `${r.num_scu} SCU` : "", r.max_panadapters ? `${pans} of ${r.max_panadapters} pans in use` : "",
     r.type === "hpsdr" && r.board_id ? `board ${r.board_id}` : "", r.type === "hpsdr" && r.receivers ? `${inUse} of ${r.receivers} receivers in use` : ""].filter(Boolean);
   const state = radioLink(seatOf, r.name);
   const link = { up: '<span class="good">Connected</span>', down: '<span class="bad">Not connected</span>', wait: '<span class="warn">Reconnecting</span>', first: '<span class="warn">Connecting</span>' }[state]

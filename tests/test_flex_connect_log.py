@@ -340,3 +340,14 @@ def test_the_station_client_id_is_the_same_on_every_start_and_differs_by_radio(m
     a, b, other = client_id("Lake"), client_id("Lake"), client_id("Dallas")
     assert a == b != other
     assert a == a.upper() and len(a) == 36
+
+
+def test_the_station_counts_every_pan_on_the_radio() -> None:
+    """cdub89/SparkGap#45: pans in use are the radio's, Maestro's and SmartSDR's too, not only SparkGap's."""
+    st = FlexStation("192.0.2.1")
+    assert st.health()["pans"] is None                          # nothing reported yet
+    st.pans = flex_iq.pan_status(LAKE_PANS)
+    st._status(["S0|display pan 0x40000003 center=7.038400 client_handle=0x6B976AE3"])
+    assert st.health()["pans"] == 4
+    st._status(["S0|display pan 0x40000001 removed"])
+    assert st.health()["pans"] == 3 and set(st.pans) == {0x4000_0000, 0x4000_0002, 0x4000_0003}

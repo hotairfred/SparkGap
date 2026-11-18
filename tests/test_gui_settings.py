@@ -85,6 +85,23 @@ def test_the_gated_rule_takes_6_db_at_gate_9_unless_set() -> None:
         assert _make_spot_rule({"spot_rule_gates": True, "spot_rule_strongest_db": off}, tracker).stronger_db is None
 
 
+def test_the_start_up_line_names_the_rule_and_every_option_on() -> None:
+    """cdub89/SparkGap#45: the Gated Rule by name; the Repeat Rule with every option it runs."""
+    from sparkgap import _spot_rule_line
+    from spot_rule import RepeatSpotRule
+    from spot_rule2 import GateSpotRule
+    assert _spot_rule_line(GateSpotRule(lambda c: "active")) == "Spot rule: Gated Rule"
+    rule = RepeatSpotRule(lambda c: 2, cq_groups=True, lockon=True, cq_qualifiers=True, split_runs=True,
+                          owner_cell=True, la1d=True, gluek=True, norival=True, contest_words=True,
+                          fragments="any,stray", strongest_db=6.0, lock_idle_s=600.0)
+    line = _spot_rule_line(rule)
+    assert line.startswith("Spot rule: Repeat Rule: lock-on, CQ groups, CQ qualifiers, split runs, DE rejoin")
+    for name in ("contest words", "owner cell", "LA1D", "glue K", "no rival", "fragments any, stray",
+                 "strongest 6 dB", "lock idle 600 s"):
+        assert name in line, name
+    assert "garbled runner" not in line and "clip busts" not in line
+
+
 def test_decoder_snr_is_on_with_itila2_unless_set() -> None:
     from sparkgap import _snr_decoder_on
     assert _snr_decoder_on({}) and _snr_decoder_on({"cw_decoder": "itila2"})
