@@ -65,6 +65,7 @@
 #define GAP_FIT_MIN_MEMBERS 2     /* letter/word clusters need this many gaps each */
 #define GAP_FIT_LW_MIN      3.5   /* fitted boundary must be at least this many units */
 #define GAP_FIT_IDLE_X      6.0   /* gaps over this multiple of the letter gap are idle time */
+#define GAP_PREV_UNIT       0.2   /* the last fitted gap centres hold while the unit is within this fraction */
 #define GAP_FIT_LW_SEP 1.8      /* word centre must be this far above letter centre: distinct classes */
 #define UNIT_FIT_MIN_MARKS   8     /* fewer interior marks: keep the passed unit */
 #define UNIT_FIT_ITERS       10    /* fixed 2-means iterations, deterministic */
@@ -156,6 +157,7 @@ typedef struct {
     const double *pow_in;           /* the new window's power during an itila_feed_pow call, else NULL */
     double        lw_units_prev;    /* last fitted letter/word boundary, in units */
     double        dit_prev, dah_prev; /* last two-class mark fit on this handle, samples */
+    double        gap_l_prev, gap_w_prev, gap_unit_prev; /* last fitted letter and word gap centres, in units, and their unit in samples */
 
     /* Speed bins */
     double speed_bins[N_SPEED_BINS];
@@ -1132,6 +1134,33 @@ static double fit_elem_gap(const run_t *runs, int n_runs, double dit, double *sc
     return (m >= GAP_ELEM_MIN * dit && m <= GAP_ELEM_MAX * dit) ? m : dit;
 }
 
+/* Letter and word gap centres from this window's gaps (idle time excluded).  Returns 0
+ * and leaves them alone when there are too few gaps to fit. */
+static int fit_gap_centres(const run_t *runs, int n_runs, double unit_sp, double *scratch,
+                           double *gap_l, double *gap_w) {
+    double *g = scratch;
+    int ng = 0;
+    for (int i = 1; i < n_runs - 1 && ng < MAX_ENV; i++)
+        if (!runs[i].is_mark && runs[i].dur >= 2.0 * unit_sp) g[ng++] = runs[i].dur;
+    if (ng >= GAP_FIT_MIN_GAPS) {
+        qsort(g, ng, sizeof(double), cmp_double);
+        double idle = g[(ng - 1) / 4] * GAP_FIT_IDLE_X;
+        while (ng > 0 && g[ng - 1] > idle) ng--;
+    }
+    if (ng < GAP_FIT_MIN_GAPS) return 0;
+    *gap_l = g[(ng - 1) * 2 / 5];
+    *gap_w = fmax(*gap_l * 7.0 / 3.0, g[(ng - 1) * 9 / 10]);
+    return 1;
+}
+
+/* This handle's last fitted gap centres, when the unit says it is still the same sender. */
+static int prev_gap_centres(const itila_state_t *st, double unit_sp, double *gap_l, double *gap_w) {
+    if (st->gap_unit_prev <= 0.0 || fabs(unit_sp / st->gap_unit_prev - 1.0) >= GAP_PREV_UNIT) return 0;
+    *gap_l = st->gap_l_prev * unit_sp;
+    *gap_w = st->gap_w_prev * unit_sp;
+    return 1;
+}
+
 static int is_callsign(const char *s);
 
 /* Most legal marks of the window lie within 1.5x of the given dit or dah. */
@@ -1264,6 +1293,31 @@ static int beam_score_cmp(const void *a, const void *b) {
 #define DESPECKLE_UNITS 0.4   /* runs shorter than this many units (rounded) are absorbed;
                                  * rounding up instead cost 3 confirmed CWT spots */
 
+/* A run shorter than DESPECKLE_UNITS is not an element or a gap: absorb it into
+ * its neighbours, shortest first.  One linear pass per length.  Returns the new run count. */
+static int despeckle_runs(run_t *runs, int n_runs, double unit) {
+    int minlen = (int)(DESPECKLE_UNITS * unit + 0.5);
+    for (int len = 1; len < minlen && n_runs >= 2; len++) {
+        int w = 0;
+        for (int i = 0; i < n_runs; i++) {
+            run_t r = runs[i];
+            if (r.dur == len && w > 0 && i + 1 < n_runs) {
+                /* internal: previous run absorbs this one and the next */
+                runs[w - 1].dur += r.dur + runs[i + 1].dur; i++; continue;
+            }
+            if (r.dur == len && (w == 0 || i + 1 == n_runs)) {
+                /* edge: becomes part of its only neighbour */
+                if (w > 0) { runs[w - 1].dur += r.dur; continue; }
+                if (i + 1 < n_runs) { runs[i + 1].dur += r.dur; continue; }
+            }
+            if (w > 0 && runs[w - 1].is_mark == r.is_mark) runs[w - 1].dur += r.dur;
+            else runs[w++] = r;
+        }
+        n_runs = w;
+    }
+    return n_runs;
+}
+
 static int decode_runs_beam(
     itila_state_t *st,
     const int8_t *marks, int T,
@@ -1290,28 +1344,7 @@ static int decode_runs_beam(
     }
     if (n_runs < MAX_ENV) { runs[n_runs].is_mark=val; runs[n_runs].dur=cnt; n_runs++; }
 
-    {   /* A run shorter than DESPECKLE_UNITS is not an element or a gap: absorb it into
-         * its neighbours, shortest first.  One linear pass per length. */
-        int minlen = (int)(DESPECKLE_UNITS * unit + 0.5);
-        for (int len = 1; len < minlen && n_runs >= 2; len++) {
-            int w = 0;
-            for (int i = 0; i < n_runs; i++) {
-                run_t r = runs[i];
-                if (r.dur == len && w > 0 && i + 1 < n_runs) {
-                    /* internal: previous run absorbs this one and the next */
-                    runs[w - 1].dur += r.dur + runs[i + 1].dur; i++; continue;
-                }
-                if (r.dur == len && (w == 0 || i + 1 == n_runs)) {
-                    /* edge: becomes part of its only neighbour */
-                    if (w > 0) { runs[w - 1].dur += r.dur; continue; }
-                    if (i + 1 < n_runs) { runs[i + 1].dur += r.dur; continue; }
-                }
-                if (w > 0 && runs[w - 1].is_mark == r.is_mark) runs[w - 1].dur += r.dur;
-                else runs[w++] = r;
-            }
-            n_runs = w;
-        }
-    }
+    n_runs = despeckle_runs(runs, n_runs, unit);
 
     int unit_fitted = 0;
     double dah_sp = 0.0;
@@ -1337,24 +1370,14 @@ static int decode_runs_beam(
         zone_hi  = boundary * 1.25;
     }
 
-    /* Letter and word gap centres from this window's gaps (idle time excluded),
-     * standard 3 and 7 units when there are too few. */
+    /* Letter and word gap centres from this window's gaps.  With too few (a short last
+     * window): this sender's last fitted centres, else the standard 3 and 7 units. */
     double gap_l = 3.0 * unit_sp, gap_w = 7.0 * unit_sp;
     double gap_e = fit_elem_gap(runs, n_runs, unit_sp, st->log_B);
-    {
-        double *g = st->log_B;  /* scratch, free in the beam stage */
-        int ng = 0;
-        for (int i = 1; i < n_runs - 1 && ng < MAX_ENV; i++)
-            if (!runs[i].is_mark && runs[i].dur >= 2.0 * unit_sp) g[ng++] = runs[i].dur;
-        if (ng >= GAP_FIT_MIN_GAPS) {
-            qsort(g, ng, sizeof(double), cmp_double);
-            double idle = g[(ng - 1) / 4] * GAP_FIT_IDLE_X;
-            while (ng > 0 && g[ng - 1] > idle) ng--;
-        }
-        if (ng >= GAP_FIT_MIN_GAPS) {
-            gap_l = g[(ng - 1) * 2 / 5];
-            gap_w = fmax(gap_l * 7.0 / 3.0, g[(ng - 1) * 9 / 10]);
-        }
+    if (fit_gap_centres(runs, n_runs, unit_sp, st->log_B, &gap_l, &gap_w)) {  /* log_B: scratch, free in the beam stage */
+        st->gap_l_prev = gap_l / unit_sp; st->gap_w_prev = gap_w / unit_sp; st->gap_unit_prev = unit_sp;
+    } else {
+        prev_gap_centres(st, unit_sp, &gap_l, &gap_w);
     }
     st->pitch_wpm = pitch_wpm(runs, n_runs, boundary, sqrt(unit_sp * gap_l));
 
@@ -1621,11 +1644,18 @@ static int find_carry_cut(itila_state_t *st, const int8_t *marks, int T, double 
         val = marks[i]; cnt = 1;
     }
     runs[n_runs].is_mark = val; runs[n_runs].dur = cnt; n_runs++;
+    n_runs = despeckle_runs(runs, n_runs, unit_samples(wpm));   /* the runs the beam fits */
 
     int fitted, lw_fitted;
     double dah;
     double unit_sp = fit_unit(runs, n_runs, unit_samples(wpm), &fitted, &dah);
-    double letter_word = letter_word_boundary(st, runs, n_runs, unit_sp, &lw_fitted);
+    double letter_word = letter_word_boundary(st, runs, n_runs, unit_sp, &lw_fitted);  /* fallback: no gap fit, no stored centres */
+    /* Cut where the beam switches from letter to word gap (equal log-normal likelihood),
+     * fitted as the beam fits them, so the cut and the text agree on what a word gap is. */
+    double gap_l, gap_w;
+    if (fit_gap_centres(runs, n_runs, unit_sp, st->log_B, &gap_l, &gap_w) ||
+        prev_gap_centres(st, unit_sp, &gap_l, &gap_w))
+        letter_word = exp((GAP_SD_WORD * log(gap_l) + GAP_SD_LETTER * log(gap_w)) / (GAP_SD_LETTER + GAP_SD_WORD));
 
     if (!runs[n_runs - 1].is_mark && runs[n_runs - 1].dur >= letter_word) return T;
 
@@ -1786,11 +1816,12 @@ static double mark_power(const double *pow, const int8_t *marks, int n) {
     return m >= SNR_MARK_MIN ? sum / m : NAN;
 }
 
-/* Blank the marks of segments that are not CW. A segment is keying between pauses of 5 units
+/* Blank the marks of segments in [t, n) that are not CW. A segment is keying between pauses of 5 units
  * or more of the fastest speed candidate; its log Bayes factor (fresh forward pass, mean over the speed bins, against all
- * noise) must reach SEG_RATE_MIN per second. Marks at or after n_dec (the carry) are kept. */
-static void gate_segments(itila_state_t *st, const double *env, int n_dec, double A, double nm,
-                          double s2, double unit, const double *cands, int n_cands) {
+ * noise) must reach SEG_RATE_MIN per second.  With leave_open, a last segment no pause closes before n is
+ * left as it is; returns its start, else n. */
+static int gate_segments(itila_state_t *st, const double *env, int t, int n, double A, double nm,
+                         double s2, double unit, const double *cands, int n_cands, int leave_open) {
     int gap = (int)(5.0 * unit), pad = (int)unit;
     double lc = -0.5 * log(2.0 * M_PI * s2);
     /* Speed bins near the window's candidates (all bins when none): the keyed case is the
@@ -1814,17 +1845,17 @@ static void gate_segments(itila_state_t *st, const double *env, int n_dec, doubl
             use[n_use++] = best;
         }
     }
-    int t = 0;
-    while (t < n_dec) {
-        while (t < n_dec && !st->marks[t]) t++;
-        if (t >= n_dec) break;
+    while (t < n) {
+        while (t < n && !st->marks[t]) t++;
+        if (t >= n) break;
         int t0 = t, last = t, sp = 0;
-        for (; t < n_dec; t++) {
+        for (; t < n; t++) {
             if (st->marks[t]) { last = t; sp = 0; }
             else if (++sp >= gap) break;
         }
+        if (leave_open && t >= n) return t0;
         int a = t0 - pad < 0 ? 0 : t0 - pad;
-        int b = last + 1 + pad > n_dec ? n_dec : last + 1 + pad;
+        int b = last + 1 + pad > n ? n : last + 1 + pad;
         int len = b - a;
         double lbf = -INFINITY;
         if (len >= 2) {
@@ -1851,6 +1882,19 @@ static void gate_segments(itila_state_t *st, const double *env, int n_dec, doubl
         if (lbf < SEG_RATE_MIN * len / (double)BAYES_RATE)
             memset(st->marks + t0, 0, (size_t)(last + 1 - t0));
     }
+    return n;
+}
+
+/* Gate, then cut; returns the cut.  Gating first keeps noise blips out of the cut's gap fit.  A segment
+ * still open at the window's end is not gated here, so a start the gate would blank alone is carried
+ * and gated whole next window; only the part of it the cut decodes now is gated, as before. */
+static int gate_and_cut(itila_state_t *st, const double *env, int n, double A, double nm, double s2,
+                        const double *cands, int n_cands) {
+    double unit = unit_samples(cands[n_cands - 1]);
+    int open = gate_segments(st, env, 0, n, A, nm, s2, unit, cands, n_cands, 1);
+    int n_dec = find_carry_cut(st, st->marks, n, cands[0]);
+    if (n_dec > open) gate_segments(st, env, open, n_dec, A, nm, s2, unit, cands, n_cands, 0);
+    return n_dec;
 }
 
 const char* itila_feed(itila_t h, const double* envelope, int n,
@@ -1910,12 +1954,10 @@ const char* itila_feed(itila_t h, const double* envelope, int n,
     st->last_timing_cost = compute_timing_cost(st->marks, n, wpm_em,
                                                 st->sc_runs);
 
-    int n_dec = find_carry_cut(st, st->marks, n, wpm_cands[0]);
+    int n_dec = gate_and_cut(st, envelope, n, A, noise_mean, sigma2_obs, wpm_cands, n_cands);
     st->carry_n = n - n_dec;
     memcpy(st->carry_env, st->feed_raw + n_dec, (size_t)st->carry_n * sizeof(double));
     if (st->pow_in) memcpy(st->carry_pow, st->feed_pow + n_dec, (size_t)st->carry_n * sizeof(double));
-    gate_segments(st, envelope, n_dec, A, noise_mean, sigma2_obs, unit_samples(wpm_cands[n_cands - 1]),
-                  wpm_cands, n_cands);
     if (st->pow_in) st->last_mark_pow = mark_power(st->feed_pow, st->marks, n_dec);
 
     /* Per-handle scratch, was function-local static; live mode races. */
@@ -2248,7 +2290,7 @@ int itila2_test_gate_segments(const double *env, int8_t *marks, int n, double A,
     itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
     if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
     memcpy(st->marks, marks, (size_t)n);
-    gate_segments(st, env, n, A, nm, s2, unit, NULL, 0);
+    gate_segments(st, env, 0, n, A, nm, s2, unit, NULL, 0, 0);
     memcpy(marks, st->marks, (size_t)n);
     int kept = 0;
     for (int i = 0; i < n; i++) kept += marks[i];
@@ -2290,6 +2332,52 @@ int itila2_test_decode_runs(const int *is_mark, const int *dur, int n, double wp
     snprintf(out, (size_t)out_len, "%s", nt > 0 ? texts[0] : "");
     itila_free(st); free(texts);
     return nt;
+}
+
+/* As itila2_test_decode_runs, after decoding the prev runs on the same handle: the short-window fallbacks see them. */
+int itila2_test_decode_runs_after(const int *prev_mark, const int *prev_dur, int prev_n, double prev_wpm,
+                                  const int *is_mark, const int *dur, int n, double wpm, char *out, int out_len) {
+    int Tp = 0, T = 0;
+    for (int i = 0; i < prev_n; i++) Tp += prev_dur[i];
+    for (int i = 0; i < n; i++) T += dur[i];
+    if (Tp < 1 || Tp > MAX_ENV || T < 1 || T > MAX_ENV || out_len < 1) return -1;
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    char (*texts)[MAX_TEXT] = malloc(4 * sizeof(*texts));
+    if (!st || !texts || !bind_scratch(st)) { if (st) itila_free(st); free(texts); return -1; }
+    for (int i = 0, t = 0; i < prev_n; i++)
+        for (int k = 0; k < prev_dur[i]; k++) st->marks[t++] = (int8_t)(prev_mark[i] != 0);
+    decode_runs_beam(st, st->marks, Tp, prev_wpm, 0.0, texts, 4, NULL);
+    for (int i = 0, t = 0; i < n; i++)
+        for (int k = 0; k < dur[i]; k++) st->marks[t++] = (int8_t)(is_mark[i] != 0);
+    int nt = decode_runs_beam(st, st->marks, T, wpm, 0.0, texts, 4, NULL);
+    snprintf(out, (size_t)out_len, "%s", nt > 0 ? texts[0] : "");
+    itila_free(st); free(texts);
+    return nt;
+}
+
+/* gate_and_cut at one speed, fresh handle; marks is updated in place.  Returns the cut sample or -1. */
+int itila2_test_gate_and_cut(const double *env, int8_t *marks, int n, double A, double nm, double s2, double wpm) {
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    if (!st || n < 1 || n > MAX_ENV || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
+    memcpy(st->marks, marks, (size_t)n);
+    int cut = gate_and_cut(st, env, n, A, nm, s2, &wpm, 1);
+    memcpy(marks, st->marks, (size_t)n);
+    itila_free(st);
+    return cut;
+}
+
+/* find_carry_cut on the mark sequence built from runs, fresh handle.  Returns the cut sample or -1. */
+int itila2_test_carry_cut(const int *is_mark, const int *dur, int n, double wpm) {
+    int T = 0;
+    for (int i = 0; i < n; i++) T += dur[i];
+    if (T < 1 || T > MAX_ENV) return -1;
+    itila_state_t *st = (itila_state_t *)itila_create(BAYES_RATE, 0.0);
+    if (!st || !bind_scratch(st)) { if (st) itila_free(st); return -1; }
+    for (int i = 0, t = 0; i < n; i++)
+        for (int k = 0; k < dur[i]; k++) st->marks[t++] = (int8_t)(is_mark[i] != 0);
+    int cut = find_carry_cut(st, st->marks, T, wpm);
+    itila_free(st);
+    return cut;
 }
 
 double itila2_test_estimate_wpm(const int *is_mark, const int *dur, int n) {

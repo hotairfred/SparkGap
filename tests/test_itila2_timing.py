@@ -430,6 +430,70 @@ def test_gate_segments_keeps_keying_and_blanks_noise() -> None:
     assert sum(out[len(keyed):]) == 0
 
 
+_lib.itila2_test_gate_and_cut.argtypes = [
+    ctypes.POINTER(ctypes.c_double),
+    ctypes.POINTER(ctypes.c_int8),
+    ctypes.c_int,
+    ctypes.c_double,
+    ctypes.c_double,
+    ctypes.c_double,
+    ctypes.c_double,
+]
+_lib.itila2_test_gate_and_cut.restype = ctypes.c_int
+
+PARIS_20 = [int(c) for c in "1011101110100000101110000010111010000010100000101010" for _ in range(GATE_UNIT)]
+GATE_PAUSE = [0] * (12 * GATE_UNIT)
+GATE_BLIPS = ([1] * GATE_UNIT + [0] * GATE_UNIT) * 6
+
+
+def _paris_env(marks: list[int]) -> list[float]:
+    """Keyed envelope for the leading PARIS only; the marks after it claim keying over noise."""
+    rng = random.Random(1)
+    k = len(PARIS_20)
+    return [(float(m) if i < k else 0.0) + rng.gauss(0.0, GATE_SIGMA) for i, m in enumerate(marks)]
+
+
+def _gate_and_cut(marks: list[int]) -> tuple[int, list[int]]:
+    env = _paris_env(marks)
+    n = len(marks)
+    marks_c = (ctypes.c_int8 * n)(*marks)
+    cut = _lib.itila2_test_gate_and_cut((ctypes.c_double * n)(*env), marks_c, n, 1.0, 0.0, GATE_SIGMA**2, 20.0)
+    assert cut >= 0
+    return cut, list(marks_c)
+
+
+def test_gate_and_cut_carries_a_start_still_open_at_the_end() -> None:
+    """A start in the window's last second, too short to pass the gate alone, is carried ungated
+    (cdub89/SparkGap#53, Fred's #181 review): gated before the cut it was blanked and lost."""
+    marks = PARIS_20 + GATE_PAUSE + GATE_BLIPS
+    start = len(PARIS_20) + len(GATE_PAUSE)
+    assert sum(_gate(_paris_env(marks), marks)[start:]) == 0   # the gate alone blanks it
+    cut, out = _gate_and_cut(marks)
+    assert cut < start
+    assert out[: len(PARIS_20)] == PARIS_20
+    assert out[start:] == GATE_BLIPS
+
+
+def test_gate_and_cut_still_blanks_closed_noise() -> None:
+    marks = PARIS_20 + GATE_PAUSE + GATE_BLIPS + GATE_PAUSE
+    cut, out = _gate_and_cut(marks)
+    assert cut == len(marks)
+    assert out[: len(PARIS_20)] == PARIS_20
+    assert sum(out[len(PARIS_20):]) == 0
+
+
+def test_gate_and_cut_gates_what_it_decodes_of_an_open_segment() -> None:
+    """Noise keying with no 5 unit pause for longer than the carry: the part decoded now is gated."""
+    noise = ([1] * GATE_UNIT + [0] * (3 * GATE_UNIT)) * 94 + [1] * GATE_UNIT   # 22.6 s
+    marks = PARIS_20 + GATE_PAUSE + noise
+    start = len(PARIS_20) + len(GATE_PAUSE)
+    cut, out = _gate_and_cut(marks)
+    assert start < cut < len(marks)
+    assert out[: len(PARIS_20)] == PARIS_20
+    assert sum(out[start:cut]) == 0
+    assert out[cut:] == marks[cut:]
+
+
 _lib.itila2_test_fit_elem_gap.argtypes = [
     ctypes.POINTER(ctypes.c_int),
     ctypes.POINTER(ctypes.c_int),
@@ -551,3 +615,128 @@ def test_fit_unit_n1de_dropped_dits_are_the_dits() -> None:
     assert fitted == 1
     assert 7.0 <= unit <= 10.0, unit        # the dits, not the dahs
     assert 19.0 <= dah <= 25.0, dah
+
+
+_lib.itila2_test_decode_runs_after.argtypes = [
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_double,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_double,
+    ctypes.c_char_p,
+    ctypes.c_int,
+]
+_lib.itila2_test_decode_runs_after.restype = ctypes.c_int
+
+_lib.itila2_test_carry_cut.argtypes = [
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_double,
+]
+_lib.itila2_test_carry_cut.restype = ctypes.c_int
+
+
+def call_decode_runs_after(prev: str, prev_wpm: float, spec: str, wpm: float) -> str:
+    p_mark, p_dur = runs(prev)
+    is_mark, dur = runs(spec)
+    pn, n = len(p_mark), len(is_mark)
+    buf = ctypes.create_string_buffer(2048)
+    nt = _lib.itila2_test_decode_runs_after(
+        (ctypes.c_int * pn)(*p_mark), (ctypes.c_int * pn)(*p_dur), pn, prev_wpm,
+        (ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, wpm, buf, len(buf),
+    )
+    assert nt > 0
+    return buf.value.decode()
+
+
+# W1AW 7047.5 kHz, 13 WPM code practice (2026-10-07 clip A, narrow path): the window that
+# decoded 'OFFICIAL ARRL QUALIFYING RUN ON' and the short last window after it, 'THU'.
+# Letter gaps are 109 samples (6 units), word gaps 257.
+W1AW_13_RUNS = (
+    "-129 +49 -15 +50 -14 +50 -108 +18 -14 +19 -14 +50 -13 +19 -109 +18 -14 +18 -14 +50 "
+    "-14 +18 -109 +18 -14 +18 -109 +50 -14 +17 -15 +50 -14 +18 -109 +18 -14 +18 -110 +18 "
+    "-14 +49 -110 +18 -14 +49 -15 +17 -15 +18 -257 +18 -14 +50 -109 +18 -14 +50 -14 +17 "
+    "-110 +18 -14 +51 -13 +18 -109 +18 -14 +50 -14 +18 -14 +19 -257 +50 -14 +50 -14 +18 "
+    "-14 +50 -109 +18 -14 +18 -14 +50 -109 +18 -14 +50 -109 +18 -14 +50 -14 +18 -14 +18 "
+    "-109 +18 -14 +18 -109 +19 -13 +19 -13 +50 -14 +18 -109 +51 -14 +17 -14 +50 -15 +49 "
+    "-110 +18 -14 +18 -109 +50 -14 +18 -109 +32 -36 +47 -13 +18 -257 +18 -14 +50 -14 +18 "
+    "-109 +18 -16 +17 -15 +49 -109 +49 -15 +18 -257 +51 -14 +50 -14 +50 -109 +50 -14 +18 "
+    "-128"
+)
+W1AW_13_LAST_RUNS = "-129 +50 -109 +18 -14 +19 -13 +19 -13 +19 -108 +19 -14 +18 -14 +48 -5992"
+
+
+def test_short_window_uses_last_gap_centres() -> None:
+    """Three letters are too few gaps to fit: the sender's last fitted centres read THU,
+    where 3 and 7 units take the 6 unit letter gaps for word gaps."""
+    assert call_decode_runs(W1AW_13_LAST_RUNS, 13.7).split() == ["T", "H", "U"]
+    assert call_decode_runs_after(W1AW_13_RUNS, 13.0, W1AW_13_LAST_RUNS, 13.7).split() == ["THU"]
+
+
+def test_short_window_ignores_centres_of_another_speed() -> None:
+    """The same spacing keyed twice as fast (every run halved) is another sender: its
+    centres are not carried to the 13 WPM window."""
+    fast = " ".join(f"{r[0]}{int(r[1:]) // 2}" for r in W1AW_13_RUNS.split())
+    text = call_decode_runs_after(fast, 26.0, W1AW_13_LAST_RUNS, 13.7)
+    assert text.split() == ["T", "H", "U"]
+
+
+# W1AW 7047.5 kHz at 5 WPM (2026-10-07 clip B, narrow path), one whole gated window:
+# 'FRGM SEPTEMBER' (FROM, in a fade), a 700 sample word gap, then the 2 of 2024 and 278
+# samples of its 298 sample letter gap before the window ends.
+W1AW_05_CUT_RUNS = (
+    "-350 +18 -15 +18 -14 +49 -14 +18 -299 +18 -14 +50 -14 +18 -298 +51 -14 +40 -48 +26 "
+    "-298 +50 -14 +50 -700 +18 -15 +17 -15 +17 -298 +18 -299 +18 -14 +50 -14 +50 -14 +18 "
+    "-299 +49 -299 +18 -298 +51 -13 +51 -298 +50 -15 +17 -14 +18 -15 +17 -299 +18 -299 "
+    "+17 -15 +49 -15 +17 -700 +18 -14 +17 -15 +50 -14 +50 -14 +51 -278"
+)
+
+
+def test_carry_cut_keeps_number_whole() -> None:
+    """The cut falls in the word gap before 2024, not in the letter gap after its 2
+    (the windows read 'SEPTEMBER 2' and '024 QST PAGE')."""
+    is_mark, dur = runs(W1AW_05_CUT_RUNS)
+    n = len(is_mark)
+    cut = _lib.itila2_test_carry_cut((ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, 16.9)
+    word_gap = len(dur) - 11                 # the 700 sample gap before the 2
+    assert dur[word_gap] == 700
+    assert cut == sum(dur[:word_gap]) + 350
+
+
+def test_carry_cut_absorbs_speckle_like_the_decode() -> None:
+    """A 2 sample noise hit inside that word gap is absorbed before the gaps are fitted,
+    as the decode does: the cut stays in the word gap."""
+    spec = W1AW_05_CUT_RUNS.replace("+17 -700 +18", "+17 -349 +2 -349 +18")
+    assert spec != W1AW_05_CUT_RUNS
+    is_mark, dur = runs(spec)
+    n = len(is_mark)
+    cut = _lib.itila2_test_carry_cut((ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, 16.9)
+    word_gap = len(dur) - 13                 # the first half of the split gap before the 2
+    assert dur[word_gap : word_gap + 3] == [349, 2, 349]
+    assert cut == sum(dur[:word_gap]) + 350
+
+
+def _ss_runs(last_gap: int) -> tuple[list[int], list[int]]:
+    """Ten 'SS' words at 20 WPM (letter gaps 3 units, word gaps 7), 'SS', last_gap, then one dit."""
+    u = 12
+    s = [(1, u), (0, u), (1, u), (0, u), (1, u)]
+    ss = s + [(0, 3 * u)] + s
+    spec = [(0, 10 * u)]
+    for _ in range(10):
+        spec += ss + [(0, 7 * u)]
+    spec += ss + [(0, last_gap), (1, u)]
+    return [m for m, _ in spec], [d for _, d in spec]
+
+
+def test_carry_cut_switches_where_the_beam_does() -> None:
+    """With centres 3 and 7 units the beam reads a gap as a word gap from 4.44 units
+    (log-normal widths 0.30 and 0.35), not the geometric middle 4.58: 4.5 units cuts there, 4.33 does not."""
+    for gap, in_last in ((54, True), (52, False)):
+        is_mark, dur = _ss_runs(gap)
+        n = len(is_mark)
+        cut = _lib.itila2_test_carry_cut((ctypes.c_int * n)(*is_mark), (ctypes.c_int * n)(*dur), n, 20.0)
+        assert (cut == sum(dur) - 12 - gap // 2) is in_last
