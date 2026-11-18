@@ -35,7 +35,7 @@ const OPTION_HINTS = {
 
 const HINTS = {
   window: "How much signal each decoded window holds (itila_window_sec). Shorter windows show text sooner but fit each signal's timing on less of it and cost more CPU. Experimental: 30 and 60 s are measured, 20 and 10 s untried. Applying restarts the skimmer.",
-  record: "Saves the raw signal to disk for replay; needs 5 GB free. Starts and stops in place. A Web-888 records every band: its first minute readies the capture, so files start within two minutes, and stop at the next minute.",
+  record: "Saves the raw signal to disk for replay; needs 5 GB free. Starts and stops in place, for every running receiver of the Node, and is off after a restart. A Web-888 records every band: it starts at once, its files appear at the next minute, and it stops at the next minute; it keeps recording across a restart while its RECORD file is there.",
   afc: "Each signal's decoder follows its keyed tone, which helps weak and slightly off-tune signals (itila2_afc). Applying restarts the skimmer.",
   spot_rule: "Repeat Rule: a call spots after enough copies of it in CQs; with call validation on, a confidence score decides. Gated Rule: a call spots only when it passes each of 12 yes/no checks in order, and the log names the check that decided (docs/SPOT_RULES.md). Choosing either sets a spot_rule other than repeat back to repeat. Applying restarts the skimmer.",
   validation: "A confidence score decides which calls are spotted: permissive spots more, aggressive fewer (docs/ITILA2.md). Off: a set number of copies, 2 to 4 by how common the call's pattern is.",
@@ -1619,7 +1619,6 @@ function addPaneHtml(k, sv, rn) {
     + (hpsdr ? `</div><div class="fhint">${proc ? `It joins ${esc(rn)}'s other receivers: their decoder options are its, and ${esc(rn)} restarts if it runs.` : `${esc(rn)} starts with it, from the shipped HPSDR defaults; change them here.`}</div>`
       + (proc ? "" : `<div class="fold"><div class="form">${decRows.join("")}</div></div>`) : "")
     + (hpsdr ? "" : row("DAX-IQ", `<select class="fsel" data-add="channel">${opts(free, d.channel)}</select>`, `<span class="fnote">its name: ${esc(name)}</span>`)
-    + row("RECORDING", choose("record", [[false, "off"], [true, "on"]], !!st.record))
     + (mates ? `</div><div class="fhint">It starts with the radio's antenna and RF gain, and runs ${esc(rn)}'s decoder options (its Node).</div>`
       : `</div><div class="fhint">It starts with the radio's antenna and RF gain, and ${back ? `the settings ${esc(name)} had before it was removed` : "the shipped default decoder options"}; change them here.</div>`
       + `<div class="fold"><div class="form">${decRows.join("")}</div></div>`));
@@ -1785,10 +1784,10 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
       : r.num_scu > 1 ? `Antenna and RF gain are shared by the receivers on the same SCU (${r.num_scu} SCUs; the radio does not say which): check the others after a change.` : SHARED_NOTE;
     rows.push(`<div class="frow"><span></span><span class="fhint">${esc(note)}</span></div>`);
   } else if (i.radio && !run && radioOf(sv, i).rx_settings && radioOf(sv, i).rx_settings.length) rows.push(`<div class="frow"><span></span><span class="fhint">Antenna and RF gain show while ${esc(i.name)} runs.</span></div>`);
-  if (!list || node) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">${run ? "in place, no restart" : "from the next start"}</span>` : "")
+  if (node || (own && run)) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">${run ? "in place, no restart" : "from the next start"}</span>` : "")
     .replace('<div class="frow"', `<div class="frow" title="${esc(HINTS.record)}"`));
   if (!node && !own) rows.push(`<div class="frow"><span></span><span class="fhint">${list ? `Run, recording, decoder options and details: ${esc(radioName)}'s Node, for all its receivers.`
-    : `Decoder options: ${esc(radioName)}'s Node, for all its receivers.`}</span></div>`);
+    : `Recording and decoder options: ${esc(radioName)}'s Node, for all its receivers.`}</span></div>`);
   const { decRows, summary } = decoderOptions(at, st, pend);
   const fold = app.fold || {}, decOpen = !!fold.decoder, detOpen = !!fold.details;
   const feed = app.instances.find(x => x.server === sv && copyName(x) === i.name) || null;
@@ -1796,7 +1795,7 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
     + (decOpen ? `<div class="fold"><div class="form">${decRows.join("")}</div><div class="fhint">${rr ? `Shared by ${esc(all)}: changes restart them all.` : `Changes restart ${esc(i.name)}.`} Hover over an option for more.</div>`
       + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div></div>` : ""))
     + (list && !node ? "" : `<button class="fentry" data-act="fold" data-fold="details" aria-expanded="${detOpen}"><span>Details</span><span class="fnote">packets, reconnects, warnings, log</span><span class="chev">${detOpen ? "\u25BE" : "\u25B8"}</span></button>`
-    + (detOpen ? `<div class="fold details">${feed && feed.status ? statusHtml(feed, i, false) : stoppedInfoHtml(i)}</div>` : ""));
+    + (detOpen ? `<div class="fold details">${node ? "<!--facts-->" : ""}${feed && feed.status ? statusHtml(feed, i, false) : stoppedInfoHtml(i)}</div>` : ""));
   const others = Object.keys(pend).filter(x => !RX_KEYS.includes(x));
   const live = run && others.every(k => k === "band" || k === "record") && others.length <= 1;  // a band or recording changes in place
   const label = { run: "run", band: "band", antenna: "antenna", rf_gain: "RF gain", record: "recording", afc: "AFC", itila_window_sec: "window",
@@ -1816,8 +1815,10 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
     { label: all, ...sum }) : statusTilesHtml(shown);
   const state = busy ? `${busy}...` : run ? `running${where ? ` · ${where}` : ""}` : "stopped";
   const err = !run && i.last_error ? `<div class="small err">${esc(i.last_error)}</div>` : "";
-  const head = node ? state : rr ? `${state.split(" · ")[0]} · ${rr.band}${rr.centre_khz ? ` ${Number(rr.centre_khz).toFixed(1)} kHz` : ""}${run && rr.spots !== null ? ` · ${rr.spots} spots` : ""}` : state;
-  return `<div class="phead"><span class="ptitle">${esc(node ? "Skimmer" : rr ? rr.name : i.name)}</span>${dot(busy ? "busy" : i.state)}<span class="muted">${esc(head)}</span></div>`
+  // laid out by the Node pane; its status boxes open with Details, as they are the skimmer's, not the node's
+  if (node) return { bar, err, rows, entries: entries.replace("<!--facts-->", facts), state: state.split(" · ")[0], dot: busy ? "busy" : i.state };
+  const head = rr ? `${state.split(" · ")[0]} · ${rr.band}${rr.centre_khz ? ` ${Number(rr.centre_khz).toFixed(1)} kHz` : ""}${run && rr.spots !== null ? ` · ${rr.spots} spots` : ""}` : state;
+  return `<div class="phead"><span class="ptitle">${esc(rr ? rr.name : i.name)}</span>${dot(busy ? "busy" : i.state)}<span class="muted">${esc(head)}</span></div>`
     + bar + facts + err + `<div class="form">${rows.join("")}</div><div class="fentries">${entries}</div>`
     + (node || !i.radio || (radioOf(sv, i).type !== "flex" && !rr) ? "" : `<div class="fremove"><button class="btn small${pend.remove ? " pend" : ""}" ${at} data-value="${esc(JSON.stringify(rr ? rr.name : true))}" data-key="remove"${busy ? " disabled" : ""}>`
     + `${pend.remove ? "Removed on Apply" : `Remove ${esc(rr ? rr.name : i.name)}`}</button></div>`);
@@ -1901,17 +1902,17 @@ function nodePaneHtml(k, sv, name) {
   const mode = pend.rbn_upload || r.rbn_upload || "off", f = ((seat.radios || []).find(x => x.name === r.name) || {}).feeder;
   const upload = `<div class="seg${"rbn_upload" in pend ? " pend" : ""}">${["off", "dry", "live"].map(m =>
     `<span data-act="srvpick" data-server="${k}" data-radio="${esc(r.name)}" data-key="rbn_upload" data-v="${m}"${m === mode ? ' class="on"' : ""}>${m}</span>`).join("")}</div>`;
-  const proc = r.type === "hpsdr" && users.length === 1 ? users[0] : null;
-  const skimmer = proc ? `<section class="psection">${receiverPaneHtml(k, sv, proc, null, "node")}</section>`
-    : users.length ? `<section class="psection">${nodeOptionsHtml(k, sv, r.name, users)}</section>` : "";
-  return `<div class="phead"><span class="ptitle">${esc(r.callsign || "Node")}</span><span class="muted">Node · ${esc(r.name)}</span></div>`
-    + srvBarHtml(k, sv, r) + `<div class="form">`
+  const proc = r.type === "hpsdr" && users.length === 1 ? users[0] : null;  // a Web-888: one skimmer for every receiver
+  const sk = proc ? receiverPaneHtml(k, sv, proc, null, "node") : users.length ? nodeOptionsHtml(k, sv, r.name, users) : null;
+  return `<div class="phead"><span class="ptitle">${esc(r.callsign || "Node")}</span>${sk && sk.dot ? dot(sk.dot) : ""}`
+    + `<span class="muted">${esc(`Node · ${r.name}${sk && sk.state ? ` · ${sk.state}` : ""}`)}</span></div>`
+    + srvBarHtml(k, sv, r) + (sk ? sk.bar + (sk.err || "") : "") + `<div class="form">`
     + field("Spotter ID", "callsign", r.callsign, "the callsign RBN shows (N0CALL-2)")
     + field("Grid", "grid", r.grid, "EM12 or EM12ub")
     + field("Operator", "op_name", r.op_name, "the operator's name")
     + setupRow("RBN upload", upload, users.length ? "dry logs what it would post; only the feeder restarts" : "used once it has receivers")
     + setupRow("Feeder", `${feederState(f, r.rbn_upload)}${f && (r.rbn_upload || "off") !== "off" ? esc(` · ${Number(f.sent) || 0} spots sent`) : ""}`)
-    + `</div>` + skimmer;
+    + (sk ? sk.rows.join("") : "") + `</div>` + (sk ? `<div class="fentries">${sk.entries}</div>` : "");
 }
 
 // the decoder options of a radio whose receivers are separate copies (Flex): one set, sent to every copy
@@ -1924,18 +1925,30 @@ function nodeDiffers(seat, radio) {
   const base = nodeBase(seat, radio), copies = (seat.instances || []).filter(i => i.radio === radio);
   return OPTION_KEYS.filter(key => copies.some(c => JSON.stringify((c.settings || {})[key]) !== JSON.stringify(base[key])));
 }
+function nodeRecording(seat, radio) {  // any running receiver of the radio records
+  return (seat.instances || []).some(i => i.radio === radio && i.state === "running" && (i.settings || {}).record);
+}
 function nodeOptionsHtml(k, sv, radio, copies) {
   const seat = sv.link.seat || {}, name = nodeKey(radio), at = `data-server="${k}" data-name="${esc(name)}"`;
   const pend = app.pending[pendKey(sv, name)] || {}, st = { ...nodeBase(seat, radio), ...pend }, n = Object.keys(pend).length;
   const { decRows, summary } = decoderOptions(at, st, pend), differ = nodeDiffers(seat, radio);
   const running = copies.filter(c => c.state === "running").map(c => c.name), names = copies.map(c => c.name).join(", ");
+  const restarts = running.length && (differ.length || Object.keys(pend).some(key => key !== "record"));
   const bar = n || differ.length ? `<div class="fbar"><span>${n ? `${n} change${n > 1 ? "s" : ""} not applied` : `${esc(names)} differ`}</span><span class="grow"></span>`
-    + `<button class="btn small primary" ${at} data-cmd="apply">${running.length ? `Apply (restarts ${esc(running.join(", "))})` : "Save"}</button>`
+    + `<button class="btn small primary" ${at} data-cmd="apply">${restarts ? `Apply (restarts ${esc(running.join(", "))})` : running.length ? "Apply" : "Save"}</button>`
     + (n ? `<button class="btn small" ${at} data-cmd="discard">Discard</button>` : "") + `</div>` : "";
-  return `<div class="psec"><span class="psectitle">Decoder options</span><span class="muted">${esc(summary)}</span></div>` + bar
+  const rec = "record" in pend ? pend.record : nodeRecording(seat, radio);
+  const recRow = running.length ? `<div class="frow" title="${esc(HINTS.record)}"><span class="flabel">RECORDING</span><span class="fctl"><div class="seg${"record" in pend ? " pend" : ""}" ${at} data-key="record">`
+    + [[false, "off"], [true, "on"]].map(([v, l]) => `<span data-value="${v}"${v === rec ? ' class="on"' : ""}>${l}</span>`).join("")
+    + `</div><span class="fnote">${esc(`in place on ${running.join(", ")}`)}</span></span></div>`
+    : `<div class="frow"><span class="flabel">RECORDING</span><span class="fctl"><span class="fnote">${esc(`turns on while a receiver of ${radio} runs`)}</span></span></div>`;
+  const decOpen = !!(app.fold || {}).decoder;
+  const entries = `<button class="fentry" data-act="fold" data-fold="decoder" aria-expanded="${decOpen}"><span>Decoder options</span><span class="fnote">${esc(summary)}</span><span class="chev">${decOpen ? "\u25BE" : "\u25B8"}</span></button>`
+    + (!decOpen ? "" : `<div class="fold">`
     + (differ.length ? `<div class="fhint">${esc(names)} run different ${esc(differ.join(", "))}: Apply sets every receiver to what shows here.</div>` : "")
     + `<div class="form">${decRows.join("")}</div><div class="fhint">Every receiver of ${esc(radio)} runs these: changes restart the running ones. Hover over an option for more.</div>`
-    + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div>`;
+    + `<div class="fremove"><button class="btn small" ${at} data-act="resetdefaults">Reset to defaults</button></div></div>`);
+  return { bar, rows: [recRow], entries };
 }
 
 // the server's Add a radio; a radio Find writes opens on its Node, ready for its spotter ID
@@ -2193,6 +2206,7 @@ function pickSetting(link, name, key, value) {
     : name.startsWith("+node:") ? nodeBase(link.seat || {}, name.slice(6)) : null;  // a Flex radio's options, for every copy
   const saved = (i && i.settings) || tpl || {}, pend = app.pending[k] || (app.pending[k] = {});
   const base = key === "run" ? !!i && i.state === "running"  // run on or off, applied as a start or stop
+    : key === "record" && name.startsWith("+node:") ? nodeRecording(link.seat || {}, name.slice(6))
     : RX_KEYS.includes(key) ? (rxOf(link.server, name) || {})[key] : saved[key];  // the receive path: the radio's
   if (base === value || (key === "validation" && (saved[key] || "off") === value)) delete pend[key]; else pend[key] = value;
   if (!Object.keys(pend).length) delete app.pending[k];
@@ -2252,8 +2266,13 @@ async function applySettings(link, name) {
 async function applyNode(link, radio) {
   const seat = link.seat || {}, k = pendKey(link.server, nodeKey(radio)), base = nodeBase(seat, radio);
   const settings = { ...Object.fromEntries(nodeDiffers(seat, radio).map(key => [key, base[key]])), ...(app.pending[k] || {}) };
+  const copies = (seat.instances || []).filter(i => i.radio === radio);
+  const record = settings.record;
+  delete settings.record;
   let ok = true;
-  for (const c of (seat.instances || []).filter(i => i.radio === radio)) ok = (await seatRequest(link, "set", c.name, settings)) && ok;
+  if (Object.keys(settings).length) for (const c of copies) ok = (await seatRequest(link, "set", c.name, settings)) && ok;
+  // then recording, in place on every running receiver: after the restarts, which come up not recording
+  if (record !== undefined) for (const c of copies.filter(i => i.state === "running")) ok = (await seatRequest(link, "set", c.name, { record })) && ok;
   if (ok) delete app.pending[k];
   renderSettings();
 }

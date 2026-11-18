@@ -875,7 +875,7 @@ class Server:
         target = self._feed_target(name)
         answer = feed_control(*target, {"record": record_wav}) if target else None
         if answer is None:
-            log.warning("Server: %s gave no answer to a live recording change: restarting it", name)
+            log.warning("Server: %s gave no answer to a live recording change: recording not changed", name)
         return answer
 
     def _live_rx(self, name: str, rx: dict[str, Any]) -> tuple[bool, str] | None:

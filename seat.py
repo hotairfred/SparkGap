@@ -573,6 +573,8 @@ class Seat:
         name = i.name
         if pid := self.pid(name):
             return f"{name}: already running (pid {pid})"
+        if self.config(i).get("record_wav"):  # a start comes up not recording (cdub89/SparkGap#32)
+            write_config(i.config, {"record_wav": None})
         self.station_up(i)
         log = self.logs / f"{name}_{self.band(i)}_{utc_stamp()}.log"
         pidfile = self.logs / f"{name}.pid"
@@ -656,9 +658,10 @@ class Seat:
         alone first goes to live(name, band), which moves the running copy in place and returns its
         answer, None when it could not (then the copy restarts, onto the band just written), or
         raises SeatError while the copy recovers from a radio outage (nothing written).
-        Recording on a running copy goes live too (cdub89/SparkGap#32): an HPSDR radio's RECORD file
-        switches its all-band recorder at the next minute; any other copy's single-band file goes to
-        live_record(name, file name or None), with a restart when it gives no answer.
+        Recording on a running copy goes live too (cdub89/SparkGap#32): an HPSDR radio's or a multi-band
+        RTP node's RECORD file switches its all-band recorder (on at once, off at the next minute); a one-band copy's file goes to
+        live_record(name, file name or None) and is refused without an answer; a stopped one-band copy
+        does not take recording on, and every start clears its record_wav: it comes up not recording.
         Receive path settings (RX_SETTINGS) on a running copy go to live_rx(name, change) only;
         given to a stopped copy, they are written as its startup values."""
         i = self.instance(name)
@@ -711,7 +714,12 @@ class Seat:
                 if not isinstance(value, bool):
                     raise SeatError("record must be true or false")
                 cfg = self.config(i)
-                if cfg.get("sdr_type") == "hpsdr":  # every band, switched by the recorder's RECORD file
+                # every band, switched by the recorder's RECORD file: HPSDR (its C receiver feeds no
+                # record_wav), or RTP with more than one band at 192 kHz (the Python path's minutes feed it)
+                if cfg.get("sdr_type") == "hpsdr" or (
+                    cfg.get("sdr_type") == "rtp" and len(cfg.get("bands") or ()) > 1
+                    and cfg.get("sample_rate", 48_000) == 192_000
+                ):
                     iq_dir = Path(cfg.get("record_iq_dir") or self.rec / name)
                     if "record_iq_dir" not in cfg:
                         changes["record_iq_dir"] = str(iq_dir)
@@ -754,13 +762,16 @@ class Seat:
                     else:
                         flag.unlink(missing_ok=True)
                     if "record_iq_dir" not in changes:  # its recorder runs: no restart
-                        said.append(f"recording {'on' if on else 'off'} at the next minute")
+                        said.append("recording on, files at the next minute" if on else "recording off at the next minute")
                         del rest["record"]
-                elif running and live_record is not None:
-                    took = live_record(name, record_wav)
-                    if took is not None and took[0]:
-                        said.append(took[1])
-                        del rest["record"]
+                elif running:  # in place, or not at all: a restart would come up not recording
+                    took = live_record(name, record_wav) if live_record is not None else None
+                    if took is None or not took[0]:
+                        raise SeatError(f"{name}: {took[1] if took else 'did not answer'}; recording not changed")
+                    said.append(took[1])
+                    del rest["record"]
+                elif on:
+                    raise SeatError(f"{name}: recording turns on while it runs")
             answer = None
             if running and live is not None and set(rest) == {"band"}:
                 answer = live(name, settings["band"])  # before the write: a refusal changes nothing

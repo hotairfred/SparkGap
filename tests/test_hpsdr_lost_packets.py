@@ -45,6 +45,7 @@ def radio():
         getattr(lib, f).argtypes = [ct.c_void_p]
     lib.hpsdr_set_freq.argtypes = [ct.c_void_p, ct.c_int, ct.c_uint32]
     lib.hpsdr_enable_ft8.argtypes = [ct.c_void_p, ct.c_int, ct.c_double, ct.c_double]
+    lib.hpsdr_disable_ft8.argtypes = [ct.c_void_p, ct.c_int]
     lib.hpsdr_pkt_lost.restype = ct.c_uint64
     lib.hpsdr_pkt_lost.argtypes = [ct.c_void_p]
     lib.hpsdr_ft8_swap_read.argtypes = [ct.c_void_p, ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_int,
@@ -106,3 +107,30 @@ def test_a_long_jump_resyncs_without_filling(radio) -> None:
     send([0, 1, 100_000, 100_001])                       # over a second ahead: the radio restarted
     assert lib.hpsdr_pkt_lost(h) == 0
     assert len(snapshot()) == 4 * SPP
+
+
+def test_capture_off_frees_and_on_again_starts_fresh(radio) -> None:
+    """cdub89/SparkGap#32 R6: a recording's capture turned off while packets arrive, then on again."""
+    lib, h, send, snapshot = radio
+    send(list(range(0, 5)))
+    lib.hpsdr_disable_ft8(h, 0)
+    assert len(snapshot()) == 0                          # off: buffers gone, nothing to read
+    send(list(range(5, 10)))                             # packets while off are not captured
+    lib.hpsdr_enable_ft8(h, 0, 14_074_000.0, 14_074_000.0)
+    send(list(range(10, 13)))
+    i = snapshot()
+    assert len(i) == 3 * SPP and i[0] == 11
+
+
+def test_capture_toggles_while_packets_stream(radio) -> None:
+    """The receive thread never writes to a freed buffer: on and off many times under traffic."""
+    import threading
+    lib, h, send, snapshot = radio
+    feed = threading.Thread(target=send, args=(list(range(0, 3000)),))
+    feed.start()
+    while feed.is_alive():
+        lib.hpsdr_disable_ft8(h, 0)
+        lib.hpsdr_enable_ft8(h, 0, 14_074_000.0, 14_074_000.0)
+    feed.join()
+    send([3000, 3001])
+    assert len(snapshot()) > 0

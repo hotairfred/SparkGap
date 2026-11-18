@@ -13,8 +13,8 @@ Config:
 
 Recording only happens while the file <record_iq_dir>/RECORD exists, so a
 capture can be started and stopped without restarting the skimmer:
-    touch /home/sparkgap/iqrec/RECORD    # start (files open at the next minute)
-    rm    /home/sparkgap/iqrec/RECORD    # stop  (files close at the next minute)
+    touch /home/sparkgap/iqrec/RECORD    # start (C receiver: capture now, files open at the next minute)
+    rm    /home/sparkgap/iqrec/RECORD    # stop  (the minute in hand is written, then files close)
 Each session writes one stereo (I,Q) WAV per band:
     <dir>/<UTC stamp>_<band kHz>kHz_<rate>_<bits>bit.wav
 The stamp is the time of the session's first sample (the first minute's
@@ -91,10 +91,14 @@ class BandRecorder:
         self._paths = {}              # band_khz -> the file it writes
         self.max_data_bytes = MAX_DATA_BYTES
         self._session = None          # UTC stamp of the open session
+        self._bands = set()           # bands recording: each writes its minute in hand when RECORD goes
         self.dropped = 0
         threading.Thread(target=self._run, name='iq-recorder', daemon=True).start()
         log.info("IQ recorder ready: %s (%d-bit); touch %s to record",
                  rec_dir, bits, os.path.join(rec_dir, 'RECORD'))
+        if self.active():   # a restart does not quietly resume a recording someone forgot
+            log.warning("IQ recording on at start: %s is there; remove it to stop",
+                        os.path.join(rec_dir, 'RECORD'))
 
     def largest_bytes(self):
         """The audio bytes in the largest band file open now (each file stops at the WAV limit), 0 before
@@ -107,13 +111,23 @@ class BandRecorder:
     def submit(self, band_khz, t_first, fi, fq, n):
         """Called once per band per minute swap. fi/fq must not be reused by
         the caller afterwards (the FT8 path allocates them fresh each swap)."""
-        item = ('data', band_khz, t_first, fi, fq, n) if self.active() else ('stop',)
-        try:
-            self._q.put_nowait(item)
-        except queue.Full:
-            self.dropped += 1
-            log.warning("IQ recorder queue full: dropped %s kHz minute (disk too slow?)",
-                        band_khz)
+        data = ('data', band_khz, t_first, fi, fq, n)
+        if self.active():
+            self._bands.add(band_khz)
+            items = [data]
+        elif band_khz in self._bands:    # RECORD removed: this minute is still written, then the files close
+            self._bands.discard(band_khz)
+            items = [data] if self._bands else [data, ('stop',)]
+        else:
+            self._bands.clear()
+            items = [('stop',)]
+        for item in items:
+            try:
+                self._q.put_nowait(item)
+            except queue.Full:
+                self.dropped += 1
+                log.warning("IQ recorder queue full: dropped %s kHz minute (disk too slow?)",
+                            band_khz)
 
     def _open(self, band_khz, t_first, part=1):
         if self._session is None:

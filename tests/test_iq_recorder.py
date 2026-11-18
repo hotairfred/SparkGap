@@ -68,13 +68,18 @@ def test_record_append_gap_and_stop(caplog=None):
         rec.submit(14090, 200.0, i3, q3, 400)
         _wait(rec)
         os.remove(os.path.join(d, 'RECORD'))
-        rec.submit(7090, 201.0, i1, q1, 600)           # inactive -> closes session
+        rec.submit(7090, 201.0, i1, q1, 600)           # RECORD gone: the minute in hand is still written
+        rec.submit(14090, 200.4, i1, q1, 600)          # the last recording band's, then the files close
         _wait(rec)
+        assert rec._writers == {}
         files = sorted(glob.glob(os.path.join(d, '*.wav')))
         assert len(files) == 2 and any('_7090kHz_' in f for f in files)
         gi, gq = _read24([f for f in files if '_7090kHz_' in f][0])
-        assert np.array_equal(gi, np.concatenate([i2, i3]).astype(np.int32))   # bit-exact
-        assert np.array_equal(gq, np.concatenate([q2, q3]).astype(np.int32))
+        assert np.array_equal(gi, np.concatenate([i2, i3, i1]).astype(np.int32))   # bit-exact
+        assert np.array_equal(gq, np.concatenate([q2, q3, q1]).astype(np.int32))
+        rec.submit(7090, 201.6, i1, q1, 600)           # the minute after: nothing more
+        _wait(rec)
+        assert len(glob.glob(os.path.join(d, '*.wav'))) == 2 and rec._writers == {}
 
 
 def test_gap_is_logged():
