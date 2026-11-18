@@ -1714,7 +1714,7 @@ function leftPaneHtml(pick) {
       const band = (i.receivers && i.receivers.length ? i.receivers.map(r => r.band).join(", ") : String(i.band || ""));
       return `<button class="navrx${is("rx", i.name) ? " on" : ""}" data-act="pick" data-server="${k}" data-kind="rx" data-pick="${esc(i.name)}">`
         + `<span class="rxtop">${dot(i.busy ? "busy" : i.state)}<b>${esc(i.name)}</b><span class="rxband">${esc(band)}</span>${pend ? '<span class="pdot" title="change not applied"></span>' : ""}<span class="chev">›</span></span>`
-        + `<span class="rxsub">${esc(i.busy ? `${i.busy}...` : i.state)}${!i.busy && i.state === "running" && (i.settings || {}).record ? ' · <span class="warn">recording</span>' : ""}</span></button>`;
+        + `<span class="rxsub">${esc(i.busy ? `${i.busy}...` : i.state)}</span></button>`;
     };
     const card = (kind, name, top, sub) => `<div class="navrx${is(kind, name) ? " on" : ""}" role="button" tabindex="0" data-act="pick" data-server="${k}" data-kind="${kind}" data-pick="${esc(name)}">`
       + `<span class="rxtop">${top}<span class="chev">›</span></span>${sub ? `<span class="rxsub">${sub}</span>` : ""}</div>`;
@@ -1733,7 +1733,8 @@ function leftPaneHtml(pick) {
       blocks.push(`<div class="navradio">`
         + card("radio", r.name, `${dot(radioState)}<b>Radio</b><span class="rxband">${esc(r.model || TYPE_NAMES[r.type] || r.type || "")}</span>`, esc(r.address || ""))
         + card("node", r.name, `${dot(nodeState)}<b>Node</b><span class="rxband">${esc(r.callsign || "no spotter ID")}</span>`,
-          esc(`RBN Upload: ${r.rbn_upload || "off"}${f && up ? ` · ${Number(f.sent) || 0} sent` : ""}`))
+          esc(`RBN Upload: ${r.rbn_upload || "off"}${f && up ? ` · ${Number(f.sent) || 0} sent` : ""}`)
+          + (nodeRecording(seat, r.name) ? ' · <span class="warn">recording</span>' : ""))
         + `<div class="navhead">RECEIVERS</div>${mine.map(rxItem).join("")}`
         + addItem(k, seat, r.name, is("add", r.name))
         + `</div>`);
@@ -1784,7 +1785,8 @@ function receiverPaneHtml(k, sv, i, rxNum, part = "rx") {
       : r.num_scu > 1 ? `Antenna and RF gain are shared by the receivers on the same SCU (${r.num_scu} SCUs; the radio does not say which): check the others after a change.` : SHARED_NOTE;
     rows.push(`<div class="frow"><span></span><span class="fhint">${esc(note)}</span></div>`);
   } else if (i.radio && !run && radioOf(sv, i).rx_settings && radioOf(sv, i).rx_settings.length) rows.push(`<div class="frow"><span></span><span class="fhint">Antenna and RF gain show while ${esc(i.name)} runs.</span></div>`);
-  if (node || (own && run)) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record), "record" in pend ? `<span class="fnote">${run ? "in place, no restart" : "from the next start"}</span>` : "")
+  if (node || (own && run)) rows.push(row("RECORDING", segOf("record", [[false, "off"], [true, "on"]], !!st.record)
+      .replace('<div class="seg', `<div class="seg${run && saved.record && !("record" in pend) ? " rec" : ""}`), "record" in pend ? `<span class="fnote">${run ? "in place, no restart" : "from the next start"}</span>` : "")
     .replace('<div class="frow"', `<div class="frow" title="${esc(HINTS.record)}"`));
   if (!node && !own) rows.push(`<div class="frow"><span></span><span class="fhint">${list ? `Run, recording, decoder options and details: ${esc(radioName)}'s Node, for all its receivers.`
     : `Recording and decoder options: ${esc(radioName)}'s Node, for all its receivers.`}</span></div>`);
@@ -1938,7 +1940,7 @@ function nodeOptionsHtml(k, sv, radio, copies) {
     + `<button class="btn small primary" ${at} data-cmd="apply">${restarts ? `Apply (restarts ${esc(running.join(", "))})` : running.length ? "Apply" : "Save"}</button>`
     + (n ? `<button class="btn small" ${at} data-cmd="discard">Discard</button>` : "") + `</div>` : "";
   const rec = "record" in pend ? pend.record : nodeRecording(seat, radio);
-  const recRow = running.length ? `<div class="frow" title="${esc(HINTS.record)}"><span class="flabel">RECORDING</span><span class="fctl"><div class="seg${"record" in pend ? " pend" : ""}" ${at} data-key="record">`
+  const recRow = running.length ? `<div class="frow" title="${esc(HINTS.record)}"><span class="flabel">RECORDING</span><span class="fctl"><div class="seg${"record" in pend ? " pend" : rec ? " rec" : ""}" ${at} data-key="record">`
     + [[false, "off"], [true, "on"]].map(([v, l]) => `<span data-value="${v}"${v === rec ? ' class="on"' : ""}>${l}</span>`).join("")
     + `</div><span class="fnote">${esc(`in place on ${running.join(", ")}`)}</span></span></div>`
     : `<div class="frow"><span class="flabel">RECORDING</span><span class="fctl"><span class="fnote">${esc(`turns on while a receiver of ${radio} runs`)}</span></span></div>`;

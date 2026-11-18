@@ -100,6 +100,7 @@ A receiver's settings:
   after a restart. A Web-888 records every band: it
   starts at once, its files appear at the next minute, and it stops at the
   next minute; while its RECORD file is there, it records across a restart.
+  While it records, the Node card says so and the switch shows on in orange.
 - **DECODED TEXT**: SparkGap reads each signal twice, through a wide and a
   narrow filter. **Lowest cost** (the default) shows whichever it is surer of;
   you can show both, or only one. This is for this browser, all receivers.
