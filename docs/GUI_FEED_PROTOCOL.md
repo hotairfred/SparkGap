@@ -136,7 +136,7 @@ What happened before the client connected.
  "windows": [{"type": "window", "khz": 7021.2, "text": "CQ DE W1AW W1AW K",
               "wpm": 22.0, "snr": 18.0, "cost": 0.4, "utc": 1792020908.1}],
  "spots": [{"type": "spot", "khz": 7021.2, "call": "W1AW", "snr": 18.0, "wpm": 22,
-            "utc": 1792020909.4}],
+            "utc": 1792020909.4, "why": "Spotted CQ"}],
  "status": null}
 ```
 
@@ -167,8 +167,11 @@ A spot, as sent to telnet.
 
 ```json
 {"type": "spot", "khz": 7021.2, "call": "W1AW", "snr": 18.0, "wpm": 22,
- "utc": 1792020909.4}
+ "utc": 1792020909.4, "why": "Spotted CQ"}
 ```
+
+- `why`: under `spot_rule_gates`, the reason the spot passed every gate
+  (`docs/SPOT_RULES.md`). Absent under the other rules.
 
 ### status
 
@@ -346,6 +349,35 @@ nothing from the old band arrives after the new `hello`. A client should treat a
   change through the server`. The copy takes `for` only on a view-only feed
   opened from its own machine.
   Browsers change settings through the server's own commands.
+
+### why
+
+Asks why a call was or was not spotted: the spot rule's newest decision on the
+call within 1 kHz of `khz`, from the rule whose spots the feed shows. It
+changes nothing, so a view-only connection may ask too.
+
+```json
+{"type": "why", "id": 6, "call": "K1VUT", "khz": 7031.4}
+```
+
+The answer goes only to the client that asked:
+
+```json
+{"type": "why_result", "id": 6, "call": "K1VUT", "ok": true,
+ "message": "Not copied clearly enough"}
+```
+
+A pass reads as the spot's `why`: `Spotted` and the keyword or qualifier that
+passed (`Spotted CQ`, `Spotted POTA`) or `Spotted beacon`. A fail names its
+group of gates: `Not a valid call` (1), `On the bad calls list` or `Not in SCP`
+(2), `Not copied clearly enough` (3, 4), `Not heard calling CQ` (5, 7, 8),
+`Already spotted` (9, 10) or `Outside the spotted range` (11); the debug log
+keeps the gate and its detail. With no
+decision kept on the call (the rule keeps its last 10,000) the message is `No
+decision on this call yet`; under the repeat rule, `No reasons under the Repeat
+Rule`. A refusal (`call must be a
+callsign`, `khz must be a number`, `not supported`) has `"ok": false` and
+`error` in place of `message`. A message with no usable `id` gets no answer.
 
 ## Keeping the connection
 

@@ -1,7 +1,7 @@
 """Gate spot rule (spot_rule2.py): one pass and one fail case per requirement."""
 
 from spot_rule import tokens
-from spot_rule2 import GateSpotRule, keyword_calls
+from spot_rule2 import GateSpotRule, keyword_calls, said
 
 RARE = {"KX9QQ"}          # unflagged patt3ch pattern: 3 reads
 NONE = {"TT5T"}           # no pattern: 5 reads
@@ -364,3 +364,41 @@ def test_window_lines_only_with_itila2_dump_windows(monkeypatch, caplog) -> None
     assert [r.getMessage() for r in caplog.records if "ITILA window" in r.getMessage()] == \
         ["ITILA window 2 bin 7 14030.0 kHz snr 12.0 snr500 None"]
     assert len(st['pending']) == 2
+
+
+def test_a_spot_keeps_its_reason_and_the_latest_decision_is_kept_per_call() -> None:
+    """cdub89/SparkGap#51 R10: SparkGap Web shows why a call spotted, or the gate that stopped it."""
+    r = _rule()
+    assert _feed(r, "CQ K1ABC K1ABC", f=14025.0) == ["K1ABC"]
+    assert r.spot_why[("K1ABC", 14025.0)] == "Spotted CQ"
+    assert r.latest("K1ABC", 14025.4) == (0, "Spotted CQ, 2 reads")
+    _feed(r, "CQ K1ABC K1ABC", t=300, f=14025.0)                # gate 10: spotted 5 minutes ago
+    assert r.latest("K1ABC", 14025.0) == (10, "spotted in the last 10 min")
+    assert r.latest("K1ABC", 14027.0) is None                   # 2 kHz away: another signal
+    assert r.latest("W1AW", 14025.0) is None
+
+
+def test_two_spots_of_one_call_in_a_pass_keep_their_own_reasons() -> None:
+    r = _rule()
+    r.feed(r.window_id(1, 1, 0.0), 7025.0, "CQ K1ABC K1ABC", 0.0)
+    r.feed(r.window_id(2, 1, 0.0), 14025.0, "CQ CQ K1ABC K1ABC K1ABC", 0.0)
+    assert sorted(r.end_pass()) == [("K1ABC", 7025.0), ("K1ABC", 14025.0)]
+    assert r.spot_why[("K1ABC", 7025.0)] == "Spotted CQ"
+    assert r.spot_why[("K1ABC", 14025.0)] == "Spotted CQ"
+
+
+def test_said_names_the_word_that_passed_or_the_group_that_failed() -> None:
+    """SparkGap Web's words (cdub89/SparkGap#51 R10); the trace keeps the gate and its detail."""
+    r = _rule(qualifiers=["POTA"])
+    _feed(r, "CQ K1ABC K1ABC")
+    _feed(r, "POTA N6RO N6RO", f=7030.0)
+    _feed(r, "KH6RS T", f=21150.0)
+    assert [r.spot_why[k] for k in (("K1ABC", 14025.0), ("N6RO", 7030.0), ("KH6RS", 21150.0))] == [
+        "Spotted CQ", "Spotted POTA", "Spotted beacon"]
+    _feed(r, "CQ KX9QQ", f=7040.0)
+    assert said(*r.latest("KX9QQ", 7040.0)) == "Not copied clearly enough"
+    assert said(2, "banned call") == "On the bad calls list"
+    assert said(2, "not in SCP") == said(2, "not in SCP or the known calls") == "Not in SCP"
+    assert [said(g, "") for g in (1, 3, 4, 5, 7, 8, 9, 10, 11)] == [
+        "Not a valid call"] + ["Not copied clearly enough"] * 2 + ["Not heard calling CQ"] * 3 + [
+        "Already spotted"] * 2 + ["Outside the spotted range"]

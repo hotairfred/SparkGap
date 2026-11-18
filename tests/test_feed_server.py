@@ -845,3 +845,49 @@ def test_new_bands_count_windows_calls_and_spots_from_zero(feed: FeedServer) -> 
     wait_for(lambda: feed.status is not None and feed.status.get("bins") == 2)
     s = feed.status
     assert (s["windows"], s["calls"], s["spots_hour"], s["bins_peak"]) == (0, 0, 0, 2)
+
+
+def _ask_why(c: WS, call: object, khz: object, rid: object = "w1") -> None:
+    c.send(OP_TEXT, json.dumps({"type": "why", "id": rid, "call": call, "khz": khz}).encode())
+
+
+def test_why_is_answered_on_a_view_only_feed(feed: FeedServer) -> None:
+    """Read only: a view-only client may ask why a call was or was not spotted (cdub89/SparkGap#51 R10)."""
+    asked: list[tuple[str, float]] = []
+    feed.on_why = lambda call, khz: (asked.append((call, khz)), "Not copied clearly enough")[1]
+    c = WS(feed.port, path="/feed?view")
+    c.json("snapshot")
+    _ask_why(c, "k1vut", 7031.4)
+    assert c.json("why_result") == {
+        "type": "why_result", "id": "w1", "call": "k1vut", "ok": True, "message": "Not copied clearly enough"
+    }
+    assert asked == [("K1VUT", 7031.4)]
+
+
+@pytest.mark.parametrize("call, khz, error", [
+    ("K1VUT", 7031.4, "not supported"),
+    ("", 7031.4, "call must be a callsign"),
+    ("K1VUT", "7031.4", "khz must be a number"),
+])
+def test_a_why_that_cannot_be_answered_says_why(feed: FeedServer, call: object, khz: object, error: str) -> None:
+    c = WS(feed.port)
+    c.json("snapshot")
+    _ask_why(c, call, khz)
+    assert c.json("why_result")["error"] == error
+
+
+def test_a_spot_carries_its_reason_when_it_has_one(feed: FeedServer) -> None:
+    c = WS(feed.port)
+    c.json("snapshot")
+    feed.publish_spot(7021.2, "W1AW", 18, 22, "Spotted CQ")
+    feed.publish_spot(7023.0, "K1ABC", 12, 20)
+    assert c.json("spot")["why"] == "Spotted CQ"
+    assert "why" not in c.json("spot")
+
+
+def test_a_khz_too_large_for_a_float_is_refused_not_raised(feed: FeedServer) -> None:
+    """A JSON number past a float's range (1 and 400 zeros) answers an error instead of dropping the client."""
+    sent: list[bytes] = []
+    feed._call = lambda fn, c, frame: sent.append(frame)  # type: ignore[method-assign]
+    feed._on_why(None, {"type": "why", "id": 1, "call": "K1VUT", "khz": 10**400})  # type: ignore[arg-type]
+    assert json.loads(sent[0][sent[0].index(b"{"):])["error"] == "khz must be a number"

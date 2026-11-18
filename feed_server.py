@@ -26,6 +26,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import secrets
 import socket
@@ -73,6 +74,7 @@ SIGNAL_TIMEOUT_S = 120  # a signal leaves the snapshot after this long without a
 MAX_HEADER_BYTES = 8_192
 MAX_CLIENT_MESSAGE = 65_536
 CONTROL_ID_CHARS = 64
+WHY_CALL_CHARS = 16  # a why message's call: longer is not a callsign
 CLIENT_QUEUE_MAX = 5_000  # text messages queued for one client before it is dropped
 MAX_CLIENTS = 16
 MAX_PENDING = 32  # connections still sending their request; more are closed at once
@@ -278,6 +280,8 @@ class FeedServer:
         self.tid = 0
         # live changes (control messages): SparkGap sets this to take them; None answers "not supported"
         self.on_control: Callable[[dict[str, Any], Callable[[bool, str], None]], None] | None = None
+        # why messages: SparkGap sets this to answer (call, kHz) with its spot rule's latest decision
+        self.on_why: Callable[[str, float], str] | None = None
 
     # ---- lifecycle ----
 
@@ -363,19 +367,18 @@ class FeedServer:
             },
         )
 
-    def publish_spot(self, khz: float, call: str, snr: float | None, wpm: int | None) -> None:
-        self._call(
-            self._on_text,
-            {
-                "type": "spot",
-                "khz": round(float(khz), 2),
-                "call": call,
-                "snr": None if snr is None else float(snr),
-                "wpm": float(wpm) if wpm else None,  # SparkGap's spots carry 0 for an unknown speed
-                "utc": time.time(),
-            },
-            self.spots,
-        )
+    def publish_spot(self, khz: float, call: str, snr: float | None, wpm: int | None, why: str | None = None) -> None:
+        spot = {
+            "type": "spot",
+            "khz": round(float(khz), 2),
+            "call": call,
+            "snr": None if snr is None else float(snr),
+            "wpm": float(wpm) if wpm else None,  # SparkGap's spots carry 0 for an unknown speed
+            "utc": time.time(),
+        }
+        if why:
+            spot["why"] = why  # the gate rule's reason (spot_rule_gates)
+        self._call(self._on_text, spot, self.spots)
 
     def publish_status(self, status: dict[str, Any]) -> None:
         self._call(self._on_status, {"type": "status", **status, "utc": time.time()})
@@ -781,6 +784,28 @@ class FeedServer:
             self._watch()
         elif isinstance(msg, dict) and msg.get("type") == "control":
             self._on_control(c, msg)
+        elif isinstance(msg, dict) and msg.get("type") == "why":
+            self._on_why(c, msg)
+
+    def _on_why(self, c: Client, msg: dict[str, Any]) -> None:
+        """Why a call was or was not spotted: read only, so a view-only client may ask too."""
+        rid, call, khz = msg.get("id"), msg.get("call"), msg.get("khz")
+        if not isinstance(rid, (str, int)) or len(str(rid)) > CONTROL_ID_CHARS:
+            return
+        try:
+            khz = float(khz) if isinstance(khz, (int, float)) and not isinstance(khz, bool) else None
+        except OverflowError:
+            khz = None
+        if not isinstance(call, str) or not call or len(call) > WHY_CALL_CHARS:
+            ok, text = False, "call must be a callsign"
+        elif khz is None or not math.isfinite(khz):
+            ok, text = False, "khz must be a number"
+        elif self.on_why is None:
+            ok, text = False, "not supported"
+        else:
+            ok, text = True, self.on_why(call.upper(), khz)
+        result = {"type": "why_result", "id": rid, "call": call, "ok": ok, ("message" if ok else "error"): text}
+        self._call(self._queue, c, encode_frame(OP_TEXT, json.dumps(result).encode()))
 
     def _on_control(self, c: Client, msg: dict[str, Any]) -> None:
         """A live change; the answer goes to the asking client only, from any thread."""

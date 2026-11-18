@@ -128,6 +128,20 @@ def _gui_settings(cfg, sample_rate):
     return eff, defaults, built_in
 
 
+def _why_answer(rule, call, khz):
+    """A why message from SparkGap Web (cdub89/SparkGap#51 R10): the gate rule's newest decision on
+    call within 1 kHz of khz, in plain words (spot_rule2.said); the debug log keeps the gate."""
+    if rule is None:
+        return "No spot rule running"
+    if not hasattr(rule, 'latest'):
+        return "No reasons under the Repeat Rule"
+    d = rule.latest(call, khz)
+    if d is None:
+        return "No decision on this call yet"
+    from spot_rule2 import said
+    return said(*d)
+
+
 def _start_gui_feed(cfg, bands, sample_rate, managers):
     """Start the GUI feed and give each band's manager a spectrum tap. bands: [(name, center_hz)]."""
     global _gui_feed
@@ -7873,11 +7887,12 @@ class SpotTracker:
                 continue
             seen = self._pass_intents.pop(id(rule), {})
             for call, f in rule.end_pass():
+                why = rule.spot_why.pop((call, f), None)    # taken for every spot, or spot_why grows
                 intent = seen.get(f)
                 if call in self.blacklist or intent is None:
                     continue
                 spots.append({'call': call, 'freq_khz': f, 'snr': rule.spot_snr.get(call, intent.snr_db),
-                              'wpm': intent.wpm, 'method': 'repeat', 'stream': stream})
+                              'wpm': intent.wpm, 'method': 'repeat', 'stream': stream, 'why': why})
         return spots
 
     def process_intent(self, intent):
@@ -8892,6 +8907,9 @@ class SparkGap:
                         self.managers)
         if _gui_feed is not None and hasattr(self.receiver, 'retune'):
             _gui_feed.on_control = self._take_control
+        if _gui_feed is not None:   # the rule of the spots the feed shows
+            _gui_feed.on_why = lambda call, khz: _why_answer(
+                self.tracker.spot_rule if self._feed_takes('rbn') else self.tracker.local_rule, call, khz)
 
         self.receiver.start()
         self.running = True
@@ -9734,7 +9752,7 @@ class SparkGap:
                         method   = spot.get('method', 'exact')
                         spot_wpm = spot.get('wpm', 0)
                         if _gui_feed and self._feed_takes(stream):
-                            _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'], spot_wpm)
+                            _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'], spot_wpm, spot.get('why'))
                         if stream == 'local':
                             # Not "*** SPOT:": log scorers count those as the RBN stream.
                             log.info("*** LOCAL SPOT: %10.2f  %-12s  %d dB  %d WPM ***",
@@ -10381,6 +10399,8 @@ def run_file_mode(args, config):
     all_spots = []
     chunk_sec = 300  # 5-minute chunks
     _start_gui_feed(config, [(f"{center_khz:.0f} kHz", center_khz * 1000.0)], file_rate, [manager])
+    if _gui_feed is not None:
+        _gui_feed.on_why = lambda call, khz: _why_answer(tracker.spot_rule, call, khz)
     gui_pace, gui_audio0, last_gui_status = None, None, 0
 
     start_sec = args.start_min * 60
@@ -10596,7 +10616,7 @@ def run_file_mode(args, config):
                     spotted_freqs.add(spot['freq_khz'])
                     if _gui_feed:
                         _gui_feed.publish_spot(spot['freq_khz'], spot['call'], spot['snr'],
-                                               spot.get('wpm', 0))
+                                               spot.get('wpm', 0), spot.get('why'))
                     log.info("SPOT: %.2f kHz %s %d dB %d WPM [%s]",
                              spot['freq_khz'], spot['call'],
                              spot['snr'], spot.get('wpm', 0), spot['method'])

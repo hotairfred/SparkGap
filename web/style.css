@@ -97,6 +97,7 @@ main { flex: 1; display: flex; gap: 12px; min-height: 0; }
 .dcopy { display: flex; align-items: center; justify-content: space-between; }
 .dcopy #dShow { margin-left: auto; margin-right: 6px; }
 .note { padding: 6px 16px; color: var(--muted); font-size: 12px; }
+.dwhy { margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .wins { flex: 1; overflow-y: auto; scrollbar-width: thin; padding: 6px 16px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 11px; }
 .win { display: flex; gap: 10px; }
 .win .t { color: var(--faint); flex: none; }

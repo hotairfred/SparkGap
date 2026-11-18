@@ -88,6 +88,21 @@ REASONS = {1: "not a callsign structure", 2: "banned call", 3: "not read enough"
            4: "not the best reading", 5: "no keyword", 7: "call not with the keyword",
            8: "the keyword follows another call", 9: "stronger copy elsewhere",
            10: "spotted in the last 10 min", 11: "outside the RBN window or notched"}
+SAID = {1: "Not a valid call", 2: "On the bad calls list", 3: "Not copied clearly enough",
+        4: "Not copied clearly enough", 5: "Not heard calling CQ", 7: "Not heard calling CQ",
+        8: "Not heard calling CQ", 9: "Already spotted", 10: "Already spotted",
+        11: "Outside the spotted range"}       # SparkGap Web's words for a gate; the log keeps REASONS
+
+
+def said(gate: int, why: str) -> str:
+    """A decision in SparkGap Web's words: a pass names the keyword or qualifier that passed
+    (Spotted CQ, Spotted POTA, Spotted beacon), a fail its group of gates; gate 2 says which list
+    stopped the call, so an owner knows what to change."""
+    if gate == 0:
+        return why.split(",")[0]
+    if gate == 2 and why.startswith("not in SCP"):     # gate 2's SCP check, not the bad calls list
+        return "Not in SCP"
+    return SAID.get(gate, "Not spotted")
 
 
 def read_bad_calls(path: str | Path) -> list[str]:
@@ -240,6 +255,7 @@ class GateSpotRule:
         self.best_reading = best_reading
         self.triggers = KEYWORDS | (frozenset(qualifiers) & QUALIFIERS)    # gates 5 and 6
         self.spot_snr: dict[str, float] = {}
+        self.spot_why: dict[tuple[str, float], str] = {}   # (call, kHz) of a spot -> why it passed, until taken
         # (t, kHz, call, gate, why)
         self.trace: deque[tuple[float, float, str, int, str]] = deque(maxlen=TRACE_KEPT)
         # bin -> {window: text}, oldest first
@@ -248,7 +264,7 @@ class GateSpotRule:
         self._reads: deque[tuple[float, str, float, float]] = deque()  # (t, call, kHz, SNR): gate 9
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}
         # gate 9: calls that passed every gate this pass, spotted by end_pass()
-        self._held: list[tuple[float, str, float, float | None, float | None]] = []
+        self._held: list[tuple[float, str, float, float | None, float | None, str]] = []
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._pruned = 0.0
         self._next_window = 0
@@ -345,7 +361,7 @@ class GateSpotRule:
             if snr is not None:
                 self._reads.append((now, call, freq_khz, snr))
             if self._check(call, buf, tied, freq_khz, now, snr):
-                self._held.append((now, call, freq_khz, snr, report))
+                self._held.append((now, call, freq_khz, snr, report, self.trace[-1][4]))
         return []
 
     def _stronger(self, call: str, f: float, snr: float | None) -> bool:
@@ -356,12 +372,19 @@ class GateSpotRule:
                 and any(c == call and MOVE_KHZ < abs(rf - f) < SAME_BAND_KHZ
                         and rs > snr - self.stronger_db for _, c, rf, rs in self._reads))
 
+    def latest(self, call: str, f: float) -> tuple[int, str] | None:
+        """The newest decision kept on this call within 1 kHz of f: (gate, why), gate 0 a pass."""
+        for _, rf, c, req, why in reversed(list(self.trace)):    # a copy: the feed thread asks while decoding appends
+            if c == call and abs(rf - f) < MOVE_KHZ:
+                return req, why
+        return None
+
     def end_pass(self) -> list[tuple[str, float]]:
         """Spot the calls held this pass: gates 9 and 10 again, now that every window of the
         pass is in. Returns [(call, kHz)]."""
         spots: list[tuple[str, float]] = []
         held, self._held = self._held, []
-        for now, call, f, snr, report in held:
+        for now, call, f, snr, report, why in held:
             if self._stronger(call, f, snr):
                 self._decide(now, f, call, 9)
                 continue
@@ -370,6 +393,7 @@ class GateSpotRule:
                 continue                              # the other filter path of a call just spotted
             spots.append((call, f))
             self._last_spot[(call, int(f // 1000))] = (now, f)
+            self.spot_why[(call, f)] = said(0, why)
             if report is not None or snr is not None:
                 self.spot_snr[call] = report if report is not None else snr      # type: ignore[assignment]
         return spots
@@ -425,8 +449,7 @@ class GateSpotRule:
             return self._decide(now, f, call, 11)
         if any(lo <= f <= hi for lo, hi in self.notched):
             return self._decide(now, f, call, 11, "notched frequency")
-        how = "beacon" if beacon else f"keyword {kw}"
-        return self._decide(now, f, call, 0, f"spot: {how}, {n} reads")
+        return self._decide(now, f, call, 0, f"Spotted {'beacon' if beacon else kw}, {n} reads")
 
     def last_spots(self) -> list[list]:
         return [[c, mhz, t, f] for (c, mhz), (t, f) in self._last_spot.items()]
