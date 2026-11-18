@@ -57,7 +57,7 @@ L2 = 0.01                    # ridge on every weight but bias
 DAY_S = 86_400
 
 _TIME = re.compile(r"^(\d\d):(\d\d):(\d\d) ")
-_RAW = re.compile(r"^(\d\d):(\d\d):(\d\d) INFO ITILA raw ([\d.]+) kHz cost=([\d.]+): (.*)$")
+_RAW = re.compile(r"^(\d\d):(\d\d):(\d\d) INFO ITILA raw ([\d.]+) kHz cost=([\d.]+)(?: snr=\S+)?(?: rep=\S+)?: (.*)$")
 _RBN = re.compile(r"^(\d\d):(\d\d):(\d\d) INFO RBN: [^,]*,,,[\d.]+,\w*,[A-Z0-9/]+,,,\w+,[^,]*,"
                   r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),")
 
