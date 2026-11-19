@@ -43,7 +43,7 @@ from urllib import request as urlreq
 
 import rbn_feeder as base
 from process_link import ProcessLink
-from spot_rule2 import BEACON_KHZ, NCDXF, NCDXF_KHZ
+from spot_rule2 import beacon_kind
 
 log = logging.getLogger("rbn2_feeder")
 
@@ -71,6 +71,7 @@ VALIDATION_ORDER = ("Off", "Permissive", "Normal", "Aggressive")
 MODE_CODE = {"CW": "1", "RTTY": "11"}  # Aggregator 6.7's mode table
 CQ_CODE = {"CQ": "1", "DX": "2", "BCN": "3", "BEACON": "3"}
 LISTED_BEACON, SLASH_B, NCDXF_BEACON = "3", "4", "5"  # the Aggregator's beacon types
+BEACON_TYPE = {"listed": LISTED_BEACON, "/B": SLASH_B, "NCDXF": NCDXF_BEACON}
 HIDDEN = ("fingerPrint", "fp", "h", "shortHash", "skimSignIn")  # never in a log
 
 
@@ -253,13 +254,8 @@ def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
 def spot_type(call: str, freq: float, cq_flag: str, beacons: dict[str, float]) -> str:
     """The spot's type code as the Aggregator sets it: a beacon match overrides CQ, and an NCDXF
     match a listed one, as spot_rule2's gate 12 finds them."""
-    if call in NCDXF and any(abs(freq - x) <= BEACON_KHZ for x in NCDXF_KHZ):
-        return NCDXF_BEACON
-    if call in beacons and abs(freq - beacons[call]) <= BEACON_KHZ:
-        return LISTED_BEACON
-    if call.upper().endswith("/B"):
-        return SLASH_B
-    return CQ_CODE.get(cq_flag, "1")
+    kind = beacon_kind(call, freq, beacons)
+    return BEACON_TYPE[kind] if kind else CQ_CODE.get(cq_flag, "1")
 
 
 class Respot:

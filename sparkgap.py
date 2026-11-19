@@ -553,12 +553,16 @@ def _rbn_spotter(cfg):
     return cfg.get('callsign', '') + ('' if suffix == '-#' else suffix)
 
 
-def _log_rbn_row(callsign, freq_khz, call, snr, wpm, t, tx_mode='CW'):
+def _log_rbn_row(callsign, freq_khz, call, snr, wpm, t, tx_mode='CW', beacons=None):
     """A spot for RBN as the archive row RBN would store (UTC, 0.1 kHz), for scoring a run before it is on RBN.
-    wpm is the speed column: WPM for CW, baud for RTTY."""
+    wpm is the speed column: WPM for CW, baud for RTTY. The mode column is the feeder's type: NCDXF B or
+    BEACON for a beacon (spot_rule2.beacon_kind, beacons = spot_rule_beacons), else CQ."""
+    from spot_rule2 import beacon_kind
+    kind = beacon_kind(call, freq_khz, beacons)
     band = SpotTracker._band_id_for_freq(freq_khz)
-    log.info("RBN: %s,,,%.1f,%s,%s,,,CQ,%d,%s,%d,%s", callsign.upper(), freq_khz,
-             '%dm' % band if band else '', call, round(snr), _rbn_utc(t), wpm, tx_mode)
+    log.info("RBN: %s,,,%.1f,%s,%s,,,%s,%d,%s,%d,%s", callsign.upper(), freq_khz,
+             '%dm' % band if band else '', call, 'NCDXF B' if kind == 'NCDXF' else 'BEACON' if kind else 'CQ',
+             round(snr), _rbn_utc(t), wpm, tx_mode)
 
 
 def _log_rbn_node(callsign, grid):
@@ -9791,7 +9795,8 @@ class SparkGap:
                                  spot['freq_khz'], spot['call'], spot['snr'],
                                  spot_wpm, method)
                         _log_rbn_row(_rbn_spotter(self.cfg), self._corrected_freq_khz(spot['freq_khz']),
-                                     spot['call'], spot['snr'], spot_wpm, time.time())
+                                     spot['call'], spot['snr'], spot_wpm, time.time(),
+                                     beacons=self.cfg.get('spot_rule_beacons'))
                         if self._spot_log:
                             import datetime
                             ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -10646,7 +10651,8 @@ def run_file_mode(args, config):
                              spot['snr'], spot.get('wpm', 0), spot['method'])
                     if t0 is not None:
                         _log_rbn_row(_rbn_spotter(config), spot['freq_khz'], spot['call'],
-                                     spot['snr'], spot.get('wpm', 0), t0 + _file_audio_t)
+                                     spot['snr'], spot.get('wpm', 0), t0 + _file_audio_t,
+                                     beacons=config.get('spot_rule_beacons'))
 
         # Final collect after all data fed — give decoders a moment to flush
         import time as _time
