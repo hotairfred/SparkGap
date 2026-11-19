@@ -1092,21 +1092,27 @@ def _ft8_cycle(jobs, skimmer):
                 i16 = (audio * 32767).astype(np.int16)
                 part = start // 12000  # used in WAV filename
                 wav_fn = f'/tmp/{mode.lower()}_{bn}_p{start}.wav'
-                with wave.open(wav_fn, 'wb') as wf:
-                    wf.setnchannels(1); wf.setsampwidth(2)
-                    wf.setframerate(12000)
-                    wf.writeframes(i16.tobytes())
+                # the WAV goes once the decoder has read it: aligned windows start at a new sample each
+                # minute, so the names never repeat and kept WAVs filled /tmp (6 GB in 5 days on WF8Z-1)
                 try:
-                    r = subprocess.run(([jt9[0]] if jt9 else [ft8_bin]) + mode_args + [wav_fn],
-                        capture_output=True, text=True, timeout=20)
-                except Exception as e:
-                    prog = 'jt9' if jt9 else 'decode_ft8'
-                    if isinstance(e, OSError) and not getattr(skimmer, '_ftx_prog_warned', False):
-                        skimmer._ftx_prog_warned = True    # a missing or broken program: say so once
-                        log.warning("%s %s p%d: %s (FT8/FT4 decodes fail until it runs)", prog, bn, part, e)
-                    else:
-                        log.debug("%s err %s p%d: %s", prog, bn, part, e)
-                    continue
+                    with wave.open(wav_fn, 'wb') as wf:
+                        wf.setnchannels(1); wf.setsampwidth(2)
+                        wf.setframerate(12000)
+                        wf.writeframes(i16.tobytes())
+                    try:
+                        r = subprocess.run(([jt9[0]] if jt9 else [ft8_bin]) + mode_args + [wav_fn],
+                            capture_output=True, text=True, timeout=20)
+                    except Exception as e:
+                        prog = 'jt9' if jt9 else 'decode_ft8'
+                        if isinstance(e, OSError) and not getattr(skimmer, '_ftx_prog_warned', False):
+                            skimmer._ftx_prog_warned = True    # a missing or broken program: say so once
+                            log.warning("%s %s p%d: %s (FT8/FT4 decodes fail until it runs)", prog, bn, part, e)
+                        else:
+                            log.debug("%s err %s p%d: %s", prog, bn, part, e)
+                        continue
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.remove(wav_fn)
                 for line in (r.stdout or '').strip().split('\n'):
                     line = line.strip()
                     if not line:

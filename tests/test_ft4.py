@@ -74,3 +74,31 @@ def test_off_by_default_nothing_changes(monkeypatch) -> None:
     assert not any("-ft4" in a for a in runs)
     assert [s["mode"] for s in spots] == ["FT8"]
     assert sparkgap._gui_settings({}, 192000)[0]["enable_ft4"] is False
+
+
+def test_no_wav_is_left_in_tmp(monkeypatch) -> None:
+    """Each window's WAV is removed once decoded: the aligned windows start at a new sample every minute,
+    so kept WAVs never get overwritten and filled /tmp on WF8Z-1 (26,629 files, 6 GB, 11-19)."""
+    import glob
+    import os
+    seen = []
+
+    def fake_run(args, **kw):
+        seen.append(os.path.exists(args[-1]))
+        return types.SimpleNamespace(stdout="")
+
+    def failing_run(args, **kw):
+        raise OSError("no decoder")
+
+    before = set(glob.glob("/tmp/ft[48]_20m_p*.wav"))
+    import subprocess
+    monkeypatch.setattr(sparkgap, "_get_mqtt_publisher", lambda: None)
+    for run in (fake_run, failing_run):
+        monkeypatch.setattr(subprocess, "run", run)
+        sk = types.SimpleNamespace(cfg={"enable_ft8": True, "enable_ft4": True, "enable_rtty": False},
+                                   spot_count=0, managers=[], _corrected_freq_khz=lambda f: f,
+                                   broadcast=lambda **s: None)
+        z = np.zeros(60 * 192000, dtype=np.float32)
+        sparkgap._ft8_cycle([("20m", 0, 14090.0, 14074, z, z, len(z), 1792551360.0)], sk)
+    assert seen and all(seen)                                  # the decoder still gets its file
+    assert set(glob.glob("/tmp/ft[48]_20m_p*.wav")) <= before  # and none is left behind
