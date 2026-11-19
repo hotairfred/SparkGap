@@ -71,3 +71,22 @@ def test_a_report_or_sign_off_after_a_stray_slash_is_no_area() -> None:
         assert _SUFFIX_RE.match(area), area
     for word in ("73", "88", "55", "5NN", "599"):          # AE7AP / 73, K1ABC / 5NN (Chris on #190)
         assert not _SUFFIX_RE.match(word), word
+
+
+def test_two_reads_in_one_window_are_enough() -> None:
+    """CQ DE W1AW /0 CQ DE W1AW /0 (WF8Z-1 11-18 20:22Z): the form twice in the window the spot comes from.
+    Counting windows sent W1AW while RBN's other skimmers spotted W1AW/0 (39 spots over 11-14..18)."""
+    rule = RepeatSpotRule(_tier2)
+    spots = _feed(rule, ["CQ CQ DE W1AW W1AW K", "CQ DE W1AW /0 CQ DE W1AW /0"])
+    assert [c for c, _ in spots] == ["W1AW/0"]
+
+
+def test_a_garbled_suffix_in_both_copies_of_a_window_is_one_read() -> None:
+    """The two filter paths decode the same audio: W1AW /T in both copies is one read, not two."""
+    rule = RepeatSpotRule(_tier2)
+    spots = []
+    for k in range(2):
+        t = 1000.0 + 30.0 * k
+        for text in ("CQ DE W1AW /T CQ DE W1AW", "CQ DE W1AW /T CQ DE W1AW"):
+            spots += rule.feed(rule.window_id(1, k, t), 7057.0, text if k == 0 else "CQ DE W1AW W1AW K", t)
+    assert [c for c, _ in spots] == ["W1AW"]

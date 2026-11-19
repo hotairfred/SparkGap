@@ -80,7 +80,7 @@ NEAR_KHZ = 0.5                # copies within this of each other are one frequen
 REPEAT_S = 600.0              # copies count for 10 minutes; one spot per call and band per 10 minutes
 RESPOT_S = REPEAT_S + 15.0     # re-spot after 10 minutes as RBN times them: its clock is the upload, a few s after ours
 MOVE_KHZ = 1.0                # ...unless it moves more than this (CW Skimmer re-spots 1 kHz moves)
-SLASH_MIN = 2                 # a base call goes out in its portable form read in this many windows here
+SLASH_MIN = 2                 # a base call goes out in its portable form read this many times here
 OWNER_CELL_KHZ = 0.25         # owner_cell: a new owner replaces only the owner within this
 STRONGEST_S = 60.0            # strongest: a stronger copy of the call elsewhere in the band this recently
 LOCK_IDLE_S = 180.0           # lock-on: ownership lapses after this long without the owner's call
@@ -277,8 +277,13 @@ def slash_forms(text: str) -> set[str]:
     """Portable calls in decoded text, whole (VE2PID/W1) or split at the slash by a word gap
     (VE2PID /W1, W7KFI / 5K, TI5 /VA3RA; see _slash_join). The spot rule counts copies as tokens()
     reads them and only sends a call in the form read here, see RepeatSpotRule._slash_form()."""
-    return {t for t in _rejoin_slashes([p for p in _SPLIT_RE.split(text.upper()) if p])
-            if "/" in t.strip("/") and CALL_RE.match(t.strip("/"))}
+    return set(slash_reads(text))
+
+
+def slash_reads(text: str) -> Counter[str]:
+    """slash_forms() with how many times each form was read in the text."""
+    return Counter(t for t in _rejoin_slashes([p for p in _SPLIT_RE.split(text.upper()) if p])
+                   if "/" in t.strip("/") and CALL_RE.match(t.strip("/")))
 
 
 def tokens(text: str, gluek: bool = False) -> list[str]:
@@ -815,7 +820,7 @@ class RepeatSpotRule:
         self._same: dict[int, set[int]] = {}      # validation: kept window -> same-audio windows, see _best_paths()
         self._signed: dict[int, set[str]] = {}    # validation: window -> calls that signed a CQ in it
         self._clean: dict[int, set[str]] = {}     # validation, clean_cq: window -> calls that signed one cleanly
-        self._forms: dict[int, set[str]] = {}     # window -> portable calls read in it, see _slash_form()
+        self._forms: dict[int, Counter[str]] = {}  # window -> portable calls read in it (reads), see _slash_form()
         self._tails: dict[int, list[list]] = {}   # window_join: bin -> [[time, keywords, window, read by, freq]]
         self._worked: deque[tuple[float, str, float]] = deque()       # runner_signs: (time, call, freq)
         self._runners: deque[tuple[float, str, float]] = deque()      # runner_signs: (time, call, freq)
@@ -852,9 +857,11 @@ class RepeatSpotRule:
         if self.clip_strength is not None or self.lead_dits:
             self._clip_toks.setdefault(round(freq_khz * 10), deque()).append(
                 (now, freq_khz, frozenset(tokens(text, self.gluek))))
-        forms = slash_forms(text)
+        forms = slash_reads(text)
         if forms:
-            self._forms.setdefault(window, set()).update(forms)
+            got = self._forms.setdefault(window, Counter())
+            for form, n in forms.items():      # a window's two copies (filter paths) read the same audio: the most, not the sum
+                got[form] = max(got[form], n)
         if self.threshold is not None:
             toks = tokens(text, self.gluek)
             self._paths.setdefault(window, []).append(Counter(toks))
@@ -928,8 +935,9 @@ class RepeatSpotRule:
 
     def _slash_form(self, call: str, near: list[_Copy]) -> str:
         """The call as it goes out: a base call whose portable form (VE2PID/W1, TI5/VA3RA) was
-        read at this frequency in SLASH_MIN windows or more goes out in that form, as other
-        skimmers spot it. One read is not enough: a suffix garbled once would send a wrong call."""
+        read at this frequency SLASH_MIN times or more goes out in that form, as other skimmers
+        spot it, in one window (CQ DE W1AW /0 CQ DE W1AW /0) or several. One read is not enough:
+        a suffix garbled once (W1AW /T) would send a wrong call."""
         if "/" in call:
             return call
         wins: dict[str, set[int]] = {}
@@ -937,8 +945,9 @@ class RepeatSpotRule:
             for form in self._forms.get(c.window, ()):
                 if call in form.split("/") and (c.call == call or c.call == form):
                     wins.setdefault(form, set()).add(c.window)
-        best = max(wins.items(), key=lambda kv: len(kv[1]), default=(call, set()))
-        return best[0] if len(best[1]) >= SLASH_MIN else call
+        reads = {f: sum(self._forms[w][f] for w in ws) for f, ws in wins.items()}
+        best = max(reads.items(), key=lambda kv: kv[1], default=(call, 0))
+        return best[0] if best[1] >= SLASH_MIN else call
 
     def last_spots(self) -> list[list]:
         """The re-spot table, for spot_rule_memory: [[call, MHz, time, freq], ...]."""
