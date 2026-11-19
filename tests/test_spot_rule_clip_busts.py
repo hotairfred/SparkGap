@@ -35,6 +35,17 @@ def test_real_look_alikes_spot() -> None:
     assert not clip_of("MX4U", "3X4U", S, keep=lambda c: c == "MX4U")       # MASTER.SCP vouches for it
 
 
+def test_a_call_scp_knows_is_its_own_station() -> None:
+    """SP3H beside SP3HRN (133 skimmers), R2AA beside KR2AA (159): real calls, held as clips on the
+    11-14..18 replays (13 confirmed spots). MASTER.SCP vouches for them; a shared bust (N2MCW of SN2MCW) is not in it."""
+    counts = Counter({"SP3H": 25, "SP3HRN": 133, "R2AA": 20, "KR2AA": 159, "N2MCW": 58, "SN2MCW": 143}).__getitem__
+    scp = {"SP3H", "SP3HRN", "R2AA", "KR2AA", "SN2MCW"}.__contains__
+    assert not clip_of("SP3H", "SP3HRN", counts, keep=scp)
+    assert not clip_of("R2AA", "KR2AA", counts, keep=scp)       # a start cut off, same guard
+    assert clip_of("N2MCW", "SN2MCW", counts, keep=scp)
+    assert clip_of("SP3H", "SP3HRN", counts)                    # no SCP given: as before
+
+
 def _rule(clip: bool) -> RepeatSpotRule:
     return RepeatSpotRule(lambda c: 2, cq_groups=True, lockon=True, clip_strength=S if clip else None)
 

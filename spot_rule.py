@@ -661,9 +661,9 @@ def clip_of(short: str, long_: str, strength: Callable[[str], int],
     """short is long_ with an end or a start cut off at a window edge or a fade (K1AY of K1AYZ, W3P of
     W3PYF, H8A of KH8A), or with the leading elements of its first character lost (MX4U and WX4U of
     3X4U: ...-- read as -- or .--), by the RBN skimmer counts of the last days: long_ had CLIP_MIN or
-    more skimmers on a day and CLIP_RATIO_END (CLIP_RATIO_FIRST) times short's. The first-character
-    case needs short weak itself (under CLIP_MIN) and not vouched for by keep (MASTER.SCP): K6AR and
-    N6AR, -.- and -., are two stations. Portable forms are not clips (W1AW of W1AW/3)."""
+    more skimmers on a day and CLIP_RATIO_END (CLIP_RATIO_FIRST) times short's, and short is not
+    vouched for by keep (MASTER.SCP): SP3H and SP3HRN, K6AR and N6AR (-.- and -.) are two stations.
+    The first-character case also needs short weak itself (under CLIP_MIN). Portable forms are not clips (W1AW of W1AW/3)."""
     if short == long_ or "/" in long_ or "/" in short or len(short) < 3:
         return False
     n_long, n_short = strength(long_), strength(short)
@@ -671,7 +671,8 @@ def clip_of(short: str, long_: str, strength: Callable[[str], int],
         return False
     d = len(long_) - len(short)
     if (long_.startswith(short) and 1 <= d <= 3) or (long_.endswith(short) and 1 <= d <= 2):
-        return n_long >= CLIP_RATIO_END * n_short
+        # a call SCP knows is a station of its own (SP3H beside SP3HRN, R2AA beside KR2AA), not a clip
+        return n_long >= CLIP_RATIO_END * n_short and not (keep and keep(short))
     if d == 0 and short[1:] == long_[1:] and n_short < CLIP_MIN and not (keep and keep(short)):
         a, b = _MORSE.get(short[0], ""), _MORSE.get(long_[0], "")
         return bool(a) and len(a) < len(b) and b.endswith(a) and n_long >= CLIP_RATIO_FIRST * n_short
