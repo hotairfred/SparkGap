@@ -79,3 +79,10 @@ def test_start_is_the_first_line_of_any_kind() -> None:
     lines = ["06:00:00 INFO Database: 50446 calls\n", _raw("06:00:30", 7028.0, "A")]
     w = parse_log(lines, start=datetime(2026, 11, 10, 12, 0, tzinfo=UTC))
     assert w[0].t == T0 + 30
+
+
+def test_log_reads_raw_lines_with_their_snr_fields() -> None:
+    lines = ["06:00:00 INFO ITILA raw 7028.0 kHz cost=1.00 snr=18.4 rep=11.2: 'CQ W9SN'\n",
+             "06:00:01 INFO ITILA raw 7028.0 kHz cost=1.00 snr=18.4: 'W9SN K'\n",
+             "06:00:05 INFO RBN: N0CALL-1,,,7028.0,40m,W9SN,,,CQ,11,2026-11-10 12:00:05,28,CW\n"]
+    assert [x.text for x in parse_log(lines)] == ["CQ W9SN", "W9SN K"]

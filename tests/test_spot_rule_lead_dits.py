@@ -21,7 +21,7 @@ def test_lead_dits_of() -> None:
     assert not lead_dits_of("MX", "3X")           # too short to judge
 
 
-RAW = re.compile(r"^(\d\d):(\d\d):(\d\d) INFO ITILA raw\s+([\d.]+) kHz cost=([\d.]+): '(.*)'$")
+RAW = re.compile(r"^(\d\d):(\d\d):(\d\d) INFO ITILA raw\s+([\d.]+) kHz cost=([\d.]+)(?: snr=\S+)?(?: rep=\S+)?: '(.*)'$")
 DATA = Path(__file__).parent / "data" / "lead_dits_3x4u_12m.txt"   # WF8Z-1 live, 11-16 15:50-17:05Z, 12 m
 
 

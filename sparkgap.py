@@ -2636,6 +2636,15 @@ def _select_parallel_decode(on):
     return _parallel_decode
 
 
+def _raw_snr(snr, rep):
+    """The SNR fields of an ITILA raw line, after cost: snr= the copy's SNR as the spot rule ranks it
+    (the scanner's), rep= the decoder's own reading the spot reports (itila2_snr_decoder), when there is
+    one. Replays of the log then rank copies as the live node did (spot_rule2's gate 9)."""
+    if snr is None or snr != snr:
+        return ""
+    return f" snr={snr:.1f}" + (f" rep={rep:.1f}" if rep is not None and rep == rep else "")
+
+
 _snr_decoder = False   # config itila2_snr_decoder: spot SNR from the decoder's window (marks over spaces)
 
 def _snr_decoder_on(cfg):
@@ -4502,7 +4511,8 @@ class _ItilaScanner:
                 continue
             if _snr_decoder:
                 st['snr500'] = dsnr      # reported by the spot; st['snr'] (the scanner's) ranks the copies
-            log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
+            log.info("ITILA raw %.1f kHz cost=%.2f%s: %r", f_khz, cost,
+                     _raw_snr(st.get('snr', snr), st.get('snr500') if _snr_decoder else None), raw[:400])
             if _gui_feed:
                 _gui_feed.publish_window(f_khz, raw, wpm_est, dsnr if _snr_decoder else snr, cost)
             # Timing-cost gate (off by default).  Drops the whole decode
@@ -4598,7 +4608,7 @@ class _ItilaScanner:
             if not raw:
                 continue
             f_khz = f_hz / 1000.0
-            log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
+            log.info("ITILA raw %.1f kHz cost=%.2f%s: %r", f_khz, cost, _raw_snr(snr, None), raw[:400])
             if _gui_feed:
                 _gui_feed.publish_window(f_khz, raw, wpm, snr, cost)
             if self.gate_timing_cost and cost > self.timing_cost_max:
@@ -9564,7 +9574,7 @@ class SparkGap:
                     if not raw:
                         continue
                     f_khz = f_hz / 1000.0
-                    log.info("ITILA raw %.1f kHz cost=%.2f: %r", f_khz, cost, raw[:400])
+                    log.info("ITILA raw %.1f kHz cost=%.2f%s: %r", f_khz, cost, _raw_snr(snr, snr500), raw[:400])
                     if _gui_feed:
                         _gui_feed.publish_window(f_khz, raw, wpm, snr500 if _snr_decoder else snr, cost)
                     # Find or create bin state for ticker tape
