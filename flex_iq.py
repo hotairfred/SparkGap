@@ -155,11 +155,11 @@ def daxiq_streams(lines, out=None):
     return out
 
 
-def pan_status(lines):
-    """Pans in pan status lines: {pan id: DAX-IQ channel, or None when none is reported}.
+def pan_status(lines, out=None):
+    """Pans in pan status lines: {pan id: DAX-IQ channel, or None when none is reported}, added to out.
     The radio restores a GUI client's saved pans with their old channel (2026-10-20), so a
     channel on a pan says nothing about who streams it: only a DAX-IQ stream does."""
-    out = {}
+    out = {} if out is None else out
     for line in lines:
         m = re.search(r'\|display pan (0x[0-9A-F]+)( .*|$)', line, re.I)
         if not m:
@@ -767,6 +767,7 @@ class FlexStation:
         self.last_ping = None
         self.started = None
         self.channels = []        # DAX-IQ streams the radio reports for this station
+        self.pans = None          # every pan on the radio, any client's: {pan id: DAX-IQ channel}
         self.budget = LossBudget()
         self._streams = {}
         self._unanswered = None   # time.time() of the first ping in a row without a reply
@@ -819,10 +820,12 @@ class FlexStation:
         """Remove the pan and slice the radio gives a new GUI client: the station streams nothing."""
         status = conn.cmd("sub pan all", settle=0.5) + conn.cmd("sub slice all", settle=0.5)
         slices, pans = owned_objects(status, conn.handle)
+        self.pans = pan_status(status)
         for n in sorted(slices):
             conn.ok(f"default slice {n} removed", conn.cmd(f"slice remove {n}", timeout=CMD_TIMEOUT_S))
         for p in sorted(pans):
             conn.ok(f"default pan {p} removed", conn.cmd(f"display pan remove {p}", timeout=CMD_TIMEOUT_S))
+            self.pans.pop(int(p, 16), None)
 
     def start_thread(self):
         self._thread = threading.Thread(target=self.run, name="flex-station", daemon=True)
@@ -876,6 +879,8 @@ class FlexStation:
 
     def _status(self, lines):
         self._streams = daxiq_streams(lines, self._streams)
+        if self.pans is not None:
+            pan_status(lines, self.pans)
         me = int(self.conn.handle, 16) if self.conn and self.conn.handle else None
         self.channels = sorted(({'channel': st.get('channel'), 'pan': st.get('pan'), 'client': st.get('client')}
                                 for st in self._streams.values() if st.get('gui') == me),
@@ -941,7 +946,8 @@ class FlexStation:
         return {'type': 'flex-station', 'address': self.ip, 'station': self.station, 'state': self.state,
                 'rtt_ms': self.rtt_ms, 'last_ping': self.last_ping, 'started': self.started,
                 'unanswered_since': self._unanswered,
-                'losses': [[round(t), why] for t, why in self.budget.losses], 'channels': list(self.channels)}
+                'losses': [[round(t), why] for t, why in self.budget.losses], 'channels': list(self.channels),
+                'pans': None if self.pans is None else len(self.pans)}
 
 
 class FlexIQReceiver:

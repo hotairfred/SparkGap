@@ -37,6 +37,9 @@ minutes.
   strength. You can select the text, or **Copy** all of it. With both readings
   shown, the one SparkGap is surer of (the lower timing cost) is in bold; a
   reading that copied nothing shows as *(nothing decoded)*.
+  Where two stations sit close together, such as the two sides of a QSO, a
+  click on the trace picks the one sending now; the other has its own row in
+  the call ladder.
 - **Switching receivers**: each receiver comes back on the signal you last
   picked on it. Two receivers that hear the same frequency (two antennas or
   radios on one band) keep the same signal, so you can compare their copy

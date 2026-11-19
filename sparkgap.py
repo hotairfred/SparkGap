@@ -2790,8 +2790,30 @@ def _select_spot_rule(name):
     if name not in _SPOT_RULES:
         raise ValueError("spot_rule must be one of %s, got %r" % (list(_SPOT_RULES), name))
     _spot_rule_on = name == 'repeat'
-    log.info("Spot rule: %s", name)
+    if not _spot_rule_on:
+        log.info("Spot rule: %s", name)    # on: _spot_rule_line() names the rule once it is made
     return _spot_rule_on
+
+def _spot_rule_line(rule):
+    """The start-up line naming the spot rule a port runs, with every Repeat Rule option on
+    (cdub89/SparkGap#45); the Gated Rule's gates and validation lines come just before it."""
+    if not hasattr(rule, 'cq_groups'):
+        return "Spot rule: Gated Rule"
+    on = [name for name, v in (
+        ("lock-on", rule.lockon), ("CQ groups", rule.cq_groups), ("CQ qualifiers", rule.cq_qualifiers),
+        ("split runs", rule.split_runs), ("DE rejoin", rule.de_rejoin), ("runner signs", rule.runner_signs),
+        ("window join", rule.window_join), ("contest words", rule.contest_words), ("CQ repeats", rule.cq_repeats),
+        ("doubled calls", rule.doubled), ("split up", rule.split_up), ("owner cell", rule.owner_cell),
+        ("owned two windows", rule.owned_two_windows), ("owner listed", rule.owner_listed), ("LA1D", rule.la1d),
+        ("glue K", rule.gluek), ("no rival", rule.norival), ("garbled runner", rule.garbled),
+        ("stray known", rule.stray_known), ("clean CQ", rule.clean_cq),
+        ("clip busts", rule.clip_strength is not None), ("lead dits", rule.lead_dits)) if v]
+    if rule.fragments:
+        on.append("fragments %s%s" % (rule.fragments, ", stray" if rule.stray else ""))
+    if rule.strongest_db is not None:
+        on.append("strongest %g dB" % rule.strongest_db)
+    on.append("lock idle %g s" % rule.lock_idle_s)
+    return "Spot rule: Repeat Rule: " + ", ".join(on)
 
 def _spot_rule_name(config):
     """spot_rule from the config. Not set: "repeat" with cw_decoder itila2 (measured as one
@@ -8664,11 +8686,7 @@ class SparkGap:
         _select_parallel_decode(self.cfg.get('itila2_parallel_decode', False))
         if _select_spot_rule(_spot_rule_name(self.cfg)):
             self.tracker.spot_rule = _make_spot_rule(self.cfg, self.tracker)
-            log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s%s%s%s",
-                     ", split runs" if self.tracker.spot_rule.split_runs else "",
-                     ", DE rejoin" if self.tracker.spot_rule.de_rejoin else "",
-                     ", runner signs" if self.tracker.spot_rule.runner_signs else "",
-                     ", window join" if self.tracker.spot_rule.window_join else "")
+            log.info("%s", _spot_rule_line(self.tracker.spot_rule))
         # If the gate is configured (peers listed), start the peer-tee
         # threads regardless of whether the gate is currently on. The
         # support map is cheap to maintain and we want it warm if the
@@ -10328,11 +10346,7 @@ def run_file_mode(args, config):
     if _select_spot_rule(_spot_rule_name(config)):
         _trk = tracker
         _trk.spot_rule = _make_spot_rule(config, tracker)
-        log.info("Spot rule: lock-on, CQ groups, CQ qualifiers%s%s%s%s",
-                 ", split runs" if _trk.spot_rule.split_runs else "",
-                 ", DE rejoin" if _trk.spot_rule.de_rejoin else "",
-                 ", runner signs" if _trk.spot_rule.runner_signs else "",
-                 ", window join" if _trk.spot_rule.window_join else "")
+        log.info("%s", _spot_rule_line(_trk.spot_rule))
         audio_now = [args.start_min * 60]
         _trk.clock = lambda: audio_now[0]      # repeats counted in audio time, as live
 

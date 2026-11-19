@@ -71,6 +71,8 @@ def test_status_highlights_state_errors_and_labels_only() -> None:
 def test_a_radio_file_s_size_shows_on_its_line() -> None:
     snap = {**SNAP, "radios": [{**SNAP["radios"][0], "num_scu": 2, "max_panadapters": 4}]}
     assert "2 SCU  pans 1/4" in ctl.render(snap)[0]
+    snap["stations"] = [{**SNAP["stations"][0], "pans": 3}]  # the radio's count: other clients' pans too
+    assert "2 SCU  pans 3/4" in ctl.render(snap)[0]
 
 
 

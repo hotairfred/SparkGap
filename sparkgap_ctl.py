@@ -300,7 +300,8 @@ def radio_lines(r: dict[str, Any], station: dict[str, Any] | None, n: int,
     if r.get("num_scu"):
         facts.append(f"{r['num_scu']} SCU")
     if r.get("max_panadapters"):
-        facts.append(f"pans {n}/{r['max_panadapters']}")
+        held = (station or {}).get("pans")   # the radio's count, other clients' pans too
+        facts.append(f"pans {n if held is None else held}/{r['max_panadapters']}")
     if r.get("board_id"):
         facts.append(f"board {r['board_id']}")
     if r.get("receivers"):

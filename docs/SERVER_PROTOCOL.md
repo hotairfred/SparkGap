@@ -63,7 +63,7 @@ one address lock it out for 10 minutes (close 4429).
                 "started": 1792690000.0}],
  "stations": [{"radio": "Dallas", "state": "running",
                "station": "SparkGap-Dallas", "live": "live", "rtt_ms": 2.8,
-               "losses_hour": 0, "last_loss": null}]}
+               "losses_hour": 0, "last_loss": null, "pans": 2}]}
 ```
 
 - `state`: `running` or `stopped`. `busy`: the operation in progress
@@ -76,7 +76,8 @@ one address lock it out for 10 minutes (close 4429).
   process, `running` or `stopped`. The rest is what the station reports (on
   each heartbeat and as a recovery starts), absent until its first report:
   `live` is the radio connection (`connecting`, `live`, `reconnecting`,
-  `halted`, `stopped`), then `station`, `rtt_ms`, `losses_hour` and `last_loss`.
+  `halted`, `stopped`), then `station`, `rtt_ms`, `losses_hour`, `last_loss` and
+  `pans`, every pan on the radio, other clients' (SmartSDR, Maestro) too.
 
 The message also carries, one line each:
 
