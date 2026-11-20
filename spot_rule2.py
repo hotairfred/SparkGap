@@ -2,11 +2,12 @@
 checked in this order; a call not spotted is dropped by the first gate that is false.
 
   S Buffer             each signal (decoder bin) keeps its last 256 decoded characters, one
-                       continuous text, first in first out; the buffer ends with its bin
+                       continuous text, first in first out; the buffer ends with its bin; of
+                       a window's two filter paths it keeps the lower-cost copy
   1 Shape              prefix (@, @@, #@ or #@@), 1 to 4 digits, 1 to 6 letters
-  2 Not banned         the call is not on the banned list or in the Bad Calls file, and is in
-                       SCP or the known-call list when the node checks it (spot_rule_scp; a
-                       beacon need not be)
+  2 Not banned         the call is not in the Bad Calls file, and is in
+                       MASTER.SCP or on the known-call list when the node's MASTER.SCP filter
+                       is on (spot_rule_scp; a beacon need not be)
   3 Reads              reads in the buffer: 2 for a patt3ch.lst + pattern, 3 unflagged, 5 none
                        (normal level), one more for a call not on the node's known-call list
                        (spot_validation_calls); a call decoded twice is read twice
@@ -15,7 +16,7 @@ checked in this order; a call not spotted is dropped by the first gate that is f
                        cut-off copy of a longer call read there (N5T of N5TJ) never wins; noise or
                        sign-off letters (E T I S K) never make a longer call (K1TRE, KE8UEX K),
                        nor does a portable form (W1AW/7 is W1AW)
-  5 Keyword            the buffer holds CQ, TEST or QRZ, or an enabled qualifier
+  5 Keyword            the buffer holds CQ or TEST, or an enabled qualifier
   6 Qualifier          a qualifier the node profile enables acts as the event's CQ (SS N6RO)
   7 Tied               the call is the first callsign within 3 words after the keyword (noise
                        letters do not count; a sign-off AR KN SK BK TU ends the CQ), or follows
@@ -27,8 +28,8 @@ checked in this order; a call not spotted is dropped by the first gate that is f
                        same band, in the last 60 s by 6 dB; a tie spots none (a multi-op on two
                        bands spots on both; a node's own call goes in BadCalls.txt)
  10 Re-spot            not spotted on this band in the last 10 minutes, unless moved 1 kHz
- 11 Window             the frequency is inside the configured CW segments and outside every
-                       range in the Notched Freqs file
+ 11 Window             the frequency is outside every range in the Notched Freqs file (the
+                       decoded window is the band plan's CW segment already)
  12 Beacon             a /B, NCDXF or listed beacon skips 5 to 8; an NCDXF or listed beacon
                        spots on one read (it sends its call once a slot); an NCDXF beacon on its
                        frequency skips 4 too (its fading dashes decode as noise words that tie
@@ -44,6 +45,7 @@ Every decision is kept in .trace and logged at debug level as (gate, reason)."""
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import Counter, deque
 from collections.abc import Callable, Iterable
@@ -65,7 +67,7 @@ from spot_rule import (
 
 log = logging.getLogger(__name__)
 
-KEYWORDS = frozenset({"CQ", "TEST", "QRZ"})   # gate 5; UP would spot a split DX's callers
+KEYWORDS = frozenset({"CQ", "TEST"})   # gate 5; UP would spot a split DX's callers, QRZ a net's (#56 EK6)
 QUALIFIERS = frozenset({"SS", "NA", "FD", "CWT", "SST", "MST", "POTA", "SOTA", "WWFF", "IOTA",
                         "SKCC", "QRP", "DX"})                           # gate 6; enabled per node
 CALL_RE = re.compile(r"^(?:[A-Z0-9]{1,3}/)?(?:[A-Z]{1,2}|[0-9][A-Z]{1,2})[0-9]{1,4}[A-Z]{1,6}"
@@ -255,7 +257,7 @@ class GateSpotRule:
 
     def __init__(self, shape: Callable[[str], str | None],
                  listed: Callable[[str], bool] | None = None,
-                 banned: Iterable[str] = (), segments: Iterable[tuple[float, float]] | None = None,
+                 banned: Iterable[str] = (),
                  beacons: dict[str, float] | None = None, stronger_db: float | None = STRONGER_DB,
                  best_reading: bool = True, qualifiers: Iterable[str] = (),
                  notched: Iterable[tuple[float, float]] = (), level: str = "normal",
@@ -266,8 +268,7 @@ class GateSpotRule:
         self.level = level                  # gate 3: spot_validation
         self.listed = listed                # gate 3: the known-call list, or None
         self.banned = frozenset(banned)
-        self.scp = scp                      # gate 2: in Super Check Partial, or None
-        self.segments = [tuple(s) for s in segments] if segments else None
+        self.scp = scp                      # gate 2, the MASTER.SCP filter: in MASTER.SCP, or None
         self.notched = [tuple(n) for n in notched]
         self.beacons = dict(beacons or {})
         self.stronger_db = stronger_db
@@ -280,11 +281,12 @@ class GateSpotRule:
         # bin -> {window: text}, oldest first
         self._bins: dict[int, dict[int, str]] = {}
         self._win_bin: dict[int, int] = {}
-        self._reads: deque[tuple[float, str, float, float]] = deque()  # (t, call, kHz, SNR): gate 9
+        self._reads: deque[tuple[float, str, float, float, int]] = deque()  # (t, call, kHz, SNR, window): gate 9
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}
         # gate 9: calls that passed every gate this pass, spotted by end_pass()
         self._held: list[tuple[float, str, float, float | None, float | None, str, int]] = []
         self._forms: dict[int, set[str]] = {}     # window -> portable calls read in it, see _slash_form()
+        self._cost: dict[int, float] = {}         # gate S: window -> the decode cost of the copy it keeps
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._pruned = 0.0
         self._next_window = 0
@@ -314,6 +316,7 @@ class GateSpotRule:
             live = {v[0] for v in self._window_ids.values()}
             self._win_bin = {w: b for w, b in self._win_bin.items() if w in live}
             self._forms = {w: f for w, f in self._forms.items() if w in live}
+            self._cost = {w: c for w, c in self._cost.items() if w in live}
 
     def close_bin(self, bin_id: int) -> None:
         """Gate S: the buffer ends with its bin."""
@@ -321,10 +324,11 @@ class GateSpotRule:
 
     @staticmethod
     def _trim(texts: dict[int, str]) -> None:
-        """Gate S: drop windows wholly older than the last BUFFER_CHARS characters."""
+        """Gate S: drop windows wholly older than the last BUFFER_CHARS characters before the
+        newest window, which its other filter path's copy may still replace with a shorter text."""
         size = 0
         old = list(texts)
-        for i in range(len(old) - 1, -1, -1):
+        for i in range(len(old) - 2, -1, -1):
             if size >= BUFFER_CHARS:
                 for w in old[: i + 1]:
                     del texts[w]
@@ -360,17 +364,30 @@ class GateSpotRule:
         return call in self.beacons and abs(f - self.beacons[call]) <= BEACON_KHZ
 
     def feed(self, window: int, freq_khz: float, text: str, now: float,
-             snr: float | None = None, report: float | None = None) -> list[tuple[str, float]]:
+             snr: float | None = None, report: float | None = None,
+             cost: float | None = None) -> list[tuple[str, float]]:
         """One decoded text of a window. A call that passes every gate is held, not returned:
         end_pass() spots it once every window decoded in the same pass is in (gate 9 then sees a
         stronger copy in another bin whatever order the bins were fed in). A window decoded
-        more than once (the two filter paths) keeps its latest text."""
+        more than once (the two filter paths) keeps its lower-cost copy (the decoder's cost; the
+        latest when either has none): a cleaner copy replaces what the other one held and read."""
         self._expire(now)
+        cost = cost if cost is not None and math.isfinite(cost) else None
+        kept = self._cost.get(window)
+        if cost is not None and kept is not None:
+            if cost >= kept:
+                return []                             # gate S: the window keeps its cleaner copy
+            self._held = [h for h in self._held if h[6] != window]
+            self._reads = deque(r for r in self._reads if r[4] != window)
+        if cost is None:
+            self._cost.pop(window, None)
+        else:
+            self._cost[window] = cost
         forms = slash_forms(text)                     # VE2PID /W1: tokens() below splits it at the slash
         if forms:
             self._forms[window] = forms
         else:
-            self._forms.pop(window, None)             # a window decoded again keeps its latest text
+            self._forms.pop(window, None)             # a window decoded again keeps the copy kept
         text = " ".join(tokens(split_runs(text, de_rejoin=True)))     # CQCQDE -> CQ CQ DE
         if any(abs(freq_khz - x) <= BEACON_KHZ for x in NCDXF_KHZ):
             text = " ".join(self._ncdxf(t) for t in text.split())
@@ -385,7 +402,7 @@ class GateSpotRule:
             snr = report                  # gate 9 ranks copies by the reported SNR
         for call in dict.fromkeys(t for t in text.split() if CALL_RE.match(t)):
             if snr is not None:
-                self._reads.append((now, call, freq_khz, snr))
+                self._reads.append((now, call, freq_khz, snr, window))
             if self._check(call, buf, tied, freq_khz, now, snr):
                 self._held.append((now, call, freq_khz, snr, report, self.trace[-1][4], window))
         return []
@@ -396,7 +413,7 @@ class GateSpotRule:
         a band)."""
         return (self.stronger_db is not None and snr is not None
                 and any(c == call and MOVE_KHZ < abs(rf - f) < SAME_BAND_KHZ
-                        and rs > snr - self.stronger_db for _, c, rf, rs in self._reads))
+                        and rs > snr - self.stronger_db for _, c, rf, rs, _ in self._reads))
 
     def latest(self, call: str, f: float) -> tuple[int, str] | None:
         """The newest decision kept on this call within 1 kHz of f: (gate, why), gate 0 a pass."""
@@ -472,8 +489,6 @@ class GateSpotRule:
         last = self._last_spot.get((call, int(f // 1000)))
         if last and now - last[0] < RESPOT_S and abs(f - last[1]) < MOVE_KHZ:
             return self._decide(now, f, call, 10)
-        if self.segments is not None and not any(lo <= f <= hi for lo, hi in self.segments):
-            return self._decide(now, f, call, 11)
         if any(lo <= f <= hi for lo, hi in self.notched):
             return self._decide(now, f, call, 11, "notched frequency")
         return self._decide(now, f, call, 0, f"Spotted {'beacon' if beacon else kw}, {n} reads")
