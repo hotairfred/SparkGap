@@ -148,8 +148,8 @@ Settings, in plain terms:
 - **Gated Rule filters**, shown only under the Gated Rule, as the Aggregator
   has them: **Bad Calls** (calls in `BadCalls.txt`), **Notched Freqs**
   (frequencies in `NotchedFreqs.txt`), each with the file's path beside the
-  config, and **SCP only** (no spot for a call in neither Super Check Partial
-  nor the known call list, beacons excepted). All are off unless set.
+  config, and **MASTER.SCP Filter** (no spot for a call that is in neither
+  MASTER.SCP nor the known call list, beacons excepted). All are off unless set.
 
 The Repeat Rule's own options (contest words, CQ repeats, fragments and the
 rest), Strongest copy and Decoder SNR are config keys, not shown here: the

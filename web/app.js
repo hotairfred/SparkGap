@@ -18,7 +18,7 @@ const SPOT_RULES = [["repeat", "Repeat Rule"], ["gates", "Gated Rule"]];
 // Aggregator's. The repeat rule's tuning, Strongest copy and Decoder SNR are config keys (cdub89/SparkGap#51 R10).
 const DECODER_OPTIONS = [
   ["spot_rule_bad_calls", "Bad Calls", "Never spot a call in BadCalls.txt beside the config (one call per line, as the Aggregator's): a node's own call and its busts while it transmits."],
-  ["spot_rule_scp", "SCP only", "Never spot a call in neither Super Check Partial (SCP.DB, fetched at start, at most once a day) nor the known call list; beacons excepted. Cuts busts; a call on the known list needs no SCP entry."],
+  ["spot_rule_scp", "MASTER.SCP Filter", "Never spots a call not in the Super Check Partial list."],
   ["spot_rule_notched_freqs", "Notched Freqs", "Never spot on a frequency in NotchedFreqs.txt beside the config (a kHz or a range per line, as the Aggregator's)."],
 ];
 const RX_KEYS = ["antenna", "loop_a", "loop_b", "rf_gain"];  // a Flex copy's receive path: the radio's, changed live
@@ -29,7 +29,7 @@ const OPTION_HINTS = {
   afc: "Each signal's decoder follows its tone as it drifts.",
   itila_window_sec: "How much audio each decoded window holds; shorter shows text sooner and costs more CPU.",
   spot_rule_bad_calls: "Never spots a call listed in BadCalls.txt.",
-  spot_rule_scp: "Never spots a call in neither Super Check Partial nor the known call list.",
+  spot_rule_scp: "Never spots a call not in the Super Check Partial list.",
   spot_rule_notched_freqs: "Never spots on a frequency listed in NotchedFreqs.txt.",
 };
 
