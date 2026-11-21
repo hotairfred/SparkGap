@@ -337,7 +337,8 @@ HOT_CLONES static double forward_backward_fast(
     itila_state_t *st,
     const double *env, int T,
     double wpm, double A, double noise_mean, double sigma2_obs,
-    double *gamma_out)   /* [T*2] output, row-major */
+    double *gamma_out,   /* [T*2] output, row-major */
+    int want_log_z)      /* 0: the caller ignores the log-likelihood, so its logs are skipped */
 {
     double p01, p10;
     transition_probs(wpm, &p01, &p10);
@@ -366,7 +367,7 @@ HOT_CLONES static double forward_backward_fast(
         x1 = (p0 * a01 + p1 * a11) * B[t*2+1];
         s0 = x0 + x1;
         al[t*2] = x0 / s0; al[t*2+1] = x1 / s0; c[t] = s0;
-        log_c += log(s0);
+        if (want_log_z) log_c += log(s0);
     }
 
     double b0 = 1.0, b1 = 1.0;
@@ -382,19 +383,27 @@ HOT_CLONES static double forward_backward_fast(
 }
 
 /* -------------------------------------------------------------------------
- * forward_log_z: forward_backward_fast's log-likelihood alone. The backward pass only gives the
- * posterior, so a caller that needs log Z (decode_marginal's speed weights) skips it. The same
- * arithmetic in the same order as forward_backward_fast's forward pass: the same value to the bit.
+ * forward_log_z_bins: forward_backward_fast's log-likelihood alone, for several speed bins at
+ * once. The backward pass only gives the posterior, so a caller that needs log Z (decode_marginal's
+ * speed weights, gate_segments) skips it. The emissions do not depend on speed, so they are
+ * computed once; the bins' recursions then run side by side, each the same arithmetic as
+ * forward_backward_fast's forward pass.
  * ---------------------------------------------------------------------- */
-HOT_CLONES static double forward_log_z(
+HOT_CLONES static void forward_log_z_bins(
     itila_state_t *st,
     const double *env, int T,
-    double wpm, double A, double noise_mean, double sigma2_obs)
+    const int *bins, int nb,
+    double A, double noise_mean, double sigma2_obs,
+    double *lz_out)   /* [nb] */
 {
-    double p01, p10;
-    transition_probs(wpm, &p01, &p10);
-    const double a00 = 1.0 - p01 + 1e-300, a01 = p01 + 1e-300;
-    const double a10 = p10 + 1e-300,       a11 = 1.0 - p10 + 1e-300;
+    double a00[N_SPEED_BINS], a01[N_SPEED_BINS], a10[N_SPEED_BINS], a11[N_SPEED_BINS];
+    double p0[N_SPEED_BINS], p1[N_SPEED_BINS], lc[N_SPEED_BINS];
+    for (int k = 0; k < nb; k++) {
+        double p01, p10;
+        transition_probs(st->speed_bins[bins[k]], &p01, &p10);
+        a00[k] = 1.0 - p01 + 1e-300; a01[k] = p01 + 1e-300;
+        a10[k] = p10 + 1e-300;       a11[k] = 1.0 - p10 + 1e-300;
+    }
 
     double log_norm = -0.5 * log(2.0 * M_PI * sigma2_obs);
     double inv2s = 0.5 / sigma2_obs;
@@ -410,16 +419,18 @@ HOT_CLONES static double forward_log_z(
     }
 
     double x0 = 0.5 * B[0], x1 = 0.5 * B[1], s0 = x0 + x1;
-    double log_c = log(s0);
-    double p0 = x0 / s0, p1 = x1 / s0;
+    for (int k = 0; k < nb; k++) { lc[k] = log(s0); p0[k] = x0 / s0; p1[k] = x1 / s0; }
     for (int t = 1; t < T; t++) {
-        x0 = (p0 * a00 + p1 * a10) * B[t*2];
-        x1 = (p0 * a01 + p1 * a11) * B[t*2+1];
-        s0 = x0 + x1;
-        p0 = x0 / s0; p1 = x1 / s0;
-        log_c += log(s0);
+        double b0 = B[t*2], b1 = B[t*2+1];
+        for (int k = 0; k < nb; k++) {
+            double y0 = (p0[k] * a00[k] + p1[k] * a10[k]) * b0;
+            double y1 = (p0[k] * a01[k] + p1[k] * a11[k]) * b1;
+            double s = y0 + y1;
+            p0[k] = y0 / s; p1[k] = y1 / s;
+            lc[k] += log(s);
+        }
     }
-    return log_c + sum_m;
+    for (int k = 0; k < nb; k++) lz_out[k] = lc[k] + sum_m;
 }
 
 /* -------------------------------------------------------------------------
@@ -571,7 +582,7 @@ HOT_CLONES static void em_estimate(
     /* One EM step: update A, nm, s2 given current wpm */
     #define EM_STEP(wpm_val, n_iter)  do { \
         for (int _iter = 0; _iter < (n_iter); _iter++) { \
-            forward_backward_fast(st, env, T, wpm_val, A, nm, s2, st->gamma); \
+            forward_backward_fast(st, env, T, wpm_val, A, nm, s2, st->gamma, 0); \
             double dm = 1e-10, ds = 1e-10, sA = 0, snm = 0; \
             for (int _i = 0; _i < T; _i++) { \
                 double gm = st->gamma[_i*2+1], gs = st->gamma[_i*2+0]; \
@@ -593,7 +604,7 @@ HOT_CLONES static void em_estimate(
             A = A_new; nm = nm_new; \
             if (em_tol > 0.0 && _sep > 0.0 && _moved < em_tol * _sep) break; \
         } \
-        forward_backward_fast(st, env, T, wpm_val, A, nm, s2, st->gamma); \
+        forward_backward_fast(st, env, T, wpm_val, A, nm, s2, st->gamma, 0); \
     } while(0)
 
     EM_STEP(wpm, half);
@@ -666,10 +677,9 @@ static void decode_marginal(
     /* Results in st->gamma_marg[T*2], st->log_Z_bins[], st->speed_post[] */
 {
     /* Pass 1: compute log_Z for each speed bin */
-    for (int b = 0; b < N_SPEED_BINS; b++) {    /* log Z only: the forward pass (forward_log_z) */
-        st->log_Z_bins[b] = forward_log_z(
-            st, env, T, st->speed_bins[b], A, noise_mean, sigma2_obs);
-    }
+    int all[N_SPEED_BINS];                       /* log Z only: the forward pass, every bin at once */
+    for (int b = 0; b < N_SPEED_BINS; b++) all[b] = b;
+    forward_log_z_bins(st, env, T, all, N_SPEED_BINS, A, noise_mean, sigma2_obs, st->log_Z_bins);
 
     /* Compute speed posterior (uniform prior) */
     double lmax = st->log_Z_bins[0];
@@ -688,7 +698,7 @@ static void decode_marginal(
         double w = st->speed_post[b];
         if (w < 1e-10) continue;
         forward_backward_fast(st, env, T, st->speed_bins[b],
-                               A, noise_mean, sigma2_obs, st->gamma);
+                               A, noise_mean, sigma2_obs, st->gamma, 0);
         for (int i = 0; i < T * 2; i++)
             st->gamma_marg[i] += w * st->gamma[i];
     }
@@ -1862,19 +1872,12 @@ static int gate_segments(itila_state_t *st, const double *env, int t, int n, dou
             double noise = 0.0;
             for (int i = 0; i < len; i++) {
                 double x = env[a + i];
-                st->log_B[i*2+0] = lc - 0.5*(x-nm)*(x-nm)/s2;
-                st->log_B[i*2+1] = lc - 0.5*(x-A)*(x-A)/s2;
-                noise += st->log_B[i*2+0];
+                noise += lc - 0.5*(x-nm)*(x-nm)/s2;
             }
             double lz[N_SPEED_BINS], lmax = -INFINITY;
-            for (int u = 0; u < n_use; u++) {
-                double p01, p10;
-                transition_probs(st->speed_bins[use[u]], &p01, &p10);
-                double lT[4] = { log(1.0 - p01 + 1e-300), log(p01 + 1e-300),
-                                 log(p10 + 1e-300), log(1.0 - p10 + 1e-300) };
-                fb_core(st->log_B, lT, len, st->log_alpha, st->log_beta, &lz[u]);
+            forward_log_z_bins(st, env + a, len, use, n_use, A, nm, s2, lz);   /* log Z only: the forward pass */
+            for (int u = 0; u < n_use; u++)
                 if (lz[u] > lmax) lmax = lz[u];
-            }
             double se = 0.0;
             for (int u = 0; u < n_use; u++) se += exp(lz[u] - lmax);
             lbf = lmax + log(se / n_use) - noise;
@@ -2074,7 +2077,7 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
     }
 
     /* E-step: one forward-backward pass with current params */
-    forward_backward_fast(st, env, n, wpm, A, nm, s2, st->gamma);
+    forward_backward_fast(st, env, n, wpm, A, nm, s2, st->gamma, 0);
 
     /* Sufficient stat contributions from this call (raw units) */
     double dN0=0, dS0=0, dQ0=0, dN1=0, dS1=0, dQ1=0;
@@ -2129,7 +2132,7 @@ const char* itila_feed_online(itila_t h, const double *envelope, int n,
     /* Quick evidence check: one FB pass vs noise-only log-likelihood.
      * Avoids the 32-FB-pass decode_marginal unless evidence is sufficient. */
     double log_Z_cw = forward_backward_fast(st, env, n, wpm2, A2, nm2, s2_2,
-                                             st->gamma);
+                                             st->gamma, 1);
     double log_lik_noise = 0.0;
     {
         double lc = -0.5 * log(2.0 * M_PI * s2_2);
