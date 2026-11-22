@@ -149,14 +149,16 @@ static const double FIR1W_48K[9] = {
 #define SC_FIR1_MAX FIR1W_192K_LEN
 
 /* ---- FFT plan: precomputed bit reversal and twiddles, power of 2, forward ---- */
-typedef struct { int n; int *rev; double *wr, *wi; } FftPlan;
+/* Each stage's twiddles in order (stage len at offset len/2 - 1), so two stages run per pass
+ * over the data with the same arithmetic as one stage at a time. */
+typedef struct { int n, odd; int *rev; double *wr, *wi; } FftPlan;   /* odd: an odd number of stages */
 
 static int fft_plan_init(FftPlan *p, int n)
 {
     p->n = n;
     p->rev = (int *)malloc(n * sizeof(int));
-    p->wr = (double *)malloc(n / 2 * sizeof(double));
-    p->wi = (double *)malloc(n / 2 * sizeof(double));
+    p->wr = (double *)malloc(n * sizeof(double));
+    p->wi = (double *)malloc(n * sizeof(double));
     if (!p->rev || !p->wr || !p->wi) return 0;
     int bits = 0;
     while ((1 << bits) < n) bits++;
@@ -165,7 +167,15 @@ static int fft_plan_init(FftPlan *p, int n)
         for (int b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
         p->rev[i] = r;
     }
-    for (int k = 0; k < n / 2; k++) { p->wr[k] = cos(-2.0 * M_PI * k / n); p->wi[k] = sin(-2.0 * M_PI * k / n); }
+    p->odd = bits & 1;
+    for (int len = 2; len <= n; len <<= 1) {
+        int half = len >> 1, step = n / len;
+        for (int k = 0; k < half; k++) {
+            int j = k * step;
+            p->wr[half - 1 + k] = cos(-2.0 * M_PI * j / n);
+            p->wi[half - 1 + k] = sin(-2.0 * M_PI * j / n);
+        }
+    }
     return 1;
 }
 
@@ -185,16 +195,40 @@ HOT_CLONES static void fft_exec(const FftPlan *p, double *re, double *im)
             t = im[i]; im[i] = im[j]; im[j] = t;
         }
     }
-    for (int len = 2; len <= n; len <<= 1) {
-        int half = len >> 1, step = n / len;
-        for (int i = 0; i < n; i += len) {
-            for (int k = 0; k < half; k++) {
-                double cr = p->wr[k * step], ci = p->wi[k * step];
-                double vr = re[i+k+half], vi = im[i+k+half];
+    int len = 2;
+    if (p->odd) {                                          /* an odd stage count: one radix-2 stage first */
+        double cr = p->wr[0], ci = p->wi[0];
+        for (int i = 0; i < n; i += 2) {
+            double vr = re[i+1], vi = im[i+1];
+            double tr = vr*cr - vi*ci, ti = vr*ci + vi*cr;
+            double ur = re[i], ui = im[i];
+            re[i]   = ur + tr; im[i]   = ui + ti;
+            re[i+1] = ur - tr; im[i+1] = ui - ti;
+        }
+        len = 4;
+    }
+    for (; len * 2 <= n; len <<= 2) {                      /* stages len and 2*len in one pass */
+        int m = len >> 1;
+        const double *ar = p->wr + m - 1, *ai = p->wi + m - 1;       /* stage len: m twiddles */
+        const double *br = p->wr + len - 1, *bi = p->wi + len - 1;   /* stage 2*len: 2m twiddles */
+        for (int i = 0; i < n; i += 2 * len) {
+            double *r = re + i, *q = im + i;
+            for (int k = 0; k < m; k++) {
+                double cr = ar[k], ci = ai[k];
+                double vr = r[k+m], vi = q[k+m];
                 double tr = vr*cr - vi*ci, ti = vr*ci + vi*cr;
-                double ur = re[i+k], ui = im[i+k];
-                re[i+k]      = ur + tr; im[i+k]      = ui + ti;
-                re[i+k+half] = ur - tr; im[i+k+half] = ui - ti;
+                double xar = r[k] + tr, xai = q[k] + ti, xbr = r[k] - tr, xbi = q[k] - ti;
+                vr = r[k+3*m]; vi = q[k+3*m];
+                tr = vr*cr - vi*ci; ti = vr*ci + vi*cr;
+                double xcr = r[k+2*m] + tr, xci = q[k+2*m] + ti, xdr = r[k+2*m] - tr, xdi = q[k+2*m] - ti;
+                cr = br[k]; ci = bi[k];
+                tr = xcr*cr - xci*ci; ti = xcr*ci + xci*cr;
+                r[k]     = xar + tr; q[k]     = xai + ti;
+                r[k+2*m] = xar - tr; q[k+2*m] = xai - ti;
+                cr = br[k+m]; ci = bi[k+m];
+                tr = xdr*cr - xdi*ci; ti = xdr*ci + xdi*cr;
+                r[k+m]   = xbr + tr; q[k+m]   = xbi + ti;
+                r[k+3*m] = xbr - tr; q[k+3*m] = xbi - ti;
             }
         }
     }
