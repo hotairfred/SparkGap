@@ -111,11 +111,6 @@ def test_10_respot() -> None:
     assert _feed(r, "CQ K1ABC K1ABC", t=700, w=3) == ["K1ABC"]
 
 
-def test_11_rbn_window() -> None:
-    r = _rule(segments=[(14000.0, 14070.0)])
-    assert _feed(r, "CQ K1ABC K1ABC", f=14095.0) == [] and _why(r, "K1ABC") == 11
-
-
 def test_11_beacon() -> None:
     r = _rule()
     assert _feed(r, "4U1UN 4U1UN", f=14100.0) == ["4U1UN"]                 # no keyword needed
@@ -446,3 +441,57 @@ def test_12_an_ncdxf_beacon_skips_gate_4() -> None:
     assert _feed(r, "VE8AT I6BT", f=14100.0) == ["VE8AT"]
     r = _rule(beacons={"W5ABC": 7039.0})
     assert _feed(r, "W5ABC I6BT", f=7039.0) == [] and _why(r, "W5ABC") == 4
+
+
+def test_5_qrz_is_no_keyword() -> None:
+    r = _rule()                     # cdub89/SparkGap#56 EK6: QRZ asks who is calling, no CQ
+    assert _feed(r, "QRZ QRZ DE W0GXQ W0GXQ K") == [] and _why(r, "W0GXQ") == 5
+    assert _feed(r, "QRZ W8OP W8OP", f=14056.6) == [] and _why(r, "W8OP") == 5
+
+
+def test_s_a_window_keeps_its_lower_cost_copy() -> None:
+    # cdub89/SparkGap#56 EK5: the two filter paths of one window; the cleaner copy is judged
+    r = _rule()
+    win = r.window_id(140250, 0, 0.0)
+    r.feed(win, 14025.0, "CQ W3MA W3MA", 0.0, cost=4.71)       # a caller where the runner was lost
+    r.feed(win, 14025.0, "CQ AB5SE AB5SE", 0.0, cost=0.45)     # the other path read the runner
+    assert [c for c, _ in r.end_pass()] == ["AB5SE"]
+    win = r.window_id(70300, 1, 1.0)
+    r.feed(win, 7030.0, "CQ K1ABC K1ABC", 1.0, cost=0.2)
+    r.feed(win, 7030.0, "CQ K1ABD K1ABD", 1.0, cost=9.0)       # costlier: never read
+    assert [c for c, _ in r.end_pass()] == ["K1ABC"] and "K1ABD" not in {c for _, _, c, _, _ in r.trace}
+
+
+def test_s_without_a_cost_both_copies_are_judged_as_before() -> None:
+    r = _rule()
+    win = r.window_id(140250, 0, 0.0)
+    r.feed(win, 14025.0, "CQ W3MA W3MA", 0.0, cost=0.1)
+    r.feed(win, 14025.0, "CQ AB5SE AB5SE", 0.0)                # no cost: the latest text stays
+    assert sorted(c for c, _ in r.end_pass()) == ["AB5SE", "W3MA"]
+    assert r.buffer(win) == ["CQ", "AB5SE", "AB5SE"]
+
+
+def test_s_a_cleaner_copy_finds_the_older_text_the_noisy_one_pushed_out() -> None:
+    # a long noisy first copy must not cost the buffer the windows its cleaner copy still needs
+    r = _rule()
+    _feed(r, "CQ CQ DE N5RG", w=1)
+    win = r.window_id(round(14025.0 * 10), 2, 30.0)
+    r.feed(win, 14025.0, "E I " * 130, 30.0, cost=26.4)          # noise: pushes window 1 out
+    r.feed(win, 14025.0, "DE N5RG K", 30.0, cost=0.4)            # the clean copy of window 2
+    assert [c for c, _ in r.end_pass()] == ["N5RG"]
+
+
+def test_s_the_spot_carries_the_kept_copy_s_speed() -> None:
+    # cdub89/SparkGap#56 EK5: a costlier later copy is set aside, and so are its WPM and SNR
+    import sparkgap
+    tracker = sparkgap.SpotTracker(set(), set())
+    rule = GateSpotRule(lambda c: "active")
+    tracker.__dict__["spot_rule"] = rule
+
+    def copy(text: str, wpm: int, cost: float) -> sparkgap.SpotIntent:
+        return sparkgap.SpotIntent(call="", freq_khz=14025.0, snr_db=12.0, wpm=wpm, is_runner=True,
+                                   window_id=1, bin_id=7, bin_seq=7, window_text=text, cost=cost)
+
+    tracker.process_intent(copy("CQ K1ABC K1ABC K", 20, 0.2))
+    tracker.process_intent(copy("CQ K1ABC E K1AB", 38, 9.5))
+    assert [(s["call"], s["wpm"]) for s in tracker.flush_pass()] == [("K1ABC", 20)]
