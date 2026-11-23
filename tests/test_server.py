@@ -594,3 +594,15 @@ def test_radiolog_reads_a_radio_named_as_radio_files_allow(server: Server, seat:
     ws.send(OP_TEXT, json.dumps({"type": "server", "id": 8, "cmd": "radiolog", "name": "radiolog",
                                  "settings": {"radio": "../x"}}).encode())
     assert not _result(ws, 8)["ok"]
+
+
+def test_downloads_takes_check_or_refresh_only(server: Server, seat: Seat) -> None:  # noqa: F811
+    ws = _ws(server)
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 21, "cmd": "downloads", "name": "downloads",
+                                 "settings": {"action": "check"}}).encode())
+    r = _result(ws, 21)
+    assert r["ok"] and r["message"] == "Downloads: none to check"
+    ws.send(OP_TEXT, json.dumps({"type": "server", "id": 22, "cmd": "downloads", "name": "downloads",
+                                 "settings": {"action": "delete"}}).encode())
+    r = _result(ws, 22)
+    assert not r["ok"] and "check or refresh" in r["error"]

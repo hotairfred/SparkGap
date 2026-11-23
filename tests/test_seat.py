@@ -51,6 +51,8 @@ def seat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Seat]:
     lines = [f"{n} {code} {n}.local.json python3" for n in ("dallas1", "dallas2")]
     (tmp_path / "instances").write_text("# name code-dir config python\n" + "\n".join(lines) + "\n")
     monkeypatch.setattr(seat_mod, "START_WAIT_S", 10)
+    plenty = seat_mod.shutil._ntuple_diskusage(0, 0, 100 * 2**30)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(seat_mod.shutil, "disk_usage", lambda _p: plenty)  # a small /tmp (Pi) must not fail recording tests
     s = Seat(tmp_path)
     yield s
     for pidfile in (tmp_path / "logs").glob("*.pid"):
@@ -68,6 +70,31 @@ def test_one_station_for_two_copies_stopped_after_the_last(seat: Seat) -> None:
     assert seat.station_pid("192.0.2.9") is not None
     seat.stop("dallas2")
     assert seat.station_pid("192.0.2.9") is None and not list(seat.logs.glob("*.pid"))
+
+
+def test_the_running_list_is_the_last_state_a_boot_starts_again(seat: Seat) -> None:
+    """cdub89/SparkGap#27 H1: started and not stopped since; a power cut leaves it as it was."""
+    assert seat.running_list() == []
+    seat.start("dallas2")
+    seat.start("dallas1")
+    assert (seat.logs / "running").read_text() == "dallas2 dallas1\n"  # sparkgap.sh start reads the names
+    seat.restart("dallas2")
+    seat.change("dallas2", {"band": "20m"})
+    assert seat.running_list() == ["dallas2", "dallas1"]
+    seat.stop("dallas2")
+    assert seat.running_list() == ["dallas1"]
+    seat.stop("dallas1")
+    assert seat.running_list() == [] and (seat.logs / "running").read_text() == ""
+
+
+def test_the_running_list_is_never_half_written(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    seat.start("dallas1")
+    def cut(*a: Any) -> None:
+        raise OSError("power cut")
+    monkeypatch.setattr(seat_mod.os, "replace", cut)
+    with pytest.raises(OSError):
+        seat.stop("dallas1")
+    assert seat.running_list() == ["dallas1"]
 
 
 def test_a_copy_keeps_running_when_its_starter_is_gone(seat: Seat) -> None:
@@ -121,6 +148,7 @@ def test_decoder_options_are_written_and_off_removes_the_key(seat: Seat) -> None
     assert cfg["spot_rule_gates"] is True and cfg["spot_rule_bad_calls"] is True
     assert seat.settings(i)["spot_rule"] == "gates"
     assert seat.settings(i)["rule_files"]["spot_rule_bad_calls"] == str(i.config.parent / "BadCalls.txt")
+    assert seat.settings(i)["rule_files"]["spot_rule_notched_freqs"] == str(i.code / "NotchedFreqs.txt")
     seat.change("dallas1", {"spot_rule": "repeat", "call_source": None})    # back: the keys go
     assert "spot_rule_gates" not in seat.config(i) and "spot_validation_calls" not in seat.config(i)
     assert seat.settings(i)["spot_rule"] == "repeat" and seat.settings(i)["call_source"] is None
@@ -264,6 +292,15 @@ def test_a_start_waits_for_the_lock_sparkgap_sh_holds(seat: Seat) -> None:
     seat.start("dallas1")
     held.wait()
     assert time.monotonic() - t0 >= 1.5
+
+
+def test_a_copy_not_live_in_time_is_stopped_with_a_run_error(seat: Seat, monkeypatch: pytest.MonkeyPatch) -> None:
+    code = seat.instance("dallas1").code / "sparkgap.py"
+    code.write_text("\n".join(line for line in COPY.splitlines() if "LIVE" not in line) + "\n" + BANDS_LINE)
+    monkeypatch.setattr(seat_mod, "START_WAIT_S", 2)
+    with pytest.raises(SeatError, match="dallas1: not live after 2 s, stopped"):
+        seat.start("dallas1")
+    assert seat.pid("dallas1") is None and "dallas1" not in seat.running_list()
 
 
 def test_a_feed_that_failed_to_start_has_no_port(seat: Seat) -> None:
@@ -725,7 +762,8 @@ def test_radio_log_flex_station_and_hpsdr_link_lines(seat: Seat) -> None:
         "12:00:00 INFO [Flex] >>> C1|info\n12:00:00 INFO [Flex] <<< R1|0|model=\"FLEX-6400\"\n")
     assert seat.radio_log("Lake") == ["12:00:00 INFO [Flex] >>> C1|info", '12:00:00 INFO [Flex] <<< R1|0|model="FLEX-6400"']
     (seat.logs / "Web888_40m_20261114_120000Z.log").write_text(
-        "12:00:00 INFO Using direct SDR IP: 192.0.2.7\n12:00:01 INFO ITILA raw 7030.0 kHz: 'CQ'\n")
+        "12:00:00 INFO Using direct SDR IP: 192.0.2.7\n12:00:01 INFO ITILA raw 7030.0 kHz: 'CQ'\n"
+        "12:00:02 INFO ITILA raw 3544.0 kHz: 'RADIO SHACK ON BOARD'\n")
     assert seat.radio_log("Web888") == ["12:00:00 INFO Using direct SDR IP: 192.0.2.7"]
     assert len(seat.radio_log("Lake", lines=1)) == 1
 
@@ -792,3 +830,84 @@ def test_nodes_the_all_band_recorder_cannot_feed_keep_record_wav(
     monkeypatch.setattr(seat, "pid", lambda name: 4242)
     seat.change("dallas1", {"record": True}, live_record=_live)
     assert seat.config(i)["record_wav"] and "record_iq_dir" not in seat.config(i)
+
+
+def test_the_snapshot_lists_downloads_from_the_run_root_and_each_rbn_known_dir(seat: Seat) -> None:
+    import downloads
+    lib = seat.root / "librbn2_auth.so"
+    lib.write_bytes(b"x")
+    downloads.note(lib, "https://example.invalid/lib", None, "rbn2auth/1.2", None)
+    elsewhere = seat.root / "code" / "rbn_known"  # a copy without rbn_known_dir: relative to its code
+    elsewhere.mkdir()
+    (elsewhere / "skccdata.txt").write_bytes(b"x")
+    downloads.note(elsewhere / "skccdata.txt", "https://example.invalid/skcc", 41_203, "members", None)
+    got = {e["name"]: e["records"] for e in seat.snapshot()["downloads"]}
+    assert got == {"librbn2_auth.so": None, "skccdata.txt": 41_203}
+    i = seat.instances()[0]
+    i.config.write_text(json.dumps({**json.loads(i.config.read_text()), "rbn_known_dir": 17}))
+    assert {e["name"] for e in seat.snapshot()["downloads"]} >= {"librbn2_auth.so"}
+
+
+def test_the_auth_library_is_a_download_only_where_it_is_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    import rbn2_feeder
+    from seat import download_specs
+    monkeypatch.setattr(rbn2_feeder, "auth_build", lambda machine=None: ("https://example.invalid/lib", "0"))
+    assert download_specs()["librbn2_auth.so"][0] == "https://example.invalid/lib"
+    monkeypatch.setattr(rbn2_feeder, "auth_build", lambda machine=None: None)
+    assert "librbn2_auth.so" not in download_specs()
+
+
+def _noted_roster(seat: Seat, downloaded: float) -> Path:
+    import os
+
+    import downloads
+    folder = seat.root / "rbn_known"
+    folder.mkdir(exist_ok=True)
+    path = folder / "skccdata.txt"
+    path.write_bytes(b"x")
+    os.utime(path, (downloaded, downloaded))
+    downloads.note(path, "https://example.invalid/from-the-manifest", 1, "members", None)
+    return path
+
+
+def test_check_for_updates_compares_the_servers_date_and_fetches_nothing(seat: Seat, monkeypatch) -> None:
+    import downloads
+    _noted_roster(seat, 1_800_000_000.0)
+    asked: list[str] = []
+    dates = iter([1_700_000_000.0, 1_900_000_000.0])
+    monkeypatch.setattr(downloads, "server_date", lambda url, agent: asked.append(url) or next(dates))
+    monkeypatch.setattr(downloads, "fetch", lambda *a, **k: pytest.fail("fetched"))
+    assert seat.check_downloads() == "Downloads: skccdata.txt up to date"
+    assert seat.check_downloads() == "Downloads: skccdata.txt newer on its server (03-17 17:46Z)"
+    import skcc_roster
+    assert asked == [skcc_roster.ROSTER_URL] * 2  # the code's URL, never the manifest's
+
+
+def test_refresh_fetches_a_fresh_file_and_a_failure_keeps_the_copy(seat: Seat, monkeypatch) -> None:
+    import time
+
+    import downloads
+    import skcc_roster
+    path = _noted_roster(seat, time.time())                     # fresh: a start would not fetch it
+    monkeypatch.setattr(skcc_roster, "_check", lambda p: 7)
+    monkeypatch.setattr(downloads, "fetch", lambda url, agent, *a: b"new copy")
+    assert seat.refresh_downloads().startswith("Downloads refreshed: skccdata.txt ok")
+    assert path.read_bytes() == b"new copy"
+
+    def offline(*a: object) -> bytes:
+        raise OSError("timed out")
+
+    monkeypatch.setattr(downloads, "fetch", offline)
+    assert "skccdata.txt failed (OSError: timed out)" in seat.refresh_downloads()
+    assert path.read_bytes() == b"new copy"
+
+
+def test_only_files_the_code_downloads_are_checked_or_refreshed(seat: Seat, monkeypatch) -> None:
+    import downloads
+    elsewhere = seat.root / "rbn_known"
+    elsewhere.mkdir(exist_ok=True)
+    for name in ("rbn_known.txt", "librbn2_auth.so"):     # built at start; the library not in the root
+        (elsewhere / name).write_bytes(b"x")
+        downloads.note(elsewhere / name, "https://example.invalid/x", 1, "x", None)
+    monkeypatch.setattr(downloads, "server_date", lambda *a: pytest.fail("asked"))
+    assert seat.check_downloads() == "Downloads: none to check"

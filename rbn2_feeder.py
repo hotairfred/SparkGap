@@ -3,8 +3,8 @@
 
 Reads SparkGap's local cluster telnet like rbn_feeder.py (whose spot parsing and band probe it
 reuses) and posts to RBN's id.php and s.php. The two hash fields come from the
-library librbn2_auth.so in the run root (the folder above this file's), handed out separately and
-never kept in a git checkout.
+library librbn2_auth.so in the run root (the folder above this file's), never kept in a git
+checkout: a live feeder downloads its machine's build (AUTH_BUILDS) when it is missing or not that build.
 Without a library of the expected version the feeder does not post (--dry-run aside).
 
 Differences from rbn_feeder.py: heartbeat every 300 s;
@@ -26,6 +26,7 @@ import http.client
 import json
 import logging
 import math
+import platform
 import queue
 import signal
 import socket
@@ -41,6 +42,7 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlreq
 
+import downloads
 import rbn_feeder as base
 from process_link import ProcessLink
 from spot_rule2 import beacon_kind
@@ -49,6 +51,14 @@ log = logging.getLogger("rbn2_feeder")
 
 AUTH_VERSION = "rbn2auth/1.2"  # RBN2_AUTH_VERSION, compared as text
 AUTH_LIB = "librbn2_auth.so"
+_X86_64 = ("https://downloads.wx7v.net/rbn/x86_64/librbn2_auth.so",
+           "bfad62727e95bee613d785329f2ed39a0d7006c70e58aed8139587d5ef75c504")
+AUTH_BUILDS = {  # platform.machine(): the build's URL and SHA-256; a new version gets new URLs
+    "x86_64": _X86_64,
+    "AMD64": _X86_64,
+    "aarch64": ("https://downloads.wx7v.net/rbn/aarch64/librbn2_auth.so",
+                "ffc342ae3952d68400a3f0bacff22e48f96a2438c52116dfabf43f056d5969a0"),
+}
 SKIM_VERSION = "SparkGap 1.2"  # skimVersion and sign-in: names SparkGap in RBN's node list
 AGG_VERSION = "6.7"  # id.php aggVersion and s.php agg, as other direct feeders send
 UPLOAD_MODES = ("dry", "live")  # rbn_upload; absent or anything else is off
@@ -284,6 +294,48 @@ class Respot:
 def auth_lib_path() -> Path:
     """librbn2_auth.so in the folder above this checkout, never inside it."""
     return Path(__file__).resolve().parent.parent / AUTH_LIB
+
+
+def auth_build(machine: str | None = None) -> tuple[str, str] | None:
+    """This machine's auth library build (URL, SHA-256), or None when there is none for it."""
+    return AUTH_BUILDS.get(machine or platform.machine())
+
+
+def _auth_check(path: Path, machine: str | None = None) -> None:
+    """This machine's pinned build or nothing: a download that is not it is never kept."""
+    got = hashlib.sha256(path.read_bytes()).hexdigest()
+    build = auth_build(machine)
+    if build is None or got != build[1]:
+        pinned = f"the pinned {build[1][:12]}..." if build else f"pinned for {machine or platform.machine()}"
+        raise ValueError(f"SHA-256 {got[:12]}... is not {pinned}")
+
+
+def _drop_other_builds(path: Path, machine: str) -> None:
+    """Remove a copy that is another machine's build, so a failed download cannot leave it in use."""
+    mine = auth_build(machine)
+    others = {sha for _url, sha in AUTH_BUILDS.values()} - {mine[1] if mine else None}
+    try:
+        if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() in others:
+            path.unlink()
+            log.info("auth library: removed the build for another machine at %s", path)
+    except OSError as e:
+        log.warning("auth library: could not check %s: %s", path, e)
+
+
+def fetch_auth_lib(path: Path, get: Callable[[], bytes] | None = None,
+                   machine: str | None = None) -> None:
+    """Download this machine's auth library build when it is missing or not that build; a failed
+    download keeps the copy there (the version check then decides)."""
+    machine = machine or platform.machine()
+    _drop_other_builds(path, machine)
+    build = auth_build(machine)
+    if build is None:
+        log.warning("auth library: built for %s, none for %s", ", ".join(AUTH_BUILDS), machine)
+        return
+    url, sha = build
+    downloads.refresh(path, url, lambda p: _auth_check(p, machine), AUTH_VERSION, "SparkGap rbn2_feeder",
+                      current=lambda p: hashlib.sha256(p.read_bytes()).hexdigest() == sha,
+                      get=get)
 
 
 def not_ready(auth: Auth | None, dry_run: bool) -> str | None:
@@ -724,6 +776,8 @@ def main() -> None:
 
     auth = None
     lib = auth_lib_path()
+    if not dry_run:
+        fetch_auth_lib(lib)
     if lib.exists():
         try:
             auth = Auth(str(lib))

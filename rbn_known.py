@@ -13,17 +13,16 @@ import argparse
 import csv
 import io
 import logging
-import os
 import re
-import tempfile
 import time
 import urllib.error
-import urllib.request
 import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+import downloads
 
 ARCHIVE_URL = "https://data.reversebeacon.net/rbn_history/{day}.zip"
 DAYS = 7                      # default days of archives a call can be known from (rbn_known_days)
@@ -125,10 +124,7 @@ def skimmer_counts(cache_dir: Path, own_call: str, days: int = DAYS, today: date
 
 
 def _fetch(day: date) -> bytes:
-    url = ARCHIVE_URL.format(day=f"{day:%Y%m%d}")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
-        return resp.read()
+    return downloads.fetch(ARCHIVE_URL.format(day=f"{day:%Y%m%d}"), USER_AGENT, FETCH_TIMEOUT_S)
 
 
 def _load(path: Path) -> Counter[str] | None:
@@ -145,15 +141,7 @@ def _load(path: Path) -> Counter[str] | None:
 
 def _write(path: Path, text: str) -> None:
     """Write through a temp file of this writer's own: copies sharing the cache never collide."""
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
-    tmp = Path(name)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        tmp.replace(path)                 # a crash mid-write never leaves a short day
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    downloads.write_atomic(path, text.encode())
 
 
 def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None = None,
@@ -169,6 +157,7 @@ def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None
     have: list[date] = []
     offline = False
     fetched = 0
+    error = None                                 # the last failed day, for downloads.json
     for back in range(1, days + 1):
         day = today - timedelta(days=back)
         path = cache_dir / f"{day:%Y%m%d}_{tag}_v{CACHE_VERSION}.calls"
@@ -185,14 +174,17 @@ def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None
                 if e.code == 404:                    # not published yet
                     log.warning("rbn_known: no archive for %s (%s)", day, e)
                     continue
+                error = f"{day}: {e}"
                 log.warning("rbn_known: archive for %s refused (%s); using the cache only", day, e)
                 offline = True                       # RBN refusing: no more tries this start
                 continue
             except OSError as e:
+                error = f"{day}: {e}"
                 log.warning("rbn_known: no archive for %s (%s); using the cache only", day, e)
                 offline = True                       # one network failure: no more tries this start
                 continue
             except Exception as e:                   # truncated or damaged download
+                error = f"{day}: {e!r}"
                 log.warning("rbn_known: unreadable archive for %s (%r)", day, e)
                 continue
             _write(path, "".join(f"{c}\t{n}\n" for c, n in sorted(counts.items())))
@@ -209,12 +201,14 @@ def refresh(cache_dir: Path, own_call: str, days: int = DAYS, today: date | None
     known = known_calls(counted, drop_busts=drop_busts, keep=keep)
     span = f"{min(have):%Y-%m-%d} to {max(have):%Y-%m-%d}" if have else "none"
     dropped = len(known_calls(counted)) - len(known) if drop_busts else 0
-    _write(cache_dir / ("rbn_known_nobusts.txt" if drop_busts else "rbn_known.txt"),
+    listed = cache_dir / ("rbn_known_nobusts.txt" if drop_busts else "rbn_known.txt")
+    _write(listed,
         f"# RBN known calls: {MIN_SKIMMERS}+ skimmers on one day, {span}, "
         f"own spotter {tag} left out" + (f", {dropped} shared busts dropped" if drop_busts else "") + "\n"
         + "".join(f"{c}\n" for c in sorted(known)))
     log.info("rbn_known: %d known calls from %d days (%s)%s", len(known), len(have), span,
              f", {dropped} shared busts dropped (rbn_known_drop_busts)" if drop_busts else "")
+    downloads.note(listed, ARCHIVE_URL.format(day="YYYYMMDD"), len(known), "calls", error)
     return known
 
 

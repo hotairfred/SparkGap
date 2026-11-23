@@ -33,6 +33,9 @@ and grid. Where broadcasts do not reach the machine it asks for the radio's
 address. Run it again any time: it asks only what is missing. Then add
 receivers in SparkGap Web (**⚙**, **+ Add a receiver**).
 
+On a Raspberry Pi, see [RASPBERRY_PI.md](RASPBERRY_PI.md) first: the build,
+clock, power and boot service.
+
 ```text
 ~/sparkgap/
   server.json                 the server's address, port and join code
@@ -44,19 +47,22 @@ receivers in SparkGap Web (**⚙**, **+ Add a receiver**).
   rec/                        recordings, when turned on
 ```
 
-Day to day, `sparkgap.sh` has four commands:
+Day to day, `sparkgap.sh` has five commands:
 
 - `setup`: as above.
-- `start`: the server, and the receivers that ran at the last `stop`.
+- `start`: the server, and the receivers that ran last: started and not
+  stopped since, so after a power cut too.
 - `stop`: every receiver (remembered for `start`), its station and feeder,
   then the server. Stopping the server alone leaves receivers running.
+- `restart`: `stop`, then `start` with the same receivers, as after a code
+  update. It takes no receiver's name: every radio restarts whole.
 - `status`: each radio, its node and feeder, and its receivers.
 
 `start` or `stop` with a receiver's name acts on that one. Everything else is
 in SparkGap Web. The command line client, `python3 sparkgap_ctl.py`
 (`status`, `start`, `stop`, `restart`, `band`, `rec`, `rbn`, `set`,
 `discover`), drives the server as SparkGap Web does; `sparkgap.sh` uses it
-for `start`, `stop` and `status`.
+for `start`, `stop`, `restart` and `status`.
 
 ## Adding and removing receivers
 
@@ -187,8 +193,8 @@ on a Ryzen 5 5500U), and nothing while no browser is connected.
 ## Sending spots to RBN
 
 Each radio's feeder needs the RBN auth library in the run folder
-(`~/sparkgap/librbn2_auth.so`) before RBN upload is set to live:
-[sending-spots.md](sending-spots.md).
+(`~/sparkgap/librbn2_auth.so`); a live feeder downloads it there on first
+start: [sending-spots.md](sending-spots.md).
 
 ## For developers
 

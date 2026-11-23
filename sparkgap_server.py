@@ -98,7 +98,7 @@ FEED_LINK_S = 20.0  # longest an RBN feeder takes to start and link to the hub
 FEED_STOP_S = 30.0
 FEED_RELINK_S = 12.0  # a running feeder links again within its RECONNECT_S after a server restart
 COMMANDS = ("start", "stop", "restart", "set", "add", "remove")
-RADIO_COMMANDS = ("discover", "node", "rename", "remove_radio")  # not tied to one instance
+RADIO_COMMANDS = ("discover", "node", "rename", "remove_radio", "downloads")  # not tied to one instance
 BY_RE = re.compile(r"[^A-Za-z0-9 ._-]")  # what a client may call itself in the log
 
 
@@ -161,7 +161,7 @@ def busy_word(cmd: str, settings: dict[str, Any]) -> str:
         return "changing the receive path"
     return {"set": "restarting", "add": "adding", "remove": "removing", "stop": "stopping",
             "node": "saving the node", "discover": "discovering", "rename": "renaming",
-            "remove_radio": "removing the radio"}.get(cmd, cmd + "ing")
+            "remove_radio": "removing the radio", "downloads": "fetching"}.get(cmd, cmd + "ing")
 
 
 class LogRing(logging.Handler):
@@ -633,7 +633,7 @@ class Server:
             name = cmd   # busy and queued like an instance, under its own name
         elif cmd not in COMMANDS or not isinstance(name, str) or not NAME_RE.match(name):
             return refuse("unknown command or instance")
-        if cmd in ("set", "add", "discover", "node", "rename", "remove_radio") and not isinstance(settings, dict):
+        if cmd in ("set", "add", *RADIO_COMMANDS) and not isinstance(settings, dict):
             return refuse("settings must be an object")
         key = name if cmd in RADIO_COMMANDS else self.seat.process_name(name)  # an HPSDR receiver: its radio
         if key in self.busy:
@@ -691,6 +691,13 @@ class Server:
             return self.seat.discover(address=address, kind=kind, name=settings.get("name") or None)
         if cmd == "remove_radio":  # a radio with no receivers left
             return self.seat.remove_radio(str(settings.get("radio") or ""))
+        if cmd == "downloads":  # SparkGap Web's Check for updates and Refresh
+            action = settings.get("action")
+            if action == "check":
+                return self.seat.check_downloads()
+            if action == "refresh":
+                return self.seat.refresh_downloads()
+            raise ValueError("downloads: action must be check or refresh")
         if cmd == "rename":  # an HPSDR radio's name, while it is stopped
             return self.seat.rename_radio(str(settings.get("radio") or ""), str(settings.get("name") or ""))
         if cmd == "node":  # sparkgap.sh setup's spotter ID, grid and operator, from the web

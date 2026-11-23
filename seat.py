@@ -26,10 +26,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import downloads
 import radios
 
-START_WAIT_S = 45  # longest a copy takes to reach the radio and go live
+START_WAIT_S = 120  # a start polls the copy's log this long for live (a Web-888 after a restart: 46 s)
 STOP_WAIT_S = 30
+RUNNING_FILE = "running"  # logs/running: the copies started and not stopped since; sparkgap.sh start (a boot) starts them
 STATION_WAIT_S = 45
 REC_MIN_GB = 5  # recording on refuses below this much free space in rec/
 LIVE_MARK = "SparkGap LIVE:"
@@ -38,7 +40,7 @@ STATION_HELD = "already has station"
 RADIO_LOG_LINES = 200  # the Radio pane's log
 RADIO_LOG_HEAD = 65_536  # an HPSDR run log's start (where its radio link is set up) and its newest part
 RADIO_LOG_TAIL = 262_144
-HPSDR_LINK_RE = re.compile(r"SDR IP|hpsdr|HPSDR|C receiver|Web-888|board|reconnect|packets? lost|radio", re.I)
+HPSDR_LINK_RE = re.compile(r"SDR IP|hpsdr|HPSDR|C receiver|Web-888|board|reconnect|packets? lost|radio")  # case-sensitive: decoded CW is all capitals
 FEED_PORT_RE = re.compile(r"GUI feed on wss?://\S+?:(\d+)/")
 ERROR_RE = re.compile(r"^[0-9:]+ ERROR |^[A-Za-z_.]*(Error|Exception): ")
 SPOT_RE = re.compile(r"SPOT:")
@@ -244,6 +246,25 @@ def proc_started(pid: int) -> float | None:
 
 _CACHE: dict[Path, tuple[tuple[int, int, int], Any]] = {}
 _CACHE_LOCK = threading.Lock()
+
+
+def download_specs() -> dict[str, tuple[str, downloads.Check, str, str]]:
+    """The files SparkGap Web can check and refresh, by name: URL, check, what it counts, user
+    agent, all the code's own; the auth library only where it is built for this machine. The RBN
+    known calls are built from the archive days at start."""
+    import rbn2_feeder
+    import rbn_files
+    import skcc_roster
+    auth = rbn2_feeder.auth_build()
+    return {
+        "skccdata.txt": (skcc_roster.ROSTER_URL, skcc_roster._check, "members", skcc_roster.USER_AGENT),
+        "patt3ch.lst": (rbn_files.PATT3CH_URL, rbn_files._check_patt3ch, "patterns", rbn_files.USER_AGENT),
+        "bcn.csv": (rbn_files.BCN_URL, rbn_files._check_beacons, "beacons", rbn_files.USER_AGENT),
+        "master.scp": (rbn_files.MASTER_SCP_URL, rbn_files._check_master_scp, "calls",
+                       rbn_files.USER_AGENT),
+        **({"librbn2_auth.so": (auth[0], rbn2_feeder._auth_check, rbn2_feeder.AUTH_VERSION,
+                                "SparkGap rbn2_feeder")} if auth else {}),
+    }
 
 
 def cached(path: Path, parse: Callable[[str], Any]) -> Any:
@@ -581,16 +602,47 @@ class Seat:
         pidfile = self.logs / f"{name}.pid"
         self._launch(i.code, pidfile, log, [i.python, "sparkgap.py", "--config", str(i.config)])
         if self._wait_for(log, LIVE_MARK, lambda: self.pid(name), START_WAIT_S):
+            self._write_running(name, True)
             return f"{name}: live (pid {self.pid(name)})"
         if self.pid(name):
-            raise SeatError(f"{name}: running but not live after {START_WAIT_S} s, see {log.name}")
+            self._stop(i)  # a run error: nothing left half started, without its feeder or a place in logs/running
+            raise SeatError(f"{name}: not live after {START_WAIT_S} s, stopped: see {log.name}")
         pidfile.unlink(missing_ok=True)
         raise SeatError(f"{name}: failed to start: {(errors_in(log) or ['no error logged'])[-1]}")
 
     def stop(self, name: str) -> str:
         i = self.instance(name)
         with self.lock(i):
-            return self._stop(i)
+            done = self._stop(i)
+            self._write_running(name, False)
+            return done
+
+    def running_list(self) -> list[str]:
+        """The copies logs/running holds, in the order they started."""
+        try:
+            return (self.logs / RUNNING_FILE).read_text().split()
+        except OSError:
+            return []
+
+    def _write_running(self, name: str, running: bool) -> None:
+        """Put a started copy on logs/running or take a stopped one off. Written through a temp file:
+        a power cut leaves the old list or the new one, never part of one."""
+        with open(self.logs / f"{RUNNING_FILE}.lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            names = [n for n in self.running_list() if n != name or running]
+            if running and name not in names:
+                names.append(name)
+            tmp = self.logs / f"{RUNNING_FILE}.new"
+            with open(tmp, "w") as f:
+                f.write(" ".join(names) + "\n" if names else "")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.logs / RUNNING_FILE)
+            d = os.open(self.logs, os.O_RDONLY)  # the rename on disk too
+            try:
+                os.fsync(d)
+            finally:
+                os.close(d)
 
     def _stop(self, i: Instance) -> str:
         """Stop a copy, and its station after the radio's last copy; the caller holds its lock."""
@@ -611,14 +663,15 @@ class Seat:
     # ---- settings: a fixed list, each applied by a restart ----
 
     def settings(self, i: Instance) -> dict[str, Any]:
+        from spot_rule2 import rule_file
         cfg = self.config(i)
         return {
             "band": self.band(i),
             "bands_known": self.bands_known(i),
             "multi_band": self.multi_band(i),
             **decoder_settings(cfg),
-            # the Gated Rule's files, beside the config, as SparkGap reads them
-            "rule_files": {k: str(i.config.parent / f) for k, f in RULE_FILES.items()},
+            # the Gated Rule's files as SparkGap reads them: beside the config, else the checkout's
+            "rule_files": {k: str(rule_file(i.config.parent, f, i.code)) for k, f in RULE_FILES.items()},
             "rbn_upload": self.upload_mode(i),
             # a Flex copy's receive path as its config sets it at start (None: the radio's own)
             **{k: cfg.get(c) for k, (_, c) in RX_SETTINGS.items()},
@@ -1299,6 +1352,57 @@ class Seat:
             "rx_settings": list(caps.rx_settings),
         }
 
+    def download_folders(self) -> list[Path]:
+        """Where this machine's downloads land: the run root (the RBN auth library), and each
+        copy's rbn_known_dir (the SKCC roster, the RBN archive days, RBN's reference files)."""
+        out = [self.root, self.root / "rbn_known"]
+        for i in self.instances():
+            try:
+                d = Path(self.config(i).get("rbn_known_dir") or "rbn_known")
+            except (OSError, ValueError, TypeError):  # a config that does not read, or not a path
+                continue
+            out.append(d if d.is_absolute() else i.code / d)
+        return out
+
+    def _downloaded(self) -> list[tuple[dict[str, Any], Path, tuple[str, downloads.Check, str, str]]]:
+        """Each noted download SparkGap Web can act on, at the path the code puts it (never a path
+        downloads.json names): its folder's file, the auth library in the run root only."""
+        specs, root = download_specs(), self.root.resolve()
+        out = []
+        for e in downloads.listed(self.download_folders()):
+            spec, folder = specs.get(e["name"]), Path(e["path"]).parent.resolve()
+            if spec is None or (e["name"] == "librbn2_auth.so" and folder != root):
+                continue
+            out.append((e, folder / e["name"], spec))
+        return out
+
+    def check_downloads(self) -> str:
+        """Check for updates: each file's date on its server against our download, nothing fetched."""
+        said = []
+        for e, path, (url, _, _, agent) in self._downloaded():
+            try:
+                newest = downloads.server_date(url, agent)
+            except downloads.FAILED as err:
+                said.append(f"{path.name} not checked ({type(err).__name__}: {err})")
+                continue
+            if newest is None:
+                said.append(f"{path.name}: its server gives no date")
+            elif e.get("downloaded") and newest <= e["downloaded"]:
+                said.append(f"{path.name} up to date")
+            else:
+                said.append(f"{path.name} newer on its server ({time.strftime('%m-%d %H:%MZ', time.gmtime(newest))})")
+        return "Downloads: " + ("; ".join(said) or "none to check")
+
+    def refresh_downloads(self) -> str:
+        """Refresh: fetch every file now, fresh or not; a failed fetch keeps the copy. Receivers
+        read a new copy at their next start."""
+        said = []
+        for _, path, (url, check, what, agent) in self._downloaded():
+            downloads.refresh(path, url, check, what, agent, current=lambda _p: False)
+            e = next((x for x in downloads.listed([path.parent]) if x["name"] == path.name), {})
+            said.append(f"{path.name} failed ({e['error']})" if e.get("error") else f"{path.name} ok")
+        return "Downloads refreshed: " + ("; ".join(said) or "none") + "; receivers read them at their next start"
+
     def snapshot(self) -> dict[str, Any]:
         instances = self.instances()
         stations = sorted({r for i in instances if (r := self.radio(i))})
@@ -1311,4 +1415,5 @@ class Seat:
             "bands": bands_in(CODE),  # what an added receiver can run
             "default_settings": self.default_settings(),
             "removed": self.removed_settings({i.name for i in instances}),
+            "downloads": downloads.listed(self.download_folders()),
         }

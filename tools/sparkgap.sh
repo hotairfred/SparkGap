@@ -25,6 +25,7 @@ ${BLUE}Commands$OFF
   ${BOLD}setup$OFF      set up or check this machine: code, server, radio, spotter ID, grid
   ${BOLD}start$OFF      start SparkGap (the server, and with it SparkGap Web)
   ${BOLD}stop$OFF       stop SparkGap
+  ${BOLD}restart$OFF    stop SparkGap, then start it with the same receivers (after a code update)
   ${BOLD}status$OFF     each radio and its receivers
 
 ${BLUE}Key terms$OFF
@@ -93,21 +94,26 @@ server() {  # server start|stop: the machine's server (sparkgap_server.py), run 
   esac
 }
 
-RUNNING=$R/logs/running   # the receivers running at the last stop, started again by start
-start_all() {  # the server, then the receivers that ran at the last stop
+RUNNING=$R/logs/running   # the receivers started and not stopped since (the server keeps it), started again by start
+write_running() {  # under the server's lock, through a temp file of its own, on disk before it returns
+  ( flock 9 && echo "$1" > "$RUNNING.sh" && mv "$RUNNING.sh" "$RUNNING" && sync ) 9> "$RUNNING.lock"
+}
+start_all() {  # the server, then the receivers that ran last: after a stop or a power cut
   local names
   server_pid > /dev/null || server start || exit 1
   names=$(cat "$RUNNING" 2>/dev/null)
   if [ -z "$names" ]; then echo "no receivers to start again: start them in SparkGap Web"; return; fi
-  ctl start $names && rm -f "$RUNNING"
+  ctl start $names
 }
 stop_all() {  # every running receiver (remembered for start), its station and feeder, then the server
-  local i names=
+  local i names= rc
   for i in $ALL; do pid "$i" > /dev/null && names="$names $i"; done
   if [ -n "$names" ]; then
-    echo "${names# }" > "$RUNNING"
+    write_running "${names# }"
     server_pid > /dev/null || die "receivers run but the server does not: sparkgap.sh start, then stop"
-    ctl stop $names || exit 1
+    ctl stop $names; rc=$?
+    write_running "${names# }"   # each stop took its name off: put back the ones start brings back
+    [ $rc -eq 0 ] || exit 1
   fi
   server stop
 }
@@ -117,14 +123,10 @@ ctl() {  # the server's command line client: every start, stop and change goes t
   local rc=$?; [ $rc -eq 2 ] && echo "sparkgap.sh: start SparkGap with: sparkgap.sh start" >&2
   return $rc
 }
-start() { ctl start "$1"; }
-stop() { ctl stop "$1"; }
 
 clone_of() {  # the clone, on a branch, that a code folder shares its repository with
   git -C "$1" worktree list --porcelain | awk '/^worktree / {w = $2} /^branch / {print w; exit}'
 }
-
-
 
 UPSTREAM=https://github.com/hotairfred/SparkGap.git
 radio_field() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$1" "$2" 2>/dev/null; }
@@ -177,16 +179,9 @@ init() {  # init <repository> <branch>: what is missing, nothing replaced
   [ -f "$R/instances" ] || { echo "# name code-dir config python" > "$R/instances"; echo "$R/instances: made"; }
 }
 
-
-
 source_clone() {  # the clone on a branch that every code folder follows: code/, or in an older root the first instance's
   if [ -d "$CODE/.git" ]; then echo "$CODE"; else clone_of "$(dir "${ALL%% *}")"; fi
 }
-
-
-
-
-
 
 [ $# -gt 0 ] || { usage; exit 0; }
 cmd=$1; shift
@@ -195,6 +190,7 @@ case $cmd in
   status) [ $# -eq 0 ] || bad; server_status; echo; ctl status ;;
   start) if [ $# -eq 0 ]; then start_all; else ctl start "$@"; fi ;;
   stop) if [ $# -eq 0 ]; then stop_all; else ctl stop "$@"; fi ;;
+  restart) [ $# -eq 0 ] || bad; stop_all; start_all ;;   # all radios: their receivers stay in step
   setup) [ $# -eq 0 ] || bad; setup ;;
   *) echo "sparkgap.sh: unknown command '$cmd'" >&2; echo >&2; bad ;;
 esac

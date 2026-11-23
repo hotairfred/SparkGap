@@ -41,6 +41,7 @@ const HINTS = {
   validation: "A confidence score decides which calls are spotted: permissive spots more, aggressive fewer (docs/ITILA2.md). Off: a set number of copies, 2 to 4 by how common the call's pattern is.",
   validation_gates: "Steps the reads a call needs (gate 3): permissive one fewer, aggressive one more than normal's 2, 3 or 5 by the call's pattern. Unset is normal, and RBN is told Normal.",
   call_source: "Calls known from this list score higher in validation: SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster.",
+  downloads: "Files this machine downloads, as sparkgap.sh status lists them. A failed fetch keeps the previous copy; receivers read a new one at their next start. Check for updates compares each file's date on its server with the download; Refresh fetches them all now.",
   call_source_gates: "A call not on this list needs one more read (gate 3): SCP, calls RBN skimmers heard in the last days, or those plus the SKCC roster. None: no list.",
 };
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -1493,6 +1494,22 @@ function seg(el, labels, current, onPick) {
   });
 }
 
+// the Radios view, rebuilt every state message: only a pane whose HTML changed is replaced, and the
+// dialog keeps its scroll, so a pane being read or scrolled stays still
+function showPanes(box, html) {
+  if (html === box.shownHtml) return;
+  const dlg = box.closest(".dialog"), top = dlg ? dlg.scrollTop : 0;
+  const t = document.createElement("template");
+  t.innerHTML = html;
+  const old = box.firstElementChild, neu = t.content.firstElementChild;
+  if (old && neu && old.className === "panes" && neu.className === "panes" && old.children.length === neu.children.length) {
+    const was = [...old.children], now = [...neu.children];
+    now.forEach((n, i) => { if (was[i].outerHTML !== n.outerHTML) was[i].replaceWith(n); });
+  } else box.replaceChildren(...t.content.childNodes);
+  box.shownHtml = html;
+  if (dlg) dlg.scrollTop = top;
+}
+
 function renderSettings() {
   if ($("modal").hidden) return;
   if (app.pressed) { app.renderDue = true; return; }  // rebuilt between press and release, a click is lost
@@ -1510,7 +1527,7 @@ function renderSettings() {
   // the log keeps its place: at the bottom it follows new lines, scrolled up it stays
   const was = {};
   for (const c of box.querySelectorAll("[data-console]")) was[c.dataset.console] = c.scrollHeight - c.scrollTop - c.clientHeight < 4 ? -1 : c.scrollTop;
-  box.innerHTML = radiosHtml();
+  showPanes(box, radiosHtml());
   for (const c of box.querySelectorAll("[data-console]")) {
     const at = was[c.dataset.console];
     c.scrollTop = at === undefined || at < 0 ? c.scrollHeight : at;
@@ -2063,6 +2080,23 @@ async function srvApply(sv, radio) {
   renderSettings();
 }
 
+// what this machine has downloaded, as sparkgap.sh status lists it: file, records, when, where, last failure
+const utcShort = t => (t ? new Date(t * 1000).toISOString().replace(/^\d{4}-(\d\d-\d\d)T(\d\d:\d\d).*/, "$1 $2Z") : "");
+function downloadRecords(e) {
+  if (!e.downloaded) return "no copy";
+  return e.records !== null && e.records !== undefined ? `${Number(e.records).toLocaleString("en-US")} ${e.what || ""}`.trim() : String(e.what || "");
+}
+function downloadsHtml(seat, k) {
+  const list = (seat && seat.downloads) || [];
+  if (!list.length) return "";
+  const cell = (t, c = "") => `<span${c ? ` class="${c}"` : ""}>${esc(t)}</span>`;
+  const rows = list.map(e => cell(e.name || "", "dlname") + cell(downloadRecords(e)) + cell(utcShort(e.downloaded)) + cell(e.path || "")
+    + (e.error ? `<span class="dlfail bad">${esc(e.name)}: last fetch failed ${esc(utcShort(e.checked))} (${esc(e.error)}); ${e.downloaded ? `using the copy from ${esc(utcShort(e.downloaded))}` : "no copy"}</span>` : "")).join("");
+  const btn = (act, label) => `<button class="btn small" data-act="${act}" data-server="${k}">${label}</button>`;
+  return `<section class="psection"><div class="psec" title="${esc(HINTS.downloads)}"><span class="psectitle">Downloads</span><span class="grow"></span>${btn("dlcheck", "Check for updates")}${btn("dlrefresh", "Refresh")}</div>`
+    + `<div class="dlist mono">${["file", "records", "downloaded", "location"].map(h => cell(h, "dlhead")).join("")}${rows}</div></section>`;
+}
+
 function serverPaneHtml(k, sv) {
   const a = sv.link, host = `${(a.hello && a.hello.host) || sv.address}${a.hello && a.hello.build ? ` (${a.hello.build})` : ""}`;
   const lines = (a.log || []).map(l => `<div class="cl ${l.level === "ERROR" || l.level === "CRITICAL" ? "bad" : l.level === "WARNING" ? "warn" : ""}">`
@@ -2072,6 +2106,7 @@ function serverPaneHtml(k, sv) {
     + `<button class="btn small" data-act="editserver" data-server="${k}">Edit</button><button class="btn small" data-act="removeserver" data-server="${k}">Remove</button></div>`
     + sec(`<div class="psec"><span class="psectitle">Join code</span></div>${joinCodeRow(sv)}`)
     + sec(addRadioHtml(k, sv))
+    + downloadsHtml(a.seat, k)
     + sec(`<div class="psec"><span class="psectitle">Log</span></div><div class="console mono" data-console="r${k}">${lines || '<div class="cl faint">nothing logged yet</div>'}</div>`);
 }
 
@@ -2416,6 +2451,12 @@ function bindInput() {
       else if (sp.dataset.act === "srvapply") { srvApply(sv, sp.dataset.radio); return; }
       else { if (document.activeElement) document.activeElement.blur(); delete (app.srvPending || {})[`${sv.address}|${sp.dataset.radio}`]; }
       renderSettings();
+      return;
+    }
+    const dl = e.target.closest('[data-act="dlcheck"], [data-act="dlrefresh"]');
+    if (dl) {  // Check for updates or Refresh: the server says what it found in its log and the footer
+      const link = app.servers[Number(dl.dataset.server)] && app.servers[Number(dl.dataset.server)].link;
+      if (link) { dl.disabled = true; seatRequest(link, "downloads", "downloads", { action: dl.dataset.act === "dlcheck" ? "check" : "refresh" }); }
       return;
     }
     const su = e.target.closest('[data-act="setupfind"], [data-act="setupremove"]');
