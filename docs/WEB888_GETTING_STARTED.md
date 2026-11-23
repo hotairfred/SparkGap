@@ -191,7 +191,7 @@ In SparkGap Web the Web-888 runs like the Flex radios:
    spots. Starting any receiver starts the radio; a band change on one card
    restarts all six receivers for about 10 seconds. Decoder options are shared
    by the six. `sparkgap.sh status` lists the same receivers;
-   band changes and everything else besides setup, start and stop are in
+   band changes and everything else besides setup, start, stop and restart are in
    SparkGap Web, whose address ends each `sparkgap.sh` output.
 4. The radio bar shows Connected while packets arrive, and how many of the six
    receivers are in use.

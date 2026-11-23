@@ -10,8 +10,8 @@ Windows box.  This document describes how.
 > against other skimmers on the same signals (hotairfred/SparkGap#49).
 
 The feeder for live uploads is `rbn2_feeder.py`. It depends on the RBN auth
-library, `librbn2_auth.so`, which is not in this repo and is available from
-Chris WX7V on request. How to set it up and go live:
+library, `librbn2_auth.so`, which is not in this repo: a live feeder downloads
+it on first start. How to set it up and go live:
 [sending-spots.md](sending-spots.md). The library's interface and how the feeder
 uses it: [rbn-auth-library.md](rbn-auth-library.md).
 

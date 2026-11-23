@@ -289,6 +289,10 @@ details.adv[open] summary > span:first-child::before { content: "\25BE  "; }
 .fctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .fnote { color: var(--muted); font-size: 13px; }
 .fhint { color: var(--muted); font-size: 13px; line-height: 1.45; }
+.dlist { display: grid; grid-template-columns: repeat(4, max-content); column-gap: 18px; row-gap: 2px; font-size: 12px; overflow-x: auto; }
+.dlist .dlhead { color: var(--muted); }
+.dlist .dlname { font-weight: 600; }
+.dlist .dlfail { grid-column: 1 / -1; padding-left: 16px; }
 .fsel { font: inherit; font-size: 14px; color: var(--fg); background: var(--sunken); border: 1px solid var(--edge); border-radius: 6px; height: 32px; padding: 0 8px; min-width: 96px; }
 .fseg { display: inline-flex; border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; }
 .fseg span { padding: 6px 14px; cursor: pointer; font-size: 14px; }

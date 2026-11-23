@@ -1,6 +1,7 @@
 """RBN known calls (rbn_known.py): counts per day, own spotter left out, cache, missing days."""
 
 import io
+import json
 import threading
 import urllib.error
 import zipfile
@@ -165,4 +166,5 @@ def test_refresh_drop_busts_writes_its_own_list(tmp_path: Path) -> None:
                     drop_busts=True)
     assert calls == {"K5MV"}
     assert (tmp_path / "rbn_known_nobusts.txt").read_text().startswith("# RBN known calls")
+    assert json.loads((tmp_path / "downloads.json").read_text())["rbn_known_nobusts.txt"]["what"] == "calls"
     assert refresh(tmp_path, "WF8Z", days=1, today=date(2026, 11, 9), sleep=_nap) == {"K5MV", "K5MVSS"}

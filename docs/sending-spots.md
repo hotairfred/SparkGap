@@ -9,25 +9,26 @@ machine.
 
 - SparkGap running, with its telnet server on (`telnet_port` in your config,
   default 7300).
-- A SparkGap checkout that has `rbn2_feeder.py`. Linux x86_64 and python3.
+- A SparkGap checkout that has `rbn2_feeder.py`. Linux x86_64 or aarch64 (a
+  64-bit Raspberry Pi) and python3.
 - **The RBN auth library, `librbn2_auth.so`.** The feeder depends on it: RBN
   accepts uploads only from a feeder that identifies itself the way RBN expects,
-  and the library does that part. It is not in SparkGap's repo and is not
-  published. It is available from Chris WX7V on request, as a download link with
-  a checksum file.
+  and the library does that part. It is not in SparkGap's repo: a live feeder
+  downloads its machine's build on first start from
+  `https://downloads.wx7v.net/rbn/<machine>/librbn2_auth.so` (`x86_64` or
+  `aarch64`) and keeps it only when its SHA-256 matches the one
+  `rbn2_feeder.py` pins.
 - Your callsign and grid in the SparkGap config.
 
 ## Setup
 
-1. **Get the library** from Chris WX7V, with `SHA256SUMS.txt` from the same
-   link. In the folder holding both, check it: `sha256sum -c SHA256SUMS.txt`
-   should print `librbn2_auth.so: OK`.
-2. **Put it in the folder that contains your SparkGap checkout,** not inside the
-   checkout. From inside the checkout: `mv /path/to/librbn2_auth.so ..`. With
-   the checkout at `~/sparkgap/code`, the file ends up at
-   `~/sparkgap/librbn2_auth.so`. Keep the name `librbn2_auth.so`. It stays out
-   of the checkout so git never picks it up.
-3. **Set the config.** In your SparkGap config:
+1. **The library downloads itself** into the folder that contains your SparkGap
+   checkout, not inside it, when `rbn_upload` is live: with the checkout at
+   `~/sparkgap/code`, it lands at `~/sparkgap/librbn2_auth.so`. A failed
+   download keeps the copy already there. To fetch it by hand, download it and
+   `SHA256SUMS.txt` from `https://downloads.wx7v.net/rbn/<machine>/`, check it with
+   `sha256sum -c SHA256SUMS.txt`, and put it there.
+2. **Set the config.** In your SparkGap config:
 
    <!-- markdownlint-disable MD013 -->
    | Key | Value |
@@ -38,13 +39,13 @@ machine.
    | `rbn_upload` | `"dry"` reads spots and logs what it would post, posting nothing; `"live"` posts; absent is off |
    <!-- markdownlint-enable MD013 -->
 
-4. **Dry run first:** `python3 rbn2_feeder.py --config <your config>` with
+3. **Dry run first:** `python3 rbn2_feeder.py --config <your config>` with
    `"rbn_upload": "dry"`, or add `--dry-run` to any config. It logs `[DRY] POST`
    lines for what it would send. Check that the spots look right and the bands
    match what you are skimming.
-5. **Go live:** set `"rbn_upload": "live"` and run the same command. The
+4. **Go live:** set `"rbn_upload": "live"` and run the same command. The
    start-up lines show `auth library rbn2auth/1.2 from <path>` and `... LIVE`.
-6. **Check RBN:** within a few minutes your node shows in RBN's node list, and
+5. **Check RBN:** within a few minutes your node shows in RBN's node list, and
    your spots show on reversebeacon.net and its telnet feed under your spotter
    call.
 
@@ -68,17 +69,14 @@ call.
 <!-- markdownlint-disable MD013 -->
 | Message | Meaning |
 | --- | --- |
-| `not posting: no <path>: RBN would drop these spots` | The library is not where the feeder looks; `<path>` is the exact place to put it |
-| `<path> is version '...', this feeder takes rbn2auth/1.2` | The library and the feeder don't match; ask Chris WX7V for the current library, or update your checkout |
-| `cannot load <path>` | The file is damaged or not for this machine; download it again and check the sum |
+| `not posting: no <path>: RBN would drop these spots` | The library is not there and did not download (see the `downloads:` warning before it); `<path>` is where it goes |
+| `<path> is version '...', this feeder takes rbn2auth/1.2` | The library and the feeder don't match, and the pinned one did not download; update your checkout, or check the `downloads:` warning |
+| `cannot load <path>` | The file is damaged or not for this machine (`uname -m`); delete it and the feeder downloads it again |
 | `rbn_upload is None: off` | The config has no `rbn_upload` key |
 | `callsign and grid must both be set` | Fill both in the config |
 | `no band info from the skimmer's SETT: empty bandLimits` | SparkGap's telnet server did not report its bands; check it is running and on the configured port |
 | `id.php failed` or `s.php failed` | RBN could not be reached or refused the post; the ID message retries after 60 s |
 <!-- markdownlint-enable MD013 -->
-
-Keep the library and its link to yourself: they are for testers, not for
-redistribution.
 
 ## With SparkGap Web
 
@@ -92,7 +90,9 @@ hand.
 - **RBN upload:** off, dry or live in the Server pane, for the whole radio. Only
   the feeder restarts.
 - **The library:** in the run folder, beside `code/`:
-  `~/sparkgap/librbn2_auth.so`.
+  `~/sparkgap/librbn2_auth.so`, downloaded there by a live feeder. The Server
+  pane's Downloads and `sparkgap.sh status` list it with SparkGap's other
+  downloads: file, records, when, where, and the last failed fetch.
 - **Telnet:** each receiver's port is set by Add (7330 plus its DAX-IQ channel);
   the feeder reads them itself.
 - **Messages:** the feeder's warnings and errors, including those above, show in

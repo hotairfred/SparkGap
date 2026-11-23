@@ -240,6 +240,20 @@ def test_a_stopped_station_is_a_radio_not_connected() -> None:
     assert ctl.render(snap)[0].startswith("━━ Radio: Not connected Lake ━━")
 
 
+def test_a_radio_not_connected_hides_its_stopped_receivers() -> None:
+    lake4 = SNAP["instances"][1]
+    snap = {**SNAP, "instances": [lake4, {**lake4, "name": "Lake-5"}],
+            "stations": [{"radio": "Lake", "state": "stopped"}]}
+    lines = ctl.render(snap)
+    assert lines[4] == "   2 receivers, shown when the radio is connected"
+    assert not any("Lake-4" in x or "last error" in x for x in lines)
+
+
+def test_a_radio_not_connected_still_shows_a_running_receiver() -> None:
+    snap = {**SNAP, "stations": [{"radio": "Lake", "state": "stopped"}]}
+    assert any("Lake-1" in x for x in ctl.render(snap))
+
+
 def test_a_recording_receiver_says_so() -> None:
     lake1 = {**SNAP["instances"][0], "settings": {"record": True}}
     snap = {**SNAP, "instances": [lake1, *SNAP["instances"][1:]]}
@@ -255,3 +269,29 @@ def test_a_radio_with_no_receivers_yet_is_shown() -> None:
     lines = ctl.render(snap)
     assert lines[0].startswith("━━ Radio: Dallas ━━  FLEX-6400M  192.0.2.150")
     assert lines[-1] == "   no receivers yet: add them in SparkGap Web"
+
+
+DOWNLOADS = [
+    {"name": "librbn2_auth.so", "path": "/r/librbn2_auth.so", "records": None, "what": "rbn2auth/1.2",
+     "downloaded": NOW - 60, "checked": NOW, "error": None},
+    {"name": "skccdata.txt", "path": "/r/rbn_known/skccdata.txt", "records": 41203, "what": "members",
+     "downloaded": NOW - 86_400, "checked": NOW, "error": "URLError: timed out"},
+]
+
+
+def test_status_lists_downloads_with_records_and_the_last_failure() -> None:
+    lines = ctl.render({**SNAP, "downloads": DOWNLOADS})
+    at = lines.index("━━ Downloads ━━")
+    assert lines[at + 1].split() == ["file", "records", "downloaded", "location"]
+    assert lines[at + 2].split() == ["librbn2_auth.so", "rbn2auth/1.2", "01-15", "07:59Z", "/r/librbn2_auth.so"]
+    assert lines[at + 3].split()[:3] == ["skccdata.txt", "41,203", "members"]
+    assert lines[at + 4] == ("     skccdata.txt: last fetch failed 01-15 08:00Z (URLError: timed out); "
+                             "using the copy from 01-14 08:00Z")
+
+
+def test_status_without_downloads_has_no_block() -> None:
+    assert "━━ Downloads ━━" not in ctl.render(SNAP)
+
+
+def test_a_download_with_no_copy_says_so() -> None:
+    assert ctl.download_records({"records": None, "what": "patterns", "downloaded": None}) == "no copy"

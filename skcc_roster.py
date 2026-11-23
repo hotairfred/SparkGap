@@ -7,12 +7,11 @@ the cached copy is used.
 """
 
 import logging
-import os
-import tempfile
 import time
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+
+import downloads
 
 ROSTER_URL = "https://www.skccgroup.com/membership_data/skccdata.txt"
 MAX_AGE_S = 24 * 3600.0
@@ -33,37 +32,28 @@ def member_calls(text: str) -> set[str]:
 
 
 def _fetch() -> bytes:
-    req = urllib.request.Request(ROSTER_URL, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
-        return resp.read()
+    return downloads.fetch(ROSTER_URL, USER_AGENT, FETCH_TIMEOUT_S)
 
 
 def _write(path: Path, text: str) -> None:
     """Write through a temp file of this writer's own: copies sharing the cache never collide."""
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
-    tmp = Path(name)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        tmp.replace(path)                 # a crash mid-write never leaves a short roster
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    downloads.write_atomic(path, text.encode())
 
 
-def refresh(cache_dir: Path, fetch: Callable[[], bytes] = _fetch,
+def _check(path: Path) -> int:
+    """The roster's member count; a file without the roster's header is not the roster."""
+    text = path.read_text(errors="replace")
+    if not text.startswith("SKCCNR|CALL|"):
+        raise ValueError("not an SKCC roster")
+    return len(member_calls(text))
+
+
+def refresh(cache_dir: Path, fetch: Callable[[], bytes] | None = None,
             now: Callable[[], float] = time.time) -> set[str]:
     """Member calls, from a roster fetched at most once a day; the cache when offline."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / "skccdata.txt"
-    if not path.exists() or now() - path.stat().st_mtime > MAX_AGE_S:
-        try:
-            data = fetch().decode("utf-8", errors="replace")
-            if not data.startswith("SKCCNR|CALL|"):
-                raise ValueError("not an SKCC roster")
-            _write(path, data)
-        except Exception as e:                   # offline, refused, truncated or not a roster
-            log.warning("skcc_roster: no roster download (%r); using the cache", e)
+    downloads.refresh(path, ROSTER_URL, _check, "members", USER_AGENT, max_age_s=MAX_AGE_S,
+                      get=fetch or _fetch, now=now)
     calls = member_calls(path.read_text(errors="replace")) if path.exists() else set()
     log.info("skcc_roster: %d member calls", len(calls))
     return calls

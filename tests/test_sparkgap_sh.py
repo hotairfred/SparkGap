@@ -56,19 +56,19 @@ def test_process_commands_go_through_the_server(root: Path) -> None:
     assert not list((root / "logs").glob("*.pid"))
 
 
-def test_only_setup_start_stop_and_status_are_taken(root: Path) -> None:
+def test_only_setup_start_stop_restart_and_status_are_taken(root: Path) -> None:
     for args in (["band", "Lake-1"], ["rec", "Lake-1"], ["rbn"], ["server"], ["server", "go"],
                  ["discover", "a", "b"], ["template", "192.0.2.101"], ["migrate"], ["setup", "x"],
-                 ["status", "Lake-1"], ["restart"], ["add", "Lake-1", "40m"], ["update"],
+                 ["status", "Lake-1"], ["restart", "Lake-1"], ["add", "Lake-1", "40m"], ["update"],
                  ["remove", "Lake-1"]):
         assert run(root, *args).returncode == 2
 
 
-def test_help_lists_only_setup_start_stop_and_status(root: Path) -> None:
+def test_help_lists_only_setup_start_stop_restart_and_status(root: Path) -> None:
     help_ = run(root, "help").stdout
     commands = help_.split("Commands\n")[1].split("\n\n")[0]
     assert [line.split()[0] for line in commands.splitlines()] == ["setup", "start", "stop",
-                                                                   "status"]
+                                                                   "restart", "status"]
     terms = help_.split("Key terms\n")[1].split("\n\n")[0]
     assert [line.split()[0] for line in terms.splitlines()] == ["radio", "station", "node",
                                                                 "feeder", "receiver"]
@@ -86,3 +86,4 @@ def test_stop_remembers_the_running_receivers_for_start(root: Path) -> None:
     r = run(root, "stop")
     assert r.returncode == 2 and "the server does not" in r.stderr  # no server in this test
     assert (root / "logs" / "running").read_text().split() == ["Lake-1"]
+    assert not (root / "logs" / "running.sh").exists() and (root / "logs" / "running.lock").exists()

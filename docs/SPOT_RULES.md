@@ -136,7 +136,7 @@ Spot decision:
 | --- | --- | --- | --- |
 | `spot_rule_qualifiers` | none | 5, 6 | Event words that act as CQ on this node |
 | `spot_rule_strongest_db` | 6 | 9 | The SNR margin a copy must beat; null or 0 is off |
-| `spot_rule_notched_freqs` | off | 11 | No spot on a frequency in `NotchedFreqs.txt` beside the config |
+| `spot_rule_notched_freqs` | off | 11 | No spot on a frequency in `NotchedFreqs.txt` beside the config, else the checkout's (the FT8 sub-bands) |
 | `spot_rule_beacons` | none | 12 | Beacon calls, each with its frequency in kHz |
 
 `spot_rule_bad_calls`, `spot_rule_scp` and `spot_rule_notched_freqs` are also the Bad Calls, MASTER.SCP Filter and Notched Freqs switches

@@ -88,6 +88,9 @@ The message also carries, one line each:
 - `bands`: the bands an added receiver can run.
 - `default_settings`: the settings an added receiver starts with.
 - `removed`: the settings of receivers taken out, which `add` restores.
+- `downloads`: each file this machine downloaded (`name`, `path`, `url`,
+  `records`, `what`, `downloaded`, `checked`, `error`), from the `downloads.json`
+  in the run root and in each receiver's `rbn_known_dir`.
 - `processes`: every linked process (see the process hub).
 
 `log`, on connect the server's last 200 log lines (`"reset": true`), then each
@@ -126,6 +129,11 @@ connected`).
   instance names its radio with `radio`.
 - `node` (no `name`, `settings`: `radio`, `callsign`, `grid`, `op_name`):
   writes that radio file's spotter ID, grid and operator.
+- `downloads` (no `name`, `settings`: `action`): `check` asks each downloaded
+  file's server for its date and says which are newer than our copy, fetching
+  nothing; `refresh` fetches them all now, a failed fetch keeping the copy. Both
+  use the code's own URL and check; the RBN known calls (built at start) are
+  left out. Receivers read a new copy at their next start.
 - `by`, optional on any request: the client's own name (`SparkGap Web`), put in
   the log with its address.
 - `cmd`: `start`, `stop`, `restart`, `set`, `add`, `remove`, `discover` or

@@ -131,6 +131,15 @@ def read_bad_calls(path: str | Path) -> list[str]:
     return [ln.strip().upper() for ln in Path(path).read_text().splitlines() if ln.strip()]
 
 
+SHIPPED_RULE_FILES = ("NotchedFreqs.txt",)  # the checkout carries a default: the FT8 sub-bands
+
+
+def rule_file(config_dir: str | Path, name: str, code: str | Path) -> Path:
+    """A Gated Rule file: the one beside the config, else the checkout's default when it ships one."""
+    own = Path(config_dir) / name
+    return own if own.exists() or name not in SHIPPED_RULE_FILES else Path(code) / name
+
+
 def read_notched(path: str | Path) -> list[tuple[float, float]]:
     """Notched Freqs file (the Aggregator's NotchedFreqs.txt): a kHz or a kHz range per line
     (7074, 7047.5-7048.5 or 7047.5 7048.5); a line that is not a number is skipped."""

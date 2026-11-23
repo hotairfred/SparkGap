@@ -289,6 +289,20 @@ def test_2_a_known_call_needs_no_scp_entry() -> None:
     assert r.trace[-1][4] == "not in SCP or the known calls"
 
 
+def test_11_notched_freqs_beside_the_config_else_the_checkouts(tmp_path) -> None:
+    from pathlib import Path
+
+    from spot_rule2 import read_notched, rule_file
+    cfg, code = tmp_path / "config", tmp_path / "code"
+    cfg.mkdir()
+    assert rule_file(cfg, "NotchedFreqs.txt", code) == code / "NotchedFreqs.txt"
+    assert rule_file(cfg, "BadCalls.txt", code) == cfg / "BadCalls.txt"  # a node's own: never shipped
+    (cfg / "NotchedFreqs.txt").write_text("7074\n")
+    assert rule_file(cfg, "NotchedFreqs.txt", code) == cfg / "NotchedFreqs.txt"
+    shipped = read_notched(rule_file(tmp_path / "none", "NotchedFreqs.txt", Path(__file__).parent.parent))
+    assert (14074.0, 14077.0) in shipped and len(shipped) == 9  # the FT8 sub-bands, 160 to 10 m
+
+
 def test_11_notched_freqs_file(tmp_path) -> None:
     from spot_rule2 import read_notched
     (tmp_path / "NotchedFreqs.txt").write_text("7074\n14079.5-14081\n14090 14092\nnote\n")
