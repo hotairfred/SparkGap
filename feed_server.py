@@ -216,15 +216,17 @@ class Client:
 
 
 def build_id() -> str | None:
-    """The commit SparkGap runs from (git describe); None outside a git checkout."""
+    """The commit SparkGap runs from (git describe), -dirty when a source file differs from it; a native
+    build of the tracked libraries (make native) is not a source change. None outside a git checkout."""
+    here = Path(__file__).resolve().parent
     try:
-        out = subprocess.run(
-            ["git", "describe", "--always", "--dirty"], cwd=Path(__file__).resolve().parent,
-            capture_output=True, text=True, timeout=5,
-        )
+        out = subprocess.run(["git", "describe", "--always"], cwd=here, capture_output=True, text=True, timeout=5)
+        diff = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", ".", ":(exclude)*.so"], cwd=here,
+                              capture_output=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return out.stdout.strip() or None
+    build = out.stdout.strip()
+    return (build + "-dirty" if diff.returncode == 1 else build) or None
 
 
 class FeedServer:

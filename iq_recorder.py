@@ -20,6 +20,7 @@ leaves out the bands that are closed at that hour (WARC bands in a contest, 160/
     echo "40m 20m 15m 10m" > /home/sparkgap/iqrec/RECORD
 Bands are named as in the config ("40m", "160m"; "40" works too) or by centre kHz ("7090"). The list
 is read once a minute; a band dropped from it while recording writes its minute in hand and closes.
+Under MIN_FREE_BYTES (2 GB) free on the disk, the recorder removes RECORD itself and stops.
 Each session writes one stereo (I,Q) WAV per band:
     <dir>/<UTC stamp>_<band kHz>kHz_<rate>_<bits>bit.wav
 The stamp is the time of the session's first sample (the first minute's
@@ -41,6 +42,7 @@ import datetime
 import logging
 import os
 import queue
+import shutil
 import threading
 import wave
 
@@ -75,6 +77,16 @@ def parse_bands(text):
             out.add(tok + "m" if int(tok) <= 160 else str(int(tok)))
     return out or None
 CLOSE_TIMEOUT_S = 10.0            # close() gives up waiting on a stalled disk after this
+MIN_FREE_BYTES = 2 * 2**30        # a recording stops when the disk has less free than this
+
+
+def low_disk(path):
+    """The free bytes at path when under MIN_FREE_BYTES, else None (also when it cannot be read)."""
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        return None
+    return free if free < MIN_FREE_BYTES else None
 
 
 def pack_iq(i, q, bits, in_scale=8388608.0):
@@ -149,6 +161,14 @@ class BandRecorder:
         """Called once per band per minute swap. fi/fq must not be reused by
         the caller afterwards (the FT8 path allocates them fresh each swap)."""
         data = ('data', band_khz, t_first, fi, fq, n)
+        free = low_disk(self.dir) if self.active() else None
+        if free is not None:   # RECORD removed: the stop below writes the minute in hand and closes
+            try:
+                os.remove(os.path.join(self.dir, 'RECORD'))
+            except OSError:
+                pass
+            log.error("IQ recording stopped: %.1f GB free in %s (stops under %d GB)",
+                      free / 2**30, self.dir, MIN_FREE_BYTES // 2**30)
         if self.wants(band_khz):
             self._bands.add(band_khz)
             items = [data]
