@@ -15,6 +15,11 @@ Recording only happens while the file <record_iq_dir>/RECORD exists, so a
 capture can be started and stopped without restarting the skimmer:
     touch /home/sparkgap/iqrec/RECORD    # start (C receiver: capture now, files open at the next minute)
     rm    /home/sparkgap/iqrec/RECORD    # stop  (the minute in hand is written, then files close)
+An empty RECORD records every band. A RECORD that names bands records only those, so a capture
+leaves out the bands that are closed at that hour (WARC bands in a contest, 160/80 m by day):
+    echo "40m 20m 15m 10m" > /home/sparkgap/iqrec/RECORD
+Bands are named as in the config ("40m", "160m"; "40" works too) or by centre kHz ("7090"). The list
+is read once a minute; a band dropped from it while recording writes its minute in hand and closes.
 Each session writes one stereo (I,Q) WAV per band:
     <dir>/<UTC stamp>_<band kHz>kHz_<rate>_<bits>bit.wav
 The stamp is the time of the session's first sample (the first minute's
@@ -46,6 +51,29 @@ log = logging.getLogger('sparkgap')
 GAP_TOL_S = 0.05
 MAX_DATA_BYTES = 4_000_000_000    # under the WAV format's 2**32 - 1 byte limit
 MAX_QUEUE = 8                     # band-minutes waiting for the disk (~550 MB at 24-bit)
+_BANDS_KHZ = ((1800, 2000, "160m"), (3500, 4000, "80m"), (5250, 5450, "60m"), (7000, 7300, "40m"),
+              (10100, 10150, "30m"), (14000, 14350, "20m"), (18068, 18168, "17m"), (21000, 21450, "15m"),
+              (24890, 24990, "12m"), (28000, 29700, "10m"), (50000, 54000, "6m"))
+BAND_SLACK_KHZ = 120              # a receiver centred just outside a band edge (1886, 10118) still counts
+
+
+def band_name(band_khz):
+    """The amateur band of a receiver centred at band_khz ("40m"), or None."""
+    return next((name for lo, hi, name in _BANDS_KHZ
+                 if lo - BAND_SLACK_KHZ <= band_khz <= hi + BAND_SLACK_KHZ), None)
+
+
+def parse_bands(text):
+    """The bands a RECORD file names: None (every band) when it names none, else a set of band
+    names ("40m") and centre kHz ("7090")."""
+    out = set()
+    for tok in text.replace(",", " ").split():
+        tok = tok.strip().lower()
+        if tok.endswith("m") and tok[:-1].isdigit():
+            out.add(tok)
+        elif tok.isdigit():
+            out.add(tok + "m" if int(tok) <= 160 else str(int(tok)))
+    return out or None
 CLOSE_TIMEOUT_S = 10.0            # close() gives up waiting on a stalled disk after this
 
 
@@ -108,16 +136,27 @@ class BandRecorder:
     def active(self):
         return os.path.exists(os.path.join(self.dir, 'RECORD'))
 
+    def wants(self, band_khz):
+        """RECORD is there and names this band, or names none (every band)."""
+        try:
+            with open(os.path.join(self.dir, 'RECORD')) as f:
+                bands = parse_bands(f.read(4096))
+        except OSError:
+            return False
+        return bands is None or band_name(band_khz) in bands or str(int(band_khz)) in bands
+
     def submit(self, band_khz, t_first, fi, fq, n):
         """Called once per band per minute swap. fi/fq must not be reused by
         the caller afterwards (the FT8 path allocates them fresh each swap)."""
         data = ('data', band_khz, t_first, fi, fq, n)
-        if self.active():
+        if self.wants(band_khz):
             self._bands.add(band_khz)
             items = [data]
-        elif band_khz in self._bands:    # RECORD removed: this minute is still written, then the files close
-            self._bands.discard(band_khz)
-            items = [data] if self._bands else [data, ('stop',)]
+        elif band_khz in self._bands:    # RECORD removed (or the band taken off it): this minute is still
+            self._bands.discard(band_khz)                        # written, then the files close
+            items = [data, ('close', band_khz)] if self._bands else [data, ('stop',)]
+        elif self.active():              # RECORD names other bands: this one is not recorded
+            return
         else:
             self._bands.clear()
             items = [('stop',)]
@@ -160,6 +199,13 @@ class BandRecorder:
             try:
                 if item[0] == 'stop':
                     self._close_all()
+                    continue
+                if item[0] == 'close':          # one band taken off RECORD's list; the session goes on
+                    got = self._writers.pop(item[1], None)
+                    if got:
+                        got[0].close()
+                        drop_cache(self._paths[item[1]])
+                        log.info("IQ recording %s kHz: stopped (no longer on RECORD's list)", item[1])
                     continue
                 _k, band_khz, t_first, fi, fq, n = item
                 w, expect, nbytes, part = self._writers.get(band_khz, (None, None, 0, 1))

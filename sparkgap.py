@@ -9297,8 +9297,9 @@ class SparkGap:
         buffers (65 s of IQ per band) are taken then, not at start, and kept until the receiver stops
         (cdub89/SparkGap#32)."""
         import ctypes as _ct
+        rec = getattr(self, '_iq_rec', None)
         for (bn, ch, ri) in self._band_meta:
-            if ri in self._iq_cap:
+            if ri in self._iq_cap or (rec is not None and not rec.wants(int(ch / 1000))):   # RECORD names other bands
                 continue
             ck = ch / 1000
             self.receiver.lib.hpsdr_enable_ft8(self.receiver._h, ri, _ct.c_double((ft8_dial_khz(ck) or ck) * 1000.0),
@@ -9576,8 +9577,8 @@ class SparkGap:
                             ft8_khz = ft8_dial_khz(ck)
                             if not _minute_modes(self.cfg):
                                 ft8_khz = None    # FT8/RTTY off: only a recording captures
-                            if self._iq_rec is not None and self._iq_rec.active():
-                                ft8_khz = ft8_khz or ck   # recording at start: capture every band
+                            if self._iq_rec is not None and self._iq_rec.wants(int(ck)):
+                                ft8_khz = ft8_khz or ck   # recording at start: capture every band RECORD names
                             if ft8_khz:
                                 self._iq_cap.add(ri)
                                 self.receiver.lib.hpsdr_enable_ft8(
