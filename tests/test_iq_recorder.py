@@ -181,3 +181,53 @@ def test_close_does_not_wait_forever_on_a_stalled_disk():
             stall.set()
             R.pack_iq = real
             _wait(rec)
+
+
+def test_record_file_names_the_bands():
+    """echo "40m 20m" > RECORD: only those bands write files; an empty RECORD records them all."""
+    assert R.band_name(1886) == "160m" and R.band_name(10118) == "30m" and R.band_name(7090) == "40m"
+    assert R.parse_bands("") is None and R.parse_bands("  \n") is None
+    assert R.parse_bands("40m, 20m 15 7090") == {"40m", "20m", "15m", "7090"}
+    rng = np.random.default_rng(3)
+    with tempfile.TemporaryDirectory() as d:
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        with open(os.path.join(d, 'RECORD'), 'w') as f:
+            f.write("40m 21090\n")
+        assert rec.wants(7090) and rec.wants(21090) and not rec.wants(14090) and not rec.wants(10118)
+        for k in (7090, 14090, 21090, 10118):
+            i, q = _swap(rng, 300)
+            rec.submit(k, 100.0, i, q, 300)
+        _wait(rec)
+        names = sorted(os.path.basename(p).split('_')[2] for p in glob.glob(os.path.join(d, '*.wav')))
+        assert names == ['21090kHz', '7090kHz']
+        rec.close()
+    with tempfile.TemporaryDirectory() as d:                  # empty RECORD: every band, as before
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        open(os.path.join(d, 'RECORD'), 'w').close()
+        for k in (7090, 14090):
+            i, q = _swap(rng, 300)
+            rec.submit(k, 100.0, i, q, 300)
+        _wait(rec)
+        assert len(glob.glob(os.path.join(d, '*.wav'))) == 2
+        rec.close()
+
+
+def test_a_band_taken_off_the_list_closes_and_the_others_go_on():
+    rng = np.random.default_rng(4)
+    with tempfile.TemporaryDirectory() as d:
+        rec = R.BandRecorder(d, bits=24, rate=RATE)
+        path = os.path.join(d, 'RECORD')
+        with open(path, 'w') as f:
+            f.write("40m 20m")
+        for t in (100.0, 100.3):
+            for k in (7090, 14090):
+                i, q = _swap(rng, 300)
+                rec.submit(k, t, i, q, 300)
+            if t == 100.0:
+                with open(path, 'w') as f:
+                    f.write("40m")
+        _wait(rec)
+        assert 14090 not in rec._writers and 7090 in rec._writers      # 20m closed, 40m still open
+        f20 = glob.glob(os.path.join(d, '*_14090kHz_*.wav'))[0]
+        assert wave.open(f20, 'rb').getnframes() == 600               # its minute in hand was written
+        rec.close()

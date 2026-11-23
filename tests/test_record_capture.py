@@ -93,3 +93,17 @@ def test_a_start_with_the_record_file_there_warns(tmp_path: Any, caplog: Any) ->
     with caplog.at_level("WARNING", logger="sparkgap"):
         BandRecorder(str(tmp_path), rate=1000)
     assert "IQ recording on at start" in caplog.text
+
+
+def test_capture_only_on_the_bands_record_names(tmp_path: Any) -> None:
+    """echo "40m" > RECORD: the minute capture (65 s of IQ) is taken on 40m only, not on 20m."""
+    from iq_recorder import BandRecorder
+    sg: Any = SparkGap({"sdr_type": "hpsdr", "sample_rate": 192_000, "bands": ["40m", "20m"]})
+    sg._band_meta = [("40m", 7_038_400, 0), ("20m", 14_038_400, 1)]
+    lib = Lib()
+    sg.receiver = type("R", (), {"lib": lib, "_h": None})()
+    sg._iq_cap = set()
+    sg._iq_rec = BandRecorder(str(tmp_path), rate=1000)
+    (tmp_path / "RECORD").write_text("40m\n")
+    sg._enable_iq_capture()
+    assert lib.enabled == [0] and sg._iq_cap == {0}
