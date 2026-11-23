@@ -448,13 +448,16 @@ def test_a_lead_dit_bust_is_never_the_best_reading() -> None:
     assert "MX4U" not in [c for _, _, c, g, _ in r.trace if g == 0]
 
 
-def test_12_an_ncdxf_beacon_skips_gate_4() -> None:
+def test_12_a_beacon_skips_gate_4() -> None:
     """The fading dashes between NCDXF beacons decode as noise words; one read of one tied a beacon
-    at gate 4 (VE8AT and I6BT on WX7V-1, 11-17). A listed beacon keeps gate 4."""
+    at gate 4 (VE8AT and I6BT on WX7V-1, 11-17). Any beacon sends its grid as often as its call, which
+    tied it too (cdub89/SparkGap#57 BL4: WB2VVV/B and FN41CR on WX7V-1, 11-21)."""
     r = _rule()
     assert _feed(r, "VE8AT I6BT", f=14100.0) == ["VE8AT"]
-    r = _rule(beacons={"W5ABC": 7039.0})
-    assert _feed(r, "W5ABC I6BT", f=7039.0) == [] and _why(r, "W5ABC") == 4
+    r = _rule(beacons={"W1DLO": 28221.0})
+    assert _feed(r, "W1DLO FN32", f=28221.6) == ["W1DLO"]
+    assert _feed(r, "DE WB2VVV/B FN41CR WB2VVV/B FN41CR", f=28263.4) == ["WB2VVV/B"]
+    assert _feed(r, "CQ K1ABC FN41CR K1ABC FN41CR", f=28030.0) == [] and _why(r, "K1ABC") == 4   # not a beacon
 
 
 def test_5_qrz_is_no_keyword() -> None:

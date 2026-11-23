@@ -30,10 +30,11 @@ checked in this order; a call not spotted is dropped by the first gate that is f
  10 Re-spot            not spotted on this band in the last 10 minutes, unless moved 1 kHz
  11 Window             the frequency is outside every range in the Notched Freqs file (the
                        decoded window is the band plan's CW segment already)
- 12 Beacon             a /B, NCDXF or listed beacon skips 5 to 8; an NCDXF or listed beacon
-                       spots on one read (it sends its call once a slot); an NCDXF beacon on its
-                       frequency skips 4 too (its fading dashes decode as noise words that tie
-                       it), and other such beacons are not a listed beacon's rivals; on an NCDXF
+ 12 Beacon             a /B (KI6MTV/B, or KI6MTV /B read so in 2 windows), NCDXF or listed beacon
+                       skips 5 to 8; an NCDXF or listed beacon
+                       spots on one read (it sends its call once a slot); every beacon skips 4
+                       too (an NCDXF beacon's fading dashes decode as noise words, and a beacon
+                       sends its grid as often as its call: either ties it); on an NCDXF
                        frequency a word one letter off one NCDXF call is read as that call
                        (UH6RS is KH6RS), unless it is on the known-call list
 
@@ -47,8 +48,9 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
 from collections import Counter, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from itertools import pairwise
 from pathlib import Path
 
@@ -91,6 +93,7 @@ NCDXF = frozenset({"4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY"
                    "4S7B", "ZS6DN", "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA", "OA4B", "YV5B"})
 NCDXF_KHZ = (14100.0, 18110.0, 21150.0, 24930.0, 28200.0)
 BEACON_MIN_CHARS = 3          # gate 12: shorter words are not read as an NCDXF call
+BCN_FILE = "bcn.csv"          # gate 12: RBN's beacon list in rbn_known_dir (spot_rule_beacons)
 
 REASONS = {1: "not a callsign structure", 2: "banned call", 3: "not read enough",
            4: "not the best reading", 5: "no keyword", 7: "call not with the keyword",
@@ -113,13 +116,62 @@ def said(gate: int, why: str) -> str:
     return SAID.get(gate, "Not spotted")
 
 
-def beacon_kind(call: str, khz: float, beacons: dict[str, float] | None = None) -> str | None:
+Beacons = Mapping[str, float | tuple[float, ...]]   # call -> the kHz it is listed on (one or several)
+
+
+def near_listed(call: str, khz: float, beacons: Beacons | None) -> bool:
+    """Gate 12: the call is a listed beacon within BEACON_KHZ of one of its listed frequencies."""
+    if not beacons or call not in beacons:
+        return False
+    listed = beacons[call]
+    freqs = (listed,) if isinstance(listed, (int, float)) else listed
+    return any(abs(khz - x) <= BEACON_KHZ for x in freqs)
+
+
+def read_beacons(path: str | Path) -> dict[str, tuple[float, ...]]:
+    """RBN's beacon list (bcn.csv, `kHz,CALL` per line): each call with every kHz it is listed on,
+    under its base call (W2DLL/B2 is W2DLL), as the decoder reads it."""
+    out: dict[str, list[float]] = {}
+    for ln in Path(path).read_text(errors="replace").splitlines():
+        parts = ln.split(",")
+        try:
+            khz, call = float(parts[0]), base(parts[1].strip().upper())
+        except (IndexError, ValueError):
+            continue
+        if call:
+            out.setdefault(call, []).append(khz)
+    return {c: tuple(f) for c, f in out.items()}
+
+
+_LISTED: dict[str, dict[str, tuple[float, ...]]] = {}   # rbn_known_dir's bcn.csv -> its list
+_LISTED_LOCK = threading.Lock()
+
+
+def listed_beacons(config: dict) -> dict[str, tuple[float, ...]]:
+    """spot_rule_beacons (off by default): RBN's beacon list, BCN_FILE in rbn_known_dir, where it
+    is fetched daily. Read once a run, so the rule, the run log and the feeder agree: a new list
+    is read at the next start. Empty when off or not there."""
+    if not config.get("spot_rule_beacons"):
+        return {}
+    path = Path(config.get("rbn_known_dir") or "rbn_known") / BCN_FILE
+    with _LISTED_LOCK:
+        if str(path) not in _LISTED:
+            try:
+                _LISTED[str(path)] = read_beacons(path)
+            except OSError as e:
+                log.warning("spot_rule_beacons is on but %s cannot be read (%s): no listed beacons",
+                            path, e)
+                _LISTED[str(path)] = {}
+        return _LISTED[str(path)]
+
+
+def beacon_kind(call: str, khz: float, beacons: Beacons | None = None) -> str | None:
     """How RBN types a spot of this call: "NCDXF" (an NCDXF call within 5 kHz of an NCDXF frequency),
-    "listed" (a spot_rule_beacons call near its kHz) or "/B" (any call ending /B); None for a CQ spot.
+    "listed" (a listed beacon near one of its kHz) or "/B" (any call ending /B); None for a CQ spot.
     The feeder sends it as the spot's type, the archive's mode column shows NCDXF B or BEACON."""
     if call in NCDXF and any(abs(khz - x) <= BEACON_KHZ for x in NCDXF_KHZ):
         return "NCDXF"
-    if beacons and call in beacons and abs(khz - beacons[call]) <= BEACON_KHZ:
+    if near_listed(call, khz, beacons):
         return "listed"
     if call.upper().endswith("/B"):
         return "/B"
@@ -267,7 +319,7 @@ class GateSpotRule:
     def __init__(self, shape: Callable[[str], str | None],
                  listed: Callable[[str], bool] | None = None,
                  banned: Iterable[str] = (),
-                 beacons: dict[str, float] | None = None, stronger_db: float | None = STRONGER_DB,
+                 beacons: Beacons | None = None, stronger_db: float | None = STRONGER_DB,
                  best_reading: bool = True, qualifiers: Iterable[str] = (),
                  notched: Iterable[tuple[float, float]] = (), level: str = "normal",
                  scp: Callable[[str], bool] | None = None):
@@ -359,6 +411,13 @@ class GateSpotRule:
     def beacon(self, call: str, f: float) -> bool:
         return call.endswith("/B") or self.known_beacon(call, f)
 
+    def _read_as_b(self, call: str, window: int) -> bool:
+        """Gate 12: a /B beacon whose /B the decoder sent as a word of its own (KI6MTV /B): its /B
+        form read in SLASH_MIN windows of the signal's buffer, the count that sends it in that form."""
+        form = call + "/B"
+        wins = self._bins.get(self._win_bin.get(window, -1), {})
+        return "/" not in call and sum(form in self._forms.get(w, ()) for w in wins) >= SLASH_MIN
+
     def _ncdxf(self, tok: str) -> str:
         """Gate 12: the NCDXF call a word on an NCDXF frequency is one letter off, if only one."""
         if (tok in NCDXF or len(tok) < BEACON_MIN_CHARS
@@ -370,7 +429,7 @@ class GateSpotRule:
     def known_beacon(self, call: str, f: float) -> bool:
         if call in NCDXF:
             return any(abs(f - x) <= BEACON_KHZ for x in NCDXF_KHZ)
-        return call in self.beacons and abs(f - self.beacons[call]) <= BEACON_KHZ
+        return near_listed(call, f, self.beacons)
 
     def feed(self, window: int, freq_khz: float, text: str, now: float,
              snr: float | None = None, report: float | None = None,
@@ -412,7 +471,7 @@ class GateSpotRule:
         for call in dict.fromkeys(t for t in text.split() if CALL_RE.match(t)):
             if snr is not None:
                 self._reads.append((now, call, freq_khz, snr, window))
-            if self._check(call, buf, tied, freq_khz, now, snr):
+            if self._check(call, buf, tied, freq_khz, now, snr, window):
                 self._held.append((now, call, freq_khz, snr, report, self.trace[-1][4], window))
         return []
 
@@ -452,13 +511,13 @@ class GateSpotRule:
         return spots
 
     def _check(self, call: str, buf: list[str], tied: list[tuple[int, str, bool]],
-               f: float, now: float, snr: float | None) -> bool:
+               f: float, now: float, snr: float | None, window: int = -1) -> bool:
         b = base(call)
         if not STRUCT_RE.match(b):
             return self._decide(now, f, call, 1)
         if call in self.banned or b in self.banned:
             return self._decide(now, f, call, 2)
-        beacon = self.beacon(call, f)
+        beacon = self.beacon(call, f) or self._read_as_b(call, window)
         if (self.scp is not None and not beacon and not (self.scp(call) or self.scp(b))
                 and (self.listed is None or not self.listed(b))):     # a known call needs no SCP entry
             return self._decide(now, f, call, 2, "not in SCP" if self.listed is None else "not in SCP or the known calls")
@@ -471,7 +530,7 @@ class GateSpotRule:
         if n < need:
             why = f"{kind or 'no'} pattern, {self.level}{', not listed' if unlisted else ''}"
             return self._decide(now, f, call, 3, f"{n} of {need} reads ({why})")
-        if self.best_reading and not (known and call in NCDXF):   # gate 12: an NCDXF beacon has no rival
+        if self.best_reading and not beacon:      # gate 12: a beacon has no rival (noise words, its grid)
             counts = best_reads(buf)
             longer = next((t for t in counts if counts[t] > 0 and clip_of(call, t)), None)
             if longer:
@@ -479,8 +538,7 @@ class GateSpotRule:
             mine = counts[call]
             # neither W1AW/7 nor a cut-off copy (C6X of NC6X) is a rival
             rival = max(((c, t) for t, c in counts.items()
-                         if base(t) != base(call) and not clip_of(t, call)
-                         and not (known and self.known_beacon(t, f))), default=(0, ""))
+                         if base(t) != base(call) and not clip_of(t, call)), default=(0, ""))
             if rival[0] >= mine:
                 return self._decide(now, f, call, 4, f"{rival[1]} read {rival[0]}x, this {mine}x")
         kw = None

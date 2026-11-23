@@ -34,3 +34,12 @@ def test_cw_windows_fit_the_flat_part(rate: int) -> None:
     for lo, _, hi_with_ft4, _ in CW_BAND_PLAN_R2:
         if lo not in (1810, 50000):  # 160m and 6m are wider than a 96 kHz span; their bottoms stay anchored
             assert (hi_with_ft4 - lo) * 1000 <= flat_hz
+
+
+def test_10m_beacons_has_its_own_centre() -> None:
+    # cdub89/SparkGap#57: a receiver where RBN lists the HF beacons, above plain 10m's window
+    from sparkgap import BAND_CENTRES_KHZ, band_known
+    assert band_center_hz("10m-beacons", 192_000) == 28_225_000 == BAND_CENTRES_KHZ["10m-beacons"] * 1000
+    assert SparkGap._resolve_band("10m-beacons", 192_000) == ("10m-beacons", 28_225_000)
+    assert band_known("10m-beacons") and band_known("10m") and not band_known("11m")
+    assert band_center_hz("10m", 192_000) == 28_076_800

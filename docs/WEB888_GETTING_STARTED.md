@@ -220,6 +220,11 @@ restart of `sparkgap.py`. 60 m has no band name: give it as a centre,
 `5368000`, which covers the US channels. A later stage moves one receiver
 without the restart ([design stage 7e](WEB888_DESIGN.md#changes-by-stage)).
 
+A 10 m receiver decodes 28000 to 28154 kHz. `10m-beacons`, a band name like
+the others, centres at 28225 and covers 28129 to 28300, where RBN lists
+almost every HF beacon and NCDXF sends on 28200; with `spot_rule_beacons` on,
+their spots go to RBN typed as beacons.
+
 ## When something is wrong
 
 <!-- markdownlint-disable MD013 -->

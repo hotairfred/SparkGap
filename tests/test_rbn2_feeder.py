@@ -672,3 +672,20 @@ def test_rtty_follows_enable_rtty_on_both_paths(tmp_path) -> None:
     radio = {"rbn_upload": "dry", "callsign": "N0CALL", "grid": "AA00"}
     assert not f.node_settings(radio, [a]).rtty
     assert f.node_settings(radio, [a, b]).rtty
+
+
+def test_rbn_s_beacon_windows_decide_whether_a_beacon_spot_goes() -> None:
+    # cdub89/SparkGap#57: RBN's id.php reply sets, per window, whether it takes beacon spots
+    sess = _session(_auth())
+    sess.beacons = {"PY4ROE": (28066.0,)}
+    beacon, cq = {**SPOT, "freq": 28066.0, "call": "PY4ROE"}, {**SPOT, "freq": 28020.0}
+    assert not sess.beacon_unwanted(beacon)                           # no reply yet: as before
+    sess.read_beacon_rules({"spotSettings": [{"startFreq": 470, "endFreq": 49999, "cq": True, "bcn": False}],
+                            "serverRules": {"spotBeacons": True}})
+    assert sess.beacon_unwanted(beacon) and not sess.beacon_unwanted(cq)
+    sess.read_beacon_rules({"spotSettings": [{"startFreq": 470, "endFreq": 49999, "bcn": True}],
+                            "serverRules": {"spotBeacons": False}})
+    assert sess.beacon_unwanted(beacon) and not sess.beacon_unwanted(cq)
+    sess.read_beacon_rules({"spotSettings": [{"startFreq": 470, "endFreq": 49999, "bcn": True}],
+                            "serverRules": {"spotBeacons": True}})
+    assert not sess.beacon_unwanted(beacon)

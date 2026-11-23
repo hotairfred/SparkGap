@@ -536,10 +536,20 @@ CW_SKIP_HOLD_SEC = 1e8       # an exclusion zone that never lapses
 BANDS = dict(zip(('160m', '80m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m'),
                  (row[0] for row in CW_BAND_PLAN_R2)))
 BAND_EDGE_MARGIN = 0.10
+# Named receivers with a centre of their own, kHz (cdub89/SparkGap#57): 10m-beacons covers 28129-28300 at
+# 192 kHz, where RBN's beacon list puts almost every HF beacon; plain 10m stops at 28154.
+BAND_CENTRES_KHZ = {'10m-beacons': 28225}
+
+
+def band_known(name):
+    """A band name SparkGap accepts: a band of the plan or a named receiver."""
+    return isinstance(name, str) and (name in BANDS or name in BAND_CENTRES_KHZ)
 
 
 def band_center_hz(name, sample_rate):
-    """Centre for a named band: its lower CW edge plus 0.4 of the IQ span."""
+    """Centre for a named band: its lower CW edge plus 0.4 of the IQ span, or its own centre."""
+    if name in BAND_CENTRES_KHZ:
+        return BAND_CENTRES_KHZ[name] * 1000
     return BANDS[name] * 1000 + round(sample_rate * (0.5 - BAND_EDGE_MARGIN))
 
 
@@ -553,10 +563,16 @@ def _rbn_spotter(cfg):
     return cfg.get('callsign', '') + ('' if suffix == '-#' else suffix)
 
 
+def _listed_beacons(config):
+    """spot_rule_beacons: RBN's beacon list from rbn_known_dir (spot_rule2.listed_beacons)."""
+    from spot_rule2 import listed_beacons
+    return listed_beacons(config)
+
+
 def _log_rbn_row(callsign, freq_khz, call, snr, wpm, t, tx_mode='CW', beacons=None):
     """A spot for RBN as the archive row RBN would store (UTC, 0.1 kHz), for scoring a run before it is on RBN.
     wpm is the speed column: WPM for CW, baud for RTTY. The mode column is the feeder's type: NCDXF B or
-    BEACON for a beacon (spot_rule2.beacon_kind, beacons = spot_rule_beacons), else CQ."""
+    BEACON for a beacon (spot_rule2.beacon_kind, beacons = RBN's list with spot_rule_beacons), else CQ."""
     from spot_rule2 import beacon_kind
     kind = beacon_kind(call, freq_khz, beacons)
     band = SpotTracker._band_id_for_freq(freq_khz)
@@ -3000,7 +3016,7 @@ def _make_spot_rule(config, tracker, local=None):
             banned=bad,
             notched=notched,
             scp=scp,
-            beacons=config.get('spot_rule_beacons'),
+            beacons=_listed_beacons(config),
             qualifiers=config.get('spot_rule_qualifiers', ()),
             stronger_db=float(stronger) if stronger else None)
     if config.get('spot_rule_scp') and local is None:
@@ -3490,7 +3506,7 @@ def _rtty_scan_band_repeat(skimmer, rtty_lib, bn, band_center_khz, fi, fq, n_sam
         for call, sf in rule.feed(w, rf_khz, _rtty_split_keywords(text), now, snr=snr_db):
             log.info("*** RTTY SPOT: %.1f kHz  %-10s  %+d dB  [%s] ***", sf, call, int(snr_db), _rtty_printable(text[:50]))
             _log_rbn_row(_rbn_spotter(skimmer.cfg), skimmer._corrected_freq_khz(sf), call, snr_db,
-                         RTTY_SPOT_BAUD, now, 'RTTY')
+                         RTTY_SPOT_BAUD, now, 'RTTY', beacons=_listed_beacons(skimmer.cfg))
             skimmer.broadcast(freq_khz=skimmer._corrected_freq_khz(sf), dx_call=call,
                               snr=int(snr_db), wpm=RTTY_SPOT_BAUD, mode='RTTY',
                               comment='CQ')
@@ -8674,7 +8690,7 @@ class SparkGap:
                 raise ValueError(f"Band dict must have center_khz or center_hz: {band_entry}")
             name = band_entry.get('name', str(int(hz // 1000)))
             return name, hz
-        if isinstance(band_entry, str) and band_entry in BANDS:
+        if band_known(band_entry):
             return band_entry, band_center_hz(band_entry, sample_rate)
         return str(band_entry), int(band_entry)
 
@@ -9037,7 +9053,7 @@ class SparkGap:
             why = "only the band can be changed live"
         elif len(self._band_meta) != 1:
             why = "not supported with more than one band"
-        elif not isinstance(band, str) or band not in BANDS:
+        elif not band_known(band):
             why = "unknown band %r" % (band,)
         elif self.cfg.get('per_band_min_snr') or self.cfg.get('pfb_scanner_bands'):
             why = "not supported with per-band settings"
@@ -9831,7 +9847,7 @@ class SparkGap:
                                  spot_wpm, method)
                         _log_rbn_row(_rbn_spotter(self.cfg), self._corrected_freq_khz(spot['freq_khz']),
                                      spot['call'], spot['snr'], spot_wpm, time.time(),
-                                     beacons=self.cfg.get('spot_rule_beacons'))
+                                     beacons=_listed_beacons(self.cfg))
                         if self._spot_log:
                             import datetime
                             ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -10688,7 +10704,7 @@ def run_file_mode(args, config):
                     if t0 is not None:
                         _log_rbn_row(_rbn_spotter(config), spot['freq_khz'], spot['call'],
                                      spot['snr'], spot.get('wpm', 0), t0 + _file_audio_t,
-                                     beacons=config.get('spot_rule_beacons'))
+                                     beacons=_listed_beacons(config))
 
         # Final collect after all data fed — give decoders a moment to flush
         import time as _time
