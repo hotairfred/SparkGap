@@ -2935,13 +2935,13 @@ def _master_scp(config):
     return str(got) if got else name
 
 def _fetch_rbn_files(config):
-    """RBN's patt3ch.lst and, with the Gated Rule, its beacon list (bcn.csv) into rbn_known_dir,
-    at most once a day (rbn_files.py). Returns the patt3ch.lst the tracker reads: the download,
-    else the copy in the checkout. No gate reads bcn.csv yet (cdub89/SparkGap#56)."""
+    """RBN's patt3ch.lst and, with the Gated Rule or spot_rule_beacons, its beacon list (bcn.csv)
+    into rbn_known_dir, at most once a day (rbn_files.py). Returns the patt3ch.lst the tracker
+    reads: the download, else the copy in the checkout."""
     import rbn_files
     from pathlib import Path
     cache = Path(config.get('rbn_known_dir', 'rbn_known'))
-    if config.get('spot_rule_gates'):
+    if config.get('spot_rule_gates') or config.get('spot_rule_beacons'):
         rbn_files.refresh_beacons(cache)
     got = rbn_files.refresh_patt3ch(cache)
     return str(got) if got else 'patt3ch.lst'

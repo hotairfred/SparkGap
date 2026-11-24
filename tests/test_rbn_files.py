@@ -71,7 +71,7 @@ def test_a_bad_copy_already_there_is_not_used(tmp_path: Path) -> None:
     assert rbn_files.refresh_patt3ch(tmp_path, fetch=offline) is None
 
 
-def test_the_beacon_list_needs_the_gated_rule(tmp_path: Path, monkeypatch) -> None:
+def test_the_beacon_list_needs_the_gated_rule_or_spot_rule_beacons(tmp_path: Path, monkeypatch) -> None:
     got: list[Path] = []
     monkeypatch.setattr(rbn_files, "refresh_beacons", lambda d: got.append(d) or True)
     monkeypatch.setattr(rbn_files, "refresh_patt3ch", lambda d: None)
@@ -79,6 +79,8 @@ def test_the_beacon_list_needs_the_gated_rule(tmp_path: Path, monkeypatch) -> No
     assert got == []
     sparkgap._fetch_rbn_files({"rbn_known_dir": str(tmp_path), "spot_rule_gates": True})
     assert got == [tmp_path]
+    sparkgap._fetch_rbn_files({"rbn_known_dir": str(tmp_path), "spot_rule_beacons": True})  # a Repeat Rule node
+    assert got == [tmp_path, tmp_path]
 
 
 SCP = b"!!Order,1,1\r\n#\r\n# Release 2026.11.18\r\nK1ABC\r\nVE2PID/W1\r\nW1AW\r\n"
