@@ -14,11 +14,18 @@ import time
 import wave
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import iq_recorder as R  # noqa: E402
 
 RATE = 1000   # small rate keeps the test fast; the recorder is rate-agnostic
+
+
+@pytest.fixture(autouse=True)
+def _room(monkeypatch):
+    """The host's free space never stops a test's recording (a Pi's /tmp is a tmpfs under 2 GB)."""
+    monkeypatch.setattr(R.shutil, 'disk_usage', lambda p: type('U', (), {'free': 100 * 2**30})())
 
 
 def _swap(rng, n):
@@ -231,3 +238,32 @@ def test_a_band_taken_off_the_list_closes_and_the_others_go_on():
         f20 = glob.glob(os.path.join(d, '*_14090kHz_*.wav'))[0]
         assert wave.open(f20, 'rb').getnframes() == 600               # its minute in hand was written
         rec.close()
+
+
+def test_low_disk_removes_record_and_stops(monkeypatch):
+    rng = np.random.default_rng(4)
+    free = {'bytes': 10 * 2**30}
+    monkeypatch.setattr(R.shutil, 'disk_usage', lambda p: type('U', (), {'free': free['bytes']})())
+    with tempfile.TemporaryDirectory() as d:
+        rec = R.BandRecorder(d, bits=16, rate=RATE)
+        open(os.path.join(d, 'RECORD'), 'w').close()
+        i1, q1 = _swap(rng, 600)
+        rec.submit(7090, 100.0, i1, q1, 600)
+        free['bytes'] = R.MIN_FREE_BYTES - 1
+        rec.submit(7090, 100.6, i1, q1, 600)           # under 2 GB: RECORD goes, this minute closes the file
+        _wait(rec)
+        assert not os.path.exists(os.path.join(d, 'RECORD'))
+        assert rec._writers == {}
+        (path,) = glob.glob(os.path.join(d, '*.wav'))
+        with wave.open(path, 'rb') as w:
+            assert w.getnframes() == 1200
+        rec.submit(7090, 101.2, i1, q1, 600)           # stopped: nothing more is written
+        _wait(rec)
+        assert glob.glob(os.path.join(d, '*.wav')) == [path]
+
+
+def test_low_disk_unreadable_never_stops(monkeypatch):
+    def fail(p):
+        raise OSError("no stat")
+    monkeypatch.setattr(R.shutil, 'disk_usage', fail)
+    assert R.low_disk('/nowhere') is None

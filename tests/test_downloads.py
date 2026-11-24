@@ -139,3 +139,12 @@ def test_a_folder_that_cannot_be_made_is_no_download_not_a_crash(tmp_path: Path)
     path = tmp_path / "file" / "sub" / "list.txt"
     ok, calls = _refresh(path, b"LIST\nA\n")
     assert not ok and calls == []
+
+
+def test_a_replaced_file_keeps_its_mode(tmp_path: Path) -> None:
+    path = tmp_path / "list.txt"
+    downloads.write_atomic(path, b"LIST\na\n", _lines)
+    assert path.stat().st_mode & 0o777 == 0o644
+    path.chmod(0o640)
+    downloads.write_atomic(path, b"LIST\na\nb\n", _lines)
+    assert path.stat().st_mode & 0o777 == 0o640 and path.read_bytes() == b"LIST\na\nb\n"

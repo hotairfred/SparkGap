@@ -11,6 +11,7 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -601,6 +602,19 @@ def test_build_in_hello(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(feed_server.subprocess, "run", no_git)
     assert feed_server.build_id() is None
+
+
+def test_build_dirty_only_for_source_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    def git(diff_rc: int) -> Callable[..., object]:
+        def run(cmd: list[str], **_k: object) -> object:
+            assert cmd[1] != "diff" or ":(exclude)*.so" in cmd       # a native build is no source change
+            return type("R", (), {"stdout": "83768ee\n", "returncode": diff_rc if cmd[1] == "diff" else 0})()
+        return run
+
+    monkeypatch.setattr(feed_server.subprocess, "run", git(0))
+    assert feed_server.build_id() == "83768ee"
+    monkeypatch.setattr(feed_server.subprocess, "run", git(1))
+    assert feed_server.build_id() == "83768ee-dirty"
 
 
 def test_pending_connections_capped() -> None:

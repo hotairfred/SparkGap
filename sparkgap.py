@@ -8693,7 +8693,10 @@ class SparkGap:
         self._wav_record = None
         self._wav_path = None
         if self.cfg.get('record_wav'):
-            self._open_wav(self.cfg['record_wav'])
+            try:
+                self._open_wav(self.cfg['record_wav'])
+            except OSError as e:
+                log.error("Recording IQ not started: %s", e)
         calls, blacklist, add_calls = load_callsign_db(
             _master_scp(self.cfg),
             self._add_calls_path,
@@ -9242,6 +9245,10 @@ class SparkGap:
         rate = self.cfg.get('sample_rate', 192000)
         center_hz = self._resolve_band(self.cfg.get('bands', [0])[0], self.cfg.get('sample_rate', 48000))[1]
         rec_path = record_wav.format(ts=ts, band=center_hz // 1000)
+        from iq_recorder import low_disk, MIN_FREE_BYTES
+        free = low_disk(os.path.dirname(os.path.abspath(rec_path)))
+        if free is not None:
+            raise OSError("%.1f GB free, a recording needs %d GB" % (free / 2**30, MIN_FREE_BYTES // 2**30))
         self._wav_base, self._wav_part, self._wav_bytes = rec_path, 1, 0
         self._wav_record = _wave.open(rec_path, 'wb')
         self._wav_record.setnchannels(2)
@@ -9376,6 +9383,11 @@ class SparkGap:
         before, self._wav_bytes = self._wav_bytes, self._wav_bytes + len(data)
         if before // RECORD_WAV_DROP_BYTES != self._wav_bytes // RECORD_WAV_DROP_BYTES:
             _wav_drop_cache(self._wav_path)
+            from iq_recorder import low_disk, MIN_FREE_BYTES
+            free = low_disk(os.path.dirname(os.path.abspath(self._wav_path)))
+            if free is not None:
+                self._close_wav()
+                log.error("Recording IQ stopped: %.1f GB free (stops under %d GB)", free / 2**30, MIN_FREE_BYTES // 2**30)
 
     def _py_minute_add(self, buf, i_cat, q_cat, rate):
         """The Python receive path's minute of IQ per band, for FT8 and RTTY: what the C receiver keeps in

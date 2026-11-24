@@ -58,14 +58,18 @@ def server_date(url: str, user_agent: str, timeout_s: float = FETCH_TIMEOUT_S) -
 def write_atomic(path: Path, data: bytes, check: Check | None = None) -> int | None:
     """Write through a temp file of this writer's own and keep it only when check passes: a crash,
     a short download or a wrong file never replaces the copy, and copies sharing it never collide.
-    Returns check's record count."""
+    Returns check's record count. A replaced file keeps its mode (an auth library kept at 0640)."""
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
     tmp = Path(name)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         records = check(tmp) if check else None
-        os.chmod(tmp, 0o644)
+        os.chmod(tmp, mode)
         tmp.replace(path)
         return records
     finally:
