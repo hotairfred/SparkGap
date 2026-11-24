@@ -171,15 +171,25 @@ class SeatError(RuntimeError):
 
 
 def bands_in(code: Path) -> list[str]:
-    """Band names a code folder's sparkgap.py accepts, from its BANDS line."""
+    """Band names a code folder's sparkgap.py accepts, from its BANDS and BAND_CENTRES_KHZ lines."""
     def parse(text: str) -> list[str]:
         m = re.search(r"^BANDS = dict\(zip\((.*)$", text, re.M)
-        return re.findall(r"'(\d+m)'", m.group(1)) if m else []
+        named = re.search(r"^BAND_CENTRES_KHZ = \{(.*)\}", text, re.M)
+        return ((re.findall(r"'(\d+m)'", m.group(1)) if m else [])
+                + (re.findall(r"'([\w-]+)':", named.group(1)) if named else []))
 
     try:
         return list(cached(code / "sparkgap.py", parse))
     except OSError:
         return []
+
+
+def band_name(band: Any) -> str:
+    """A config band's name: the name itself, or a band given as {"name", "center_khz"} by its name,
+    else by its centre in kHz."""
+    if isinstance(band, dict):
+        return str(band.get("name") or band.get("center_khz") or band.get("center_hz") or "?")
+    return str(band)
 
 
 def recording(cfg: dict[str, Any]) -> bool:
@@ -411,8 +421,9 @@ class Seat:
         return dict(cached(i.config, parse))
 
     def band(self, i: Instance) -> str:
+        """The instance's bands by name: its label, and part of its log names."""
         bands = self.config(i).get("bands") or ["?"]
-        return "+".join(str(b) for b in bands)
+        return "+".join(band_name(b) for b in bands)
 
     def multi_band(self, i: Instance) -> bool:
         """Several bands in one copy: its bands are set in its config, never from the web."""

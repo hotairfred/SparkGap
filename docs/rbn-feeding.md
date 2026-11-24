@@ -90,9 +90,12 @@ sparkgap.py itself).  This split mirrors what Aggregator does — RBN
 doesn't accept FT8 spots through its ingest endpoint.
 
 A beacon spot goes up typed as a beacon, not CQ: `NCDXF B` for an NCDXF
-call near an NCDXF frequency, `BEACON` for a `spot_rule_beacons` call near
-its frequency or a `/B` call (`spot_rule2.beacon_kind`). The run log's
-`RBN:` row carries the same type.
+call near an NCDXF frequency, `BEACON` for a beacon on RBN's list
+(`spot_rule_beacons`) near one of its frequencies or a `/B` call
+(`spot_rule2.beacon_kind`). The run log's `RBN:` row carries the same type.
+RBN's sign-in reply says which frequency windows take beacon spots
+(`spotSettings`, `serverRules`); the feeder drops a beacon spot RBN turns off
+there and counts it as `beacon off`.
 
 ## Common operational notes
 

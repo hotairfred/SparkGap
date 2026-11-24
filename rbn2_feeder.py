@@ -45,7 +45,7 @@ from urllib import request as urlreq
 import downloads
 import rbn_feeder as base
 from process_link import ProcessLink
-from spot_rule2 import beacon_kind
+from spot_rule2 import Beacons, beacon_kind, listed_beacons
 
 log = logging.getLogger("rbn2_feeder")
 
@@ -175,7 +175,7 @@ class Seat:
     port: int
     mode: str  # "dry" or "live"
     rtty: bool = True  # enable_rtty (on unless false, as in sparkgap.py): its ranges go in rTTYBandLimits too
-    beacons: dict[str, float] = field(default_factory=dict)  # spot_rule_beacons: call -> kHz
+    beacons: Beacons = field(default_factory=dict)  # spot_rule_beacons: RBN's list, call -> kHz
 
 
 def spotter_id(cfg: dict[str, Any]) -> str:
@@ -202,7 +202,7 @@ def seat_settings(cfg: dict[str, Any]) -> Seat:
         port=int(cfg.get("telnet_port", 7300)),
         mode=mode,
         rtty=bool(cfg.get("enable_rtty", True)),
-        beacons=dict(cfg.get("spot_rule_beacons") or {}),
+        beacons=listed_beacons(cfg),
     )
 
 
@@ -224,7 +224,7 @@ class Receiver:
     respot_s: float
     validation: str
     rtty: bool = True  # enable_rtty, on unless false as in sparkgap.py
-    beacons: dict[str, float] = field(default_factory=dict)  # spot_rule_beacons: call -> kHz
+    beacons: Beacons = field(default_factory=dict)  # spot_rule_beacons: RBN's list, call -> kHz
 
 
 def receiver_settings(config_dir: Path, name: str) -> Receiver:
@@ -240,7 +240,7 @@ def receiver_settings(config_dir: Path, name: str) -> Receiver:
     if not math.isfinite(respot) or respot <= 0:
         respot = RESPOT_S
     return Receiver(name, int(cfg.get("telnet_port", 7300)), respot, validation_of(cfg),
-                    bool(cfg.get("enable_rtty", True)), dict(cfg.get("spot_rule_beacons") or {}))
+                    bool(cfg.get("enable_rtty", True)), listed_beacons(cfg))
 
 
 def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
@@ -261,7 +261,7 @@ def node_settings(radio: dict[str, Any], receivers: list[Receiver]) -> Seat:
                 beacons={c: f for r in receivers for c, f in r.beacons.items()})
 
 
-def spot_type(call: str, freq: float, cq_flag: str, beacons: dict[str, float]) -> str:
+def spot_type(call: str, freq: float, cq_flag: str, beacons: Beacons) -> str:
     """The spot's type code as the Aggregator sets it: a beacon match overrides CQ, and an NCDXF
     match a listed one, as spot_rule2's gate 12 finds them."""
     kind = beacon_kind(call, freq, beacons)
@@ -367,7 +367,7 @@ class Session:
         dry_run: bool,
         bands_of: Callable[[], list[tuple[float, float]]] | None = None,
         rtty: bool = False,
-        beacons: dict[str, float] | None = None,
+        beacons: Beacons | None = None,
     ) -> None:
         if auth is None and not dry_run:
             raise AuthError("no auth library: a session without one may only dry-run")
@@ -377,6 +377,8 @@ class Session:
         self.bands_of = bands_of  # read again before each id.php: a seat changes band while it runs
         self.rtty = rtty
         self.beacons = dict(beacons or {})  # spot_rule_beacons, for the spot type
+        # id.php serverRules.spotBeacons and spotSettings' (kHz from, to, bcn), set together
+        self.beacon_rules: tuple[bool, list[tuple[float, float, bool]]] = (True, [])
         self.auth, self.version, self.fingerprint, self.dry_run = (
             auth,
             version,
@@ -514,7 +516,34 @@ class Session:
                 log.warning(
                     "serverUploadInterval %r unusable: tick stays %.0f s", interval, self.upload_s
                 )
+            self.read_beacon_rules(resp)
         return ok
+
+    def read_beacon_rules(self, resp: dict[str, Any]) -> None:
+        """Which windows take beacon spots, from the id.php reply (spotSettings' bcn per window,
+        serverRules' spotBeacons for all); a reply without them leaves the last ones."""
+        spot_beacons, windows = self.beacon_rules
+        settings = resp.get("spotSettings")
+        if isinstance(settings, list):
+            windows = []
+            for w in settings:
+                try:
+                    windows.append((float(w["startFreq"]), float(w["endFreq"]), bool(w["bcn"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        rules = resp.get("serverRules")
+        if isinstance(rules, dict) and "spotBeacons" in rules:
+            spot_beacons = bool(rules["spotBeacons"])
+        self.beacon_rules = (spot_beacons, windows)  # one assignment: the upload thread reads it
+
+    def beacon_unwanted(self, spot: dict[str, Any]) -> bool:
+        """A beacon spot RBN's id.php reply turns off: everywhere, or in the spot's window."""
+        if beacon_kind(spot["call"], spot["freq"], self.beacons) is None:
+            return False
+        spot_beacons, windows = self.beacon_rules
+        if not spot_beacons:
+            return True
+        return any(lo <= spot["freq"] <= hi and not bcn for lo, hi, bcn in windows)
 
 
 def upload_loop(
@@ -540,6 +569,8 @@ def upload_loop(
             elif respot is not None and not respot.allow(spot["call"], spot["freq"], clock(),
                                                          spot.get("rx", "")):
                 counts["respot"] = counts.get("respot", 0) + 1
+            elif sess.beacon_unwanted(spot):
+                counts["beacon off"] = counts.get("beacon off", 0) + 1
             else:
                 batch.append(spot)
         if not batch:
