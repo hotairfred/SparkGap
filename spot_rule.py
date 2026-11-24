@@ -179,12 +179,14 @@ def _split_run_together(rest: str, prev: str | None) -> list[str] | None:
 
 
 def _split_merged(tok: str) -> list[str]:
-    """CQK1ABC -> CQ K1ABC, DEW1AW -> DE W1AW (decoder dropped the word gap)."""
+    """CQK1ABC -> CQ K1ABC, DEW1AW -> DE W1AW (decoder dropped the word gap). CQ and a digit is
+    a Portuguese call, never split: CQ80BH, CQ7T (the ITU gives Portugal CQA-CUZ)."""
     out: list[str] = []
     rest = tok
     while rest:
         for pre in _MERGED_PREFIXES:
             if (rest.startswith(pre) and len(rest) > len(pre)
+                    and not (pre == "CQ" and rest[len(pre)].isdigit())
                     and re.match(r"[A-Z0-9]{1,2}\d", rest[len(pre):])):
                 out.append(pre)
                 rest = rest[len(pre):]
