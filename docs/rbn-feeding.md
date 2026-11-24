@@ -95,7 +95,9 @@ call near an NCDXF frequency, `BEACON` for a beacon on RBN's list
 (`spot_rule2.beacon_kind`). The run log's `RBN:` row carries the same type.
 RBN's sign-in reply says which frequency windows take beacon spots
 (`spotSettings`, `serverRules`); the feeder drops a beacon spot RBN turns off
-there and counts it as `beacon off`.
+there and counts it as `beacon off`. The feeder reads the beacon list once,
+when it starts: on a first install, a feeder started before SparkGap's first
+download of `bcn.csv` types no listed beacons until it is restarted.
 
 ## Common operational notes
 

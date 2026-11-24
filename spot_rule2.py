@@ -151,11 +151,15 @@ def listed_beacons(config: dict) -> dict[str, tuple[float, ...]]:
     """spot_rule_beacons (off by default): RBN's beacon list, BCN_FILE in rbn_known_dir, where it
     is fetched daily. Read once a run, so the rule, the run log and the feeder agree: a new list
     is read at the next start. Empty when off or not there."""
-    if not config.get("spot_rule_beacons"):
+    on = config.get("spot_rule_beacons")
+    if not on:
         return {}
     path = Path(config.get("rbn_known_dir") or "rbn_known") / BCN_FILE
     with _LISTED_LOCK:
         if str(path) not in _LISTED:
+            if isinstance(on, dict):          # the old call -> kHz map: now just "on"
+                log.warning("spot_rule_beacons holds a map of calls, no longer read: it turns on RBN's "
+                            "beacon list, %s; set it to true", path)
             try:
                 _LISTED[str(path)] = read_beacons(path)
             except OSError as e:

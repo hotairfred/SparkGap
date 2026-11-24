@@ -32,6 +32,15 @@ def test_the_list_is_read_only_when_the_switch_is_on(tmp_path: Path,
     assert "no listed beacons" in caplog.text
 
 
+def test_an_old_map_turns_the_list_on_and_says_so_once(tmp_path: Path,
+                                                       caplog: pytest.LogCaptureFixture) -> None:
+    spot_rule2._LISTED.clear()
+    (tmp_path / "bcn.csv").write_text(BCN)
+    old = {"rbn_known_dir": str(tmp_path), "spot_rule_beacons": {"W1AW": 7047.5}}
+    assert listed_beacons(old)["PY4ROE"] == (28066.0, 50085.0) and "W1AW" not in listed_beacons(old)
+    assert caplog.text.count("holds a map of calls") == 1
+
+
 def test_a_listed_beacon_spots_on_any_of_its_frequencies() -> None:
     r = spot_rule2.GateSpotRule(lambda c: "active", beacons={"PY4ROE": (28066.0, 50085.0)})
     win = r.window_id(280660, 0, 0.0)
