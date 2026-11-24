@@ -433,6 +433,27 @@ def test_portable_form_and_base_call_are_one_spot() -> None:
     assert _feed(r, "CQ CQ DE VE2PID /W1 K", t=60.0, w=2) == []                 # gate 10: spotted
 
 
+def test_two_portable_forms_in_as_many_windows_go_by_reads() -> None:
+    # the base call KW5CW with KW5CW/PAR and KW5CW/P each in both windows: the form read more often goes out
+    r = _rule()
+    _feed(r, "CQ CQ DE KW5CW KW5CW/P KW5CW/PAR KW5CW/PAR K", t=0.0, w=0)
+    assert _feed(r, "CQ CQ DE KW5CW KW5CW/P KW5CW/PAR K", t=30.0, w=1) == ["KW5CW/PAR"]
+
+
+def test_two_portable_forms_tied_go_by_the_first_read_in_every_run() -> None:
+    # a full tie went by set order, which PYTHONHASHSEED changes (KW5CW/P or KW5CW/PAR on 11-20)
+    import os, subprocess, sys
+    code = ("from tests.test_spot_rule2 import _rule, _feed\n"
+            "r = _rule()\n"
+            "_feed(r, 'CQ CQ DE KW5CW KW5CW/P KW5CW/PAR K', t=0.0, w=0)\n"
+            "print(_feed(r, 'CQ CQ DE KW5CW KW5CW/P KW5CW/PAR K', t=30.0, w=1))")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    outs = {subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True,
+                           env={**os.environ, "PYTHONHASHSEED": str(seed)}, check=True).stdout.strip()
+            for seed in range(8)}
+    assert outs == {"['KW5CW/P']"}
+
+
 def test_a_report_after_a_stray_slash_is_no_portable_form() -> None:
     r = _rule()
     _feed(r, "CQ DE K1ABC / 5NN K1ABC", t=0.0, w=0)
