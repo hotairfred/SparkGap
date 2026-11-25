@@ -176,6 +176,12 @@ def _start_link(skimmer, receivers):
         if cmd == 'note':    # who asked the server for what is about to happen to this copy
             log.info("Server: %s", str(args.get('text', ''))[:200])
             return True, "noted"
+        if cmd == 'pause':   # SparkGap Web's Pause and Play: no new bins while the operator transmits
+            on = args.get('on')
+            if not isinstance(on, bool):
+                return False, "pause: on must be true or false"
+            skimmer._pause_ask = on   # the state run() keeps the scanners at: they are freed and made there
+            return True, "paused" if on else "playing"
         if cmd != 'stop':
             return False, f"unknown command {cmd}"
         log.info("Stop asked by the server: shutting down...")
@@ -2736,6 +2742,20 @@ def _select_tone_lock(hz):
                  _tone_lock_hz)
     return _tone_lock_hz
 
+_bins_paused = False   # Pause in SparkGap Web: no new bins on any band while the operator transmits
+
+
+def _pause_scanner(sc, on):
+    """New bins paused (on) or resumed on one band's scanner; False when its library has no pause."""
+    import ctypes as _ct
+    lib = sc._lib
+    if not hasattr(lib, 'itila_sc_set_pause'):
+        return False
+    lib.itila_sc_set_pause.restype = _ct.c_int
+    lib.itila_sc_set_pause.argtypes = [_ct.c_void_p, _ct.c_int]
+    lib.itila_sc_set_pause(sc._h, 1 if on else 0)
+    return True
+
 _bin_liveness = False   # config itila2_bin_liveness: a window that copies a known runner keeps its bin
 
 
@@ -4067,6 +4087,7 @@ class _PFBLibShim:
         'itila_sc_env_drops':     'pfb_sc_env_drops',
         'itila_sc_bins_peak':     'pfb_sc_bins_peak',
         'itila_sc_free':          'pfb_sc_free',
+        'itila_sc_set_pause':     'pfb_sc_set_pause',
     }
 
     def __init__(self, lib):
@@ -6463,6 +6484,8 @@ class InstanceManager:
                     gate_timing_cost=getattr(self, 'gate_timing_cost', False),
                     timing_cost_max=getattr(self, 'timing_cost_max', 30.0))
                 sc = getattr(self._itila_scanner, '_sc', None)
+                if _bins_paused and sc is not None:
+                    _pause_scanner(sc, True)
                 for lo, hi in skips:
                     if sc is None or not sc.exclude(lo * 1000.0, hi * 1000.0, CW_SKIP_HOLD_SEC):
                         log.warning("CW window: cannot skip %.1f-%.1f kHz (no exclusion zones in this scanner)", lo, hi)
@@ -8599,6 +8622,7 @@ class SparkGap:
         # rx_index=0 is the only key (same as before).
         self._band_bufs = {}   # rx_index → {'iq': (n, 2) array, 'i': [], 'q': []}
         self._controls = []    # (change, reply) live changes from the GUI feed, run by run()
+        self._pause_ask = False   # the server's pause (True) or play (False), applied by run()
         # Software frequency calibration. ppm_offset > 0 means our
         # uncorrected reports run high; we subtract it before emitting.
         # Replaces a hardware GPSDO until/unless we add the R25/R26
@@ -9200,7 +9224,8 @@ class SparkGap:
                 'telnet': {'port': self.cfg.get('telnet_port', 7300),
                            'clients': self.telnet.client_count if self.telnet else 0},
                 'iq_trimmed_s': round(self._iq_trimmed / rate, 1) if rate else 0.0,
-                'recording': rec}
+                'recording': rec,
+                'paused': _bins_paused}
 
     async def stop(self):
         self.running = False
@@ -9281,6 +9306,20 @@ class SparkGap:
             self._wav_record = None
             _wav_drop_cache(self._wav_path)
             log.info("Recording IQ stopped: %s", self._wav_path)
+
+    def _pause_bins(self, on):
+        """No new bins on any band while paused; open bins keep decoding."""
+        global _bins_paused
+        _bins_paused = on
+        n = 0
+        for mgr in self.managers:
+            sc = getattr(getattr(mgr, '_itila_scanner', None), '_sc', None)
+            if sc is not None and sc._h:
+                if not _pause_scanner(sc, on):
+                    log.warning("Pause: %s has no itila_sc_set_pause; new bins not paused", _scanner_lib_path)
+                    return
+                n += 1
+        log.info("New bins %s on %d band(s)", "paused" if on else "resumed", n)
 
     def _live_record(self, record_wav, reply):
         """{"record": <record_wav file name> | null}: the single-band recording opened or closed in place
@@ -9496,6 +9535,8 @@ class SparkGap:
                     await self._live_change(*self._controls[0])
                 finally:
                     self._controls.pop(0)
+            if self._pause_ask != _bins_paused:   # one value, never cleared: no ask is lost between threads
+                self._pause_bins(self._pause_ask)
             # ----------------------------------------------------------------
             # Per-band: drain IQ and push to decoders
             # ----------------------------------------------------------------

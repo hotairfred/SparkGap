@@ -13,7 +13,7 @@ import pytest
 import sparkgap_server
 from feed_server import OP_CLOSE, OP_TEXT, FeedServer
 from seat import Seat
-from sparkgap_server import SERVER_PROTOCOL, Server, load_settings
+from sparkgap_server import PAUSE_MAX_S, SERVER_PROTOCOL, Server, load_settings
 from tests.test_feed_server import WS
 from tests.test_seat import seat, with_radio  # noqa: F401  (the fixture: a temporary root with stand-ins)
 
@@ -606,3 +606,70 @@ def test_downloads_takes_check_or_refresh_only(server: Server, seat: Seat) -> No
                                  "settings": {"action": "delete"}}).encode())
     r = _result(ws, 22)
     assert not r["ok"] and "check or refresh" in r["error"]
+
+
+def test_pause_reaches_every_receiver_and_one_linked_later(server: Server, seat: Seat) -> None:  # noqa: F811
+    from process_link import ProcessLink
+
+    asked: list[tuple[str, object]] = []
+
+    def on_command(name: str):
+        def take(cmd: str, args: dict) -> tuple[bool, str]:
+            asked.append((name, args.get("on")))
+            return True, "ok"
+        return take
+
+    def wait_for(count: int) -> None:
+        end = time.monotonic() + 5
+        while len(asked) < count and time.monotonic() < end:
+            time.sleep(0.05)
+
+    def pause(rid: int, on: object) -> dict:
+        ws.send(OP_TEXT, json.dumps({"type": "server", "id": rid, "cmd": "pause", "name": "pause",
+                                     "settings": {"on": on}}).encode())
+        return _result(ws, rid)
+
+    ws = _ws(server)
+    assert not pause(1, "yes")["ok"]  # before the links: their log forward would echo the warning back
+    first = ProcessLink("skimmer", "dallas1", on_command("dallas1"), port=server.port).start()
+    later = ProcessLink("skimmer", "dallas2", on_command("dallas2"), port=server.port)
+    again = ProcessLink("skimmer", "dallas3", on_command("dallas3"), port=server.port)
+    try:
+        wait_for(1)
+        assert asked == [("dallas1", False)]  # linked while playing: told so
+        assert pause(2, True)["ok"] and server.paused_at is not None
+        later.start()
+        wait_for(3)
+        assert sorted(asked[1:3]) == [("dallas1", True), ("dallas2", True)]
+        assert ws.json("seat")["paused"] is True
+        assert pause(3, False)["ok"] and server.paused_at is None
+        wait_for(5)
+        assert sorted(asked[3:5]) == [("dallas1", False), ("dallas2", False)]
+        again.start()  # a copy that missed the Play while unlinked is told on its link
+        wait_for(6)
+        assert asked[5:] == [("dallas3", False)]
+    finally:
+        first.close()
+        later.close()
+        again.close()
+
+
+def test_a_pause_left_on_plays_again(server: Server) -> None:
+    from process_link import ProcessLink
+
+    asked: list[object] = []
+    link = ProcessLink("skimmer", "dallas1", lambda cmd, args: (asked.append(args.get("on")), (True, "ok"))[1],
+                       port=server.port).start()
+    ws = _ws(server)
+    try:
+        ws.send(OP_TEXT, json.dumps({"type": "server", "id": 1, "cmd": "pause", "name": "pause",
+                                     "settings": {"on": True}}).encode())
+        assert _result(ws, 1)["ok"]
+        server.paused_at = time.monotonic() - PAUSE_MAX_S - 1  # as if pressed 15 min ago
+        end = time.monotonic() + 10
+        while asked[-1:] != [False] and time.monotonic() < end:
+            time.sleep(0.05)
+        assert asked[-1:] == [False] and server.paused_at is None
+        assert any(ws.json("seat")["paused"] is False for _ in range(5))  # an update sent before the Play may be queued
+    finally:
+        link.close()

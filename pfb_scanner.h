@@ -48,6 +48,7 @@ int  pfb_sc_drain_env  (PfbSc *sc, double f_hz,
 int  pfb_sc_peek_env   (PfbSc *sc, double f_hz,
                         double *env100_out, double *env200_out, int max_n);
 void pfb_sc_mark_evidence(PfbSc *sc, double f_hz);
+int  pfb_sc_set_pause(PfbSc *sc, int on);   /* no new bins while on */
 int  pfb_sc_bin_count  (PfbSc *sc);
 int  pfb_sc_env_n      (PfbSc *sc, double f_hz);
 int  pfb_sc_list_bins  (PfbSc *sc, double *f_hz_out, int max_out);
