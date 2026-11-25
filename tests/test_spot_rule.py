@@ -2,7 +2,7 @@
 
 import pytest
 
-from spot_rule import LOCK_IDLE_S, REPEAT_S, RESPOT_S, RepeatSpotRule, _regap, runner_calls, runner_groups, split_runs
+from spot_rule import LOCK_IDLE_S, REPEAT_S, RESPOT_S, RepeatSpotRule, _regap, runner_calls, runner_groups, split_runs, tokens
 
 SCP = {"K0TQ", "WX7V", "W1AW", "VE7KW", "K3JT", "K1ABC", "K1AJ", "AA3B", "NA2U"}
 
@@ -945,3 +945,12 @@ def test_takeover_idle_s_lets_a_new_runner_take_a_frequency_its_old_owner_left()
     assert run(None) == [("W6YH", 7030.0)]                       # still owned: one window waits
     assert run(180.0) == [("W6YH", 7030.0), ("K1ABC", 7030.0)]
 
+
+
+def test_cq_and_a_digit_is_a_portuguese_call_not_cq() -> None:
+    # TU CQ80BH N5TJ: the runner CQ80BH works N5TJ; split as CQ 80BH, N5TJ looked like a CQ (11-24)
+    assert tokens("TU CQ80BH N5TJ 5NN") == ["TU", "CQ80BH", "N5TJ", "5NN"]
+    assert tokens("CQCQ80BH") == ["CQ", "CQ80BH"]
+    assert tokens("CQK1ABC") == ["CQ", "K1ABC"]                 # CQ and a letter still splits
+    assert runner_calls("TU CQ80BH N5TJ 5NN") == []
+    assert runner_calls("CQ CQ80BH CQ80BH K") == ["CQ80BH"]

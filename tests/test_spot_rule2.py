@@ -533,3 +533,11 @@ def test_s_the_spot_carries_the_kept_copy_s_speed() -> None:
     tracker.process_intent(copy("CQ K1ABC K1ABC K", 20, 0.2))
     tracker.process_intent(copy("CQ K1ABC E K1AB", 38, 9.5))
     assert [(s["call"], s["wpm"]) for s in tracker.flush_pass()] == [("K1ABC", 20)]
+
+
+def test_a_station_working_cq80bh_is_no_cq() -> None:
+    # CQ80BH is a Portuguese call (CQ and a digit), not CQ run into 80BH
+    r = _rule()
+    assert _feed(r, "? TU CQ80BH N5TJ 5NN R", t=0.0, w=0) == []
+    assert _feed(r, "TU CQ80BH N5TJ 5NN", t=30.0, w=1) == []
+    assert _feed(r, "CQ CQ80BH CQ80BH K", t=60.0, w=2) == ["CQ80BH"]
