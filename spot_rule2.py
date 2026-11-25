@@ -62,7 +62,7 @@ from spot_rule import (
     _fragment,
     _lev1,
     is_exchange,
-    slash_forms,
+    slash_reads,
     split_runs,
     tokens,
 )
@@ -350,7 +350,7 @@ class GateSpotRule:
         self._last_spot: dict[tuple[str, int], tuple[float, float]] = {}
         # gate 9: calls that passed every gate this pass, spotted by end_pass()
         self._held: list[tuple[float, str, float, float | None, float | None, str, int]] = []
-        self._forms: dict[int, set[str]] = {}     # window -> portable calls read in it, see _slash_form()
+        self._forms: dict[int, Counter[str]] = {}  # window -> portable calls read in it (reads, in the order read), see _slash_form()
         self._cost: dict[int, float] = {}         # gate S: window -> the decode cost of the copy it keeps
         self._window_ids: dict[tuple[int, int], tuple[int, float]] = {}   # -> (id, first seen)
         self._pruned = 0.0
@@ -455,7 +455,7 @@ class GateSpotRule:
             self._cost.pop(window, None)
         else:
             self._cost[window] = cost
-        forms = slash_forms(text)                     # VE2PID /W1: tokens() below splits it at the slash
+        forms = slash_reads(text)                     # VE2PID /W1: tokens() below splits it at the slash
         if forms:
             self._forms[window] = forms
         else:
@@ -572,13 +572,17 @@ class GateSpotRule:
         wrong call."""
         if "/" in call:
             return call
-        wins: dict[str, int] = {}
+        wins: dict[str, list[int]] = {}       # form -> [windows, reads], in the order first read
         for w in self._bins.get(self._win_bin.get(window, -1), {}):
-            for form in self._forms.get(w, ()):
+            for form, n in self._forms.get(w, Counter()).items():
                 if call in form.split("/"):
-                    wins[form] = wins.get(form, 0) + 1
-        best = max(wins.items(), key=lambda kv: kv[1], default=(call, 0))
-        return best[0] if best[1] >= SLASH_MIN else call
+                    got = wins.setdefault(form, [0, 0])
+                    got[0] += 1
+                    got[1] += n
+        # most windows, then most reads, then the form read first: never set order, which changes
+        # from run to run (KW5CW/P or KW5CW/PAR, read in as many windows)
+        best = max(wins.items(), key=lambda kv: kv[1], default=(call, [0, 0]))
+        return best[0] if best[1][0] >= SLASH_MIN else call
 
     def last_spots(self) -> list[list]:
         return [[c, mhz, t, f] for (c, mhz), (t, f) in self._last_spot.items()]
