@@ -138,6 +138,7 @@ struct PfbSc {
     int    sample_rate;
     double center_hz;
     int    max_bins;
+    int    paused;          /* pfb_sc_set_pause: no new bins */
     double min_snr;
     int    window_samples;
     int    energy_win;
@@ -348,6 +349,7 @@ static void run_scan(PfbSc *sc, const double *seg_i, const double *seg_q)
             }
         }
         if (found) continue;
+        if (sc->paused) continue;
 
         if (sc->n_bins >= sc->max_bins) {
             /* Eviction policy: same as itila_scanner.  300s grace then evict
@@ -768,4 +770,15 @@ static void bin_free_decoders(PfbSc *sc, PsBin *b)
         if (b->h100) { sc->dec_free(b->h100); b->h100 = NULL; }
         if (b->h200) { sc->dec_free(b->h200); b->h200 = NULL; }
     }
+}
+
+/* Pause (1) or resume (0) new bins; open bins keep decoding. Returns the new state. */
+int pfb_sc_set_pause(PfbSc *sc, int on)
+{
+    if (!sc) return 0;
+    pthread_mutex_lock(&sc->lock);
+    sc->paused = on != 0;
+    int r = sc->paused;
+    pthread_mutex_unlock(&sc->lock);
+    return r;
 }

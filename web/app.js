@@ -940,7 +940,7 @@ class ServerLink {
       const names = new Set((m.instances || []).map(i => i.name));
       const radioNames = new Set((m.instances || []).map(i => i.radio));  // a radio's Node options stay while it has receivers
       dropPending(this.server.address, name => !names.has(name) && !name.startsWith("+add:") && !(name.startsWith("+node:") && radioNames.has(name.slice(6))));
-      serverCopies(this.server); renderSettings(); renderState();
+      serverCopies(this.server); renderSettings(); renderState(); renderPause();
     }
     else if (m.type === "server_result" && this.waiting.has(m.id)) { this.waiting.get(m.id)(m); this.waiting.delete(m.id); }
     else if (m.type === "log" && Array.isArray(m.lines)) {
@@ -1476,6 +1476,7 @@ function renderStatus() {
   const rec = i && s && s.recording;  // the server is writing IQ: REC in the header
   $("rec").hidden = !rec;
   $("rec").title = rec ? `Recording IQ to ${rec.file}` : "";
+  renderPause();
   const items = [["Load", s.cpu !== undefined && s.cpu !== null ? s.cpu + "%" : "-"], ["Memory", s.rss_mb ? s.rss_mb + " MB" : "-"],
     ["Bins", s.bins !== undefined ? s.bins : "-"], ["Spots", s.spots !== undefined ? s.spots : "-"],
     ["Decoder", i && i.hello.decoder ? i.hello.decoder : "-"], ["Server Build", i && i.hello.build ? i.hello.build : "-"],
@@ -2294,6 +2295,27 @@ function pickSetting(link, name, key, value) {
   renderSettings();
 }
 
+// Pause and Play: no new bins on any receiver of the shown copy's server, while the operator transmits
+function pauseLink() {
+  const i = inst(), link = i && i.server && i.server.link;
+  return link && link.state === "live" ? link : null;
+}
+function renderPause() {
+  const link = pauseLink(), on = !!(link && link.seat && link.seat.paused), b = $("pause");
+  b.hidden = !link;
+  $("paused").hidden = !on;
+  b.textContent = on ? "▶" : "⏸";
+  b.title = on ? "Play: new bins open again" : "Pause: no new bins on any receiver while you transmit";
+  b.classList.toggle("on", on);
+}
+async function togglePause() {
+  const link = pauseLink();
+  if (!link) return;
+  const on = !(link.seat && link.seat.paused);
+  if (await seatRequest(link, "pause", "pause", { on }) && link.seat) link.seat.paused = on;
+  renderPause();
+}
+
 // a request to the server; what it does shows in the server log, and so in the footer
 async function seatRequest(link, cmd, name, settings) {
   const r = await link.request(cmd, name, settings);
@@ -2435,6 +2457,7 @@ function closeSettings() { $("modal").hidden = true; app.editing = -2; app.form 
 // ---- input ----
 
 function bindInput() {
+  $("pause").onclick = togglePause;
   $("gear").onclick = () => {
     if (!$("modal").hidden) return closeSettings();
     app.mode = "radios";
